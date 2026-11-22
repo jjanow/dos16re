@@ -13,14 +13,20 @@ from .atari8 import (
 )
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
+from .d88 import D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
-from .image import APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, ImageError
+from .image import APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, ImageError
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
+from .pc88 import (
+    BOOT_ADDRESS as PC88_BOOT_ADDRESS, DISK_SUFFIXES as PC88_DISK_SUFFIXES, HIGH_BANKS, LOW_BANKS,
+    Pc88Error, boot_source, build_pc88_image, copy_source, disk_source,
+)
 from .search import SearchError, find_bytes
 from .trace import TraceError, import_trace
+from .z80 import Z80Source
 
 _PREVIEW_LIMIT = 10
 
@@ -56,12 +62,25 @@ def _unit_path(value: str) -> tuple[Path, int | None]:
     return Path(value), None
 
 
-def _msx2_copy(value: str) -> tuple[int, int, int]:
+def _runtime_copy(value: str) -> tuple[int, int, int]:
     span, at, destination = value.partition("@")
     address, colon, size = span.partition(":")
     if not at or not colon:
         raise argparse.ArgumentTypeError("expected hexadecimal SRC:SIZE@DEST")
     return _hex_address(address), _hex_address(size), _hex_address(destination)
+
+
+def _pc88_sector(value: str) -> tuple[int, int, int, int, int]:
+    chs, at, address = value.partition("@")
+    if not at:
+        raise argparse.ArgumentTypeError("expected decimal C:H:R[+COUNT] and hexadecimal @HEX")
+    chs, plus, count = chs.partition("+")
+    try:
+        cylinder, head, record = map(int, chs.split(":"))
+        sectors = int(count) if plus else 1
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected decimal C:H:R[+COUNT] and hexadecimal @HEX") from None
+    return cylinder, head, record, sectors, _hex_address(address)
 
 
 def _c64_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
@@ -223,6 +242,46 @@ def _msx2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
                                  root.disk_file, offset))
     sources[1:1] = copies
     return build_msx2_image(sources, name, entries, disk=disk)
+
+
+def _pc88_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
+    if args.base_segment is not None or args.overlay:
+        raise Pc88Error("--base-segment and --overlay apply to DOS executables")
+    if args.disk_file:
+        raise Pc88Error("select PC-88 disk sectors with --pc88-sector, or omit it for the boot sector")
+    if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
+            or args.apple2_disk_order or args.atari8_unit or args.atari8_portb is not None
+            or args.msx2_unit or args.msx2_copy):
+        raise Pc88Error("other platform options cannot be used with --pc88")
+    filename = args.program.name
+    disk = None
+    entries = args.entry
+    low = args.pc88_low
+    if args.program.suffix.lower() in PC88_DISK_SUFFIXES or args.pc88_sector or args.pc88_disk is not None:
+        if args.base_address is not None:
+            raise Pc88Error("set disk load addresses with --pc88-sector C:H:R[+COUNT]@HEX")
+        disk = D88Disk(data, args.pc88_disk if args.pc88_disk is not None else 1)
+        if args.pc88_sector:
+            sources = [
+                disk_source(disk, filename, "root" if index == 0 else f"sector_{cylinder}_{head}_{record}_{address:04x}",
+                            address, cylinder, head, record, count)
+                for index, (cylinder, head, record, count, address) in enumerate(args.pc88_sector)
+            ]
+        else:
+            sources = [boot_source(disk, filename)]
+            entries = entries or [PC88_BOOT_ADDRESS]
+            low = low or "n88-rom"
+    elif args.base_address is None:
+        raise Pc88Error("--base-address is required for raw PC-88 files")
+    else:
+        sources = [Z80Source("root", filename, args.base_address, data)]
+    for address, size, destination in args.pc88_copy:
+        sources.append(copy_source(sources, address, size, destination))
+    for path, address in args.pc88_unit:
+        if address is None:
+            raise Pc88Error(f"specify a PC-88 load address for {path.name!r} with @HEX")
+        sources.append(Z80Source(path.stem, path.name, address, path.read_bytes()))
+    return build_pc88_image(sources, filename, entries, low or "ram", args.pc88_high or "ram", disk)
 
 
 def _export_image(output: Path, image: bytes, program_map: dict) -> None:
@@ -460,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         platform.add_argument("--atari8", action="store_true", help="interpret the input as an Atari 8-bit program")
         platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
         platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
+        platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
         command.add_argument(
             "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
             help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
@@ -497,9 +557,24 @@ def main(argv: list[str] | None = None) -> int:
             help="load an additional MSX2 file at its runtime address",
         )
         command.add_argument(
-            "--msx2-copy", type=_msx2_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
+            "--msx2-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
             help="copy a hexadecimal root RAM span to DEST before loading MSX2 overlays",
         )
+        command.add_argument("--pc88-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
+        command.add_argument(
+            "--pc88-sector", type=_pc88_sector, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
+            help="load a disk sector span by decimal cylinder, head, and sector ID (default: IPL at c000)",
+        )
+        command.add_argument(
+            "--pc88-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
+            help="copy a hexadecimal span after the root and disk loads and before additional raw files",
+        )
+        command.add_argument(
+            "--pc88-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
+            help="load an additional raw PC-88 file at its runtime address",
+        )
+        command.add_argument("--pc88-low", choices=LOW_BANKS, help="select visible memory below 8000")
+        command.add_argument("--pc88-high", choices=HIGH_BANKS, help="select RAM or a graphics VRAM plane at c000")
         command.add_argument(
             "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
             help="seed 8-bit machine-code analysis at this address (repeatable)",
@@ -621,7 +696,12 @@ def main(argv: list[str] | None = None) -> int:
             and (extension in (".atr", ".xex") or
                  extension not in (".d64", ".prg") and data.startswith((ATR_MAGIC, XEX_MAGIC)))
         )
-        if args.msx2:
+        if args.pc88:
+            image, program_map = _pc88_image(args, data)
+        elif (args.pc88_disk is not None or args.pc88_sector or args.pc88_copy or args.pc88_unit
+              or args.pc88_low or args.pc88_high):
+            raise Pc88Error("PC-88 options require --pc88")
+        elif args.msx2:
             image, program_map = _msx2_image(args, data)
         elif args.msx2_unit or args.msx2_copy:
             raise Msx2Error("--msx2-unit and --msx2-copy require --msx2")
@@ -658,8 +738,8 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (Apple2Error, Atari8Error, C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
-            Msx2Error, PrgError, SearchError, TraceError, OSError) as error:
+    except (Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
+            Msx2Error, Pc88Error, PrgError, SearchError, TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
@@ -684,6 +764,8 @@ def main(argv: list[str] | None = None) -> int:
             platform = f"Atari 8-bit  PORTB {program_map['portb']:02x}"
         elif program_map["format"] == MSX2_FORMAT:
             platform = "MSX2  MSX-DOS RAM"
+        elif program_map["format"] == PC88_FORMAT:
+            platform = f"PC-88  {program_map['memory_view']}"
         else:
             platform = f"C64 PRG  bank {program_map['bank']}"
         print(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")

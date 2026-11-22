@@ -1,7 +1,8 @@
 # retrore
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
-Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, and MSX2 programs.
+Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
+and NEC PC-88 programs.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -232,6 +233,42 @@ entry points. Queries accept flat hexadecimal addresses or `unit:offset`. Ghidra
 selected I/O ports. The exported view uses caller-supplied memory placement and covers MSX-DOS RAM.
 [Ghidra Z80 language definition](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/Z80/data/languages/z80.ldefs)
 
+## NEC PC-88 loader
+
+Pass `--pc88` to `info` or `load`. A `.d88` or `.d77` image defaults to loading the 256-byte
+IPL from cylinder 0, head 0, sector ID 1 at `$C000`. For a container with multiple disks, use
+`--pc88-disk INDEX` to select one by its 1-based index. A raw input needs `--base-address HEX`.
+[D88 disk format](https://illusioncity.net/PC88/D88STRUC.txt)
+[PC-8801 IPL demonstration](https://www.kiwi-us.com/~ohta/pc88/ipl.htm)
+
+```sh
+.venv/bin/retrore info DISK.d88 --pc88 --json
+.venv/bin/retrore load DISK.d88 --pc88 --pc88-sector 0:0:1@c000 --pc88-sector 0:0:2+4@8000 \
+  --entry c000 -o out/pc88
+.venv/bin/retrore ghidra import out/pc88 out/pc88-project
+.venv/bin/retrore decomp c000 --project out/pc88-project --json
+```
+
+Supply repeatable `--pc88-sector C:H:R[+COUNT]@HEX` options to choose the disk spans and their load
+addresses. Specify cylinder, head, sector ID, and count in decimal. A span follows ascending sector
+IDs within each track and continues onto the next track in cylinder and head order. Explicit spans
+replace the default IPL selection. Use `--entry HEX` to seed analysis in an explicit layout.
+`map.json` records original container offsets, including a `file_spans` list for loads whose bytes
+cross sector headers.
+
+After disk placement, use `--pc88-copy SRC:SIZE@DEST` to copy hexadecimal spans from a single visible
+load. Repeat `--pc88-unit FILE@HEX` to apply additional raw loads after the copies. Later loads
+replace overlapping bytes. Export alternative overlays and bank states separately.
+
+The default IPL view uses N88-BASIC ROM below `$8000` and main RAM at `$C000` and above. Explicit
+loads default to main RAM throughout. Use `--pc88-low ram|n88-rom|n-rom` and
+`--pc88-high ram|blue|red|green` to select the visible ROM window and graphics VRAM plane.
+The ROM window is represented as uninitialized memory. The export describes one main-CPU view,
+with the text window at its default address. Disk and bank switching are supplied by the caller.
+Ghidra labels selected hardware ports in the `pc88_ports` block. The command
+`xrefs pc88_ports:0031 --project out/pc88-project --json` queries the graphics memory control port.
+[MAME PC-8801 memory and I/O maps](https://github.com/mamedev/mame/blob/master/src/mame/nec/pc8801.cpp)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -427,8 +464,10 @@ the extracted Amiga directories containing `game` and `PhantasieIII` respectivel
 `Phantasie_III_1987_SSI_cr_Disk_1_of_3_Side_A.dsk`. Point `RETRORE_PH1_ATARI8_DIR` and
 `RETRORE_PH2_ATARI8_DIR` to directories containing `phantasie1-side-{a,b}.atr` and
 `phantasie2-side-{a,b}.atr` respectively. Set `RETRORE_PH3_MSX2_DIR` to the directory containing
-the Phantasie III MSX2 Scenario Disk `.dsk` image. The Ghidra tests use `GHIDRA_HOME` and include
-synthetic programs for all supported platforms. Tests skip when their input variables are unset.
+the Phantasie III MSX2 Scenario Disk `.dsk` image. Set `RETRORE_PH3_PC88_DIR` to the directory
+containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. The Ghidra tests use
+`GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
+input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
 runs the synthetic suites with Ghidra 12.2 and JDK 25. [Release workflow](.github/workflows/release-ci.yml)
 

@@ -2,9 +2,9 @@
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
-binaries, Atari 8-bit executables, and MSX2 programs. It handles formats and compiler patterns shared
-across 1980s and early 1990s games and uses those games to validate support. It gives Ghidra's decompiler
-and agents driving it one whole-program image to work on.
+binaries, Atari 8-bit executables, MSX2 programs, and NEC PC-88 programs. It handles formats and compiler
+patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
+Ghidra's decompiler and agents driving it one whole-program image to work on.
 
 The primary goal is to help LLMs reverse 16-bit binaries faster and with fewer tokens. Prioritize the
 work Ghidra leaves to the analyst: recovering the runtime layout, resolving segmented and indirect
@@ -12,12 +12,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22, added MSX2 FAT12 loading and Z80 analysis for snapshots with resident copies and
-overlays. Validated both Phantasie III overlay layouts in Ghidra 12.2. Added field selection, filters,
-compact addresses, and reference paging to single and batch Ghidra queries. The Ghidra suite passed
-136 tests with 21 skipped, and the installed wheel passed an MSX2 import and reference query.
+On 2026-11-22, added NEC PC-88 D88/D77 loading, raw loads and resident copies, selected ROM and
+VRAM views, and Z80 analysis with hardware port labels. Validated the Phantasie III Program and
+Utility Disk boot paths and their transfers into distinct programs at `$0100` in Ghidra 12.2.
+The standalone suite passed 133 tests. The installed wheel passed 146 tests with 21 skipped,
+including opt-in PC-88 and MSX2 validation.
 
-Resume with NEC PC-88 for platform support or decompilation excerpts and targeted data-flow slices
+Resume with NEC PC-98 for platform support or decompilation excerpts and targeted data-flow slices
 for Phase 8.
 
 ## Why
@@ -180,12 +181,14 @@ across separated overlay units.
 | Phantasie I and III (Apple II) | RDOS 2.1 and 3.3 sector disks | Native binary load addresses, alternative helper loads, 6502 calls and soft-switch references |
 | Phantasie I and II (Atari 8-bit) | Atari DOS boot disks and segmented executables in ATR images | Boot and RUNAD entry points, alternative helper loads, 6502 calls and ANTIC references |
 | Phantasie III (MSX2) | FAT12 Scenario Disk, MSX-DOS `.COM` and `.OVR` files | Resident code copy, alternative overlays, Z80 decompilation and cross-unit transfers |
+| Phantasie III (NEC PC-88) | D88 Program and Utility Disks | IPL, alternative Z80 payloads, cross-unit transfers and hardware port references |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
 tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. The opt-in Apple II tests use
 `RETRORE_PH1_APPLE2_DIR` and `RETRORE_PH3_APPLE2_DIR`. The opt-in Atari 8-bit tests use
 `RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. The opt-in MSX2 tests use `RETRORE_PH3_MSX2_DIR`.
+The opt-in PC-88 tests use `RETRORE_PH3_PC88_DIR`.
 Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
@@ -198,8 +201,8 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, and MSX2 milestones are complete for the
-validated releases. NEC PC-88 is the next platform milestone. The analysis backlog below applies to existing
+The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, and NEC PC-88 milestones are complete
+for the validated releases. NEC PC-98 is the next platform milestone. The analysis backlog below applies to existing
 and future platforms.
 
 ## Analysis backlog
@@ -294,7 +297,7 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, and MSX2 |
+| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, MSX2, and PC-88 |
 |---|---|---|---|
 | Load, export, and byte search | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented |
@@ -410,3 +413,17 @@ Phantasie III's `PM3.COM` starts at `$0100` and copies `$5F13` bytes to `$7000`.
 `INIT2.OVR` snapshots place each overlay at `$0100` with the same resident copy. Ghidra resolves the
 resident transfer from `$B684` to each overlay entry and decompiles the overlay bodies at `$0103` and
 `$01A5`. Cartridge formats and slot or mapper transition analysis are future loader work.
+
+### NEC PC-88
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` read the IPL or caller-selected sectors
+from D88/D77 disks, including containers with multiple disks. Raw files and explicit resident copies
+can share the selected Z80 address space. The map records sector payload offsets and the selected
+ROM and VRAM banks. The Z80 importer seeds entry points and labels memory control, graphics, interrupt,
+and floppy interface ports.
+
+The Phantasie III Program and Utility Disks both boot at `$C000` and pass control through `$C100`.
+Their second stages load different programs at `$0100`, reaching routines at `$0523` and `$0161`
+respectively. Ghidra recovered both transfers and the IPL's write to port `$31`. The loader represents
+each stage with a caller-selected memory layout. Future loader work includes filesystem member
+selection and additional PC-88 memory modes.

@@ -44,6 +44,7 @@ public class Retrore8BitImport extends HeadlessScript {
             case "APPLE2" -> "apple2_";
             case "ATARI8" -> "atari8_";
             case "MSX2" -> "msx2_";
+            case "PC88" -> "pc88_";
             default -> throw new IllegalArgumentException("Unsupported 8-bit image format " + format);
         };
         for (var element : units) {
@@ -79,12 +80,12 @@ public class Retrore8BitImport extends HeadlessScript {
         String viewKey = switch (format) {
             case "C64_PRG" -> "bank";
             case "APPLE2" -> "language_card";
-            case "MSX2" -> "memory_view";
+            case "MSX2", "PC88" -> "memory_view";
             default -> "portb";
         };
         Object view;
-        if (format.equals("MSX2")) {
-            addMsx2Labels();
+        if (viewKey.equals("memory_view")) {
+            addZ80Labels(format, prefix);
             view = map.get(viewKey).getAsString();
         } else {
             int bank = map.get(viewKey).getAsInt();
@@ -107,14 +108,28 @@ public class Retrore8BitImport extends HeadlessScript {
             "units", units.size(), "entries", entries.size(), viewKey, view);
     }
 
-    private void addMsx2Labels() throws Exception {
+    private void addZ80Labels(String format, String prefix) throws Exception {
         var symbols = currentProgram.getSymbolTable();
-        symbols.createLabel(address(0x0005), "BDOS", SourceType.IMPORTED);
+        Map<Integer, String> ports;
+        if (format.equals("MSX2")) {
+            symbols.createLabel(address(0x0005), "BDOS", SourceType.IMPORTED);
+            ports = Map.of(0x98, "VDP_DATA", 0x99, "VDP_CONTROL", 0xa8, "PRIMARY_SLOT",
+                0xfc, "MAPPER_PAGE_0", 0xfd, "MAPPER_PAGE_1", 0xfe, "MAPPER_PAGE_2", 0xff, "MAPPER_PAGE_3");
+        } else {
+            ports = Map.ofEntries(
+                Map.entry(0x31, "GRAPHICS_MEMORY_CONTROL"), Map.entry(0x32, "MISC_CONTROL"),
+                Map.entry(0x50, "CRTC_DATA"), Map.entry(0x51, "CRTC_COMMAND"),
+                Map.entry(0x53, "VIDEO_LAYER_MASK"), Map.entry(0x5c, "SELECT_BLUE_VRAM"),
+                Map.entry(0x5d, "SELECT_RED_VRAM"), Map.entry(0x5e, "SELECT_GREEN_VRAM"),
+                Map.entry(0x5f, "SELECT_MAIN_RAM"), Map.entry(0x70, "RAM_WINDOW_BANK"),
+                Map.entry(0x71, "EXT_ROM_SELECT"), Map.entry(0xe2, "EXT_RAM_MODE"),
+                Map.entry(0xe3, "EXT_RAM_BANK"), Map.entry(0xe4, "IRQ_LEVEL"), Map.entry(0xe6, "IRQ_MASK"),
+                Map.entry(0xfc, "DISK_PPI_A"), Map.entry(0xfd, "DISK_PPI_B"),
+                Map.entry(0xfe, "DISK_PPI_C"), Map.entry(0xff, "DISK_PPI_CONTROL"));
+        }
         var io = currentProgram.getAddressFactory().getAddressSpace("io");
-        var block = currentProgram.getMemory().createUninitializedBlock("msx2_ports", io.getAddress(0), 0x100, false);
+        var block = currentProgram.getMemory().createUninitializedBlock(prefix + "ports", io.getAddress(0), 0x100, false);
         block.setVolatile(true);
-        var ports = Map.of(0x98, "VDP_DATA", 0x99, "VDP_CONTROL", 0xa8, "PRIMARY_SLOT",
-            0xfc, "MAPPER_PAGE_0", 0xfd, "MAPPER_PAGE_1", 0xfe, "MAPPER_PAGE_2", 0xff, "MAPPER_PAGE_3");
         for (var port : ports.entrySet()) {
             symbols.createLabel(io.getAddress(port.getKey()), port.getValue(), SourceType.IMPORTED);
         }

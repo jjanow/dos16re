@@ -1,11 +1,10 @@
 """Read MSX-DOS disk members and reconstruct a selected Z80 RAM layout."""
 
-from collections import Counter
-from dataclasses import dataclass
-from itertools import groupby
 from struct import unpack_from
 
-from .image import FLAT16_ADDRESS_LIMIT, MSX2_FORMAT
+from .image import MSX2_FORMAT
+from .z80 import Z80Source as Msx2Source
+from .z80 import place_z80_sources
 
 COM_ADDRESS = 0x0100
 _SECTOR_SIZE = 512
@@ -76,74 +75,17 @@ class MsxDosDisk:
         return bytes(contents[:size])
 
 
-@dataclass(frozen=True)
-class Msx2Source:
-    name: str
-    source: str
-    address: int
-    data: bytes
-    disk_file: str | None = None
-    file_offset: int = 0
-
-    @property
-    def end(self) -> int:
-        return self.address + len(self.data)
-
-
 def build_msx2_image(
     sources: list[Msx2Source], program: str, entries: list[int], *, disk: bool = False,
 ) -> tuple[bytes, dict]:
     """Export an MSX-DOS view with later loads replacing bytes at the same address."""
-    if not sources:
-        raise Msx2Error("no MSX2 inputs to load")
-    image = bytearray(FLAT16_ADDRESS_LIMIT)
-    owners = [None] * FLAT16_ADDRESS_LIMIT
-    names = set()
-    for index, source in enumerate(sources):
-        name = source.name.casefold()
-        if not name or ":" in name or name.startswith("msx2_") or name in names:
-            raise Msx2Error(f"invalid or duplicate MSX2 source name {source.name!r}")
-        names.add(name)
-        if not 0 <= source.address < source.end <= FLAT16_ADDRESS_LIMIT:
-            raise Msx2Error(f"MSX2 source {source.name!r} is empty or exceeds the 16-bit address space")
-        image[source.address:source.end] = source.data
-        owners[source.address:source.end] = [index] * len(source.data)
-
-    ranges = []
-    for index, addresses in groupby(range(FLAT16_ADDRESS_LIMIT), key=owners.__getitem__):
-        if index is not None:
-            start = next(addresses)
-            end = start + 1 + sum(1 for _ in addresses)
-            ranges.append((index, start, end))
-    counts = Counter(index for index, _, _ in ranges)
-    origin = ranges[0][1]
-    units = []
-    for index, start, end in ranges:
-        source = sources[index]
-        name = source.name if counts[index] == 1 and start == source.address else f"{source.name}_{start:04x}"
-        units.append({
-            "name": name, "kind": "ram", "linear": start, "size": end - start, "image_offset": start - origin,
-            "file_size": end - start, "file_offset": source.file_offset + start - source.address,
-            "source": source.source, "disk_file": source.disk_file,
-        })
-    if len({unit["name"].casefold() for unit in units}) != len(units):
-        raise Msx2Error("duplicate MSX2 memory block name")
-
-    entry_records = []
-    for address in dict.fromkeys(entries):
-        unit = next((unit for unit in units if unit["linear"] <= address < unit["linear"] + unit["size"]), None)
-        if unit is None:
-            raise Msx2Error(f"MSX2 entry {address:x} is outside loaded RAM")
-        entry_records.append({"linear": address, "unit_address": f"{unit['name']}:{address - unit['linear']:04x}"})
+    image, layout = place_z80_sources(sources, entries, "MSX2", Msx2Error)
     program_map = {
-        "version": 1, "format": MSX2_FORMAT, "program": program, "base_address": origin, "memory_view": "msxdos",
+        "version": 1, "format": MSX2_FORMAT, "program": program, "memory_view": "msxdos",
         "memory_map": [{"name": f"page_{page}", "linear": page * 0x4000, "size": 0x4000, "read": "ram", "write": "ram"}
                        for page in range(4)],
-        "sources": [{"name": source.name, "source": source.source, "disk_file": source.disk_file,
-                     "linear": source.address, "size": len(source.data), "file_offset": source.file_offset}
-                    for source in sources],
-        "units": units, "entry": entry_records[0] if entry_records else None, "entries": entry_records,
+        **layout,
     }
     if disk:
         program_map["disk"] = {"filesystem": "FAT12", "sector_size": _SECTOR_SIZE}
-    return bytes(image[origin:ranges[-1][2]]), program_map
+    return image, program_map
