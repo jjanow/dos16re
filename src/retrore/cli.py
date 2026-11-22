@@ -1,4 +1,4 @@
-"""Inspect and analyze DOS, AmigaDOS, and Atari ST executables."""
+"""Inspect and analyze DOS, AmigaDOS, Atari ST, and Commodore 64 programs."""
 
 import argparse
 import json
@@ -8,9 +8,10 @@ from pathlib import Path
 
 from .amiga import HUNK_MAGIC, HunkError, build_hunk_image
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
+from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
-from .image import DEFAULT_M68K_BASE, ImageError
+from .image import C64_FORMAT, DEFAULT_M68K_BASE, ImageError
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 from .search import SearchError, find_bytes
@@ -41,6 +42,35 @@ def _overlay(value: str) -> tuple[Path, int | None]:
     if suffix:
         return Path(path), _hex_segment(segment)
     return Path(value), None
+
+
+def _c64_unit(value: str) -> tuple[Path, int | None]:
+    path, suffix, address = value.rpartition("@")
+    if suffix:
+        return Path(path), _hex_address(address)
+    return Path(value), None
+
+
+def _c64_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
+    if args.base_segment is not None or args.overlay:
+        raise C64Error("--base-segment and --overlay apply to DOS executables")
+    source = args.program.name
+    if args.disk_file:
+        disk = D64Image(data)
+        units = [
+            PrgUnit(
+                "root" if index == 0 else name, source, disk.read_prg(name),
+                address=args.base_address if index == 0 else None, disk_file=name.upper(),
+            )
+            for index, name in enumerate(args.disk_file)
+        ]
+    elif args.program.suffix.lower() == ".d64":
+        raise C64Error("select a D64 program with --disk-file NAME")
+    else:
+        units = [PrgUnit("root", source, data, args.base_address)]
+    units.extend(PrgUnit(path.stem, path.name, path.read_bytes(), address) for path, address in args.c64_unit)
+    bank = DEFAULT_BANK if args.c64_bank is None else args.c64_bank
+    return build_c64_image(units, source, bank=bank, entries=args.entry)
 
 
 def _export_image(output: Path, image: bytes, program_map: dict) -> None:
@@ -210,9 +240,9 @@ def _trace(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retrore", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    load_parser = commands.add_parser("load", help="export a relocated executable image")
+    load_parser = commands.add_parser("load", help="export a program image")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
-    info_parser = commands.add_parser("info", help="summarize a DOS MZ, Amiga Hunk, or Atari ST GEMDOS executable")
+    info_parser = commands.add_parser("info", help="summarize a DOS, AmigaDOS, Atari ST, or Commodore 64 program")
 
     for command in (load_parser, info_parser):
         command.add_argument("program", type=Path, metavar="PROGRAM")
@@ -225,12 +255,29 @@ def main(argv: list[str] | None = None) -> int:
         )
         base.add_argument(
             "--base-address", type=_hex_address, metavar="HEX",
-            help=f"Amiga or Atari ST load address (default: {DEFAULT_M68K_BASE:06x})",
+            help=f"Amiga/Atari ST load address (default {DEFAULT_M68K_BASE:06x}) or C64 root load address override",
         )
         command.add_argument("--json", action="store_true", help="print JSON")
         command.add_argument(
             "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
             help="add a Turbo Pascal overlay bank or raw overlay (optionally at hex SEG)",
+        )
+        command.add_argument("--c64", action="store_true", help="interpret the input as a Commodore 64 program")
+        command.add_argument(
+            "--disk-file", action="append", default=[], metavar="NAME",
+            help="select a PRG from a D64 image (first is root, repeat for co-resident PRGs)",
+        )
+        command.add_argument(
+            "--c64-unit", type=_c64_unit, action="append", default=[], metavar="FILE[@HEX]",
+            help="add a co-resident PRG file (optional hex load address override)",
+        )
+        command.add_argument(
+            "--c64-bank", type=_hex_address, metavar="HEX",
+            help=f"effective C64 bank bits CHAREN/HIRAM/LORAM (0–7, default {DEFAULT_BANK})",
+        )
+        command.add_argument(
+            "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
+            help="seed C64 machine-code analysis at this address (repeatable)",
         )
 
     ghidra_parser = commands.add_parser("ghidra", help="manage a headless Ghidra import")
@@ -251,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     for name, help_text in address_queries.items():
         query_parser = commands.add_parser(name, help=help_text)
-        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, DOS seg:off, or 68k address")
+        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, DOS seg:off, or flat address")
         query_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
         query_parser.add_argument("--json", action="store_true", help="print JSON")
 
@@ -259,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     pattern = search_parser.add_mutually_exclusive_group(required=True)
     pattern.add_argument("--bytes", metavar="HEX", help="hexadecimal bytes")
-    pattern.add_argument("--string", metavar="TEXT", help="literal string (DOS CP437, Amiga Latin-1, or Atari ST ASCII)")
+    pattern.add_argument("--string", metavar="TEXT", help="literal string in the image's supported encoding")
     pattern.add_argument("--constant", metavar="N", help="decimal or 0x-prefixed integer in the image's byte order")
     search_parser.add_argument("--width", type=int, choices=(1, 2, 4, 8), help="constant width in bytes (default 2)")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
@@ -327,7 +374,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         data = args.program.read_bytes()
         hunk = data.startswith(HUNK_MAGIC)
-        if hunk or data.startswith(PRG_MAGIC):
+        m68k = hunk or data.startswith(PRG_MAGIC)
+        extension = args.program.suffix.lower()
+        if args.c64 or args.disk_file or extension == ".d64" or (
+            extension == ".prg" and not (m68k or data.startswith(b"MZ"))
+        ):
+            image, program_map = _c64_image(args, data)
+        elif args.c64_unit or args.c64_bank is not None or args.entry:
+            raise C64Error("--c64-unit, --c64-bank, and --entry require a Commodore 64 program")
+        elif m68k:
             if args.base_segment is not None or args.overlay:
                 raise MZError("--base-segment and --overlay apply to DOS executables")
             base_address = DEFAULT_M68K_BASE if args.base_address is None else args.base_address
@@ -335,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = loader(data, args.program.name, base_address)
         else:
             if args.base_address is not None:
-                raise MZError("--base-address applies to Amiga Hunk and Atari ST GEMDOS executables")
+                raise MZError("--base-address applies to Amiga, Atari ST, and Commodore 64 programs")
             executable = MZExecutable.parse(data)
             base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
             loaded = executable.load(base_segment)
@@ -346,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError, TraceError, OSError) as error:
+    except (C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError, TraceError,
+            OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
@@ -363,6 +419,14 @@ def main(argv: list[str] | None = None) -> int:
     elif program_map["format"] == "PRG":
         print(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
         print("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
+    elif program_map["format"] == C64_FORMAT:
+        entries = program_map["entries"]
+        print(f"C64 PRG  bank {program_map['bank']}  {len(program_map['units'])} units  {len(entries)} entry points")
+        if entries:
+            addresses = ", ".join(f"{entry['linear']:04x}" for entry in entries[:_PREVIEW_LIMIT])
+            print(f"  entries  {addresses}")
+        for unit in program_map["units"][:_PREVIEW_LIMIT]:
+            print(f"  {unit['name']}  {unit['linear']:04x}  {unit['size']} bytes")
     else:
         packer = f" ({loaded.packer})" if loaded.packer else ""
         print(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")

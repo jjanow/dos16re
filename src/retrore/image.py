@@ -9,6 +9,9 @@ from .mz import Address
 DEFAULT_M68K_BASE = 0x10000
 M68K_ADDRESS_LIMIT = 0x1000000
 M68K_FORMATS = ("HUNK", "PRG")
+C64_FORMAT = "C64_PRG"
+C64_ADDRESS_LIMIT = 0x10000
+_FLAT_LIMITS = dict.fromkeys(M68K_FORMATS, M68K_ADDRESS_LIMIT) | {C64_FORMAT: C64_ADDRESS_LIMIT}
 
 
 class ImageError(ValueError):
@@ -23,11 +26,12 @@ class ImageUnit:
     size: int
     file_size: int
     segment: int | None
+    address_width: int = 8
 
     def location(self, offset: int) -> dict:
         linear = self.linear + offset
         if self.segment is None:
-            address = f"{linear:08x}"
+            address = f"{linear:0{self.address_width}x}"
         else:
             segmented = Address(self.segment, offset) if offset <= 0xFFFF else Address(linear >> 4, linear & 0xF)
             address = str(segmented)
@@ -39,7 +43,7 @@ def read_map(export: Path) -> dict:
         program = json.loads((export / "map.json").read_text(encoding="utf-8"))
         if program["version"] != 1:
             raise ValueError("unsupported map version")
-        if program.get("format", "MZ") not in ("MZ", *M68K_FORMATS):
+        if program.get("format", "MZ") not in ("MZ", *_FLAT_LIMITS):
             raise ValueError("unsupported image format")
         return program
     except (KeyError, TypeError, ValueError) as error:
@@ -51,13 +55,16 @@ def read_units(export: Path, image_size: int) -> list[ImageUnit]:
 
 
 def image_units(program: dict, image_size: int) -> list[ImageUnit]:
-    flat = program.get("format") in M68K_FORMATS
+    image_format = program.get("format", "MZ")
+    flat = image_format in _FLAT_LIMITS
+    address_width = 4 if image_format == C64_FORMAT else 8
     try:
         units = program["units"]
         origin = units[0]["linear"]
-        limit = M68K_ADDRESS_LIMIT if flat else 0x100000
+        limit = _FLAT_LIMITS.get(image_format, 0x100000)
         if type(origin) is not int or not 0 <= origin <= origin + image_size <= limit:
-            raise ValueError(f"image extends past the {limit >> 20} MiB image limit")
+            size_limit = f"{limit >> 20} MiB" if limit >= 0x100000 else "64 KiB"
+            raise ValueError(f"image extends past the {size_limit} image limit")
         placements = []
         for unit in units:
             name, linear, start, size = (unit[key] for key in ("name", "linear", "image_offset", "size"))
@@ -78,7 +85,7 @@ def image_units(program: dict, image_size: int) -> list[ImageUnit]:
                 segment = unit["segment"]
                 if type(segment) is not int or not 0 <= segment <= 0xFFFF or segment * 16 != linear:
                     raise ValueError(f"invalid segment for unit {name}")
-            placements.append(ImageUnit(name, linear, start, size, file_size, segment))
+            placements.append(ImageUnit(name, linear, start, size, file_size, segment, address_width))
         placements.sort(key=lambda unit: (unit.image_offset, unit.size))
         if any(left.image_offset + left.size > right.image_offset for left, right in zip(placements, placements[1:])):
             raise ValueError("image units overlap")

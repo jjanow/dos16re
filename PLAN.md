@@ -1,7 +1,7 @@
 # retrore plan
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
-packers and overlay systems), AmigaDOS Hunk executables, and Atari ST GEMDOS executables. It handles formats and
+packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, and Commodore 64 PRGs. It handles formats and
 compiler patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
 Ghidra's decompiler and agents driving it one whole-program image to work on.
 
@@ -161,10 +161,11 @@ across separated overlay units.
 | Phantasie I (Amiga) | AmigaDOS Hunk, 240 resident hunks | Cross-hunk relocation and palette routine callers |
 | Phantasie III (Amiga) | AmigaDOS Hunk, CODE/DATA/BSS | Flat memory layout, main-loop decompilation and global reference |
 | Phantasie II (Atari ST v1.0) | GEMDOS PRG, resident TEXT/DATA/BSS | Longword fixups, DRI symbols, startup decompilation and references |
+| Phantasie I (Commodore 64) | D64 disk, PRGs with 16-bit load addresses | Co-resident helpers, RAM under BASIC ROM, alternative program loads, 6510 code and VIC references |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
-tests use `RETRORE_PH2_ST_DIR`. Headless tests also use `GHIDRA_HOME`. Tests skip when their inputs
+tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. Headless tests also use `GHIDRA_HOME`. Tests skip when their inputs
 are unset. The default suite uses synthetic files.
 
 ## Setup
@@ -176,7 +177,8 @@ are unset. The default suite uses synthetic files.
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga and Atari ST milestones are complete for the validated releases. Commodore 64 is next.
+The Commodore Amiga, Atari ST, and Commodore 64 milestones are complete for the validated releases.
+Apple II is next.
 
 ## Post-DOS stretch goals
 
@@ -229,3 +231,16 @@ Phantasie II v1.0 uses a resident `PHANT.PRG` with 6,485 fixups. Ghidra decompil
 `text:ec36`, found its call from `text:ec8e` to the title-music wait at `text:b8f2`, and resolved a relocated
 pointer from `data:02ec` to `data:0718`. The separate `UTILIT2.PRG` validated DRI symbols in all three
 sections. The release runs its loader, game, and utility as separate GEMDOS programs.
+
+### Commodore 64
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` read standalone PRGs and named PRG
+members from D64 disks. The loader places co-resident files in one selected 6510 memory view and
+records RAM, ROM, and I/O ranges. The Ghidra importer uses the 6502 language and seeds analysis
+from an identified BASIC `SYS` stub or explicit entries. Queries use `unit:offset` or a flat address.
+
+The English SSI Phantasie I side A disk supplied the validation programs. `TOWNR` and `OUTDOORS`
+both load at `$0801` and can be exported as separate layouts. `RTL-64` can be placed at its runtime
+address of `$A000` with BASIC ROM banked out. With BASIC ROM and I/O visible, Ghidra decompiled
+the `UTIL-3.O` routine at `$C5C3`, recovered its call to `$C0CC` and a write to the VIC at `$D017`,
+and decompiled the co-resident `FAST` install routine at `$CC00`.

@@ -249,3 +249,51 @@ def test_ghidra_analyzes_phantasie_ii_atari_st(phantasie_ii_atari_export, capsys
     result = query("decomp", "text:ec36")
     assert result["unit_address"] == "text:ec36"
     assert "FUN_0001b8f2()" in result["decompilation"]
+
+
+@pytest.fixture
+def phantasie_c64_disk():
+    return _game_files("RETRORE_PH1_C64_DIR")["PHANTASIE_I_1986_SSI_SIDE_A.D64"]
+
+
+def test_phantasie_c64_program_loads(phantasie_c64_disk, tmp_path, capsys):
+    disk = str(phantasie_c64_disk)
+    assert main(["load", disk, "--disk-file", "RTL-64", "--base-address", "a000", "--c64-bank", "6",
+                 "--disk-file", "TOWNR", "--entry", "a090", "-o", str(tmp_path), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    town, runtime = program["units"]
+    assert (town["linear"], town["file_size"]) == (0x0801, 21629)
+    assert (runtime["load_address"], runtime["linear"], runtime["file_size"]) == (0x0801, 0xA000, 8191)
+    assert program["entry"] == {"unit_address": "root:0090", "linear": 0xA090}
+    assert main(["info", disk, "--disk-file", "OUTDOORS", "--json"]) == 0
+    outdoors, = json.loads(capsys.readouterr().out)["units"]
+    assert (outdoors["linear"], outdoors["file_size"]) == (0x0801, 29202)
+    assert main(["info", disk, "--disk-file", "TOWNR", "--disk-file", "OUTDOORS", "--json"]) == 1
+    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]
+
+
+def test_ghidra_analyzes_phantasie_c64(phantasie_c64_disk, tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    output = tmp_path / "out"
+    project = tmp_path / "phantasie-c64"
+    assert main(["load", str(phantasie_c64_disk), "--disk-file", "UTIL-3.O", "--disk-file", "FAST",
+                 "--entry", "c5c3", "--entry", "cc00", "-o", str(output), "--json"]) == 0
+    util, fast = json.loads(capsys.readouterr().out)["units"]
+    assert (util["linear"], util["file_size"]) == (0xC000, 2281)
+    assert (fast["linear"], fast["file_size"]) == (0xCC00, 699)
+    assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["entries"] == 2
+
+    def query(command, address):
+        assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)
+
+    call, = query("xrefs", "c5c3")["outgoing"]
+    assert call["to"]["unit_address"] == "root:00cc"
+    assert call["type"] == "UNCONDITIONAL_CALL"
+    vic_write, = query("xrefs", "root:05de")["outgoing"]
+    assert vic_write["to"]["unit_address"] == "c64_vic:0017"
+    assert vic_write["type"] == "WRITE"
+    assert "FUN_c0cc()" in query("decomp", "root:05c3")["decompilation"]
+    assert query("decomp", "FAST:0000")["linear"] == 0xCC00

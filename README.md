@@ -1,7 +1,7 @@
 # retrore
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
-and Atari ST GEMDOS executables.
+Atari ST GEMDOS executables, and Commodore 64 PRGs.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -95,6 +95,41 @@ relative to their sections.
 
 Ghidra imports the symbols and starts 68k analysis at `text:0000`. Use `text:offset`, `data:offset`,
 `bss:offset`, or a flat hexadecimal address in queries. This layout covers the resident GEMDOS image.
+
+## Commodore 64 loader
+
+`info` and `load` accept a Commodore 64 `.prg` or a named PRG from a `.d64` disk image. Use `--c64`
+for extracted files without an extension or when the PRG's two-byte address matches another format's
+signature. D64 selection accepts ASCII member names, ignoring letter case, and reads closed PRGs from
+35-, 40-, and 42-track sector images with optional error tables.
+[VICE disk format documentation](https://vice-emu.sourceforge.io/vice_17.html)
+
+```sh
+.venv/bin/retrore info DISK.d64 --disk-file MAIN --json
+.venv/bin/retrore load DISK.d64 --disk-file MAIN --disk-file HELPERS --entry c000 -o out/c64
+.venv/bin/retrore ghidra import out/c64 out/c64-project
+.venv/bin/retrore decomp c000 --project out/c64-project --json
+```
+
+The loader strips the two-byte little-endian load address and places each payload unchanged.
+The first `--disk-file` is `root`. Repeat it for co-resident files on that disk, or add extracted
+PRGs with `--c64-unit FILE`. Use `--base-address HEX` for the root or `--c64-unit FILE@HEX` for an
+additional PRG when the program copies it to a different address. `map.json` records the original
+load address and the source of each payload. Export modules that reuse the same addresses in
+separate layouts.
+
+Each export represents one CPU view of a stock C64. `--c64-bank 0` exposes RAM beneath ROM and I/O.
+The default `7` exposes BASIC ROM, KERNAL ROM, and I/O, while `6` exposes RAM at `$A000` and keeps
+KERNAL ROM and I/O visible. Choose a bank where each PRG resides in visible RAM. The JSON memory map
+records the read and write destinations. Ghidra creates uninitialized blocks for the remaining memory
+and names the 6510 port registers. For software that changes the port at runtime, export one layout
+per bank you want to analyze. [Commodore 64 Programmer's Reference Guide, memory management](https://www.commodore.ca/manuals/c64_programmers_reference/c64-programmers_reference_guide-05-basic_to_machine_language.pdf)
+
+PRG headers specify a load address. A single-line BASIC `SYS` stub at `$0801` can supply a machine-code
+entry inside the payload. Use repeatable `--entry HEX` to specify entry points for raw machine code or
+more complex programs. The Ghidra importer uses its 6502 language for 6510 instructions. Queries accept
+a flat hexadecimal address or `unit:offset`. `where-is --string` uses literal ASCII bytes. Use `--bytes`
+for other PETSCII characters.
 
 ## Ghidra
 
@@ -242,8 +277,10 @@ Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Ra
 `MAIN.EXE` from `RETRORE_PH3_DIR`. Point `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR` to
 the extracted Amiga directories containing `game` and `PhantasieIII` respectively. Set
 `RETRORE_PH2_ST_DIR` to the extracted Phantasie II v1.0 Atari ST disk directory with `PHANT.PRG` and
-`UTILIT2.PRG`. The Ghidra tests use `GHIDRA_HOME` and include synthetic DOS, Amiga, and Atari ST
-executables. Tests skip when their input variables are unset. See the roadmap for upcoming work.
+`UTILIT2.PRG`. Set `RETRORE_PH1_C64_DIR` to the directory containing
+`Phantasie_I_1986_SSI_Side_A.d64`. The Ghidra tests use `GHIDRA_HOME` and include synthetic DOS,
+Amiga, Atari ST, and C64 programs. Tests skip when their input variables are unset. See the roadmap
+for upcoming work.
 [PLAN.md](PLAN.md)
 
 ## License

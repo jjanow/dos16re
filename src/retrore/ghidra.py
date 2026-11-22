@@ -8,7 +8,7 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .image import M68K_FORMATS, image_units, read_map
+from .image import C64_FORMAT, M68K_FORMATS, image_units, read_map
 
 
 class GhidraError(ValueError):
@@ -72,6 +72,11 @@ def import_program(export: Path, project: Path) -> dict:
         return _run(
             project, [*options, "68000:BE:32:MC68020"], None, str(manifest), pre_script="RetroreM68kImport.java",
         )
+    if program.get("format") == C64_FORMAT:
+        image_units(program, image.stat().st_size)
+        return _run(
+            project, [*options, "6502:LE:16:default"], None, str(manifest), pre_script="RetroreC64Import.java",
+        )
     return _run(
         project, [*options, "x86:LE:16:Real Mode"],
         "RetroreSegments.java", str(manifest), pre_script="RetroreImport.java",
@@ -84,7 +89,7 @@ def decompile(address: str, project: Path) -> dict:
 
 def query_address(command: str, address: str, project: Path) -> dict:
     if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
-        raise GhidraError("expected a hexadecimal unit:offset, DOS seg:off, or 68k address")
+        raise GhidraError("expected a hexadecimal unit:offset, DOS seg:off, or flat address")
     return _query(project, "RetroreQuery.java", command, address)
 
 
