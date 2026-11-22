@@ -12,14 +12,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22, added NEC PC-98 D88/D77 and HDM sector loads, raw real-mode loads, and Ghidra
-import with PC-9801 VRAM and IPL ROM windows. Validated the Phantasie III Program and Utility
-Disk IPLs, second-stage loaders, and far jumps into the two programs in Ghidra 12.2. Also verified
-the Phantasie IV HDM boot sector import. The standalone suite passed 136 tests. The installed
-wheel passed 148 tests with 25 skipped, including both opt-in PC-98 tests.
+On 2026-11-22, added `decomp --context` for address-linked C excerpts and `decomp --slice` for
+bounded backward p-code queries. Both work in single and batch queries. Synthetic DOS and Atari ST
+fixtures cover call arguments, a branch condition, a memory load and store, and instruction addresses.
+The standalone suite passed 141 tests with 38 skipped. With Ghidra 12.2 and JDK 25, both the source
+checkout and installed wheel passed 152 tests with 27 skipped.
 
-Resume with Sharp X1 / X1turbo for platform support or decompilation excerpts and targeted data-flow slices
-for Phase 8.
+Resume Phase 8 with bounded bulk function and symbol lookups. Sharp X1 / X1turbo is the next platform.
 
 ## Why
 
@@ -218,8 +217,9 @@ The analysis backlog below applies to existing and future platforms.
 - **Implemented.** Single and batch Ghidra address queries support field selection. Reference lists
   support paging with filtered totals and next offsets, exact reference type filters, direction selection
   for `xrefs`, and compact address records.
-- Offer decompilation excerpts and targeted data-flow slices around one call, branch, or memory
-  access. Include stable addresses for retrieving the supporting instructions or full function.
+- **Implemented.** Single and batch `decomp` queries return address-linked C excerpts and bounded
+  backward p-code slices for calls, branches, and memory accesses. The results identify the containing
+  function and the instruction addresses that support the excerpt and slice.
 - Add bounded bulk function and symbol lookups, unit-scoped inventories, limited call-graph walks,
   and contextual results that combine a routine's prototype, calls, and referenced data. Allow bulk
   queries for coverage and analysis gaps when a workflow needs them.
@@ -304,6 +304,7 @@ underlying analysis uses each machine's conventions and available emulator or tr
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
 | Batch Ghidra address queries | Implemented | Implemented | Implemented | Implemented |
 | Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
+| Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
 | Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
 | Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Extend for relevant targets | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
 | Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned | Planned |
@@ -439,5 +440,5 @@ importer tracks segment context and represents text VRAM, graphics VRAM, and IPL
 The Phantasie III Program and Utility Disks both start at `1fc0:0000` and load a second stage at
 `3f00:0000`. Ghidra decompiled both loaders and recovered their direct far jumps to `0200:035f`.
 The startup routines there lead to `0412:0006` on the Program Disk and `03ca:000f` on the Utility
-Disk. Future loader work includes FAT12 member selection for PC-98 DOS floppies and additional
-machine-specific ROM and graphics views.
+Disk. The Phantasie IV HDM boot sector also imported into Ghidra. Future loader work includes FAT12
+member selection for PC-98 DOS floppies and additional machine-specific ROM and graphics views.

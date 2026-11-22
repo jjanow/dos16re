@@ -4,26 +4,37 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import ghidra.app.decompiler.ClangStatement;
+import ghidra.app.decompiler.ClangToken;
 import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.decompiler.PrettyPrinter;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressOverflowException;
 import ghidra.program.model.address.SegmentedAddressSpace;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.pcode.PcodeOp;
+import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.Reference;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
@@ -34,16 +45,25 @@ public class RetroreQuery extends GhidraScript {
     private record CrossReference(Object from, Object to, String type, int operand,
             Routine fromFunction, Routine toFunction) {}
     private record Page(int offset, int total, int returned, Integer nextOffset) {}
+    private record Focus(Location address, String instruction, String bytes) {}
+    private record ExcerptLine(int line, String text, boolean focused, List<Location> addresses) {}
+    private record SliceValue(String storage, int size) {}
+    private record SliceInput(String storage, int size, Integer definition) {}
+    private record SliceOperation(int id, Location address, String opcode, boolean focused,
+            List<SliceInput> inputs, SliceValue output) {}
+    private record DataSlice(List<SliceOperation> operations, boolean truncated) {}
 
     private record Options(Set<String> fields, String direction, Set<String> types,
-            Integer limit, int offset, boolean paged, boolean compact) {
+            Integer limit, int offset, boolean paged, boolean compact, Integer context, Integer slice) {
         Options(JsonObject request) {
             this(values(request, "fields"), request.has("direction") ? request.get("direction").getAsString() : "both",
                 values(request, "ref_types").stream().map(type -> type.toUpperCase(Locale.ROOT)).collect(Collectors.toSet()),
                 request.has("limit") ? request.get("limit").getAsInt() : null,
                 request.has("offset") ? request.get("offset").getAsInt() : 0,
                 request.has("limit") || request.has("offset"),
-                request.has("compact") && request.get("compact").getAsBoolean());
+                request.has("compact") && request.get("compact").getAsBoolean(),
+                request.has("context") ? request.get("context").getAsInt() : null,
+                request.has("slice") ? request.get("slice").getAsInt() : null);
         }
 
         private static Set<String> values(JsonObject request, String key) {
@@ -177,7 +197,7 @@ public class RetroreQuery extends GhidraScript {
                 throw new IllegalArgumentException("no analyzed function contains " + input);
             }
             if (command.equals("decomp")) {
-                return describeDecompilation(function, options);
+                return describeDecompilation(function, address, options);
             }
             if (options.includes("function")) {
                 report.put("function", routine(function, options.compact()));
@@ -321,7 +341,8 @@ public class RetroreQuery extends GhidraScript {
         return new Location(address.toString(), unitAddress, address.isMemoryAddress() ? address.getOffset() : null);
     }
 
-    private Map<String, Object> describeDecompilation(Function function, Options options) throws Exception {
+    private Map<String, Object> describeDecompilation(Function function, Address address, Options options)
+            throws Exception {
         var report = new LinkedHashMap<String, Object>();
         var entry = location(function.getEntryPoint());
         if (options.includes("address")) {
@@ -336,13 +357,130 @@ public class RetroreQuery extends GhidraScript {
         if (options.includes("name")) {
             report.put("name", function.getName());
         }
-        if (options.includes("decompilation")) {
-            report.put("decompilation", decompile(function));
+        boolean targeted = options.context() != null || options.slice() != null;
+        boolean full = targeted ? options.fields().contains("decompilation") : options.includes("decompilation");
+        boolean excerpt = options.context() != null && options.includes("excerpt");
+        boolean slice = options.slice() != null && options.includes("slice");
+        Instruction instruction = null;
+        if (targeted && (options.includes("focus") || excerpt || slice)) {
+            instruction = currentProgram.getListing().getInstructionContaining(address);
+            if (instruction == null) {
+                throw new IllegalArgumentException("no analyzed instruction contains " + address);
+            }
+            if (options.includes("focus")) {
+                report.put("focus", new Focus(location(instruction.getAddress()), instruction.toString(),
+                    HexFormat.of().formatHex(instruction.getBytes())));
+            }
+        }
+        if (full || excerpt || slice) {
+            var result = decompile(function);
+            if (full) {
+                report.put("decompilation", result.getDecompiledFunction().getC());
+            }
+            if (excerpt) {
+                report.put("excerpt", excerpt(result, instruction.getAddress(), options.context()));
+            }
+            if (slice) {
+                report.put("slice", dataSlice(result, instruction, options.slice()));
+            }
         }
         return report;
     }
 
-    private String decompile(Function function) throws Exception {
+    private List<ExcerptLine> excerpt(DecompileResults result, Address focus, int context) throws Exception {
+        var lines = new PrettyPrinter(result.getFunction(), result.getCCodeMarkup(), null).getLines();
+        var excerpt = new ArrayList<ExcerptLine>();
+        for (int index = 0; index < lines.size(); index++) {
+            monitor.checkCancelled();
+            if (!lineAddresses(lines.get(index).getAllTokens()).contains(focus)) {
+                continue;
+            }
+            int start = Math.max(0, index - context);
+            int end = Math.min(lines.size(), index + context + 1);
+            for (var line : lines.subList(start, end)) {
+                var addresses = lineAddresses(line.getAllTokens());
+                excerpt.add(new ExcerptLine(line.getLineNumber(), PrettyPrinter.getText(line),
+                    addresses.contains(focus), addresses.stream().map(this::location).toList()));
+            }
+            break;
+        }
+        return excerpt;
+    }
+
+    private static Set<Address> lineAddresses(List<ClangToken> tokens) {
+        var addresses = new TreeSet<Address>();
+        for (var token : tokens) {
+            var op = token.getPcodeOp();
+            if (op != null) {
+                addresses.add(op.getSeqnum().getTarget());
+            }
+            if (token.Parent() instanceof ClangStatement statement && statement.getPcodeOp() != null) {
+                addresses.add(statement.getPcodeOp().getSeqnum().getTarget());
+            }
+        }
+        return addresses;
+    }
+
+    private DataSlice dataSlice(DecompileResults result, Instruction instruction, int limit) throws Exception {
+        var atFocus = new ArrayList<PcodeOp>();
+        var candidates = result.getHighFunction().getPcodeOps(instruction.getAddress());
+        while (candidates.hasNext()) {
+            var op = candidates.next();
+            if (op.getParent() != null) {
+                atFocus.add(op);
+            }
+        }
+        var flow = instruction.getFlowType();
+        var focused = atFocus.stream().filter(op -> switch (op.getOpcode()) {
+            case PcodeOp.CALL, PcodeOp.CALLIND -> flow.isCall();
+            case PcodeOp.BRANCH, PcodeOp.CBRANCH, PcodeOp.BRANCHIND -> flow.isJump();
+            case PcodeOp.LOAD, PcodeOp.STORE -> !flow.isCall() && !flow.isJump();
+            default -> false;
+        }).toList();
+        if (focused.isEmpty()) {
+            focused = atFocus;
+        }
+        var roots = new HashSet<>(focused);
+        var seen = new HashSet<>(focused);
+        var pending = new ArrayDeque<>(focused);
+        var operations = new ArrayList<SliceOperation>();
+        var language = currentProgram.getLanguage();
+        while (!pending.isEmpty() && operations.size() < limit) {
+            monitor.checkCancelled();
+            var op = pending.removeFirst();
+            var inputs = new ArrayList<SliceInput>();
+            for (int index = 0; index < op.getNumInputs(); index++) {
+                var input = op.getInput(index);
+                var definition = input.getDef();
+                if (definition != null && seen.add(definition)) {
+                    pending.addLast(definition);
+                }
+                inputs.add(new SliceInput(inputStorage(op.getOpcode(), index, input), input.getSize(),
+                    definition == null ? null : definition.getSeqnum().getTime()));
+            }
+            var output = op.getOutput();
+            operations.add(new SliceOperation(op.getSeqnum().getTime(), location(op.getSeqnum().getTarget()),
+                op.getMnemonic(), roots.contains(op), inputs,
+                output == null ? null : new SliceValue(output.toString(language), output.getSize())));
+        }
+        return new DataSlice(operations, !pending.isEmpty());
+    }
+
+    private String inputStorage(int opcode, int index, Varnode input) {
+        if (index == 0 && opcode == PcodeOp.SEGMENTOP) {
+            // Ghidra emits a native pointer identifying the address space for this operator.
+            return "segment address space";
+        }
+        if (index == 0 && (opcode == PcodeOp.LOAD || opcode == PcodeOp.STORE)) {
+            var space = currentProgram.getAddressFactory().getAddressSpace((int) input.getOffset());
+            if (space != null) {
+                return space.getName();
+            }
+        }
+        return input.toString(currentProgram.getLanguage());
+    }
+
+    private DecompileResults decompile(Function function) throws Exception {
         if (decompiler == null) {
             decompiler = new DecompInterface();
             if (!decompiler.openProgram(currentProgram)) {
@@ -353,10 +491,11 @@ public class RetroreQuery extends GhidraScript {
             }
         }
         var result = decompiler.decompileFunction(function, 60, monitor);
-        if (!result.decompileCompleted()) {
-            throw new IllegalArgumentException(result.getErrorMessage());
+        if (!result.decompileCompleted() || result.getCCodeMarkup() == null) {
+            throw new IllegalArgumentException(Objects.requireNonNullElse(result.getErrorMessage(),
+                "decompiler returned no C markup"));
         }
-        return result.getDecompiledFunction().getC();
+        return result;
     }
 
     private Address resolve(String input) throws Exception {

@@ -18,6 +18,7 @@ _QUERY_FIELDS = {
     "func": {"function", "ranges", "size", "address", "segments", "callers"},
 }
 _REFERENCE_OPTIONS = {"limit", "offset", "ref_types", "compact"}
+_DECOMP_LIMITS = {"context": (0, 20), "slice": (1, 128)}
 
 
 class GhidraError(ValueError):
@@ -116,7 +117,19 @@ def _validate_query(request: object) -> None:
     if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
         raise GhidraError("expected a hexadecimal unit:offset, seg:off, or flat address")
     allowed = {"command", "address", "fields"}
-    if command != "decomp":
+    fields_allowed = _QUERY_FIELDS[command].copy()
+    if command == "decomp":
+        allowed.update(_DECOMP_LIMITS)
+        for name, (minimum, maximum) in _DECOMP_LIMITS.items():
+            if name in request and (type(request[name]) is not int or not minimum <= request[name] <= maximum):
+                raise GhidraError(f"{name} must be an integer between {minimum} and {maximum}")
+        if "context" in request:
+            fields_allowed.add("excerpt")
+        if "slice" in request:
+            fields_allowed.add("slice")
+        if "context" in request or "slice" in request:
+            fields_allowed.add("focus")
+    else:
         allowed.update(_REFERENCE_OPTIONS)
     if command == "xrefs":
         allowed.add("direction")
@@ -126,8 +139,8 @@ def _validate_query(request: object) -> None:
     if "fields" in request:
         fields = request["fields"]
         if (not isinstance(fields, list) or not fields
-                or any(not isinstance(field, str) or field not in _QUERY_FIELDS[command] for field in fields)):
-            raise GhidraError(f"fields for {command} must be a nonempty list chosen from {', '.join(sorted(_QUERY_FIELDS[command]))}")
+                or any(not isinstance(field, str) or field not in fields_allowed for field in fields)):
+            raise GhidraError(f"fields for {command} must be a nonempty list chosen from {', '.join(sorted(fields_allowed))}")
     if "direction" in request and request["direction"] not in ("incoming", "outgoing", "both"):
         raise GhidraError("direction must be incoming, outgoing, or both")
     if "ref_types" in request:

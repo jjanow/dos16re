@@ -393,6 +393,33 @@ list included. Use the same filters and pass `next_offset` as `--offset` to get 
 top-level result fields in JSON, including for `decomp`. Paging metadata accompanies any selected
 reference lists. Request only metadata fields from `decomp` to skip decompiling the body.
 
+### Focused decompilation
+
+Pass a call, branch, or memory instruction address to `decomp` to see the relevant C and the
+values that reach the instruction. `--context N` returns up to N lines before and after the first
+matching C line (0–20). `--slice N` returns up to N Ghidra high p-code operations (1–128), starting
+at the selected instruction and following input definitions within the function. Use either option
+on its own or combine them.
+
+```sh
+.venv/bin/retrore decomp OV1:20a5 --project out/phantasie-project --context 2 --slice 12 --json
+```
+
+The top-level address still identifies the function entry. `focus` gives the selected instruction's
+start address, disassembly, and loaded bytes, including when the query address is inside the
+instruction. `excerpt` lists C line numbers and addresses from Ghidra's p-code markup. In `slice`,
+operations marked `focused` seed the search. Inputs give their storage, size in bytes, and the local
+operation ID of their definition, when known. A bounded slice reports `truncated: true` if there
+are more operations, and a definition can refer to an operation beyond the limit.
+
+The slice follows Ghidra's recovered input definitions within one function. Call arguments reflect
+Ghidra's prototype analysis. A load traces its address calculation and any other input definitions
+Ghidra recovered. Instructions eliminated by the decompiler can yield an empty excerpt or slice.
+[Ghidra p-code reference](https://ghidra.re/ghidra_docs/languages/html/pcoderef.html)
+
+Use plain `decomp` or select `decompilation` explicitly with `--fields` to get the entire C body.
+To retrieve the instruction bytes at any returned address, query it with `--context 0 --fields focus --json`.
+
 ### Batch Ghidra queries
 
 `batch` runs `decomp`, `xrefs`, `callers`, `callees`, and `func` against one project in a single
@@ -403,6 +430,7 @@ from every supported platform and accepts the same addresses as the individual c
 .venv/bin/retrore batch --project out/phantasie-project --json <<'EOF'
 [
   {"command": "decomp", "address": "OV1:20bb"},
+  {"command": "decomp", "address": "OV1:20a5", "context": 2, "slice": 12},
   {"command": "callers", "address": "OV1:20bb"},
   {"command": "xrefs", "address": "OV1:20a5", "direction": "outgoing", "limit": 10, "compact": true}
 ]
@@ -411,8 +439,8 @@ EOF
 
 Pass a UTF-8 JSON file as the positional argument or pipe the array on stdin. Each request contains
 a `command` and an `address`. Optional fields match the individual commands. Use the arrays `fields`
-and `ref_types`, the integers `limit` and `offset`, the boolean `compact`, and the string `direction`
-where supported. The JSON response contains a `results` array in request order. Each
+and `ref_types`, the integers `limit`, `offset`, `context`, and `slice`, the boolean `compact`, and
+the string `direction` where supported. The JSON response contains a `results` array in request order. Each
 row echoes those two fields and includes either `result`, with the individual command's JSON, or
 `error`. The CLI writes the whole batch report to stdout and exits with status 1 if any query fails.
 An invalid request array or a headless launch failure uses the command's error stream.

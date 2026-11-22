@@ -420,11 +420,40 @@ def _query_options(args: argparse.Namespace) -> dict:
     if fields is not None and not args.json:
         raise GhidraError("--fields requires --json")
     options = {"fields": fields.split(",")} if fields is not None else {}
-    for name in ("limit", "offset", "direction", "ref_types", "compact"):
+    for name in ("limit", "offset", "direction", "ref_types", "compact", "context", "slice"):
         value = getattr(args, name, None)
         if value is not None:
             options[name] = value
     return options
+
+
+def _decomp(args: argparse.Namespace) -> None:
+    report = decompile(args.address, args.project, **_query_options(args))
+    if args.json:
+        print(json.dumps(report))
+        return
+    if "decompilation" in report:
+        print(report["decompilation"].strip())
+        return
+    focus = report["focus"]
+    print(f"{_location(focus['address'])}  {focus['instruction']}")
+    if "excerpt" in report:
+        for line in report["excerpt"]:
+            marker = ">" if line["focused"] else " "
+            print(f"{marker} {line['line']:4} {line['text']}")
+        if not report["excerpt"]:
+            print("No decompiled C line maps to this instruction.")
+    if "slice" in report:
+        operations = report["slice"]["operations"]
+        for operation in operations[:_PREVIEW_LIMIT]:
+            inputs = ", ".join(value["storage"] for value in operation["inputs"])
+            print(f"  {_location(operation['address'])}  {operation['opcode']} {inputs}".rstrip())
+        if not operations:
+            print("No high p-code maps to this instruction.")
+        if len(operations) > _PREVIEW_LIMIT:
+            print("Use --json for all returned operations.")
+        if report["slice"]["truncated"]:
+            print("Slice truncated at the requested operation limit.")
 
 
 def _address_query(args: argparse.Namespace) -> None:
@@ -649,6 +678,8 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser.add_argument("address", metavar="ADDR")
     decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     decomp_parser.add_argument("--fields", metavar="FIELD,...", help="select top-level JSON fields")
+    decomp_parser.add_argument("--context", type=int, metavar="N", help="show N C lines around the selected instruction (0–20)")
+    decomp_parser.add_argument("--slice", type=int, metavar="N", help="trace up to N backward p-code operations (1–128)")
     gaps_parser = commands.add_parser("gaps", help="report undefined ranges in an analyzed Ghidra project")
     gaps_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     batch_parser = commands.add_parser("batch", help="run multiple address queries in one Ghidra session")
@@ -720,8 +751,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report) if args.json else summary)
             return 0
         if args.command == "decomp":
-            report = decompile(args.address, args.project, **_query_options(args))
-            print(json.dumps(report) if args.json else report["decompilation"].strip())
+            _decomp(args)
             return 0
         if args.command == "gaps":
             report = analysis_gaps(args.project)

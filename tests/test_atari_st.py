@@ -119,5 +119,9 @@ def test_atari_st_ghidra_import_and_queries(tmp_path, capsys):
     assert call["from"]["unit_address"] == "text:0000"
     assert call["to_function"]["name"] == "worker"
     assert "return 7;" in query("decomp", "text:0008")["decompilation"]
+    focused = query("decomp", "00010000", "--context", "0", "--slice", "1")
+    assert focused["focus"]["address"]["unit_address"] == "text:0000"
+    assert "worker(" in focused["excerpt"][0]["text"]
+    assert focused["slice"]["operations"][0]["opcode"] == "CALL"
     assert any(ref["to"]["unit_address"] == "bss:0002" for ref in query("xrefs", "data:0004")["outgoing"])
     assert {gap["unit"] for gap in query("gaps")["ranges"]} == {"text"}
