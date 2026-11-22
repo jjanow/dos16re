@@ -1,8 +1,8 @@
 # dos16re
 
-Reverse-engineering tools for 16-bit real-mode DOS programs. The toolkit is designed for any project in that
-scope. The games in [PLAN.md](PLAN.md) are validation targets for particular executable formats and compiler
-patterns.
+Standalone reverse-engineering tools for 16-bit real-mode DOS programs. Install and run `dos16re` independently
+of any game or remaster project. The games in [PLAN.md](PLAN.md) are optional validation targets for particular
+executable formats and compiler patterns.
 
 ## DOS loader
 

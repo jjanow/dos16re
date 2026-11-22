@@ -24,7 +24,8 @@ handles them well enough.
 ## Design
 
 - **Python 3 package + CLI** (`dos16re`), standard library plus `capstone` and `unicorn`. Every command can print
-  JSON (`--json`) so agents can call it cheaply.
+  JSON (`--json`) so agents can call it cheaply. The package and its default test suite run independently of
+  sibling projects. Game-specific addresses and expectations belong in opt-in validation tests.
 - **Ghidra integration through headless scripts**, not a full Ghidra extension at first: the loader writes a flat
   image + a JSON "program map" (segments, units, symbols, segment-register assumptions, functions, jump tables),
   and a Ghidra post-script (Java or PyGhidra on Ghidra 12.x) imports it into a project. A real Ghidra loader
@@ -103,8 +104,9 @@ targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of
 
 ### Phase 6: emulator harness
 
-1. Generalize the PoR unicorn harness into a library: load the phase-1 image, call any routine by address with
-   registers/memory set up by the caller, run to return, read results back.
+1. Build a general-purpose Unicorn harness in `dos16re`, using the PoR harness as a reference. Load the phase-1
+   image, call any routine by address with registers and memory set up by the caller, run to return, and read
+   results back.
 2. Traps for INT 10h/16h/21h/1Ah, port I/O (video, sound, timer), and per-address hooks; stub INT 3Fh overlay loads
    since every unit is resident.
 3. CLI: `dos16re call ADDR --regs ... --mem ...` for quick oracle checks.
