@@ -19,6 +19,19 @@ python3 -m venv .venv
 File inspection and image export work with the Python install. See [Ghidra](#ghidra) for the
 additional setup for project import, decompilation, and cross-reference queries.
 
+### Compatibility
+
+The package requires Python 3.12 or newer. The table records the Linux setups used for local
+verification and configured for release CI.
+
+| Check | Python | Ghidra | JDK |
+|---|---|---|---|
+| Local standalone suite | 3.14 | — | — |
+| Local suite with headless tests enabled | 3.14 | 12.2 | OpenJDK 25 |
+| Release CI configuration for the installed wheel | 3.12 | 12.2 | Temurin 25 |
+
+See the [release workflow](.github/workflows/release-ci.yml) for the exact CI setup.
+
 ### Try a synthetic program
 
 From the checkout, generate a tiny Commodore 64 PRG with a two-byte load address and a routine
@@ -393,8 +406,8 @@ such as `blue_vram:0012`. [MAME PC-9801 memory map](https://github.com/mamedev/m
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
-supported by that installation. The tested setup is Ghidra 12.2 with JDK 25. Set `JAVA_HOME` if your
-shell defaults to a different JDK.
+supported by that installation. Set `JAVA_HOME` if your shell defaults to a different JDK. See
+[Compatibility](#compatibility) for the tested setup.
 
 ```sh
 export GHIDRA_HOME=/path/to/ghidra
@@ -630,7 +643,7 @@ containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. Set
 `GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
 input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
-runs the synthetic suites with Ghidra 12.2 and JDK 25. [Release workflow](.github/workflows/release-ci.yml)
+runs the synthetic suites with the headless tests enabled. [Release workflow](.github/workflows/release-ci.yml)
 
 See the roadmap for upcoming work.
 [PLAN.md](PLAN.md)

@@ -12,9 +12,9 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22, added and ran the README's synthetic Commodore 64 walkthrough from PRG generation
-through Ghidra import and batch queries. Verified the call and VIC-II write references with
-Ghidra 12.2 and JDK 25. The default suite passed 141 tests with 38 skipped.
+On 2026-11-22, added the README compatibility table for Python, Ghidra, and the JDK. Checked the
+wheel-test configuration against the release workflow. The standalone suite on Python 3.14 passed
+141 tests with 38 skipped. With Ghidra 12.2 and OpenJDK 25, 152 tests passed with 27 skipped.
 
 Resume Phase 8 with bounded bulk function and symbol lookups. The typed tool adapter remains open.
 Sharp X1 / X1turbo is the next platform.
@@ -227,8 +227,9 @@ The analysis backlog below applies to existing and future platforms.
   questions. Consider a persistent project worker or cache if batching leaves material overhead.
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
-- Keep a verified Python, Ghidra, and JDK compatibility table. Version exported maps and query
-  contracts and test compatibility with older exports.
+- **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested
+  Python, Ghidra, and JDK combinations and the release CI configuration. Update it as verification changes.
+- Version exported maps and query contracts and test compatibility with older exports.
 - Provide a discoverable request schema and a thin tool adapter for agents that benefit from
   typed inputs. Keep the CLI and the adapter on the same query contract.
 
