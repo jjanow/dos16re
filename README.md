@@ -276,6 +276,28 @@ Text output previews up to ten references or matches. Use `--json` for the full 
 `unit:offset` and linear addresses where available. Ghidra queries also report the address as
 displayed by the analyzed project.
 
+### Batch Ghidra queries
+
+`batch` runs `decomp`, `xrefs`, `callers`, `callees`, and `func` against one project in a single
+read-only headless session. Decompilations share one decompiler. The command works with projects
+from every supported platform and accepts the same addresses as the individual commands.
+
+```sh
+.venv/bin/retrore batch --project out/phantasie-project --json <<'EOF'
+[
+  {"command": "decomp", "address": "OV1:20bb"},
+  {"command": "callers", "address": "OV1:20bb"},
+  {"command": "xrefs", "address": "OV1:20a5"}
+]
+EOF
+```
+
+Pass a UTF-8 JSON file as the positional argument or pipe the array on stdin. Each request contains
+a `command` and an `address`. The JSON response contains a `results` array in request order. Each
+row echoes those two fields and includes either `result`, with the individual command's JSON, or
+`error`. The CLI writes the whole batch report to stdout and exits with status 1 if any query fails.
+An invalid request array or a headless launch failure uses the command's error stream.
+
 ## Emulator harness
 
 `call` runs a routine from an exported image with Unicorn. Each call starts with a fresh copy of the
@@ -357,6 +379,9 @@ the extracted Amiga directories containing `game` and `PhantasieIII` respectivel
 `RETRORE_PH2_ATARI8_DIR` to directories containing `phantasie1-side-{a,b}.atr` and
 `phantasie2-side-{a,b}.atr` respectively. The Ghidra tests use `GHIDRA_HOME` and include synthetic
 DOS, Amiga, Atari ST, C64, Apple II, and Atari 8-bit programs. Tests skip when their input variables are unset.
+Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
+runs the synthetic suites with Ghidra 12.2 and JDK 25. [Release workflow](.github/workflows/release-ci.yml)
+
 See the roadmap for upcoming work.
 [PLAN.md](PLAN.md)
 

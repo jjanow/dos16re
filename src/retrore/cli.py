@@ -14,7 +14,7 @@ from .atari8 import (
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
-from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
+from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
 from .image import APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, MOS6502_FORMATS, ImageError
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
@@ -257,6 +257,25 @@ def _address_query(args: argparse.Namespace) -> None:
     _print_references(("callers" if args.command == "func" else args.command,), report)
 
 
+def _batch(args: argparse.Namespace) -> int:
+    try:
+        data = sys.stdin.read() if args.input == "-" else Path(args.input).read_text(encoding="utf-8")
+        requests = json.loads(data)
+    except (json.JSONDecodeError, UnicodeError) as error:
+        raise GhidraError(f"invalid batch JSON: {error}") from error
+
+    report = query_batch(args.project, requests)
+    results = report["results"]
+    errors = [row for row in results if "error" in row]
+    if args.json:
+        print(json.dumps(report))
+    else:
+        print(f"{len(results) - len(errors)}/{len(results)} queries succeeded")
+        for row in errors[:_PREVIEW_LIMIT]:
+            print(f"  {row['command']} {row['address']}: {row['error']}")
+    return int(bool(errors))
+
+
 def _where_is(args: argparse.Namespace) -> None:
     if args.width is not None and args.constant is None:
         raise SearchError("--width requires --constant")
@@ -396,6 +415,9 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     gaps_parser = commands.add_parser("gaps", help="report undefined ranges in an analyzed Ghidra project")
     gaps_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    batch_parser = commands.add_parser("batch", help="run multiple address queries in one Ghidra session")
+    batch_parser.add_argument("input", metavar="FILE", nargs="?", default="-", help="JSON request file (default: stdin)")
+    batch_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     address_queries = {
         "xrefs": "list references to and from an address",
         "callers": "list calls to a function",
@@ -440,11 +462,13 @@ def main(argv: list[str] | None = None) -> int:
     trace_parser.add_argument(
         "--overlay-segment", metavar="UNIT=HEX", action="append", default=[], help="map an overlay at its runtime segment",
     )
-    for command in (import_parser, decomp_parser, gaps_parser, search_parser, call_parser, trace_parser):
+    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
 
     args = parser.parse_args(argv)
     try:
+        if args.command == "batch":
+            return _batch(args)
         if args.command == "ghidra":
             report = import_program(args.export, args.project)
             summary = f"Imported {report['units']} units into {args.project}"

@@ -1,11 +1,13 @@
 import json
 import os
 import subprocess
+from io import StringIO
 from pathlib import Path
 from struct import pack_into
 
 import pytest
 
+from retrore import ghidra
 from retrore.cli import main
 from retrore.ghidra import _headless
 
@@ -113,7 +115,7 @@ def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
     )
 
 
-def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
+def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, monkeypatch):
     image = bytes.fromhex(
         "b8 34 12 50 0e e8 08 00"  # push argument and CS, then call the far routine
         " 0e e8 10 00 5b c3"       # push CS as an argument to an ordinary near call
@@ -139,8 +141,38 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
     result = json.loads(capsys.readouterr().out)
     assert "__stdcall16far" in result["decompilation"]
 
+    requests = [
+        {"command": "decomp", "address": "root:10"},
+        {"command": "func", "address": "root:e"},
+        {"command": "decomp", "address": "OV1:0"},
+        {"command": "callers", "address": "1000:0013"},
+        {"command": "callees", "address": "root:0"},
+        {"command": "xrefs", "address": "root:5"},
+        {"command": "func", "address": "root:10"},
+    ]
+    real_run = ghidra._run
+    launches = []
+
+    def count_launch(*args, **kwargs):
+        launches.append(args)
+        return real_run(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("sys.stdin", StringIO(json.dumps(requests)))
+        patch.setattr(ghidra, "_run", count_launch)
+        assert main(["batch", "--project", str(project), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert not captured.err
+    assert len(launches) == 1
+    batch = json.loads(captured.out)["results"]
+    assert [{name: row[name] for name in ("command", "address")} for row in batch] == requests
+    assert "no analyzed function" in batch[1]["error"]
+    assert batch[0]["result"] == result
+    assert batch[2]["result"]["unit_address"] == "OV1:0000"
+
     assert main(["callers", "1000:0013", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     callers = json.loads(capsys.readouterr().out)
+    assert batch[3]["result"] == callers
     assert callers["function"]["entry"]["unit_address"] == "root:0010"
     call, = callers["callers"]
     assert call["from"]["unit_address"] == "root:0005"
@@ -148,6 +180,7 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
 
     assert main(["callees", "root:0", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     callees = json.loads(capsys.readouterr().out)
+    assert batch[4]["result"] == callees
     assert callees["callees"][0] == call
     assert [edge["to"]["unit_address"] for edge in callees["callees"]] == ["root:0010", "root:001c"]
 
@@ -158,10 +191,13 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
     assert entry["linear"] == 0x11000
 
     assert main(["xrefs", "root:5", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    assert call in json.loads(capsys.readouterr().out)["outgoing"]
+    xrefs = json.loads(capsys.readouterr().out)
+    assert batch[5]["result"] == xrefs
+    assert call in xrefs["outgoing"]
 
     assert main(["func", "root:10", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     function = json.loads(capsys.readouterr().out)
+    assert batch[6]["result"] == function
     assert function["size"] == 10
     assert [(span["start"]["unit_address"], span["end"]["unit_address"]) for span in function["ranges"]] == [
         ("root:0010", "root:0019"),

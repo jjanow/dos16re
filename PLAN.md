@@ -5,6 +5,10 @@ packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executa
 binaries, and Atari 8-bit executables. It handles formats and compiler patterns shared across 1980s and early 1990s games and uses those games to
 validate support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
 
+The primary goal is to help LLMs reverse 16-bit binaries faster and with fewer tokens. Prioritize the
+work Ghidra leaves to the analyst: recovering the runtime layout, resolving segmented and indirect
+references, and returning compact evidence that an agent can verify against the original bytes.
+
 ## Why
 
 Recurring failures from the Gold Box (Pool of Radiance) and Phantasie remaster projects:
@@ -182,7 +186,112 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, and Atari 8-bit milestones are complete for the
-validated releases. MSX2 is next.
+validated releases. MSX2 is the next platform milestone. The analysis backlog below applies to existing
+and future platforms.
+
+## Analysis backlog
+
+### Phase 8: faster queries and reproducible releases
+
+- **Implemented.** Publication of a tagged GitHub release builds a wheel, installs it in a clean
+  environment, and runs the standalone and synthetic Ghidra suites against the installed package.
+- **Implemented.** `retrore batch` runs decompilation and address queries against one project in
+  one read-only headless session. It shares the decompiler, preserves request order, and returns
+  individual failures alongside successful results.
+- Add result limits, field selection, reference direction and type filters, and compact address
+  records. Include counts and continuation information so an agent can narrow a large result.
+- Offer decompilation excerpts and targeted data-flow slices around one call, branch, or memory
+  access. Include stable addresses for retrieving the supporting instructions or full function.
+- Add bounded bulk function and symbol lookups, unit-scoped inventories, limited call-graph walks,
+  and contextual results that combine a routine's prototype, calls, and referenced data. Allow bulk
+  queries for coverage and analysis gaps when a workflow needs them.
+- Add time budgets and actionable error codes for headless operations. Benchmark cold and warm
+  query latency, launch counts, output size, and steps required to answer representative reversing
+  questions. Consider a persistent project worker or cache if batching leaves material overhead.
+- Add a synthetic end-to-end walkthrough and keep a verified Python, Ghidra, and JDK compatibility
+  table. Version exported maps and query contracts and test compatibility with older exports.
+- Provide a discoverable request schema and a thin tool adapter for agents that benefit from
+  typed inputs. Keep the CLI and the adapter on the same query contract.
+
+### Phase 9: better code and data recovery
+
+- Extend DOS segment analysis to track CS, DS, ES, and SS across call boundaries with per-function
+  summaries. Recover `LDS`/`LES`, stack-relative pointers, segment aliases, and far pointers built
+  from relocation-backed words and offset arithmetic. Track selective memory effects and show
+  where joined paths or unknown calls caused loss of precision.
+- Recover more compiler switch patterns, near and far indirect calls, callback tables, tail calls,
+  and dispatch through writable tables. Keep candidate targets and their evidence when a target
+  cannot be proved. Apply equivalent recovery to banked and position-independent code as available.
+- Improve calling-convention recovery for Pascal, C, and assembly, including segmented pointer
+  arguments, stack cleanup, register parameters, and return locations. Expand runtime signatures
+  with synthetic probes and match known OS calls and hardware interfaces per platform.
+- Detect likely code in undefined ranges, flag conflicting code and data interpretations, and
+  corroborate candidates with call targets, relocations, and traces.
+- Recover typed arrays, packed records, globals, strings, and table layouts from access patterns.
+  Explain widths, strides, and conflicting observations. Add platform-aware string search,
+  relocation and pointer searches, and entry-point and symbol lookup across units.
+
+### Phase 10: inspectable evidence and reusable analysis
+
+- Add bounded disassembly and bytes queries with unit offsets, file offsets, resolved operands,
+  and original versus relocated bytes. Map logical, linear, runtime, and file addresses in both
+  directions. Make decompiler statements traceable to instruction ranges.
+- Report why a claim exists, such as a loader fixup, instruction, Ghidra reference, heuristic,
+  user annotation, or trace observation. Expose unresolved targets and conflicting evidence
+  explicitly in JSON.
+- Import and export names, types, signatures, comments, entry points, and layout hints in a
+  versioned, diffable file. Preview changes, apply them transactionally, and preserve manual
+  Ghidra work across re-imports.
+- Identify matching functions and changed behavior across revisions or ports with normalized
+  signatures, call graphs, and referenced data. Transfer annotations with provenance and a
+  reviewable match report.
+- Support read-only queries on compatible existing Ghidra programs where possible. Provide a
+  compact project summary and an export of selected evidence for handing work to another agent.
+
+### Phase 11: repeatable dynamic analysis
+
+- Add declarative routine fixtures for register inputs, memory, expected outputs, OS calls, and I/O.
+  Report only relevant register and memory changes by default. Support input matrices, repeatable
+  snapshots, and differential comparisons with a reimplementation or another release.
+- Import emulator snapshots, executed edges, memory accesses, and overlay or bank changes. Correlate
+  them with static addresses and show gaps between observed and recovered control flow. Let an
+  analyst preview trace-backed additions before applying them to Ghidra.
+- Extend routine execution, trace mapping, and coverage queries through platform-specific backends.
+  Use a shared request and result shape for common operations, with machine-specific registers, OS
+  services, and hardware state available where they matter.
+
+### Phase 12: loader depth on supported platforms
+
+- Add DOS `.COM` and raw loads, PKLITE variants, and Borland VROOMM and Microsoft LINK overlays
+  as representative inputs become available. Improve diagnostics for partial and ambiguous loads.
+- Add Amiga Hunk overlay trees and broader relocation coverage. Add usable symbols and signatures
+  from supported original toolchains, linker maps, and debug records where available.
+- Describe load order, mutually exclusive overlays, and bank transitions in reusable manifests.
+  Support viewing alternative states together where Ghidra permits, and preserve source provenance
+  when runtime addresses overlap.
+- Give disk and container loaders a uniform way to enumerate members, select inputs, and record
+  layout decisions. Validate expanded format coverage with synthetic fixtures and optional original
+  releases.
+
+## Platform capability parity
+
+Aim for the same agent workflows on every supported platform. CLI verbs, address and evidence
+records, result limits, and failure behavior should be shared. Provide equivalent platform
+capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
+underlying analysis uses each machine's conventions and available emulator or trace backend.
+
+| Capability | DOS | Amiga and Atari ST | C64, Apple II, and Atari 8-bit |
+|---|---|---|---|
+| Load, export, and byte search | Implemented | Implemented | Implemented |
+| Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented |
+| Batch Ghidra address queries | Implemented | Implemented | Implemented |
+| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export |
+| Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Extend for relevant targets | Extend for relevant targets |
+| Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned |
+
+For each new capability, use shared synthetic contract checks where possible and add fixtures for
+platform-specific behavior. Track missing capabilities so a platform's loader milestone is distinct
+from its analysis coverage.
 
 ## Post-DOS stretch goals
 

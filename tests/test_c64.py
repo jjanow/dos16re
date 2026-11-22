@@ -134,13 +134,17 @@ def test_c64_ghidra_import_and_queries(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert (report["format"], report["units"], report["entries"], report["bank"]) == ("C64_PRG", 2, 1, 6)
 
-    def query(*args):
-        assert main([*args, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-        return json.loads(capsys.readouterr().out)
-
-    call, = query("callees", "080d")["callees"]
+    requests = tmp_path / "queries.json"
+    requests.write_text(json.dumps([
+        {"command": "callees", "address": "080d"},
+        {"command": "xrefs", "address": "worker:0002"},
+        {"command": "decomp", "address": "worker:0000"},
+    ]), encoding="utf-8")
+    assert main(["batch", str(requests), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    callees, xrefs, decompiled = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+    call, = callees["callees"]
     assert call["to_function"]["entry"]["unit_address"] == "worker:0000"
-    write, = query("xrefs", "worker:0002")["outgoing"]
+    write, = xrefs["outgoing"]
     assert write["to"]["unit_address"] == "c64_vic:0020"
     assert write["type"] == "WRITE"
-    assert "FUN_a000" in query("decomp", "worker:0000")["decompilation"]
+    assert "FUN_a000" in decompiled["decompilation"]

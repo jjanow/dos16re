@@ -10,6 +10,8 @@ from tempfile import TemporaryDirectory
 
 from .image import M68K_FORMATS, MOS6502_FORMATS, image_units, read_map
 
+_ADDRESS_QUERIES = frozenset({"decomp", "xrefs", "callers", "callees", "func"})
+
 
 class GhidraError(ValueError):
     """A headless Ghidra command could not complete."""
@@ -88,9 +90,36 @@ def decompile(address: str, project: Path) -> dict:
 
 
 def query_address(command: str, address: str, project: Path) -> dict:
+    _validate_address(address)
+    return _query(project, "RetroreQuery.java", command, address)
+
+
+def _validate_address(address: str) -> None:
     if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
         raise GhidraError("expected a hexadecimal unit:offset, DOS seg:off, or flat address")
-    return _query(project, "RetroreQuery.java", command, address)
+
+
+def query_batch(project: Path, requests: object) -> dict:
+    """Run an ordered array of address queries in one read-only Ghidra session."""
+    if not isinstance(requests, list) or not requests:
+        raise GhidraError("expected a nonempty JSON array of queries")
+    for index, request in enumerate(requests, 1):
+        if not isinstance(request, dict) or request.keys() != {"command", "address"}:
+            raise GhidraError(f"query {index} must be an object with command and address")
+        command, address = request["command"], request["address"]
+        if not isinstance(command, str) or command not in _ADDRESS_QUERIES:
+            raise GhidraError(f"query {index} must use decomp, xrefs, callers, callees, or func")
+        if not isinstance(address, str):
+            raise GhidraError(f"query {index} address must be a string")
+        try:
+            _validate_address(address)
+        except GhidraError as error:
+            raise GhidraError(f"query {index}: {error}") from error
+
+    with TemporaryDirectory() as temp:
+        input_file = Path(temp) / "queries.json"
+        input_file.write_text(json.dumps(requests), encoding="utf-8")
+        return _query(project, "RetroreQuery.java", "batch", str(input_file))
 
 
 def analysis_gaps(project: Path) -> dict:

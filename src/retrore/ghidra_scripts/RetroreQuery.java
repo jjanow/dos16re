@@ -6,6 +6,8 @@ import com.google.gson.JsonParser;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressOutOfBoundsException;
+import ghidra.program.model.address.AddressOverflowException;
 import ghidra.program.model.address.SegmentedAddressSpace;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.mem.MemoryBlock;
@@ -18,6 +20,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 public class RetroreQuery extends GhidraScript {
     private record Location(String address, String unitAddress, Long linear) {}
@@ -30,18 +33,53 @@ public class RetroreQuery extends GhidraScript {
         .comparing(Reference::getFromAddress).thenComparing(Reference::getToAddress)
         .thenComparingInt(Reference::getOperandIndex);
 
+    private DecompInterface decompiler;
+
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
         Map<String, Object> report;
         try {
-            report = args[0].equals("trace") ? trace(Path.of(args[1])) : query(args[0], args[1]);
-        } catch (IllegalArgumentException error) {
-            report = Map.of("error", error.getMessage());
+            report = switch (args[0]) {
+                case "trace" -> trace(Path.of(args[1]));
+                case "batch" -> batch(Path.of(args[1]));
+                default -> query(args[0], args[1]);
+            };
+        } catch (IllegalArgumentException | AddressOutOfBoundsException | AddressOverflowException error) {
+            report = Map.of("error", errorMessage(error));
+        } finally {
+            if (decompiler != null) {
+                decompiler.dispose();
+            }
         }
         var gson = new GsonBuilder().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .serializeNulls().create();
         Files.writeString(Path.of(args[2]), gson.toJson(report));
+    }
+
+    private Map<String, Object> batch(Path input) throws Exception {
+        var requests = JsonParser.parseString(Files.readString(input)).getAsJsonArray();
+        var results = new ArrayList<Map<String, Object>>();
+        for (var item : requests) {
+            monitor.checkCancelled();
+            var request = item.getAsJsonObject();
+            String command = request.get("command").getAsString();
+            String address = request.get("address").getAsString();
+            var row = new LinkedHashMap<String, Object>();
+            row.put("command", command);
+            row.put("address", address);
+            try {
+                row.put("result", query(command, address));
+            } catch (IllegalArgumentException | AddressOutOfBoundsException | AddressOverflowException error) {
+                row.put("error", errorMessage(error));
+            }
+            results.add(row);
+        }
+        return Map.of("results", results);
+    }
+
+    private static String errorMessage(Exception error) {
+        return Objects.toString(error.getMessage(), error.getClass().getSimpleName());
     }
 
     private Map<String, Object> trace(Path input) throws Exception {
@@ -190,22 +228,23 @@ public class RetroreQuery extends GhidraScript {
     }
 
     private Map<String, Object> decompile(Function function) throws Exception {
-        DecompInterface decompiler = new DecompInterface();
-        try {
+        if (decompiler == null) {
+            decompiler = new DecompInterface();
             if (!decompiler.openProgram(currentProgram)) {
-                throw new IllegalArgumentException(decompiler.getLastMessage());
+                String message = decompiler.getLastMessage();
+                decompiler.dispose();
+                decompiler = null;
+                throw new IllegalArgumentException(message);
             }
-            var result = decompiler.decompileFunction(function, 60, monitor);
-            if (!result.decompileCompleted()) {
-                throw new IllegalArgumentException(result.getErrorMessage());
-            }
-            var entry = location(function.getEntryPoint());
-            return Map.of("address", entry.address(), "unit_address", entry.unitAddress(),
-                "linear", entry.linear(), "name", function.getName(),
-                "decompilation", result.getDecompiledFunction().getC());
-        } finally {
-            decompiler.dispose();
         }
+        var result = decompiler.decompileFunction(function, 60, monitor);
+        if (!result.decompileCompleted()) {
+            throw new IllegalArgumentException(result.getErrorMessage());
+        }
+        var entry = location(function.getEntryPoint());
+        return Map.of("address", entry.address(), "unit_address", entry.unitAddress(),
+            "linear", entry.linear(), "name", function.getName(),
+            "decompilation", result.getDecompiledFunction().getC());
     }
 
     private Address resolve(String input) throws Exception {
