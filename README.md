@@ -6,6 +6,62 @@ and NEC PC-88 and PC-98 programs.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
+## Installation
+
+From the `retrore` checkout, use Python 3.12 or newer to install the CLI in a virtual environment.
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/retrore --help
+```
+
+File inspection and image export work with the Python install. See [Ghidra](#ghidra) for the
+additional setup for project import, decompilation, and cross-reference queries.
+
+### Claude Code and other coding agents
+
+Claude Code can run `retrore` through Bash and read its `--json` output. From the `retrore` checkout,
+add the installed CLI to `PATH`, then launch Claude Code from your analysis project. Replace
+`/path/to/analysis-project` with the directory where you keep your analysis inputs and outputs.
+
+```sh
+export PATH="$(pwd -P)/.venv/bin:$PATH"
+retrore --help
+cd /path/to/analysis-project && claude
+```
+
+Try asking Claude Code to run `retrore info ./PROGRAM.EXE --json` on an executable in that project
+and summarize the format, entry point, and any compiler evidence. For decompilation and references,
+set `GHIDRA_HOME` before launching the agent and make a compatible JDK available. The same workflow
+works with other agents that can run shell commands. For a separately launched agent, give it the
+absolute path to `.venv/bin/retrore` inside your checkout.
+
+For repeated use, save the following as `.claude/skills/retrore/SKILL.md` in the analysis project or
+`~/.claude/skills/retrore/SKILL.md` for all local projects. Invoke it with `/retrore ./PROGRAM.EXE`
+and describe what you want to learn. The skill uses the CLI on `PATH`. You can also put the
+executable's absolute path in the skill.
+[Claude Code skills documentation](https://code.claude.com/docs/en/skills)
+
+```markdown
+---
+name: retrore
+description: Inspect retro executables and query their Ghidra analysis with retrore.
+---
+
+Run `retrore` through Bash and use `--json` to read results. Use the input path
+and analysis goal provided by the user.
+Start with `retrore info INPUT --json` to identify the format and entry point.
+Use `retrore load INPUT -o EXPORT --json` to create `image.bin` and `map.json`.
+For decompilation or references, run `retrore ghidra import EXPORT PROJECT --json`,
+then `retrore decomp ADDRESS --project PROJECT --json` or
+`retrore xrefs ADDRESS --project PROJECT --json`.
+Use `retrore COMMAND --help` to check supported arguments and cite the addresses
+and tool evidence behind your findings.
+```
+
+An MCP adapter is on the [analysis roadmap](PLAN.md#phase-8-faster-queries-and-reproducible-releases).
+
 ## DOS loader
 
 The loader restores the original load module from EXEPACK and LZEXE 0.90, 0.91, and 0.91e executables.
@@ -13,8 +69,6 @@ It applies segment relocations and records the original initial `CS:IP` and `SS:
 packers such as PKLITE produce a diagnostic.
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e . pytest
 .venv/bin/retrore info PROGRAM.EXE
 .venv/bin/retrore load PROGRAM.EXE -o out/program --json
 .venv/bin/retrore load START.EXE --overlay GAME.OVR -o out/pool
@@ -304,7 +358,15 @@ such as `blue_vram:0012`. [MAME PC-9801 memory map](https://github.com/mamedev/m
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
-supported by that installation. Pass the project path with or without its `.gpr` extension.
+supported by that installation. The tested setup is Ghidra 12.2 with JDK 25. Set `JAVA_HOME` if your
+shell defaults to a different JDK.
+
+```sh
+export GHIDRA_HOME=/path/to/ghidra
+export JAVA_HOME=/path/to/jdk-25
+```
+
+Pass the project path with or without its `.gpr` extension.
 
 For DOS, the importer creates one memory block per unit, names overlay entries and stubs, and runs
 Ghidra's auto-analysis.
@@ -514,7 +576,8 @@ defined as data, or inside an instruction.
 
 ## Tests
 
-Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Radiance DOS v1.3 from
+Install `pytest` with `.venv/bin/python -m pip install pytest`, then run tests with
+`.venv/bin/python -m pytest`. The real-game tests read Pool of Radiance DOS v1.3 from
 `RETRORE_POR_DIR`, the Phantasie I DOS MZ edition from `RETRORE_PH1_DIR`, and Phantasie III's
 `MAIN.EXE` from `RETRORE_PH3_DIR`. Point `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR` to
 the extracted Amiga directories containing `game` and `PhantasieIII` respectively. Set
