@@ -1,8 +1,8 @@
 # dos16re plan
 
 A reverse-engineering toolkit for 16-bit real-mode DOS programs: MZ executables, packers and overlay systems, as
-used by 1980s–early-1990s games. It doesn't replace Ghidra's decompiler. It does the parts Ghidra gets wrong or
-skips for these programs, then gives Ghidra (and agents driving it) one correct, whole-program image to work on.
+used by 1980s–early–1990s games. It handles formats and compiler patterns shared across projects and uses games
+to validate that support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
 
 ## Why
 
@@ -38,9 +38,11 @@ handles them well enough.
 
 ### Phase 1: whole-program loader (the main win)
 
-1. MZ parsing: header, relocations, load at a fixed base segment, entry CS:IP and SS:SP.
-2. Unpackers: EXEPACK (Microsoft, documented scheme), then LZEXE 0.91/0.90 and PKLITE as targets need them. Detect
-   unknown packers and say so instead of guessing.
+1. **Implemented for standalone MZ load modules.** Parse the header and relocation table, relocate the module
+   at a fixed base segment, and report the initial CS:IP and SS:SP. See the
+   [MS-DOS Encyclopedia](https://www.pcjs.org/documents/books/mspl13/msdos/encyclopedia/section2/#article-4-structure-of-an-application-program).
+2. **Next.** Add EXEPACK (Microsoft, documented scheme), then LZEXE 0.91/0.90 and PKLITE as targets need them.
+   Detect unknown packers and report them.
 3. Overlay systems, each placed at its own segment above the root image:
    - Turbo Pascal overlays (`FBOV`/`TPOV` header, INT 3Fh stubs in the root, stub table → unit file offset, size,
      entry list). Target: PoR `GAME.EXE` + `GAME.OVR`.
@@ -50,8 +52,9 @@ handles them well enough.
      .COM programs.
 4. Stub rewriting: in the exported image, each overlay stub call becomes a direct far call to the unit's resolved
    segment (the original bytes are kept in the map), so cross-references flow across the root and all overlays.
-5. `dos16re load PROGRAM [OVERLAYS...] -o OUT/` writes `image.bin` + `map.json`; `dos16re info` prints the
-   segment/unit table.
+5. `dos16re load PROGRAM -o OUT/` writes `image.bin` and `map.json` for the root module. `dos16re info PROGRAM`
+   prints the initial registers and root unit. Both support `--json`. Add overlay inputs and extend the unit
+   table once overlay loading lands.
 
 **Done when:** PoR loads with all 35 units at distinct segments; every stub resolves; addresses hand-resolved in
 the Gold Box docs (e.g. stub `0085:0039` → `0x21AED`) come out the same.

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dos16re"
+version = "0.1.0"
+description = "Reverse-engineering tools for 16-bit real-mode DOS programs"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[project.scripts]
+dos16re = "dos16re.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
