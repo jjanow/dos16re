@@ -114,3 +114,9 @@ def test_ghidra_decompiles_cross_overlay_call(por_export, capsys):
     address = f"{caller['segment']:04x}:1036"
     assert main(["decomp", address, "--project", str(project) + ".gpr", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == by_unit
+
+    assert main(["decomp", "tpov_001f:0c74", "--project", str(project), "--json"]) == 0
+    loadpieces = json.loads(capsys.readouterr().out)["decompilation"]
+    assert "DGROUP_4433" in loadpieces
+    assert "DGROUP_4434" in loadpieces
+    assert "tpov_03d5_0e08(" in loadpieces

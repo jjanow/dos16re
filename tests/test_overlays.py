@@ -30,6 +30,7 @@ def test_build_image_relocates_overlay_and_rewrites_both_callers(signature):
     assert unit["segment"] == 0x1005
     assert unit["entries"] == [5]
     assert unit["relocation_count"] == 1
+    assert program["relocations"] == [3, unit["image_offset"] + 3]
     assert unpack_from("<BHH", image, 0) == (0x9A, 5, 0x1005)
     assert unpack_from("<BHH", image, 48) == (0xEA, 5, 0x1005)
     assert unpack_from("<BHH", image, unit["image_offset"]) == (0x9A, 5, 0x1005)

@@ -94,6 +94,7 @@ def test_cli_load_and_info_share_the_map(tmp_path, capsys):
     assert main(["info", str(program), "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == program_map
     assert program_map["entry"] == {"segment": 0x1001, "offset": 3, "linear": 0x10013}
+    assert program_map["relocations"] == [1, 20]
     assert program_map["units"] == [
         {"name": "root", "segment": 0x1000, "linear": 0x10000, "image_offset": 0, "size": 22}
     ]

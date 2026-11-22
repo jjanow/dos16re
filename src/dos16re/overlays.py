@@ -213,9 +213,12 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
         "entry": address_record(root.entry), "stack": address_record(root.stack),
         "relocation_count": len(root.relocations), "units": [root_record],
     }
+    fixup_positions = {fixup.linear for fixup in root.relocations}
     if root.packer:
         program_map["packer"] = root.packer
     if not overlays:
+        if fixup_positions:
+            program_map["relocations"] = sorted(fixup_positions)
         _add_jump_tables(root.image, program_map)
         return root.image, program_map
 
@@ -225,7 +228,6 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     stub_targets = {}
     stub_records = []
     call_records = []
-    fixup_positions = [fixup.linear for fixup in root.relocations]
     for unit, segment in zip(units, segments):
         record = _unit_record(unit.name, segment, origin, len(unit.data))
         record["source"] = unit.source
@@ -239,7 +241,7 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
             for fixup in unit.fixups:
                 old_segment, = _WORD.unpack_from(data, fixup)
                 _WORD.pack_into(data, fixup, (old_segment + root.base_segment) & 0xFFFF)
-                fixup_positions.append(code_start + fixup)
+                fixup_positions.add(code_start + fixup)
 
             stub_segment = root.base_segment + descriptor.segment
             for index, offset in enumerate(descriptor.entries):
@@ -265,7 +267,7 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
         index for linear in stub_targets
         for index in range(linear - origin, linear - origin + _STUB_SIZE)
     }
-    for fixup in sorted(set(fixup_positions)):
+    for fixup in sorted(fixup_positions):
         start = fixup - 3
         if start < 0 or image[start] != 0x9A or not stub_bytes.isdisjoint(range(start, start + 5)):
             continue
@@ -280,6 +282,8 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     if stub_records:
         program_map["stubs"] = stub_records
         program_map["calls"] = call_records
+    if fixup_positions:
+        program_map["relocations"] = sorted(fixup_positions)
     relocated = bytes(image)
     _add_jump_tables(relocated, program_map)
     return relocated, program_map

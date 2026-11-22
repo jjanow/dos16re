@@ -29,14 +29,20 @@ def _project_parts(project: Path) -> tuple[str, str]:
     return str(project.parent), project.name.removesuffix(".gpr")
 
 
-def _run(project: Path, options: list[str], phase: str, script: str, *arguments: str) -> dict:
+def _run(
+    project: Path, options: list[str], script: str, *arguments: str, pre_script: str | None = None,
+) -> dict:
     launcher = _headless()
     scripts = files("dos16re").joinpath("ghidra_scripts")
     with as_file(scripts) as script_dir, TemporaryDirectory() as temp:
         result_file = Path(temp) / "result.json"
+        script_args = [*arguments, str(result_file)]
+        script_options = ["-postScript", script, *script_args]
+        if pre_script:
+            script_options = ["-preScript", pre_script, *script_args, *script_options]
         result = subprocess.run(
             [str(launcher), *_project_parts(project), *options,
-             "-scriptPath", str(script_dir), phase, script, *arguments, str(result_file)],
+             "-scriptPath", str(script_dir), *script_options],
             check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace",
         )
@@ -60,7 +66,7 @@ def import_program(export: Path, project: Path) -> dict:
     return _run(
         project,
         ["-import", str(image), "-loader", "BinaryLoader", "-processor", "x86:LE:16:Real Mode"],
-        "-preScript", "Dos16reImport.java", str(manifest),
+        "Dos16reSegments.java", str(manifest), pre_script="Dos16reImport.java",
     )
 
 
@@ -72,5 +78,5 @@ def decompile(address: str, project: Path) -> dict:
         raise GhidraError(f"Ghidra project not found at {Path(project_dir, project_name + '.gpr')}")
     return _run(
         project, ["-process", "image.bin", "-noanalysis", "-readOnly"],
-        "-postScript", "Dos16reDecompile.java", address,
+        "Dos16reDecompile.java", address,
     )

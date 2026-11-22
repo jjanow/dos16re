@@ -75,12 +75,15 @@ Phase 3 a second validation case alongside Phantasie III.
 
 ### Phase 3: segment-register tracking
 
-1. Per-function DS/ES/SS inference: DS from the startup code (DGROUP), segment words loaded from DGROUP globals
-   (`mov es,[x]` where `[x]` holds a constant segment after init), `push ds / pop es` patterns.
-2. Write the results into Ghidra's segment-register context so memory operands resolve to the right far data
-   segment, and name far globals by segment (`FAR1820_97f0`).
+1. **Implemented.** Track DS, ES, and SS through recovered control flow, using the startup DGROUP, the
+   initial stack segment, relocated segment words loaded from memory, and transfers such as
+   `push ds / pop es`. Drop conflicting values at control-flow joins.
+2. **Implemented.** Persist segment context in Ghidra and add references and width-based types for
+   direct data operands. Name globals by their resolved segment and offset.
 
-**Done when:** Phantasie III references to segment `0x1820` resolve to typed globals in Ghidra.
+**Validated on Ghidra 12.2.** Phantasie III's save-game load and store now reference the typed word
+`FAR2820_97f0` in the Ghidra listing. File-relative segment `0x1820` loads as `0x2820` at the default
+base. Pool of Radiance's `LOADPIECES` decompilation names DGROUP flags at `0x4433` and `0x4434`.
 
 ### Phase 4: code recovery
 
@@ -127,7 +130,7 @@ context, callers), all with `--json`. Keep outputs short by default so they fit 
 | Phantasie III (DOS) | MZ, far data segment `0x1820` | Segment tracking, far globals |
 
 Game files are found through `DOS16RE_POR_DIR` and `DOS16RE_PH1_DIR`. The headless integration test also
-uses `GHIDRA_HOME`. The Phase 3 Phantasie III test will use `DOS16RE_PH3_DIR`. Tests skip when their inputs are unset.
+uses `GHIDRA_HOME`. The Phase 3 Phantasie III test uses `DOS16RE_PH3_DIR`. Tests skip when their inputs are unset.
 Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 
 ## Setup
@@ -138,6 +141,6 @@ Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 
 ## Order of work
 
-Phases 1 and 2 are complete for the initial targets, and Phase 4 jump-table recovery is validated on Mystic
-SCORE. Next is Phase 3 segment tracking for Phantasie III and the Pool of Radiance LOADPIECES data references.
-Then continue with Phase 6 for emulator reuse and Phases 5 and 7 for signatures and queries.
+Phases 1–3 are validated for the initial targets, and Phase 4 jump-table recovery is validated on Mystic
+SCORE. Next is Phase 6 for emulator reuse, followed by Phases 5 and 7 for signatures and queries.
+Phase 4 still has far-procedure recognition and the `gaps` command open.

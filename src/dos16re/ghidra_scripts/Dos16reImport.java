@@ -31,9 +31,6 @@ public class Dos16reImport extends HeadlessScript {
         try {
             JsonObject map = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
             loadMap(map);
-            Files.writeString(result, new Gson().toJson(Map.of(
-                "program", currentProgram.getName(), "units", map.getAsJsonArray("units").size()
-            )));
             setHeadlessContinuationOption(HeadlessContinuationOption.CONTINUE);
         } catch (Exception error) {
             Files.writeString(result, new Gson().toJson(Map.of("error", error.toString())));
