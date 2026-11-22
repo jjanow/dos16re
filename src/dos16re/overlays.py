@@ -1,11 +1,12 @@
 """Build an analysis image with all supplied DOS overlays resident."""
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from struct import Struct, pack, unpack_from
 
 from .jump_tables import recover_jump_tables
 from .mz import Address, LoadedMZ, MZError
+from .signatures import detect_compiler, match_runtime
 
 _DESCRIPTOR = Struct("<4xI3H")
 _TRAP = b"\xcd\x3f"
@@ -205,6 +206,31 @@ def _add_jump_tables(image: bytes, program_map: dict) -> None:
         program_map["jump_tables"] = tables
 
 
+def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
+    _add_jump_tables(image, program_map)
+    units = program_map["units"]
+    compiler = detect_compiler(root, pascal_overlays=any("file_offset" in unit for unit in units))
+    program_map["compiler"] = None
+    program_map["runtime_signatures"] = signatures = []
+    if compiler is None:
+        return
+    program_map["compiler"] = {
+        "family": compiler.family, "version": compiler.version, "evidence": compiler.evidence,
+    }
+    for unit in units:
+        start = unit["image_offset"]
+        data = image[start:start + unit["size"]]
+        for offset, prototype in match_runtime(compiler, data):
+            linear = unit["linear"] + offset
+            segment = root.entry.segment if unit["name"] == "root" else unit["segment"]
+            if not 0 <= linear - segment * 16 <= 0xFFFF:
+                segment = unit["segment"] if offset <= 0xFFFF else linear >> 4
+            signatures.append({
+                **asdict(prototype), "unit": unit["name"], "unit_offset": offset,
+                "address": address_record(Address(segment, linear - segment * 16)),
+            })
+
+
 def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[bytes, dict]:
     origin = root.base_segment * 16
     root_record = _unit_record("root", root.base_segment, origin, len(root.image))
@@ -219,7 +245,7 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     if not overlays:
         if fixup_positions:
             program_map["relocations"] = sorted(fixup_positions)
-        _add_jump_tables(root.image, program_map)
+        _add_analysis(root, root.image, program_map)
         return root.image, program_map
 
     units = _read_units(root.image, overlays)
@@ -285,5 +311,5 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     if fixup_positions:
         program_map["relocations"] = sorted(fixup_positions)
     relocated = bytes(image)
-    _add_jump_tables(relocated, program_map)
+    _add_analysis(root, relocated, program_map)
     return relocated, program_map

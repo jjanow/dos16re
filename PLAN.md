@@ -18,8 +18,8 @@ Recurring failures from the Gold Box (Pool of Radiance) and Phantasie remaster p
 | Runtime library noise | Turbo Pascal 6 runtime (Real48, strings, sets, I/O) decompiles as clutter instead of named calls |
 | Emulator harness is one-off | PoR's unicorn harness and ~4,500 lines of per-routine oracle scripts only work for that one game |
 
-Real-mode x86 only. 68000 (Amiga, Atari ST, X68000) and 6502 (C64, Apple II) targets are out of scope; Ghidra
-handles them well enough.
+The initial scope is 16-bit real-mode x86 for DOS. The remaster projects' other source platforms are stretch
+goals after the DOS roadmap.
 
 ## Design
 
@@ -91,8 +91,10 @@ base. Pool of Radiance's `LOADPIECES` decompilation names DGROUP flags at `0x443
    `ja` or `jae` and a scaled 16-bit register index. Infer the runtime offset of adjacent tables in flat
    overlays. The Ghidra importer disassembles case blocks and adds computed jump references, allowing
    auto-analysis to find the routines those blocks call.
-2. Far procedures called as `push cs` + near call (seen in Borland C/C++ code).
-3. Report code no analysis reached (`dos16re gaps`), so nothing is silently dropped.
+2. **Implemented.** Recognize `push cs` + direct near call when the analyzed callee returns with `RETF` and
+   its returns agree on stack cleanup. Assign the 16-bit far calling convention in Ghidra.
+3. **Implemented.** `dos16re gaps --project PROJECT` reports undefined ranges per loaded unit. These are
+   candidates for further analysis and may contain code, data, or padding.
 
 **Validated on Ghidra 12.2.** The Phantasie I Mystic dispatcher at `OV1:20a5` has seven computed jump
 targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of those cases, and
@@ -100,10 +102,24 @@ targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of
 
 ### Phase 5: runtime signatures
 
-1. Fingerprints for Turbo Pascal 5.5/6/7, Turbo C 2 / Turbo C++, Borland C++, Microsoft C 5/6 runtime routines
-   (byte patterns with wildcards over relocated bytes; learned from known binaries where we have them).
-2. Name and type them in Ghidra (Real48 math, string/set helpers, `Write`/`WriteLn`, heap, overlay manager).
-3. Compiler detection in `dos16re info`.
+1. **Implemented.** Masked byte patterns cover selected Turbo Pascal 5.5, 6.0, and 7.0 routines and
+   small-model Turbo C 2.01, Turbo C++ 1.01, Borland C++ 2.0, and Microsoft C 5.1 and 6.0a routines.
+2. **Implemented.** Ghidra names and types matches at analyzed function entries. The Pascal catalog includes
+   Real48 addition, string copy and concatenation, set union, `Write` for strings, `WriteLn`, `GetMem`,
+   `FreeMem`, and `OvrInit`. The C catalog covers selected string, output, and heap routines.
+3. **Implemented.** `dos16re info` identifies runtimes from startup code and corroborating runtime strings or
+   a recognized Turbo Pascal overlay directory. JSON records the evidence and any identified version.
+
+**Validated.** The signatures come from original toolchains and purpose-built DOS probes. The Pascal probe
+uses `Overlay`, adds two `Real` values, copies and concatenates short strings, unions two `set of byte`
+values, writes text, and allocates and frees a block. The C probe calls `strcpy`, `strlen`, `puts`, `printf`,
+`malloc`, and `free` and uses linker map symbols to verify matches. The Microsoft 6.0a probe links a 5.1
+object against its 6.0a DOS runtime library.
+[Turbo Pascal 5.5](https://altd.embarcadero.com/download/museum/tp55.zip),
+[Turbo Pascal 6.0](https://sources.ru/pascal/museum/tp60.htm), [Turbo Pascal 7.0](https://winworldpc.com/product/turbo-pascal/7x),
+[Turbo C 2.01](https://altd.embarcadero.com/download/museum/tc201.zip),
+[Turbo C++ 1.01](https://altd.embarcadero.com/download/museum/tcpp101.zip), [Borland C++ 2.0](https://winworldpc.com/product/borland-c/20),
+[Microsoft C 5.x](https://winworldpc.com/product/microsoft-c-c/5x), [Microsoft C 6.x](https://winworldpc.com/product/microsoft-c-c/6x).
 
 ### Phase 6: emulator harness
 
@@ -145,6 +161,33 @@ Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 
 ## Order of work
 
-Phases 1–3 are validated for the initial targets, and Phase 4 jump-table recovery is validated on Mystic
-SCORE. Phase 6's emulator harness is implemented. Next is Phase 5 for runtime signatures, followed by
-Phase 7 for agent-facing queries. Phase 4 still has far-procedure recognition and the `gaps` command open.
+Phases 1–6 are implemented for the initial scope. Next is Phase 7 for agent-facing queries. The DOSBox-X
+trace import in Phase 6 remains optional.
+
+## Post-DOS stretch goals
+
+Begin after the DOS phases are complete. For each source platform, validate the executable or ROM loader,
+memory map, bank or overlay handling, and analysis on a representative release. Keep original media and
+platform-specific game expectations in opt-in validation.
+
+| Original source platform | Phantasie remaster | Gold Box remaster |
+|---|---|---|
+| IBM PC compatibles running DOS | Yes, current scope | Yes, current scope |
+| Commodore Amiga | Yes | Yes |
+| Atari ST | Yes | Yes |
+| Commodore 64 | Yes | Yes |
+| Apple II | Yes | Yes |
+| Atari 8-bit | Yes | |
+| MSX2 | Yes | |
+| NEC PC-88 | Yes | Yes |
+| NEC PC-98 | Yes | Yes |
+| Sharp X1 / X1turbo | X1 | X1turbo |
+| Sharp X68000 | Yes | |
+| Classic Macintosh | | Yes |
+| Nintendo NES / Famicom | | Yes |
+| Sega Genesis / Mega Drive | | Yes |
+
+The matrix follows OpenPhantasie's supported copies and planned source platforms, and the Gold Box
+remaster's port matrix. Gold Box PC-88 and X1turbo validation depends on finding copies of the releases.
+The Phantasie project also tracks FM-7 and additional ports on platforms already in the table as research
+candidates pending release confirmation. [OpenPhantasie source-platform roadmap](https://github.com/jjanow/OpenPhantasie#planned-source-platform-support)

@@ -30,6 +30,8 @@ def test_pool_of_radiance_overlay_directory_and_view_call(por_export):
     output, program = por_export
     units = program["units"]
     assert program["packer"] == "EXEPACK"
+    assert program["compiler"]["family"] == "Turbo Pascal"
+    assert program["compiler"]["version"] == "6.0"
     assert len(units) == len({unit["segment"] for unit in units}) == 36
     assert len(program["stubs"]) == 406
 
@@ -116,7 +118,9 @@ def test_ghidra_decompiles_cross_overlay_call(por_export, capsys):
     output, program = por_export
     project = output / "pool"
     assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["units"] == len(program["units"])
+    report = json.loads(capsys.readouterr().out)
+    assert report["units"] == len(program["units"])
+    assert report["runtime_signatures"] > 0
     assert main(["decomp", "tpov_0025:1036", "--project", str(project), "--json"]) == 0
     by_unit = json.loads(capsys.readouterr().out)
     assert "tpov_0085_0ab3(" in by_unit["decompilation"]

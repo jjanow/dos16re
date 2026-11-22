@@ -38,6 +38,16 @@ When the loader finds a bounded CS-relative word jump table, `map.json` records 
 default branch, and case targets in index order. It uses the `cmp` and `ja` or `jae` guard to size the table.
 For adjacent tables in flat overlays, it can infer the original runtime offset from the table's file position.
 
+`info` reports the compiler when it recognizes the startup code or a Turbo Pascal overlay directory.
+The JSON output includes `compiler` with the evidence and any identified version. `compiler` is `null` when
+the evidence is inconclusive. `load` and `info` both report candidate `runtime_signatures` with unit addresses
+and prototypes. Patterns wildcard relocated segment words and link-dependent operands.
+
+The catalog covers Turbo Pascal 5.5, 6.0, and 7.0 helpers for Real48 addition, strings, sets, text output, heap
+allocation, and overlays. It also covers selected small-model C routines from Turbo C 2.01, Turbo C++ 1.01,
+Borland C++ 2.0, and Microsoft C 5.1 and 6.0a. The compiler report identifies the linked runtime and only
+includes a version when supported by the evidence. See the validation notes in [PLAN.md](PLAN.md#phase-5-runtime-signatures).
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -45,6 +55,11 @@ supported by that installation. The importer creates one memory block per unit, 
 stubs, and runs Ghidra's auto-analysis. Pass the project path with or without its `.gpr` extension.
 The importer marks recovered table words as data, adds computed jump references, and disassembles each case
 so auto-analysis can discover the routines they call.
+
+After analysis, the importer recognizes `push cs` followed by a direct near `call` when the callee's return
+instructions agree on a far return and stack cleanup. It applies the far calling convention to the callee.
+It also names and types runtime signature matches at analyzed function entries. Import JSON reports the
+number of far procedures recognized and runtime signatures applied.
 
 After auto-analysis, the importer tracks DS, ES, and SS through recovered control flow. It recognizes the
 startup DGROUP assignment, relocation-backed segment words, and register transfers such as
@@ -62,10 +77,15 @@ Re-export images made by older versions to include the relocation metadata.
 .venv/bin/dos16re decomp tpov_0025:1036 --project out/pool-project --json
 .venv/bin/dos16re ghidra import out/phantasie out/phantasie-project
 .venv/bin/dos16re decomp OV1:20bb --project out/phantasie-project --json
+.venv/bin/dos16re gaps --project out/phantasie-project --json
 ```
 
 `decomp` accepts a `unit:offset` or `seg:off` address in an analyzed function. Offset and segment values
 are hexadecimal. The JSON response includes the function's entry address and decompiled C.
+
+`gaps` reports ranges of undefined bytes in the initialized image blocks. These ranges may contain code,
+data, or padding. Text output shows the total and the first ten ranges. JSON includes all ranges with
+inclusive `unit:offset` endpoints, the starting linear address, and byte counts.
 
 ## Emulator harness
 

@@ -95,3 +95,36 @@ def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
         "13b2:452a,ES,2820,1,2820:97f0,word,FAR2820_97f0",
         "13b2:467d,ES,2820,0,2820:97f0,word,FAR2820_97f0",
     )
+
+
+def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
+    image = bytes.fromhex(
+        "b8 34 12 50 0e e8 08 00"  # push argument and CS, then call the far routine
+        " 0e e8 10 00 5b c3"       # push CS as an argument to an ordinary near call
+        " 9d d7"                   # 0x0e, no incoming flow
+        " 55 8b ec 8b 46 06 5d ca 02 00"  # 0x10, far routine returns its argument
+        " 9e d7"                   # 0x1a, no incoming flow
+        " b8 01 00 c3"             # 0x1c, near routine
+    )
+    header = bytearray(32)
+    pack_into("<2s13H", header, 0, b"MZ", len(header) + len(image), 1, 0, 2, 32, 32, 2, 0x200, 0, 0, 0, 28, 0)
+    exe = tmp_path / "sample.exe"
+    exe.write_bytes(header + image)
+    export = tmp_path / "export"
+    project = tmp_path / "recovery"
+    assert main(["load", str(exe), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["far_procedures"] == 1
+
+    assert main(["decomp", "root:10", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    result = json.loads(capsys.readouterr().out)
+    assert "__stdcall16far" in result["decompilation"]
+
+    assert main(["gaps", "--project", str(project) + ".gpr", "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["undefined_bytes"] == 4
+    assert report["ranges"] == [
+        {"unit": "root", "size": 2, "linear": 0x1000E, "start": "root:000e", "end": "root:000f"},
+        {"unit": "root", "size": 2, "linear": 0x1001A, "start": "root:001a", "end": "root:001b"},
+    ]

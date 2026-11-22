@@ -1,4 +1,4 @@
-"""Run Ghidra's headless importer and decompiler."""
+"""Run Ghidra's headless importer and analysis queries."""
 
 import json
 import os
@@ -73,10 +73,18 @@ def import_program(export: Path, project: Path) -> dict:
 def decompile(address: str, project: Path) -> dict:
     if not re.fullmatch(r"[^:]+:[0-9a-fA-F]{1,8}", address):
         raise GhidraError("expected a hexadecimal seg:off or unit:offset address")
+    return _query(project, "Dos16reDecompile.java", address)
+
+
+def analysis_gaps(project: Path) -> dict:
+    return _query(project, "Dos16reGaps.java")
+
+
+def _query(project: Path, script: str, *arguments: str) -> dict:
     project_dir, project_name = _project_parts(project)
     if not Path(project_dir, project_name + ".gpr").is_file():
         raise GhidraError(f"Ghidra project not found at {Path(project_dir, project_name + '.gpr')}")
     return _run(
         project, ["-process", "image.bin", "-noanalysis", "-readOnly"],
-        "Dos16reDecompile.java", address,
+        script, *arguments,
     )

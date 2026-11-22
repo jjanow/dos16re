@@ -1,5 +1,6 @@
-// Track real-mode segment registers after Ghidra has recovered code and control flow.
+// Apply DOS conventions, runtime prototypes, and segment context after auto-analysis.
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -8,12 +9,25 @@ import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.SegmentedAddress;
 import ghidra.program.model.address.SegmentedAddressSpace;
+import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.ByteDataType;
+import ghidra.program.model.data.CharDataType;
 import ghidra.program.model.data.DWordDataType;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.QWordDataType;
+import ghidra.program.model.data.ShortDataType;
+import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.UnsignedShortDataType;
+import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.Function.FunctionUpdateType;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.Parameter;
+import ghidra.program.model.listing.ParameterImpl;
+import ghidra.program.model.listing.ReturnParameterImpl;
+import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.RefType;
@@ -91,9 +105,13 @@ public class Dos16reSegments extends HeadlessScript {
         Path result = Path.of(args[1]);
         try {
             JsonObject map = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
+            space = (SegmentedAddressSpace) currentProgram.getAddressFactory().getDefaultAddressSpace();
+            int farProcedures = recoverFarProcedures();
+            int runtimeSignatures = applyRuntimeSignatures(map.getAsJsonArray("runtime_signatures"));
             applySegments(map);
             Files.writeString(result, new Gson().toJson(Map.of(
-                "program", currentProgram.getName(), "units", map.getAsJsonArray("units").size()
+                "program", currentProgram.getName(), "units", map.getAsJsonArray("units").size(),
+                "far_procedures", farProcedures, "runtime_signatures", runtimeSignatures
             )));
             setHeadlessContinuationOption(HeadlessContinuationOption.CONTINUE);
         } catch (Exception error) {
@@ -102,8 +120,137 @@ public class Dos16reSegments extends HeadlessScript {
         }
     }
 
+    private int recoverFarProcedures() throws Exception {
+        var listing = currentProgram.getListing();
+        var functions = currentProgram.getFunctionManager();
+        var references = currentProgram.getReferenceManager();
+        var candidates = new HashSet<Address>();
+        for (var call : listing.getInstructions(true)) {
+            monitor.checkCancelled();
+            if (!call.getFlowType().isCall() || call.getLength() != 3 || call.getByte(0) != (byte) 0xe8) {
+                continue;
+            }
+            Address previous = call.getFallFrom();
+            var push = previous == null ? null : listing.getInstructionAt(previous);
+            if (push == null || push.getLength() != 1 || push.getByte(0) != 0x0e ||
+                    !call.getAddress().equals(push.getFallThrough())) {
+                continue;
+            }
+            boolean otherEntry = false;
+            for (var reference : references.getReferencesTo(call.getAddress())) {
+                if (reference.getReferenceType().isFlow() && !reference.getFromAddress().equals(push.getAddress())) {
+                    otherEntry = true;
+                    break;
+                }
+            }
+            var targets = call.getFlows();
+            if (!otherEntry && targets.length == 1) {
+                candidates.add(targets[0]);
+            }
+        }
+
+        int recovered = 0;
+        for (Address target : candidates) {
+            monitor.checkCancelled();
+            var function = functions.getFunctionAt(target);
+            if (function == null || function.isThunk() || function.getSignatureSource() == SourceType.USER_DEFINED) {
+                continue;
+            }
+            Integer purge = null;
+            for (var instruction : listing.getInstructions(function.getBody(), true)) {
+                monitor.checkCancelled();
+                String mnemonic = instruction.getMnemonicString();
+                if (mnemonic.startsWith("RET") || mnemonic.startsWith("IRET")) {
+                    int opcode = instruction.getByte(0) & 0xff;
+                    if (opcode != 0xcb && opcode != 0xca) {
+                        purge = null;
+                        break;
+                    }
+                    int size = opcode == 0xcb ? 0 : (int) instruction.getScalar(0).getUnsignedValue();
+                    if (purge != null && purge != size) {
+                        purge = null;
+                        break;
+                    }
+                    purge = size;
+                }
+            }
+            if (purge != null) {
+                function.setCallingConvention("__stdcall16far");
+                function.setStackPurgeSize(purge);
+                recovered++;
+            }
+        }
+        return recovered;
+    }
+
+    private int applyRuntimeSignatures(JsonArray signatures) throws Exception {
+        if (signatures == null) {
+            return 0;
+        }
+        int applied = 0;
+        for (var item : signatures) {
+            monitor.checkCancelled();
+            var signature = item.getAsJsonObject();
+            Address address = space.getAddress(signature.getAsJsonObject("address").get("linear").getAsLong());
+            var function = getFunctionAt(address);
+            if (function == null || function.isThunk() || function.getSignatureSource() == SourceType.USER_DEFINED) {
+                continue;
+            }
+            var registers = signature.getAsJsonArray("result_registers");
+            boolean custom = !registers.isEmpty();
+            DataType result = runtimeType(signature.get("result").getAsString());
+            var returnValue = custom ? new ReturnParameterImpl(result, registerStorage(registers), currentProgram)
+                : new ReturnParameterImpl(result, currentProgram);
+            var parameters = new ArrayList<Parameter>();
+            for (var argument : signature.getAsJsonArray("parameters")) {
+                var parameter = argument.getAsJsonObject();
+                String name = parameter.get("name").getAsString();
+                DataType type = runtimeType(parameter.get("type").getAsString());
+                parameters.add(custom
+                    ? new ParameterImpl(name, type, registerStorage(parameter.getAsJsonArray("registers")), currentProgram)
+                    : new ParameterImpl(name, type, currentProgram));
+            }
+            var purge = signature.get("stack_purge");
+            String convention = purge.isJsonNull() ? "__cdecl16near" : "__stdcall16far";
+            function.updateFunction(convention, returnValue, parameters,
+                custom ? FunctionUpdateType.CUSTOM_STORAGE : FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+                true, SourceType.ANALYSIS);
+            function.setStackPurgeSize(purge.isJsonNull() ? 0 : purge.getAsInt());
+            function.setVarArgs(signature.get("variadic").getAsBoolean());
+            function.setName(signature.get("name").getAsString(), SourceType.ANALYSIS);
+            applied++;
+        }
+        return applied;
+    }
+
+    private VariableStorage registerStorage(JsonArray names) throws Exception {
+        Register[] registers = new Register[names.size()];
+        for (int i = 0; i < names.size(); i++) {
+            registers[i] = currentProgram.getRegister(names.get(i).getAsString());
+        }
+        return new VariableStorage(currentProgram, registers);
+    }
+
+    private DataType runtimeType(String name) {
+        var manager = currentProgram.getDataTypeManager();
+        return switch (name) {
+            case "void" -> VoidDataType.dataType;
+            case "int" -> ShortDataType.dataType;
+            case "uint" -> UnsignedShortDataType.dataType;
+            case "char*" -> new PointerDataType(CharDataType.dataType, 2, manager);
+            case "void*" -> new PointerDataType(VoidDataType.dataType, 2, manager);
+            case "farptr" -> new PointerDataType(VoidDataType.dataType, 4, manager);
+            case "Real48" -> {
+                var type = new StructureDataType("Real48", 0, manager);
+                type.add(ByteDataType.dataType, "exponent", null);
+                type.add(new ArrayDataType(ByteDataType.dataType, 5, 1), "fraction_and_sign", null);
+                yield type;
+            }
+            default -> throw new IllegalArgumentException("unknown runtime type " + name);
+        };
+    }
+
     private void applySegments(JsonObject map) throws Exception {
-        space = (SegmentedAddressSpace) currentProgram.getAddressFactory().getDefaultAddressSpace();
         cs = currentProgram.getRegister("CS");
         ds = currentProgram.getRegister("DS");
         es = currentProgram.getRegister("ES");

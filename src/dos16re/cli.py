@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
-from .ghidra import GhidraError, decompile, import_program
+from .ghidra import GhidraError, analysis_gaps, decompile, import_program
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 
@@ -116,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser = commands.add_parser("decomp", help="decompile a function in a Ghidra project")
     decomp_parser.add_argument("address", metavar="ADDR")
     decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    gaps_parser = commands.add_parser("gaps", help="report undefined ranges in an analyzed Ghidra project")
+    gaps_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
     call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
@@ -131,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit", default=DEFAULT_INSTRUCTION_LIMIT, metavar="N",
         help=f"maximum instructions (default: {DEFAULT_INSTRUCTION_LIMIT})",
     )
-    for command in (import_parser, decomp_parser, call_parser):
+    for command in (import_parser, decomp_parser, gaps_parser, call_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
 
     args = parser.parse_args(argv)
@@ -144,6 +146,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "decomp":
             report = decompile(args.address, args.project)
             print(json.dumps(report) if args.json else report["decompilation"].strip())
+            return 0
+        if args.command == "gaps":
+            report = analysis_gaps(args.project)
+            if args.json:
+                print(json.dumps(report))
+            else:
+                ranges = report["ranges"]
+                print(f"{report['undefined_bytes']} undefined bytes in {len(ranges)} ranges")
+                for gap in ranges[:10]:
+                    print(f"{gap['start']}–{gap['end']}  {gap['size']} bytes")
+                if len(ranges) > 10:
+                    print("Use --json for all ranges.")
             return 0
         if args.command == "call":
             _call(args)
@@ -173,6 +187,10 @@ def main(argv: list[str] | None = None) -> int:
         packer = f" ({loaded.packer})" if loaded.packer else ""
         print(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")
         print(f"root  {loaded.base_segment:04x}:0000  {len(loaded.image)} bytes")
+        compiler = program_map["compiler"]
+        if compiler:
+            identity = " ".join(filter(None, (compiler["family"], compiler["version"])))
+            print(f"compiler  {identity}")
         if overlays:
             unit_count = len(program_map["units"]) - 1
             stub_count = len(program_map.get("stubs", []))
