@@ -1,11 +1,11 @@
 """Build a static NEC PC-8801 main-CPU view from disk sectors or raw loads."""
 
+from .d88 import D88_SUFFIXES as DISK_SUFFIXES
 from .d88 import D88Disk
 from .image import PC88_FORMAT
 from .z80 import SourceSpan, Z80Source, place_z80_sources
 
 BOOT_ADDRESS = 0xC000
-DISK_SUFFIXES = (".d88", ".d77")
 LOW_BANKS = ("ram", "n88-rom", "n-rom")
 HIGH_BANKS = ("ram", "blue", "red", "green")
 

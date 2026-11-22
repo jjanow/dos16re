@@ -364,7 +364,7 @@ public class RetroreQuery extends GhidraScript {
         var space = currentProgram.getAddressFactory().getDefaultAddressSpace();
         if (parts.length == 1) {
             if (space instanceof SegmentedAddressSpace) {
-                throw new IllegalArgumentException("expected a DOS seg:off or unit:offset address");
+                throw new IllegalArgumentException("expected a seg:off or unit:offset address");
             }
             return space.getAddress(Long.parseLong(parts[0], 16));
         }

@@ -13,17 +13,20 @@ from .atari8 import (
 )
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
-from .d88 import D88Disk, D88Error
+from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
-from .image import APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, ImageError
+from .image import (
+    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, ImageError,
+)
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
-from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
+from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 from .pc88 import (
     BOOT_ADDRESS as PC88_BOOT_ADDRESS, DISK_SUFFIXES as PC88_DISK_SUFFIXES, HIGH_BANKS, LOW_BANKS,
     Pc88Error, boot_source, build_pc88_image, copy_source, disk_source,
 )
+from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build_pc98_image
 from .search import SearchError, find_bytes
 from .trace import TraceError, import_trace
 from .z80 import Z80Source
@@ -70,7 +73,7 @@ def _runtime_copy(value: str) -> tuple[int, int, int]:
     return _hex_address(address), _hex_address(size), _hex_address(destination)
 
 
-def _pc88_sector(value: str) -> tuple[int, int, int, int, int]:
+def _disk_sector(value: str) -> tuple[int, int, int, int, int]:
     chs, at, address = value.partition("@")
     if not at:
         raise argparse.ArgumentTypeError("expected decimal C:H:R[+COUNT] and hexadecimal @HEX")
@@ -81,6 +84,13 @@ def _pc88_sector(value: str) -> tuple[int, int, int, int, int]:
     except ValueError:
         raise argparse.ArgumentTypeError("expected decimal C:H:R[+COUNT] and hexadecimal @HEX") from None
     return cylinder, head, record, sectors, _hex_address(address)
+
+
+def _segmented_address(value: str) -> Address:
+    segment, colon, offset = value.partition(":")
+    if not colon:
+        raise argparse.ArgumentTypeError("expected hexadecimal SEG:OFF")
+    return Address(_hex_segment(segment), _hex_segment(offset))
 
 
 def _c64_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
@@ -282,6 +292,42 @@ def _pc88_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
             raise Pc88Error(f"specify a PC-88 load address for {path.name!r} with @HEX")
         sources.append(Z80Source(path.stem, path.name, address, path.read_bytes()))
     return build_pc88_image(sources, filename, entries, low or "ram", args.pc88_high or "ram", disk)
+
+
+def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
+    if (args.base_address is not None or args.overlay or args.disk_file or args.entry
+            or args.c64_unit or args.c64_bank is not None
+            or args.apple2_unit or args.apple2_lc is not None or args.apple2_disk_order
+            or args.atari8_unit or args.atari8_portb is not None or args.msx2_unit or args.msx2_copy):
+        raise Pc98Error("use PC-98 load and entry options with --pc98")
+    filename = args.program.name
+    extension = args.program.suffix.lower()
+    disk = None
+    if extension == HDM_SUFFIX:
+        if args.pc98_disk is not None:
+            raise Pc98Error("--pc98-disk applies to D88/D77 containers")
+        disk = HdmDisk(data)
+    elif extension in D88_SUFFIXES or args.pc98_sector or args.pc98_disk is not None:
+        disk = D88Disk(data, args.pc98_disk if args.pc98_disk is not None else 1)
+
+    if disk is not None:
+        if args.base_segment is not None:
+            raise Pc98Error("set PC-98 disk load segments with --pc98-sector C:H:R[+COUNT]@SEG")
+        selections = args.pc98_sector or [(0, 0, 1, 1, IPL_SEGMENT)]
+        sources = [
+            Pc98Source.from_disk(disk, "root" if index == 0 else f"sector_{c}_{h}_{r}_{seg:04x}",
+                                 filename, c, h, r, count, seg)
+            for index, (c, h, r, count, seg) in enumerate(selections)
+        ]
+    else:
+        if args.base_segment is None:
+            raise Pc98Error("--base-segment is required for raw PC-98 files")
+        sources = [Pc98Source("root", filename, args.base_segment, data)]
+    for path, segment in args.pc98_unit:
+        if segment is None:
+            raise Pc98Error("specify a PC-98 unit load segment with FILE@SEG")
+        sources.append(Pc98Source(path.stem, path.name, segment, path.read_bytes()))
+    return build_pc98_image(sources, filename, args.pc98_entry, disk)
 
 
 def _export_image(output: Path, image: bytes, program_map: dict) -> None:
@@ -501,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
             "--base-segment",
             type=_hex_segment,
             metavar="HEX",
-            help=f"DOS load segment (default: {DEFAULT_BASE_SEGMENT:04x})",
+            help=f"DOS load segment (default: {DEFAULT_BASE_SEGMENT:04x}) or raw PC-98 load segment",
         )
         base.add_argument(
             "--base-address", type=_hex_address, metavar="HEX",
@@ -520,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
         platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
         platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
         platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
+        platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
         command.add_argument(
             "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
             help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
@@ -562,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         command.add_argument("--pc88-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
         command.add_argument(
-            "--pc88-sector", type=_pc88_sector, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
+            "--pc88-sector", type=_disk_sector, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
             help="load a disk sector span by decimal cylinder, head, and sector ID (default: IPL at c000)",
         )
         command.add_argument(
@@ -575,6 +622,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         command.add_argument("--pc88-low", choices=LOW_BANKS, help="select visible memory below 8000")
         command.add_argument("--pc88-high", choices=HIGH_BANKS, help="select RAM or a graphics VRAM plane at c000")
+        command.add_argument("--pc98-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
+        command.add_argument(
+            "--pc98-sector", type=_disk_sector, action="append", default=[], metavar="C:H:R[+COUNT]@SEG",
+            help="load a decimal disk sector span at hexadecimal SEG:0000 (default: IPL at 1fc0:0000)",
+        )
+        command.add_argument(
+            "--pc98-unit", type=_overlay, action="append", default=[], metavar="FILE@SEG",
+            help="load a co-resident raw PC-98 file at hexadecimal SEG:0000",
+        )
+        command.add_argument(
+            "--pc98-entry", type=_segmented_address, action="append", default=[], metavar="SEG:OFF",
+            help="seed PC-98 analysis at a hexadecimal segment and offset (repeatable)",
+        )
         command.add_argument(
             "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
             help="seed 8-bit machine-code analysis at this address (repeatable)",
@@ -602,7 +662,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     for name, help_text in address_queries.items():
         query_parser = commands.add_parser(name, help=help_text)
-        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, DOS seg:off, or flat address")
+        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, seg:off, or flat address")
         query_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
         query_parser.add_argument("--json", action="store_true", help="print JSON")
         query_parser.add_argument("--fields", metavar="FIELD,...", help="select top-level JSON fields")
@@ -696,11 +756,15 @@ def main(argv: list[str] | None = None) -> int:
             and (extension in (".atr", ".xex") or
                  extension not in (".d64", ".prg") and data.startswith((ATR_MAGIC, XEX_MAGIC)))
         )
-        if args.pc88:
-            image, program_map = _pc88_image(args, data)
-        elif (args.pc88_disk is not None or args.pc88_sector or args.pc88_copy or args.pc88_unit
-              or args.pc88_low or args.pc88_high):
+        if not args.pc88 and (args.pc88_disk is not None or args.pc88_sector or args.pc88_copy or args.pc88_unit
+                             or args.pc88_low or args.pc88_high):
             raise Pc88Error("PC-88 options require --pc88")
+        if not args.pc98 and (args.pc98_disk is not None or args.pc98_sector or args.pc98_unit or args.pc98_entry):
+            raise Pc98Error("PC-98 options require --pc98")
+        if args.pc98:
+            image, program_map = _pc98_image(args, data)
+        elif args.pc88:
+            image, program_map = _pc88_image(args, data)
         elif args.msx2:
             image, program_map = _msx2_image(args, data)
         elif args.msx2_unit or args.msx2_copy:
@@ -739,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "load":
             _export_image(args.output, image, program_map)
     except (Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
-            Msx2Error, Pc88Error, PrgError, SearchError, TraceError, OSError) as error:
+            Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
@@ -756,6 +820,9 @@ def main(argv: list[str] | None = None) -> int:
     elif program_map["format"] == "PRG":
         print(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
         print("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
+    elif program_map["format"] == PC98_FORMAT:
+        entry = program_map["entry"]
+        print(f"PC-98  entry {entry['segment']:04x}:{entry['offset']:04x}  {len(program_map['units'])} units")
     elif program_map["format"] in FLAT16_FORMATS:
         entries = program_map["entries"]
         if program_map["format"] == APPLE2_FORMAT:

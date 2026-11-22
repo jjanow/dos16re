@@ -14,6 +14,8 @@ APPLE2_FORMAT = "APPLE2"
 ATARI8_FORMAT = "ATARI8"
 MSX2_FORMAT = "MSX2"
 PC88_FORMAT = "PC88"
+PC98_FORMAT = "PC98"
+PC98_RAM_END = 0xA0000
 MOS6502_FORMATS = (C64_FORMAT, APPLE2_FORMAT, ATARI8_FORMAT)
 Z80_FORMATS = (MSX2_FORMAT, PC88_FORMAT)
 FLAT16_FORMATS = (*MOS6502_FORMATS, *Z80_FORMATS)
@@ -50,7 +52,7 @@ def read_map(export: Path) -> dict:
         program = json.loads((export / "map.json").read_text(encoding="utf-8"))
         if program["version"] != 1:
             raise ValueError("unsupported map version")
-        if program.get("format", "MZ") not in ("MZ", *_FLAT_LIMITS):
+        if program.get("format", "MZ") not in ("MZ", PC98_FORMAT, *_FLAT_LIMITS):
             raise ValueError("unsupported image format")
         return program
     except (KeyError, TypeError, ValueError) as error:
@@ -67,9 +69,11 @@ def image_units(program: dict, image_size: int) -> list[ImageUnit]:
     address_width = 4 if image_format in FLAT16_FORMATS else 8
     try:
         units = program["units"]
-        origin = units[0]["linear"]
-        limit = _FLAT_LIMITS.get(image_format, 0x100000)
+        origin = program["image_origin"] if image_format == PC98_FORMAT else units[0]["linear"]
+        limit = PC98_RAM_END if image_format == PC98_FORMAT else _FLAT_LIMITS.get(image_format, 0x100000)
         if type(origin) is not int or not 0 <= origin <= origin + image_size <= limit:
+            if image_format == PC98_FORMAT:
+                raise ValueError("image extends past PC-98 conventional RAM")
             size_limit = f"{limit >> 20} MiB" if limit >= 0x100000 else "64 KiB"
             raise ValueError(f"image extends past the {size_limit} image limit")
         placements = []
@@ -94,6 +98,8 @@ def image_units(program: dict, image_size: int) -> list[ImageUnit]:
                     raise ValueError(f"invalid segment for unit {name}")
             placements.append(ImageUnit(name, linear, start, size, file_size, segment, address_width))
         placements.sort(key=lambda unit: (unit.image_offset, unit.size))
+        if image_format == PC98_FORMAT and placements[0].image_offset:
+            raise ValueError("invalid PC-98 image origin")
         if any(left.image_offset + left.size > right.image_offset for left, right in zip(placements, placements[1:])):
             raise ValueError("image units overlap")
         return placements

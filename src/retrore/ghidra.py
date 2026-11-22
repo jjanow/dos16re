@@ -8,7 +8,7 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .image import FLAT16_FORMATS, M68K_FORMATS, Z80_FORMATS, image_units, read_map
+from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, Z80_FORMATS, image_units, read_map
 
 _QUERY_FIELDS = {
     "decomp": {"address", "unit_address", "linear", "name", "decompilation"},
@@ -87,6 +87,8 @@ def import_program(export: Path, project: Path) -> dict:
         return _run(
             project, [*options, language], None, str(manifest), pre_script="Retrore8BitImport.java",
         )
+    if program.get("format") == PC98_FORMAT:
+        image_units(program, image.stat().st_size)
     return _run(
         project, [*options, "x86:LE:16:Real Mode"],
         "RetroreSegments.java", str(manifest), pre_script="RetroreImport.java",
@@ -112,7 +114,7 @@ def _validate_query(request: object) -> None:
     if not isinstance(address, str):
         raise GhidraError("address must be a string")
     if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
-        raise GhidraError("expected a hexadecimal unit:offset, DOS seg:off, or flat address")
+        raise GhidraError("expected a hexadecimal unit:offset, seg:off, or flat address")
     allowed = {"command", "address", "fields"}
     if command != "decomp":
         allowed.update(_REFERENCE_OPTIONS)

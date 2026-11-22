@@ -9,6 +9,7 @@ _SHORT_TRACK_COUNT = 160
 _TRACK_COUNT = 164
 _SECTOR_HEADER_SIZE = 16
 _MEDIA_TYPES = {0x00: "2D", 0x10: "2DD", 0x20: "2HD", 0x30: "1D", 0x40: "1DD"}
+D88_SUFFIXES = (".d88", ".d77")
 
 
 class D88Error(ValueError):

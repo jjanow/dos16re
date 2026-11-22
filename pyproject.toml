@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "retrore"
 version = "0.1.0"
-description = "Reverse-engineering tools for DOS, AmigaDOS, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, and NEC PC-88 programs"
+description = "Reverse-engineering tools for DOS, AmigaDOS, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, and NEC PC-98"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["capstone>=5,<6", "unicorn>=2.1,<3"]

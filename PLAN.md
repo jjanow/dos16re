@@ -2,7 +2,7 @@
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
-binaries, Atari 8-bit executables, MSX2 programs, and NEC PC-88 programs. It handles formats and compiler
+binaries, Atari 8-bit executables, MSX2 programs, and NEC PC-88 and PC-98 programs. It handles formats and compiler
 patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
 Ghidra's decompiler and agents driving it one whole-program image to work on.
 
@@ -12,13 +12,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22, added NEC PC-88 D88/D77 loading, raw loads and resident copies, selected ROM and
-VRAM views, and Z80 analysis with hardware port labels. Validated the Phantasie III Program and
-Utility Disk boot paths and their transfers into distinct programs at `$0100` in Ghidra 12.2.
-The standalone suite passed 133 tests. The installed wheel passed 146 tests with 21 skipped,
-including opt-in PC-88 and MSX2 validation.
+On 2026-11-22, added NEC PC-98 D88/D77 and HDM sector loads, raw real-mode loads, and Ghidra
+import with PC-9801 VRAM and IPL ROM windows. Validated the Phantasie III Program and Utility
+Disk IPLs, second-stage loaders, and far jumps into the two programs in Ghidra 12.2. Also verified
+the Phantasie IV HDM boot sector import. The standalone suite passed 136 tests. The installed
+wheel passed 148 tests with 25 skipped, including both opt-in PC-98 tests.
 
-Resume with NEC PC-98 for platform support or decompilation excerpts and targeted data-flow slices
+Resume with Sharp X1 / X1turbo for platform support or decompilation excerpts and targeted data-flow slices
 for Phase 8.
 
 ## Why
@@ -182,13 +182,14 @@ across separated overlay units.
 | Phantasie I and II (Atari 8-bit) | Atari DOS boot disks and segmented executables in ATR images | Boot and RUNAD entry points, alternative helper loads, 6502 calls and ANTIC references |
 | Phantasie III (MSX2) | FAT12 Scenario Disk, MSX-DOS `.COM` and `.OVR` files | Resident code copy, alternative overlays, Z80 decompilation and cross-unit transfers |
 | Phantasie III (NEC PC-88) | D88 Program and Utility Disks | IPL, alternative Z80 payloads, cross-unit transfers and hardware port references |
+| Phantasie III (NEC PC-98) | D88 Program and Utility Disks | Real-mode IPL, alternative payloads, cross-unit far jumps and segment context |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
 tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. The opt-in Apple II tests use
 `RETRORE_PH1_APPLE2_DIR` and `RETRORE_PH3_APPLE2_DIR`. The opt-in Atari 8-bit tests use
 `RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. The opt-in MSX2 tests use `RETRORE_PH3_MSX2_DIR`.
-The opt-in PC-88 tests use `RETRORE_PH3_PC88_DIR`.
+The opt-in PC-88 and PC-98 tests use `RETRORE_PH3_PC88_DIR` and `RETRORE_PH3_PC98_DIR`.
 Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
@@ -201,9 +202,9 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, and NEC PC-88 milestones are complete
-for the validated releases. NEC PC-98 is the next platform milestone. The analysis backlog below applies to existing
-and future platforms.
+The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, and NEC PC-98
+milestones are complete for the validated releases. Sharp X1 / X1turbo is the next platform milestone.
+The analysis backlog below applies to existing and future platforms.
 
 ## Analysis backlog
 
@@ -297,15 +298,15 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, MSX2, and PC-88 |
-|---|---|---|---|
-| Load, export, and byte search | Implemented | Implemented | Implemented |
-| Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented |
-| Batch Ghidra address queries | Implemented | Implemented | Implemented |
-| Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented |
-| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export |
-| Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Extend for relevant targets | Extend for relevant targets |
-| Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned |
+| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, MSX2, and PC-88 | PC-98 |
+|---|---|---|---|---|
+| Load, export, and byte search | Implemented | Implemented | Implemented | Implemented |
+| Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
+| Batch Ghidra address queries | Implemented | Implemented | Implemented | Implemented |
+| Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
+| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
+| Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Extend for relevant targets | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
+| Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned | Planned |
 
 For each new capability, use shared synthetic contract checks where possible and add fixtures for
 platform-specific behavior. Track missing capabilities so a platform's loader milestone is distinct
@@ -427,3 +428,16 @@ Their second stages load different programs at `$0100`, reaching routines at `$0
 respectively. Ghidra recovered both transfers and the IPL's write to port `$31`. The loader represents
 each stage with a caller-selected memory layout. Future loader work includes filesystem member
 selection and additional PC-88 memory modes.
+
+### NEC PC-98
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` read the IPL or explicit sectors
+from D88/D77 and 1232 KiB HDM floppies. Raw files and selected disk spans load at explicit real-mode
+segments. The export records original sector offsets and the PC-9801 memory map. The shared x86
+importer tracks segment context and represents text VRAM, graphics VRAM, and IPL ROM.
+
+The Phantasie III Program and Utility Disks both start at `1fc0:0000` and load a second stage at
+`3f00:0000`. Ghidra decompiled both loaders and recovered their direct far jumps to `0200:035f`.
+The startup routines there lead to `0412:0006` on the Program Disk and `03ca:000f` on the Utility
+Disk. Future loader work includes FAT12 member selection for PC-98 DOS floppies and additional
+machine-specific ROM and graphics views.

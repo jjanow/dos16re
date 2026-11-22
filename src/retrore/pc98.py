@@ -1,0 +1,137 @@
+"""Reconstruct a selected NEC PC-98 real-mode memory layout."""
+
+from dataclasses import dataclass
+
+from .d88 import D88Disk, D88Sector
+from .image import PC98_FORMAT, PC98_RAM_END
+from .mz import Address
+from .overlays import address_record
+
+IPL_SEGMENT = 0x1FC0
+HDM_SUFFIX = ".hdm"
+
+_MEMORY_MAP = (
+    ("conventional_ram", 0x00000, PC98_RAM_END, "ram"),
+    ("text_vram", 0xA0000, 0x4000, "vram"),
+    ("blue_vram", 0xA8000, 0x8000, "vram"),
+    ("red_vram", 0xB0000, 0x8000, "vram"),
+    ("green_vram", 0xB8000, 0x8000, "vram"),
+    ("cbus_window", 0xC0000, 0x20000, "expansion"),
+    ("ipl_rom", 0xE8000, 0x18000, "rom"),
+)
+
+
+class Pc98Error(ValueError):
+    """An invalid or unsupported PC-98 load."""
+
+
+class HdmDisk:
+    """Read raw PC-98 2HD floppies with 77 cylinders and 1024-byte sectors."""
+
+    _CYLINDERS = 77
+    _HEADS = 2
+    _RECORDS = 8
+    _SECTOR_SIZE = 1024
+
+    def __init__(self, data: bytes):
+        if len(data) != self._CYLINDERS * self._HEADS * self._RECORDS * self._SECTOR_SIZE:
+            raise Pc98Error("expected a 1232 KiB PC-98 HDM disk")
+        self._data = data
+        self.metadata = {
+            "format": "HDM", "media_type": "2HD", "cylinders": self._CYLINDERS, "heads": self._HEADS,
+            "sectors_per_track": self._RECORDS, "sector_size": self._SECTOR_SIZE,
+        }
+
+    def read_sectors(self, cylinder: int, head: int, record: int, count: int = 1) -> tuple[D88Sector, ...]:
+        if not (0 <= cylinder < self._CYLINDERS and 0 <= head < self._HEADS
+                and 1 <= record <= self._RECORDS and count > 0):
+            raise Pc98Error("invalid HDM cylinder, head, sector ID, or sector count")
+        start = (cylinder * self._HEADS + head) * self._RECORDS + record - 1
+        if (start + count) * self._SECTOR_SIZE > len(self._data):
+            raise Pc98Error("HDM sector span extends beyond the disk")
+        sectors = []
+        for index in range(start, start + count):
+            offset = index * self._SECTOR_SIZE
+            sectors.append(D88Sector(index % self._RECORDS + 1, 3, offset, self._data[offset:offset + self._SECTOR_SIZE]))
+        return tuple(sectors)
+
+
+@dataclass(frozen=True)
+class Pc98Source:
+    name: str
+    source: str
+    segment: int
+    data: bytes
+    sectors: tuple[D88Sector, ...] = ()
+    chs: tuple[int, int, int] | None = None
+
+    @classmethod
+    def from_disk(
+        cls, disk: D88Disk | HdmDisk, name: str, source: str,
+        cylinder: int, head: int, record: int, count: int, segment: int,
+    ) -> "Pc98Source":
+        sectors = disk.read_sectors(cylinder, head, record, count)
+        return cls(name, source, segment, b"".join(sector.data for sector in sectors),
+                   sectors, (cylinder, head, record))
+
+
+def build_pc98_image(
+    sources: list[Pc98Source], program: str, entries: list[Address], disk: D88Disk | HdmDisk | None = None,
+) -> tuple[bytes, dict]:
+    """Place co-resident loads at their actual segments and retain their disk offsets."""
+    if not sources:
+        raise Pc98Error("expected at least one PC-98 load")
+    reserved = {name for name, *_ in _MEMORY_MAP}
+    names = set()
+    units = []
+    for source in sources:
+        name = source.name.casefold()
+        if not name or ":" in name or name in names or name in reserved:
+            raise Pc98Error(f"invalid, duplicate, or reserved PC-98 unit name {source.name!r}")
+        names.add(name)
+        linear = 16 * source.segment
+        if not source.data or not 0 <= linear < linear + len(source.data) <= PC98_RAM_END:
+            raise Pc98Error(f"PC-98 unit {source.name} must contain bytes within conventional RAM")
+        unit = {"name": source.name, "source": source.source, "segment": source.segment,
+                "linear": linear, "size": len(source.data), "file_offset": 0}
+        if source.chs is not None:
+            cylinder, head, record = source.chs
+            unit["disk_span"] = {"cylinder": cylinder, "head": head, "record": record, "count": len(source.sectors)}
+            unit["file_offset"] = source.sectors[0].file_offset
+            if len(source.sectors) > 1:
+                offset = 0
+                spans = []
+                for sector in source.sectors:
+                    spans.append({"offset": offset, "file_offset": sector.file_offset, "size": len(sector.data)})
+                    offset += len(sector.data)
+                unit["file_spans"] = spans
+        units.append(unit)
+
+    ordered = sorted(units, key=lambda unit: unit["linear"])
+    for left, right in zip(ordered, ordered[1:]):
+        if left["linear"] + left["size"] > right["linear"]:
+            raise Pc98Error(f"PC-98 units {left['name']} and {right['name']} overlap in this memory view")
+    origin = ordered[0]["linear"]
+    end = ordered[-1]["linear"] + ordered[-1]["size"]
+    image = bytearray(end - origin)
+    for unit, source in zip(units, sources):
+        start = unit["linear"] - origin
+        unit["image_offset"] = start
+        image[start:start + unit["size"]] = source.data
+
+    entries = list(dict.fromkeys(entries or [Address(sources[0].segment, 0)]))
+    for entry in entries:
+        if not (0 <= entry.segment <= 0xFFFF and 0 <= entry.offset <= 0xFFFF
+                and any(unit["linear"] <= entry.linear < unit["linear"] + unit["size"] for unit in units)):
+            raise Pc98Error(f"PC-98 entry {entry} is outside the loaded image")
+    report = {
+        "version": 1, "format": PC98_FORMAT, "program": program, "units": units, "image_origin": origin,
+        "entry": address_record(entries[0]), "entries": [address_record(entry) for entry in entries],
+        "memory_view": "pc9801", "memory_map": [
+            {"name": name, "linear": start, "size": size, "kind": kind}
+            for name, start, size, kind in _MEMORY_MAP
+        ],
+    }
+    if disk is not None:
+        report["disk"] = disk.metadata
+    return bytes(image), report

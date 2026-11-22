@@ -40,6 +40,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -109,10 +110,15 @@ public class RetroreSegments extends HeadlessScript {
             int farProcedures = recoverFarProcedures();
             int runtimeSignatures = applyRuntimeSignatures(map.getAsJsonArray("runtime_signatures"));
             applySegments(map);
-            Files.writeString(result, new Gson().toJson(Map.of(
+            var report = new HashMap<String, Object>(Map.of(
                 "program", currentProgram.getName(), "units", map.getAsJsonArray("units").size(),
                 "far_procedures", farProcedures, "runtime_signatures", runtimeSignatures
-            )));
+            ));
+            if (map.has("format") && map.get("format").getAsString().equals("PC98")) {
+                report.put("format", "PC98");
+                report.put("memory_view", map.get("memory_view").getAsString());
+            }
+            Files.writeString(result, new Gson().toJson(report));
             setHeadlessContinuationOption(HeadlessContinuationOption.CONTINUE);
         } catch (Exception error) {
             Files.writeString(result, new Gson().toJson(Map.of("error", error.toString())));
@@ -258,8 +264,9 @@ public class RetroreSegments extends HeadlessScript {
         sp = currentProgram.getRegister("SP");
         var memory = currentProgram.getMemory();
         var units = map.getAsJsonArray("units");
-        long origin = units.get(0).getAsJsonObject().get("linear").getAsLong();
-        for (int index = 1; index < units.size(); index++) {
+        boolean pc98 = map.has("format") && map.get("format").getAsString().equals("PC98");
+        long origin = pc98 ? map.get("image_origin").getAsLong() : units.get(0).getAsJsonObject().get("linear").getAsLong();
+        for (int index = pc98 ? 0 : 1; index < units.size(); index++) {
             var unit = units.get(index).getAsJsonObject();
             overlaySegments.put(unit.get("name").getAsString(), unit.get("segment").getAsInt());
         }
@@ -278,14 +285,33 @@ public class RetroreSegments extends HeadlessScript {
         Address entry = space.getAddress(codeSegment, entryRecord.get("offset").getAsInt());
         State initial = new State();
         initial.set(cs, codeSegment);
-        initial.set(ss, map.getAsJsonObject("stack").get("segment").getAsInt());
+        if (map.has("stack")) {
+            initial.set(ss, map.getAsJsonObject("stack").get("segment").getAsInt());
+        }
         startup = findStartup(entry, initial, 2);
+        var entryStates = new LinkedHashMap<Address, State>();
+        entryStates.put(entry, initial);
+        if (pc98) {
+            for (int index = 1; index < map.getAsJsonArray("entries").size(); index++) {
+                var extra = map.getAsJsonArray("entries").get(index).getAsJsonObject();
+                int segment = extra.get("segment").getAsInt();
+                Address start = space.getAddress(segment, extra.get("offset").getAsInt());
+                State state = new State();
+                state.set(cs, segment);
+                entryStates.merge(start, state, (previous, incoming) -> {
+                    previous.merge(incoming);
+                    return previous;
+                });
+            }
+        }
 
         // A direct write may invalidate a segment word even when another path first reads it.
         // Re-run after removing such words so no context depends on their initial contents.
         do {
             states.clear();
-            offer(entry, initial);
+            for (var seed : entryStates.entrySet()) {
+                offer(seed.getKey(), seed.getValue());
+            }
             follow();
             for (var function : currentProgram.getFunctionManager().getFunctions(true)) {
                 Address start = function.getEntryPoint();

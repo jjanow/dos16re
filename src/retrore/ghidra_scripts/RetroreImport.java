@@ -47,7 +47,8 @@ public class RetroreImport extends HeadlessScript {
         FileBytes bytes = memory.getAllFileBytes().getFirst();
         var units = map.getAsJsonArray("units");
         var root = units.get(0).getAsJsonObject();
-        long origin = root.get("linear").getAsLong();
+        boolean pc98 = map.has("format") && map.get("format").getAsString().equals("PC98");
+        long origin = pc98 ? map.get("image_origin").getAsLong() : root.get("linear").getAsLong();
         if (!root.get("name").getAsString().equals("root")) {
             throw new IllegalArgumentException("the first unit must be root");
         }
@@ -71,14 +72,29 @@ public class RetroreImport extends HeadlessScript {
             block.setExecute(true);
             block.setWrite(true);
         }
+        if (pc98) {
+            addPc98Hardware(map.getAsJsonArray("memory_map"), memory);
+        }
         var entry = address(map.getAsJsonObject("entry"));
-        if (!memory.contains(entry)) {
+        var entryBlock = memory.getBlock(entry);
+        if (entryBlock == null || !entryBlock.isExecute()) {
             throw new IllegalArgumentException("entry point is outside the image");
         }
         if (map.has("jump_tables")) {
             recoverSwitches(map.getAsJsonArray("jump_tables"));
         }
         seed(entry, "entry");
+        if (pc98) {
+            var entries = map.getAsJsonArray("entries");
+            for (int index = 1; index < entries.size(); index++) {
+                Address target = address(entries.get(index).getAsJsonObject());
+                var block = memory.getBlock(target);
+                if (block == null || !block.isExecute()) {
+                    throw new IllegalArgumentException("entry point is outside the image: " + target);
+                }
+                seed(target, "entry_" + target.toString().replace(':', '_'));
+            }
+        }
         for (JsonElement item : units) {
             JsonObject unit = item.getAsJsonObject();
             if (!unit.has("entries")) {
@@ -111,6 +127,22 @@ public class RetroreImport extends HeadlessScript {
                 Address stub = address(call.getAsJsonObject("stub"));
                 comment(start, "Originally called " + stub + ". Original bytes " +
                     call.get("original").getAsString());
+            }
+        }
+    }
+
+    private void addPc98Hardware(JsonArray layout, Memory memory) throws Exception {
+        for (JsonElement item : layout) {
+            var region = item.getAsJsonObject();
+            String kind = region.get("kind").getAsString();
+            if (kind.equals("vram") || kind.equals("rom")) {
+                long linear = region.get("linear").getAsLong();
+                Address start = space.getAddress((int) (linear >> 4), 0);
+                var block = memory.createUninitializedBlock(region.get("name").getAsString(), start,
+                    region.get("size").getAsLong(), false);
+                block.setWrite(kind.equals("vram"));
+                block.setVolatile(kind.equals("vram"));
+                block.setExecute(false);
             }
         }
     }

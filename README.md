@@ -2,7 +2,7 @@
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
-and NEC PC-88 programs.
+and NEC PC-88 and PC-98 programs.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -269,6 +269,38 @@ Ghidra labels selected hardware ports in the `pc88_ports` block. The command
 `xrefs pc88_ports:0031 --project out/pc88-project --json` queries the graphics memory control port.
 [MAME PC-8801 memory and I/O maps](https://github.com/mamedev/mame/blob/master/src/mame/nec/pc8801.cpp)
 
+## NEC PC-98 loader
+
+Pass `--pc98` to `info` or `load` for D88/D77 disks, 1232 KiB raw HDM floppies, or raw binaries.
+The default disk selection is cylinder 0, head 0, sector ID 1 at `1fc0:0000`. Use
+`--pc98-disk INDEX` to select a disk in a concatenated D88/D77 container (1-based).
+[NEC PC-9800 Technical Data Book](https://vtda.org/docs/computing/NEC/PC-9800TechnicalDataBookHARDWARE%2BOCR_1993.pdf)
+
+```sh
+.venv/bin/retrore info DISK.d88 --pc98 --json
+.venv/bin/retrore load DISK.d88 --pc98 --pc98-sector 0:0:1@1fc0 --pc98-sector 0:1:1+2@3f00 \
+  --pc98-entry 1fc0:0000 --pc98-entry 3f00:0000 -o out/pc98
+.venv/bin/retrore ghidra import out/pc98 out/pc98-project --json
+.venv/bin/retrore decomp 3f00:0000 --project out/pc98-project --json
+```
+
+Repeat `--pc98-sector C:H:R[+COUNT]@SEG` to select co-resident pieces. Cylinder, head, sector ID,
+and count are decimal. Each span follows sector IDs in ascending order and continues to the next
+track when needed. The hexadecimal segment places the span at `SEG:0000`. Explicit selections
+replace the default IPL selection. The map records original disk offsets, with `file_spans` for
+multi-sector loads.
+
+Use `--base-segment HEX` for a raw root file and repeat `--pc98-unit FILE@SEG` for additional raw
+loads. A layout represents one set of non-overlapping loads in conventional RAM. Export a separate
+layout when another stage or disk replaces those bytes. The first load is the root and its start is
+the default entry. Repeat `--pc98-entry SEG:OFF` to seed explicit entries, including in stages
+reached through an indirect transfer.
+
+The map describes the PC-9801 conventional RAM, text and graphics VRAM, C-Bus window, and IPL ROM.
+Ghidra imports the program as 16-bit real-mode x86 and represents VRAM and IPL ROM as uninitialized
+blocks. Query loaded code by `seg:off` or `unit:offset` and graphics references by block name,
+such as `blue_vram:0012`. [MAME PC-9801 memory map](https://github.com/mamedev/mame/blob/master/src/mame/nec/pc9801.cpp)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -332,7 +364,8 @@ it gives Ghidra's DS, ES, and SS values at the requested address. Unknown values
 and `null` in JSON.
 
 `where-is` searches relocated, file-backed bytes in the export. Matches can overlap and must fit
-within a unit's file-backed span. `--string` uses DOS CP437, Amiga Latin-1, or Atari ST ASCII. Use
+within a unit's file-backed span. `--string` uses DOS CP437, Amiga Latin-1, PC-98 CP932, or ASCII
+on the other platforms. Use
 `--bytes` to search for Atari ST text containing bytes above `0x7f`.
 `--constant` accepts a decimal or `0x`-prefixed integer and encodes it in the platform's byte order
 at the specified width (1, 2, 4, or 8 bytes, default 2).
@@ -465,7 +498,9 @@ the extracted Amiga directories containing `game` and `PhantasieIII` respectivel
 `RETRORE_PH2_ATARI8_DIR` to directories containing `phantasie1-side-{a,b}.atr` and
 `phantasie2-side-{a,b}.atr` respectively. Set `RETRORE_PH3_MSX2_DIR` to the directory containing
 the Phantasie III MSX2 Scenario Disk `.dsk` image. Set `RETRORE_PH3_PC88_DIR` to the directory
-containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. The Ghidra tests use
+containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. Set
+`RETRORE_PH3_PC98_DIR` to the directory containing the Phantasie III PC-98 Program and Utility Disk
+`.d88` images. The Ghidra tests use
 `GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
 input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and

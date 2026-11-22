@@ -8,7 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .ghidra import trace_coverage
-from .image import ImageUnit, read_units
+from .image import ImageUnit, image_units, read_map
 from .mz import Address
 
 _TRACE_LINE = re.compile(r"^\s*(?:\d+\.\d+\s+)?([0-9a-fA-F]{4}):([0-9a-fA-F]{4,8})(?=\s|$)")
@@ -55,9 +55,10 @@ def import_trace(
     overlay_segments: dict[str, int] | None = None, project: Path | None = None,
 ) -> dict:
     image = export / "image.bin"
-    units = read_units(export, image.stat().st_size)
-    if units[0].segment is None:
+    program = read_map(export)
+    if program.get("format", "MZ") != "MZ":
         raise TraceError("DOSBox-X traces require a DOS MZ image")
+    units = image_units(program, image.stat().st_size)
     ranges = _runtime_units(units, runtime_base, overlay_segments or {})
     starts = [start for start, _ in ranges]
     counts: Counter[int] = Counter()
