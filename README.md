@@ -19,6 +19,41 @@ python3 -m venv .venv
 File inspection and image export work with the Python install. See [Ghidra](#ghidra) for the
 additional setup for project import, decompilation, and cross-reference queries.
 
+### Try a synthetic program
+
+From the checkout, generate a tiny Commodore 64 PRG with a two-byte load address and a routine
+that writes `7` to the VIC-II border color register. The example uses only synthetic bytes and
+saves its files in a fresh temporary directory. Set up [Ghidra](#ghidra) before running the import
+and batch commands.
+
+```sh
+demo_dir=$(mktemp -d)
+.venv/bin/python - "$demo_dir/demo.prg" <<'PY'
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_bytes(bytes.fromhex(
+    "00 c0 "       # Load address $C000
+    "20 04 c0 60 " # JSR $C004, RTS
+    "a9 07 "       # LDA #$07
+    "8d 20 d0 60"  # STA $D020, RTS
+))
+PY
+.venv/bin/retrore info "$demo_dir/demo.prg" --json
+.venv/bin/retrore load "$demo_dir/demo.prg" --entry c000 -o "$demo_dir/export" --json
+.venv/bin/retrore ghidra import "$demo_dir/export" "$demo_dir/project" --json
+.venv/bin/retrore batch --project "$demo_dir/project" --json <<'JSON'
+[
+  {"command": "callees", "address": "c000", "limit": 1},
+  {"command": "decomp", "address": "c004"},
+  {"command": "xrefs", "address": "c006", "direction": "outgoing", "ref_types": ["WRITE"], "limit": 1}
+]
+JSON
+```
+
+The batch results show a call from `$C000` to `$C004`, decompiled C for the callee, and a `WRITE`
+reference from `$C006` to `$D020`. Compare those addresses with the instructions in the generated PRG.
+
 ### Claude Code and other coding agents
 
 Claude Code can run `retrore` through Bash and read its `--json` output. From the `retrore` checkout,
