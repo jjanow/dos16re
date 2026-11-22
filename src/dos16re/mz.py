@@ -63,6 +63,8 @@ class LoadedMZ:
     image: bytes
     entry: Address
     stack: Address
+    relocations: tuple[Address, ...] = ()
+    packer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class MZExecutable:
     header: MZHeader
     relocations: tuple[Address, ...]
     image: bytes
+    packer: str | None = None
 
     @classmethod
     def parse(cls, data: bytes) -> "MZExecutable":
@@ -91,24 +94,47 @@ class MZExecutable:
         # The file may contain overlay data after the declared MZ module.
         image = data[header.header_size:header.file_size]
         relocations = _parse_relocations(data, header, len(image))
-        return cls(header, relocations, image)
+        from .packers import detect_packer
+
+        packer = detect_packer(header, data[_HEADER.size:header.header_size], image)
+        return cls(header, relocations, image, packer)
 
     def load(self, base_segment: int = DEFAULT_BASE_SEGMENT) -> LoadedMZ:
         if not 0 <= base_segment <= _SEGMENT_MASK:
             raise MZError("base segment must be between 0000 and ffff")
-        if base_segment * _PARAGRAPH_SIZE + len(self.image) > _REAL_MODE_SIZE:
+        header = self.header
+        entry = Address(header.initial_cs, header.initial_ip)
+        stack = Address(header.initial_ss, header.initial_sp)
+        image, relocations = self.image, self.relocations
+        if self.packer == "EXEPACK":
+            from .packers import unpack_exepack
+
+            image, entry, stack, relocations = unpack_exepack(image, entry)
+        elif self.packer in ("LZEXE 0.90", "LZEXE 0.91", "LZEXE 0.91e"):
+            from .packers import unpack_lzexe
+
+            image, entry, stack, relocations = unpack_lzexe(image, entry, self.packer)
+        elif self.packer:
+            raise UnsupportedPacker(self.packer)
+
+        if base_segment * _PARAGRAPH_SIZE + len(image) > _REAL_MODE_SIZE:
             raise MZError("load module extends past the 1 MiB image limit")
 
-        image = bytearray(self.image)
-        for relocation in self.relocations:
+        image = bytearray(image)
+        for relocation in relocations:
             offset = relocation.linear
             value, = _WORD.unpack_from(image, offset)
             _WORD.pack_into(image, offset, (value + base_segment) & _SEGMENT_MASK)
 
-        header = self.header
-        entry = Address((base_segment + header.initial_cs) & _SEGMENT_MASK, header.initial_ip)
-        stack = Address((base_segment + header.initial_ss) & _SEGMENT_MASK, header.initial_sp)
-        return LoadedMZ(base_segment, bytes(image), entry, stack)
+        entry = Address((base_segment + entry.segment) & _SEGMENT_MASK, entry.offset)
+        stack = Address((base_segment + stack.segment) & _SEGMENT_MASK, stack.offset)
+        return LoadedMZ(base_segment, bytes(image), entry, stack, relocations, self.packer)
+
+
+class UnsupportedPacker(MZError):
+    def __init__(self, packer: str) -> None:
+        self.packer = packer
+        super().__init__(f"unsupported DOS executable packer ({packer})")
 
 
 def _parse_relocations(data: bytes, header: MZHeader, image_size: int) -> tuple[Address, ...]:

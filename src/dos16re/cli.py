@@ -6,7 +6,9 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 
-from .mz import DEFAULT_BASE_SEGMENT, Address, LoadedMZ, MZError, MZExecutable
+from .ghidra import GhidraError, decompile, import_program
+from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
+from .overlays import Overlay, build_image
 
 
 def _hex_segment(value: str) -> int:
@@ -19,11 +21,14 @@ def _hex_segment(value: str) -> int:
     return segment
 
 
-def _address_record(address: Address) -> dict[str, int]:
-    return {"segment": address.segment, "offset": address.offset, "linear": address.linear}
+def _overlay(value: str) -> tuple[Path, int | None]:
+    path, suffix, segment = value.rpartition("@")
+    if suffix:
+        return Path(path), _hex_segment(segment)
+    return Path(value), None
 
 
-def _export_image(output: Path, loaded: LoadedMZ, program_map: dict) -> None:
+def _export_image(output: Path, image: bytes, program_map: dict) -> None:
     output.mkdir(parents=True, exist_ok=True)
     image_path = output / "image.bin"
     map_path = output / "map.json"
@@ -32,7 +37,7 @@ def _export_image(output: Path, loaded: LoadedMZ, program_map: dict) -> None:
     with ExitStack() as rollback:
         with image_path.open("xb") as image_file:
             rollback.callback(image_path.unlink)
-            image_file.write(loaded.image)
+            image_file.write(image)
         with map_path.open("x", encoding="utf-8") as map_file:
             rollback.callback(map_path.unlink)
             map_file.write(map_text)
@@ -42,7 +47,7 @@ def _export_image(output: Path, loaded: LoadedMZ, program_map: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dos16re", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    load_parser = commands.add_parser("load", help="export a relocated MZ load module")
+    load_parser = commands.add_parser("load", help="export a relocated DOS program and its overlays")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
     info_parser = commands.add_parser("info", help="summarize an MZ load module")
 
@@ -56,32 +61,47 @@ def main(argv: list[str] | None = None) -> int:
             help=f"load segment (default: {DEFAULT_BASE_SEGMENT:04x})",
         )
         command.add_argument("--json", action="store_true", help="print JSON")
+        command.add_argument(
+            "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
+            help="add a Turbo Pascal overlay bank or raw overlay (optionally at hex SEG)",
+        )
+
+    ghidra_parser = commands.add_parser("ghidra", help="manage a headless Ghidra import")
+    ghidra_commands = ghidra_parser.add_subparsers(dest="ghidra_command", required=True)
+    import_parser = ghidra_commands.add_parser("import", help="import and analyze an exported image")
+    import_parser.add_argument("export", metavar="OUT", type=Path)
+    import_parser.add_argument("project", metavar="PROJECT", type=Path)
+    decomp_parser = commands.add_parser("decomp", help="decompile a function in a Ghidra project")
+    decomp_parser.add_argument("address", metavar="ADDR")
+    decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    for command in (import_parser, decomp_parser):
+        command.add_argument("--json", action="store_true", help="print JSON")
 
     args = parser.parse_args(argv)
     try:
+        if args.command == "ghidra":
+            report = import_program(args.export, args.project)
+            summary = f"Imported {report['units']} units into {args.project}"
+            print(json.dumps(report) if args.json else summary)
+            return 0
+        if args.command == "decomp":
+            report = decompile(args.address, args.project)
+            print(json.dumps(report) if args.json else report["decompilation"].strip())
+            return 0
         executable = MZExecutable.parse(args.program.read_bytes())
         loaded = executable.load(args.base_segment)
-        program_map = {
-            "version": 1,
-            "format": "MZ",
-            "program": args.program.name,
-            "entry": _address_record(loaded.entry),
-            "stack": _address_record(loaded.stack),
-            "relocation_count": executable.header.relocation_count,
-            "units": [
-                {
-                    "name": "root",
-                    "segment": loaded.base_segment,
-                    "linear": Address(loaded.base_segment, 0).linear,
-                    "image_offset": 0,
-                    "size": len(loaded.image),
-                }
-            ],
-        }
+        overlays = [
+            Overlay(path.name, path.stem, path.read_bytes(), segment)
+            for path, segment in args.overlay
+        ]
+        image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
-            _export_image(args.output, loaded, program_map)
-    except (MZError, OSError) as error:
-        message = json.dumps({"error": str(error)}) if args.json else f"dos16re: {error}"
+            _export_image(args.output, image, program_map)
+    except (GhidraError, MZError, OSError) as error:
+        report = {"error": str(error)}
+        if isinstance(error, UnsupportedPacker):
+            report["packer"] = error.packer
+        message = json.dumps(report) if args.json else f"dos16re: {error}"
         print(message, file=sys.stderr)
         return 1
 
@@ -90,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "load":
         print(f"Wrote image.bin and map.json to {args.output}")
     else:
-        print(f"MZ  entry {loaded.entry}  stack {loaded.stack}")
+        packer = f" ({loaded.packer})" if loaded.packer else ""
+        print(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")
         print(f"root  {loaded.base_segment:04x}:0000  {len(loaded.image)} bytes")
+        if overlays:
+            unit_count = len(program_map["units"]) - 1
+            stub_count = len(program_map.get("stubs", []))
+            print(f"{unit_count} overlay units, {stub_count} stubs")
     return 0
