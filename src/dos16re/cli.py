@@ -1,4 +1,4 @@
-"""Command-line interface for inspecting and exporting DOS executables."""
+"""Command-line interface for inspecting, exporting, and running DOS code."""
 
 import argparse
 import json
@@ -6,9 +6,10 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 
+from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, decompile, import_program
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
-from .overlays import Overlay, build_image
+from .overlays import Overlay, address_record, build_image
 
 
 def _hex_segment(value: str) -> int:
@@ -44,6 +45,47 @@ def _export_image(output: Path, image: bytes, program_map: dict) -> None:
         rollback.pop_all()
 
 
+def _assignment(text: str, expected: str) -> tuple[str, str]:
+    key, equals, value = text.partition("=")
+    if not equals or not key or not value:
+        raise ValueError(f"expected {expected}, got {text!r}")
+    return key, value
+
+
+def _call(args: argparse.Namespace) -> None:
+    regs = {}
+    writes = []
+    reads = []
+    try:
+        for group in args.regs:
+            for assignment in group.split(","):
+                name, value = _assignment(assignment, "REG=HEX")
+                regs[name.strip()] = int(value, 16)
+        for assignment in args.mem:
+            address, value = _assignment(assignment, "ADDR=HEXBYTES")
+            writes.append((address, bytes.fromhex(value)))
+        for assignment in args.read:
+            address, value = _assignment(assignment, "ADDR=SIZE")
+            base = 16 if value.lower().startswith("0x") else 10
+            reads.append((address, int(value, base)))
+        limit = int(args.limit)
+    except ValueError as error:
+        raise EmulatorError(str(error)) from error
+    result = Emulator.from_export(args.export).call(
+        args.address, regs=regs, writes=writes, reads=reads, far=args.far, limit=limit,
+    )
+    if args.json:
+        print(json.dumps({
+            "address": address_record(result.address),
+            "registers": result.registers,
+            "memory": [{"address": address_record(address), "data": data.hex()} for address, data in result.memory],
+        }))
+    else:
+        print(f"Returned from {result.address}  AX={result.registers['ax']:04x} DX={result.registers['dx']:04x}")
+        for address, data in result.memory:
+            print(f"{address}  {data.hex()}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dos16re", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -74,7 +116,22 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser = commands.add_parser("decomp", help="decompile a function in a Ghidra project")
     decomp_parser.add_argument("address", metavar="ADDR")
     decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
-    for command in (import_parser, decomp_parser):
+    call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
+    call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
+    call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
+    call_parser.add_argument("--far", action="store_true", help="expect RETF (default: near RET)")
+    call_parser.add_argument("--regs", action="append", default=[], metavar="REG=HEX,...", help="set initial registers")
+    call_parser.add_argument(
+        "--mem", action="append", default=[], metavar="ADDR=HEXBYTES", help="write memory before call",
+    )
+    call_parser.add_argument(
+        "--read", action="append", default=[], metavar="ADDR=SIZE", help="read memory after return",
+    )
+    call_parser.add_argument(
+        "--limit", default=DEFAULT_INSTRUCTION_LIMIT, metavar="N",
+        help=f"maximum instructions (default: {DEFAULT_INSTRUCTION_LIMIT})",
+    )
+    for command in (import_parser, decomp_parser, call_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
 
     args = parser.parse_args(argv)
@@ -88,6 +145,9 @@ def main(argv: list[str] | None = None) -> int:
             report = decompile(args.address, args.project)
             print(json.dumps(report) if args.json else report["decompilation"].strip())
             return 0
+        if args.command == "call":
+            _call(args)
+            return 0
         executable = MZExecutable.parse(args.program.read_bytes())
         loaded = executable.load(args.base_segment)
         overlays = [
@@ -97,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (GhidraError, MZError, OSError) as error:
+    except (EmulatorError, GhidraError, MZError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer

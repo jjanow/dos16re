@@ -67,6 +67,52 @@ Re-export images made by older versions to include the relocation metadata.
 `decomp` accepts a `unit:offset` or `seg:off` address in an analyzed function. Offset and segment values
 are hexadecimal. The JSON response includes the function's entry address and decompiled C.
 
+## Emulator harness
+
+`call` runs a routine from an exported image with Unicorn. Each call starts with a fresh copy of the
+image and the exported `SS:SP`, which you can override through `--regs`. Supply the data segments,
+arguments, and memory the routine expects. The harness pushes a synthetic return frame below the
+configured `SP`, so stack arguments start at the configured `SS:SP`. Use `--far` for a routine that
+ends in `RETF`. The default is a near `RET`.
+
+```sh
+.venv/bin/dos16re call root:1234 --export out/program --regs ax=10,ds=2000 \
+  --mem 2000:0100=3412 --read 2000:0100=2 --json
+```
+
+Addresses and register values are hexadecimal. `--mem` writes literal bytes in the order given.
+`--read` sizes are decimal or `0x`-prefixed. Repeat these options for additional ranges. JSON returns
+the resolved address, final registers as integers, and requested memory bytes as hex strings. The
+default instruction limit is one million. Set `--limit N` for another budget.
+
+The Python API supports interrupt handlers, port I/O, and execution hooks. For example, a routine
+that calls BIOS to read a key can receive a scripted Enter key.
+
+```python
+from pathlib import Path
+
+from unicorn.x86_const import UC_X86_REG_AX
+
+from dos16re.emulator import Emulator
+
+
+def read_key(cpu, vector):
+    cpu.reg_write(UC_X86_REG_AX, 0x1C0D)
+
+
+emulator = Emulator.from_export(Path("out/program"))
+result = emulator.call("root:1234", interrupts={0x16: read_key})
+print(result.registers["ax"])
+```
+
+Use `on_in(cpu, port, size)` to return a port value and `on_out(cpu, port, size, value)` to handle a
+port write. Pass `hooks={address: callback}` to run `callback(cpu)` before executing an instruction
+at that address. These callbacks receive the live Unicorn CPU. Turbo Pascal stubs use the resident
+overlays, including when an original `INT 3Fh` stub is restored. Unhandled interrupts and port I/O
+stop the call with an error.
+
+## Tests
+
 Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Radiance DOS v1.3 from
 `DOS16RE_POR_DIR`, the Phantasie I DOS MZ edition from `DOS16RE_PH1_DIR`, and Phantasie III's
 `MAIN.EXE` from `DOS16RE_PH3_DIR`. The Ghidra tests use `GHIDRA_HOME` and include a synthetic DOS

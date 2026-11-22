@@ -85,6 +85,18 @@ def test_phantasie_i_raw_overlays(phantasie_export):
     assert mystic["targets"][2]["offset"] == 0x1F5A
 
 
+def test_calls_phantasie_i_revive_routine(phantasie_export, capsys):
+    output, _, _ = phantasie_export
+    assert main([
+        "call", "OV1:016b", "--export", str(output), "--regs", "ds=3000,ss=4000,sp=1000",
+        "--mem", "4000:1000=0020", "--mem", "3000:2014=7d0001000000", "--read", "3000:2016=4", "--json",
+    ]) == 0, capsys.readouterr().err
+    result = json.loads(capsys.readouterr().out)
+    # The near routine updates current HP and status in a caller-provided character record.
+    assert result["memory"][0]["data"] == "7d000100"
+    assert result["registers"]["sp"] == 0x1000
+
+
 def test_ghidra_recovers_mystic_score(phantasie_export, capsys):
     if not os.environ.get("GHIDRA_HOME"):
         pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")

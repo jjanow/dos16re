@@ -107,14 +107,18 @@ targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of
 
 ### Phase 6: emulator harness
 
-1. Build a general-purpose Unicorn harness in `dos16re`, using the PoR harness as a reference. Load the phase-1
-   image, call any routine by address with registers and memory set up by the caller, run to return, and read
-   results back.
-2. Traps for INT 10h/16h/21h/1Ah, port I/O (video, sound, timer), and per-address hooks; stub INT 3Fh overlay loads
-   since every unit is resident.
-3. CLI: `dos16re call ADDR --regs ... --mem ...` for quick oracle checks.
+1. **Implemented.** The Unicorn harness loads the exported image and runs near or far routines with
+   caller-supplied registers and memory. Calls start from a fresh image and stop at the synthetic return frame
+   or the instruction limit.
+2. **Implemented.** Python hooks handle interrupts, port I/O, and execution at specific addresses.
+   INT 3Fh at a known Turbo Pascal stub redirects to the resident unit.
+3. **Implemented.** `dos16re call ADDR --export OUT --regs ... --mem ... --read ...` reports register
+   and memory results, with `--json` for scripts.
 4. Optional: import DOSBox-X debugger traces (CS:IP logs) and map them onto the static image, marking which
    functions ran and listing reached code the static analysis missed.
+
+**Validated.** Synthetic tests cover near and far calls, nested calls, overlay dispatch, and I/O hooks.
+The Phantasie I revive routine runs from a loaded overlay and updates a caller-supplied character record.
 
 ### Phase 7: agent-facing queries
 
@@ -142,5 +146,5 @@ Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 ## Order of work
 
 Phases 1–3 are validated for the initial targets, and Phase 4 jump-table recovery is validated on Mystic
-SCORE. Next is Phase 6 for emulator reuse, followed by Phases 5 and 7 for signatures and queries.
-Phase 4 still has far-procedure recognition and the `gaps` command open.
+SCORE. Phase 6's emulator harness is implemented. Next is Phase 5 for runtime signatures, followed by
+Phase 7 for agent-facing queries. Phase 4 still has far-procedure recognition and the `gaps` command open.
