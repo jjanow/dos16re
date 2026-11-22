@@ -67,6 +67,8 @@ class Emulator:
         try:
             if program_map["version"] != 1:
                 raise ValueError("unsupported map version")
+            if program_map.get("format", "MZ") != "MZ":
+                raise ValueError("routine emulation requires a DOS MZ image")
             units = program_map["units"]
             self._origin = units[0]["linear"]
             if type(self._origin) is not int or not 0 <= self._origin <= self._origin + len(image) <= _IMAGE_LIMIT:

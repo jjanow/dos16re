@@ -1,4 +1,4 @@
-"""Command-line interface for inspecting, exporting, and running DOS code."""
+"""Inspect and analyze DOS and Amiga executables."""
 
 import argparse
 import json
@@ -6,6 +6,7 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 
+from .amiga import DEFAULT_BASE_ADDRESS, HUNK_MAGIC, HunkError, build_hunk_image
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
 from .image import ImageError
@@ -25,6 +26,13 @@ def _hex_segment(value: str) -> int:
     if not 0 <= segment <= 0xFFFF:
         raise argparse.ArgumentTypeError("segment must be between 0000 and ffff")
     return segment
+
+
+def _hex_address(value: str) -> int:
+    try:
+        return int(value, 16)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a hexadecimal address") from None
 
 
 def _overlay(value: str) -> tuple[Path, int | None]:
@@ -132,7 +140,8 @@ def _address_query(args: argparse.Namespace) -> None:
             f"{name}={value:04x}" if value is not None else f"{name}=?"
             for name, value in report["segments"].items()
         )
-        print(f"{_location(report['address'])}  {segments}")
+        if segments:
+            print(f"{_location(report['address'])}  {segments}")
     _print_references(("callers" if args.command == "func" else args.command,), report)
 
 
@@ -143,14 +152,13 @@ def _where_is(args: argparse.Namespace) -> None:
         if args.bytes is not None:
             pattern = bytes.fromhex(args.bytes)
         elif args.string is not None:
-            pattern = args.string.encode("cp437")
+            pattern = args.string
         else:
             base = 16 if args.constant.lstrip("+-").lower().startswith("0x") else 10
-            value = int(args.constant, base)
-            pattern = value.to_bytes(args.width or 2, "little", signed=value < 0)
-    except (ValueError, OverflowError) as error:
+            pattern = int(args.constant, base)
+    except ValueError as error:
         raise SearchError(str(error)) from error
-    report = find_bytes(args.export, pattern, limit=None if args.json else _PREVIEW_LIMIT)
+    report = find_bytes(args.export, pattern, width=args.width or 2, limit=None if args.json else _PREVIEW_LIMIT)
     if args.json:
         print(json.dumps(report))
         return
@@ -201,18 +209,22 @@ def _trace(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dos16re", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    load_parser = commands.add_parser("load", help="export a relocated DOS program and its overlays")
+    load_parser = commands.add_parser("load", help="export a relocated DOS or Amiga program")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
-    info_parser = commands.add_parser("info", help="summarize an MZ load module")
+    info_parser = commands.add_parser("info", help="summarize a DOS MZ or Amiga Hunk executable")
 
     for command in (load_parser, info_parser):
         command.add_argument("program", type=Path, metavar="PROGRAM")
-        command.add_argument(
+        base = command.add_mutually_exclusive_group()
+        base.add_argument(
             "--base-segment",
             type=_hex_segment,
-            default=DEFAULT_BASE_SEGMENT,
             metavar="HEX",
-            help=f"load segment (default: {DEFAULT_BASE_SEGMENT:04x})",
+            help=f"DOS load segment (default: {DEFAULT_BASE_SEGMENT:04x})",
+        )
+        base.add_argument(
+            "--base-address", type=_hex_address, metavar="HEX",
+            help=f"Amiga load address (default: {DEFAULT_BASE_ADDRESS:06x})",
         )
         command.add_argument("--json", action="store_true", help="print JSON")
         command.add_argument(
@@ -238,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     for name, help_text in address_queries.items():
         query_parser = commands.add_parser(name, help=help_text)
-        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
+        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, DOS seg:off, or Amiga address")
         query_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
         query_parser.add_argument("--json", action="store_true", help="print JSON")
 
@@ -246,8 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
     pattern = search_parser.add_mutually_exclusive_group(required=True)
     pattern.add_argument("--bytes", metavar="HEX", help="hexadecimal bytes")
-    pattern.add_argument("--string", metavar="TEXT", help="literal DOS code page 437 string")
-    pattern.add_argument("--constant", metavar="N", help="decimal or 0x-prefixed integer, encoded little-endian")
+    pattern.add_argument("--string", metavar="TEXT", help="literal string (DOS CP437 or Amiga Latin-1)")
+    pattern.add_argument("--constant", metavar="N", help="decimal or 0x-prefixed integer in the image's byte order")
     search_parser.add_argument("--width", type=int, choices=(1, 2, 4, 8), help="constant width in bytes (default 2)")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
@@ -312,16 +324,26 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "trace":
             _trace(args)
             return 0
-        executable = MZExecutable.parse(args.program.read_bytes())
-        loaded = executable.load(args.base_segment)
-        overlays = [
-            Overlay(path.name, path.stem, path.read_bytes(), segment)
-            for path, segment in args.overlay
-        ]
-        image, program_map = build_image(loaded, args.program.name, overlays)
+        data = args.program.read_bytes()
+        if data.startswith(HUNK_MAGIC):
+            if args.base_segment is not None or args.overlay:
+                raise HunkError("--base-segment and --overlay apply to DOS executables")
+            base_address = DEFAULT_BASE_ADDRESS if args.base_address is None else args.base_address
+            image, program_map = build_hunk_image(data, args.program.name, base_address)
+        else:
+            if args.base_address is not None:
+                raise MZError("--base-address applies to Amiga Hunk executables")
+            executable = MZExecutable.parse(data)
+            base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
+            loaded = executable.load(base_segment)
+            overlays = [
+                Overlay(path.name, path.stem, path.read_bytes(), segment)
+                for path, segment in args.overlay
+            ]
+            image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (EmulatorError, GhidraError, ImageError, MZError, SearchError, TraceError, OSError) as error:
+    except (EmulatorError, GhidraError, HunkError, ImageError, MZError, SearchError, TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
@@ -333,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(program_map))
     elif args.command == "load":
         print(f"Wrote image.bin and map.json to {args.output}")
+    elif program_map["format"] == "HUNK":
+        print(f"Amiga Hunk  entry h0:0000 ({base_address:06x})  {len(program_map['units'])} hunks")
     else:
         packer = f" ({loaded.packer})" if loaded.packer else ""
         print(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")

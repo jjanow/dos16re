@@ -155,10 +155,12 @@ public class Dos16reQuery extends GhidraScript {
             ranges.add(new BodyRange(location(range.getMinAddress()), location(range.getMaxAddress())));
         }
         var segments = new LinkedHashMap<String, Integer>();
-        var context = currentProgram.getProgramContext();
-        for (String name : List.of("DS", "ES", "SS")) {
-            var value = context.getValue(currentProgram.getRegister(name), address, false);
-            segments.put(name, value == null ? null : value.intValue());
+        if (address.getAddressSpace() instanceof SegmentedAddressSpace) {
+            var context = currentProgram.getProgramContext();
+            for (String name : List.of("DS", "ES", "SS")) {
+                var value = context.getValue(currentProgram.getRegister(name), address, false);
+                segments.put(name, value == null ? null : value.intValue());
+            }
         }
         return Map.of("function", routine(function), "ranges", ranges, "size", body.getNumAddresses(),
             "address", location(address), "segments", segments, "callers", callers(function));
@@ -208,6 +210,13 @@ public class Dos16reQuery extends GhidraScript {
 
     private Address resolve(String input) throws Exception {
         String[] parts = input.split(":", 2);
+        var space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+        if (parts.length == 1) {
+            if (space instanceof SegmentedAddressSpace) {
+                throw new IllegalArgumentException("expected a DOS seg:off or unit:offset address");
+            }
+            return space.getAddress(Long.parseLong(parts[0], 16));
+        }
         long offset = Long.parseLong(parts[1], 16);
         // Prefer unit names so that overlays named with hexadecimal characters still work.
         for (MemoryBlock block : currentProgram.getMemory().getBlocks()) {
@@ -218,9 +227,9 @@ public class Dos16reQuery extends GhidraScript {
                 return block.getStart().addNoWrap(offset);
             }
         }
-        if (parts[0].matches("[0-9a-fA-F]{1,4}") && offset <= 0xffff) {
-            var space = (SegmentedAddressSpace) currentProgram.getAddressFactory().getDefaultAddressSpace();
-            return space.getAddress(Integer.parseInt(parts[0], 16), (int) offset);
+        if (space instanceof SegmentedAddressSpace segmented &&
+                parts[0].matches("[0-9a-fA-F]{1,4}") && offset <= 0xffff) {
+            return segmented.getAddress(Integer.parseInt(parts[0], 16), (int) offset);
         }
         throw new IllegalArgumentException("unknown unit or invalid segment address " + input);
     }

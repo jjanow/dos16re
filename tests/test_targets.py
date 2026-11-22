@@ -136,3 +136,65 @@ def test_ghidra_decompiles_cross_overlay_call(por_export, capsys):
     assert "DGROUP_4433" in loadpieces
     assert "DGROUP_4434" in loadpieces
     assert "tpov_03d5_0e08(" in loadpieces
+
+
+@pytest.fixture(params=[
+    ("DOS16RE_PH1_AMIGA_DIR", "GAME"),
+    ("DOS16RE_PH3_AMIGA_DIR", "PHANTASIEIII"),
+], ids=["phantasie-i", "phantasie-iii"])
+def amiga_export(request, tmp_path, capsys):
+    variable, filename = request.param
+    source = _game_files(variable)[filename]
+    assert main(["load", str(source), "--base-address", "0", "-o", str(tmp_path), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    return tmp_path, program
+
+
+def test_phantasie_amiga_hunk_layout(amiga_export):
+    output, program = amiga_export
+    units = program["units"]
+    image = (output / "image.bin").read_bytes()
+    assert program["entry"] == {"unit_address": "h0:0000", "linear": 0}
+    assert len(units) == len({unit["linear"] for unit in units})
+
+    if program["program"].upper() == "GAME":
+        assert len(units) == 240
+        assert units[69]["file_offset"] == 0x19428
+        caller, target = units[20], units[77]
+        fixup = next(item for item in caller["relocations"] if item["offset"] == 0x18E)
+        assert fixup["target"] == "h77"
+        assert unpack_from(">I", image, caller["image_offset"] + 0x18E) == (target["linear"] + 0x466,)
+    else:
+        assert [unit["kind"] for unit in units] == ["code", "data", "bss"]
+        code, data, bss = units
+        assert (data["linear"], bss["linear"]) == (0x21890, 0x283A0)
+        assert image[data["linear"] + data["file_size"]:data["linear"] + data["size"]] == bytes(0x4390)
+        assert image[bss["linear"]:bss["linear"] + bss["size"]] == bytes(4)
+        assert unpack_from(">I", image, code["image_offset"] + 0x7372) == (0x240FC,)
+
+
+def test_ghidra_analyzes_phantasie_amiga(amiga_export, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    output, program = amiga_export
+    project = output / "amiga"
+    assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["units"] == len(program["units"])
+    assert report["relocations"] == sum(len(unit["relocations"]) for unit in program["units"])
+
+    def query(command, address):
+        assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)
+
+    if program["program"].upper() == "GAME":
+        routine = "h77:0466"
+        calls = query("callers", routine)["callers"]
+        assert any(call["from"]["unit_address"] == "h20:018c" for call in calls)
+    else:
+        routine = "h0:736c"
+        writes = query("xrefs", "h0:7370")["outgoing"]
+        assert any(ref["to"]["unit_address"] == "h1:286c" and ref["type"] == "WRITE" for ref in writes)
+    result = query("decomp", routine)
+    assert result["unit_address"] == routine
+    assert result["decompilation"].strip()

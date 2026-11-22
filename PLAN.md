@@ -18,8 +18,8 @@ Recurring failures from the Gold Box (Pool of Radiance) and Phantasie remaster p
 | Runtime library noise | Turbo Pascal 6 runtime (Real48, strings, sets, I/O) decompiles as clutter instead of named calls |
 | Emulator harness is one-off | PoR's unicorn harness and ~4,500 lines of per-routine oracle scripts only work for that one game |
 
-The initial scope is 16-bit real-mode x86 for DOS. The remaster projects' other source platforms are stretch
-goals after the DOS roadmap.
+The initial scope was 16-bit real-mode x86 for DOS. The post-DOS roadmap now covers original source
+platforms used by the remaster projects, starting with AmigaDOS.
 
 ## Design
 
@@ -28,9 +28,9 @@ goals after the DOS roadmap.
   sibling projects. Game-specific addresses and expectations belong in opt-in validation tests.
 - **Ghidra integration through headless scripts**, not a full Ghidra extension at first: the loader writes a flat
   image + a JSON "program map" (segments, units, symbols, segment-register assumptions, functions, jump tables),
-  and a Ghidra post-script (Java or PyGhidra on Ghidra 12.x) imports it into a project. A real Ghidra loader
+  and a Ghidra headless script imports it into a project. A real Ghidra loader
   extension can come later if the script route turns out to be limiting.
-- **One canonical address form:** `seg:off` with a stable segment per unit, plus a linear address. Overlay code is
+- **DOS addresses:** `seg:off` with a stable segment per unit, plus a linear address. Overlay code is
   always named `unit:offset` too (e.g. `OV2:34aa`), so notes from different tools line up.
 - **No game data in this repo.** Tests that need real game files read them from paths in environment variables and
   skip when unset. Expected values (addresses, names) may be checked in; the binaries may not.
@@ -157,10 +157,12 @@ across separated overlay units.
 | Pool of Radiance (DOS v1.3) | TP6, EXEPACK, `FBOV` overlays | Unit table, stub resolution, addresses listed in the Gold Box RE docs |
 | Phantasie I (DOS) | LZEXE 0.90 MZ + program-loaded `OV1.OVR`/`OV2.OVR` | Distinct overlay segments, jump-table recovery (Mystic SCORE) |
 | Phantasie III (DOS) | MZ, far data segment `0x1820` | Segment tracking, far globals |
+| Phantasie I (Amiga) | AmigaDOS Hunk, 240 resident hunks | Cross-hunk relocation and palette routine callers |
+| Phantasie III (Amiga) | AmigaDOS Hunk, CODE/DATA/BSS | Flat memory layout, main-loop decompilation and global reference |
 
-Game files are found through `DOS16RE_POR_DIR` and `DOS16RE_PH1_DIR`. The headless integration test also
-uses `GHIDRA_HOME`. The Phase 3 Phantasie III test uses `DOS16RE_PH3_DIR`. Tests skip when their inputs are unset.
-Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
+The opt-in DOS tests use `DOS16RE_POR_DIR`, `DOS16RE_PH1_DIR`, and `DOS16RE_PH3_DIR`.
+The opt-in Amiga tests use `DOS16RE_PH1_AMIGA_DIR` and `DOS16RE_PH3_AMIGA_DIR`. Headless tests
+also use `GHIDRA_HOME`. Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 ## Setup
 
@@ -171,7 +173,7 @@ Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-Work through the post-DOS platforms below in order, one at a time, beginning with Commodore Amiga.
+The Commodore Amiga milestone is complete for the validated releases. Atari ST is next.
 
 ## Post-DOS stretch goals
 
@@ -199,3 +201,16 @@ The matrix follows OpenPhantasie's supported copies and planned source platforms
 remaster's port matrix. Gold Box PC-88 and X1turbo validation depends on finding copies of the releases.
 The Phantasie project also tracks FM-7 and additional ports on platforms already in the table as research
 candidates pending release confirmation. [OpenPhantasie source-platform roadmap](https://github.com/jjanow/OpenPhantasie#planned-source-platform-support)
+
+### Commodore Amiga
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` detect AmigaDOS Hunk executables,
+place their resident CODE, DATA, and BSS at stable addresses, and apply absolute long and compact
+relocations. The headless importer restores that layout for 68k analysis and makes the DOS
+toolkit's existing decompilation and reference queries available at `hN:offset` addresses.
+
+The SSI Phantasie I and III Amiga disk images from the Phantasie remaster supplied the validation
+executables. Ghidra recovered Phantasie I's call from `h20:018c` to the palette routine at
+`h77:0466`. For Phantasie III, a zero-based export placed DATA at `0x21890`, and Ghidra
+decompiled the main loop at `h0:736c` and resolved its write to `h1:286c`.
+Both releases keep their hunks resident. The loader diagnoses AmigaDOS overlay trees as unsupported.

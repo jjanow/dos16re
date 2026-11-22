@@ -1,55 +1,81 @@
-"""Read initialized unit ranges from a DOS image export."""
+"""Read units and locations from an image export."""
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .amiga import ADDRESS_LIMIT
 from .mz import Address
 
 
 class ImageError(ValueError):
-    """An invalid DOS image export."""
+    """An invalid image export."""
 
 
 @dataclass(frozen=True)
 class ImageUnit:
     name: str
-    segment: int
+    linear: int
     image_offset: int
     size: int
-
-    @property
-    def linear(self) -> int:
-        return self.segment * 16
+    file_size: int
+    segment: int | None
 
     def location(self, offset: int) -> dict:
-        address = Address(self.segment, offset)
-        if offset > 0xFFFF:
-            address = Address(address.linear >> 4, address.linear & 0xF)
-        return {"address": str(address), "unit_address": f"{self.name}:{offset:04x}", "linear": address.linear}
+        linear = self.linear + offset
+        if self.segment is None:
+            address = f"{linear:08x}"
+        else:
+            segmented = Address(self.segment, offset) if offset <= 0xFFFF else Address(linear >> 4, linear & 0xF)
+            address = str(segmented)
+        return {"address": address, "unit_address": f"{self.name}:{offset:04x}", "linear": linear}
 
 
-def read_units(export: Path, image_size: int) -> list[ImageUnit]:
+def read_map(export: Path) -> dict:
     try:
         program = json.loads((export / "map.json").read_text(encoding="utf-8"))
         if program["version"] != 1:
             raise ValueError("unsupported map version")
+        if program.get("format", "MZ") not in ("MZ", "HUNK"):
+            raise ValueError("unsupported image format")
+        return program
+    except (KeyError, TypeError, ValueError) as error:
+        raise ImageError(f"invalid map.json: {error}") from error
+
+
+def read_units(export: Path, image_size: int) -> list[ImageUnit]:
+    return image_units(read_map(export), image_size)
+
+
+def image_units(program: dict, image_size: int) -> list[ImageUnit]:
+    amiga = program.get("format") == "HUNK"
+    try:
         units = program["units"]
         origin = units[0]["linear"]
-        if type(origin) is not int or not 0 <= origin <= origin + image_size <= 0x100000:
-            raise ValueError("image extends past the 1 MiB image limit")
+        limit = ADDRESS_LIMIT if amiga else 0x100000
+        if type(origin) is not int or not 0 <= origin <= origin + image_size <= limit:
+            raise ValueError(f"image extends past the {limit >> 20} MiB image limit")
         placements = []
         for unit in units:
-            name, segment, start, size = (unit[key] for key in ("name", "segment", "image_offset", "size"))
+            name, linear, start, size = (unit[key] for key in ("name", "linear", "image_offset", "size"))
             if not isinstance(name, str) or not name:
                 raise ValueError("missing unit name")
             if not (
-                type(segment) is int and 0 <= segment <= 0xFFFF
-                and type(start) is int and origin + start == segment * 16 == unit["linear"]
+                type(linear) is int and type(start) is int and origin + start == linear
                 and type(size) is int and 0 <= start <= start + size <= image_size
             ):
                 raise ValueError(f"invalid placement for unit {name}")
-            placements.append(ImageUnit(name, segment, start, size))
+            segment = None
+            file_size = size
+            if amiga:
+                file_size = unit["file_size"]
+                if type(file_size) is not int or not 0 <= file_size <= size:
+                    raise ValueError(f"invalid file size for unit {name}")
+            else:
+                segment = unit["segment"]
+                if type(segment) is not int or not 0 <= segment <= 0xFFFF or segment * 16 != linear:
+                    raise ValueError(f"invalid segment for unit {name}")
+            placements.append(ImageUnit(name, linear, start, size, file_size, segment))
         placements.sort(key=lambda unit: (unit.image_offset, unit.size))
         if any(left.image_offset + left.size > right.image_offset for left, right in zip(placements, placements[1:])):
             raise ValueError("image units overlap")

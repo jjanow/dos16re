@@ -8,6 +8,8 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from .image import image_units, read_map
+
 
 class GhidraError(ValueError):
     """A headless Ghidra command could not complete."""
@@ -30,14 +32,14 @@ def _project_parts(project: Path) -> tuple[str, str]:
 
 
 def _run(
-    project: Path, options: list[str], script: str, *arguments: str, pre_script: str | None = None,
+    project: Path, options: list[str], script: str | None, *arguments: str, pre_script: str | None = None,
 ) -> dict:
     launcher = _headless()
     scripts = files("dos16re").joinpath("ghidra_scripts")
     with as_file(scripts) as script_dir, TemporaryDirectory() as temp:
         result_file = Path(temp) / "result.json"
         script_args = [*arguments, str(result_file)]
-        script_options = ["-postScript", script, *script_args]
+        script_options = ["-postScript", script, *script_args] if script else []
         if pre_script:
             script_options = ["-preScript", pre_script, *script_args, *script_options]
         result = subprocess.run(
@@ -50,7 +52,7 @@ def _run(
             lines = result.stdout.splitlines()
             errors = [line for line in lines if "ERROR" in line or "Exception" in line]
             detail = "\n".join((errors or lines)[-8:])
-            raise GhidraError(f"Ghidra {script} failed\n{detail}")
+            raise GhidraError(f"Ghidra {script or pre_script} failed\n{detail}")
         report = json.loads(result_file.read_text(encoding="utf-8"))
         if "error" in report:
             raise GhidraError(report["error"])
@@ -63,9 +65,15 @@ def import_program(export: Path, project: Path) -> dict:
     image = export / "image.bin"
     if not manifest.is_file() or not image.is_file():
         raise GhidraError(f"expected map.json and image.bin in {export}")
+    program = read_map(export)
+    options = ["-import", str(image), "-loader", "BinaryLoader", "-processor"]
+    if program.get("format") == "HUNK":
+        image_units(program, image.stat().st_size)
+        return _run(
+            project, [*options, "68000:BE:32:MC68020"], None, str(manifest), pre_script="Dos16reAmigaImport.java",
+        )
     return _run(
-        project,
-        ["-import", str(image), "-loader", "BinaryLoader", "-processor", "x86:LE:16:Real Mode"],
+        project, [*options, "x86:LE:16:Real Mode"],
         "Dos16reSegments.java", str(manifest), pre_script="Dos16reImport.java",
     )
 
@@ -75,8 +83,8 @@ def decompile(address: str, project: Path) -> dict:
 
 
 def query_address(command: str, address: str, project: Path) -> dict:
-    if not re.fullmatch(r"[^:]+:[0-9a-fA-F]{1,8}", address):
-        raise GhidraError("expected a hexadecimal seg:off or unit:offset address")
+    if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
+        raise GhidraError("expected a hexadecimal unit:offset, DOS seg:off, or Amiga address")
     return _query(project, "Dos16reQuery.java", command, address)
 
 

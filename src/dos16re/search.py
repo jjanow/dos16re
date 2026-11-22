@@ -1,26 +1,32 @@
-"""Search the initialized units of an exported DOS program."""
+"""Search file-backed portions of an exported program."""
 
 from pathlib import Path
 
-from .image import ImageError, read_units
+from .image import image_units, read_map
 
 
 class SearchError(ValueError):
-    """An invalid search pattern or DOS image export."""
+    """An invalid search pattern or image export."""
 
 
-def find_bytes(export: Path, pattern: bytes, *, limit: int | None = None) -> dict:
+def find_bytes(export: Path, pattern: bytes | str | int, *, width: int = 2, limit: int | None = None) -> dict:
+    image = (export / "image.bin").read_bytes()
+    try:
+        program = read_map(export)
+        units = image_units(program, len(image))
+        amiga = program.get("format") == "HUNK"
+        if isinstance(pattern, str):
+            pattern = pattern.encode("latin-1" if amiga else "cp437")
+        elif isinstance(pattern, int):
+            pattern = pattern.to_bytes(width, "big" if amiga else "little", signed=pattern < 0)
+    except (ValueError, OverflowError) as error:
+        raise SearchError(str(error)) from error
     if not pattern:
         raise SearchError("search pattern must contain at least one byte")
-    image = (export / "image.bin").read_bytes()
     matches = []
     count = 0
-    try:
-        units = read_units(export, len(image))
-    except ImageError as error:
-        raise SearchError(str(error)) from error
     for unit in units:
-        start, end = unit.image_offset, unit.image_offset + unit.size
+        start, end = unit.image_offset, unit.image_offset + unit.file_size
         position = image.find(pattern, start, end)
         while position != -1:
             count += 1

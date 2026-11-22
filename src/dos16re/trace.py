@@ -56,6 +56,8 @@ def import_trace(
 ) -> dict:
     image = export / "image.bin"
     units = read_units(export, image.stat().st_size)
+    if units[0].segment is None:
+        raise TraceError("DOSBox-X traces require a DOS MZ image")
     ranges = _runtime_units(units, runtime_base, overlay_segments or {})
     starts = [start for start, _ in ranges]
     counts: Counter[int] = Counter()

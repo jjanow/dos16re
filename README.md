@@ -1,8 +1,8 @@
 # dos16re
 
-Standalone reverse-engineering tools for 16-bit real-mode DOS programs. Install and run `dos16re` independently
-of any game or remaster project. The games in [PLAN.md](PLAN.md) are optional validation targets for particular
-executable formats and compiler patterns.
+Standalone reverse-engineering tools for 16-bit real-mode DOS programs and AmigaDOS Hunk executables.
+Install and run `dos16re` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
+are optional validation targets for particular executable formats and compiler patterns.
 
 ## DOS loader
 
@@ -48,11 +48,37 @@ allocation, and overlays. It also covers selected small-model C routines from Tu
 Borland C++ 2.0, and Microsoft C 5.1 and 6.0a. The compiler report identifies the linked runtime and only
 includes a version when supported by the evidence. See the validation notes in [PLAN.md](PLAN.md#phase-5-runtime-signatures).
 
+## Amiga loader
+
+`info` and `load` detect classic AmigaDOS Hunk executables by their header. If starting from an ADF,
+unpack it with `xdftool DISK.adf unpack out/disk` and pass the extracted executable to `dos16re`.
+
+```sh
+.venv/bin/dos16re info out/disk/PROGRAM --json
+.venv/bin/dos16re load out/disk/PROGRAM -o out/amiga
+.venv/bin/dos16re ghidra import out/amiga out/amiga-project
+.venv/bin/dos16re decomp h0:0000 --project out/amiga-project --json
+```
+
+The loader places resident CODE, DATA, and BSS hunks at distinct 16-byte-aligned addresses.
+The default image base is `0x10000`. Use `--base-address HEX` to select another aligned address
+in the 24-bit address space, including `0` for zero-based analysis notes. The layout is for static
+analysis. It records the requested Amiga memory flags and zero-fills BSS, unused allocation, and gaps.
+
+`map.json` identifies hunks as `h0`, `h1`, and so on. Each unit records its file span and memory
+allocation, symbols, and applied absolute 32-bit relocations, including the compact variant. Ghidra
+uses its big-endian 68k language, imports the symbols, and analyzes from the executable's entry in
+`h0`. Amiga Ghidra queries accept `hN:offset` or a flat hexadecimal address. `HUNK_OVERLAY` files
+produce an unsupported-format diagnostic. The `call` and `trace` commands are DOS-specific.
+[Amiga ROM Kernel Reference Manual, DOS, chapter 11](https://developer.amigaos3.net/sites/default/files/downloads/2024-10/Amiga_ROM_Kernel_Reference_Manual_DOS.pdf)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
-supported by that installation. The importer creates one memory block per unit, names overlay entries and
-stubs, and runs Ghidra's auto-analysis. Pass the project path with or without its `.gpr` extension.
+supported by that installation. Pass the project path with or without its `.gpr` extension.
+
+For DOS, the importer creates one memory block per unit, names overlay entries and stubs, and runs
+Ghidra's auto-analysis.
 The importer marks recovered table words as data, adds computed jump references, and disassembles each case
 so auto-analysis can discover the routines they call.
 
@@ -80,10 +106,10 @@ Re-export images made by older versions to include the relocation metadata.
 .venv/bin/dos16re gaps --project out/phantasie-project --json
 ```
 
-`decomp` accepts a `unit:offset` or `seg:off` address in an analyzed function. Offset and segment values
-are hexadecimal. The JSON response includes the function's entry address and decompiled C.
+`decomp` accepts any address in an analyzed function. For DOS, use a hexadecimal `unit:offset` or
+`seg:off` address. The JSON response includes the function's entry address and decompiled C.
 
-`gaps` reports ranges of undefined bytes in the initialized image blocks. These ranges may contain code,
+`gaps` reports ranges of undefined bytes in executable image blocks. These ranges may contain code,
 data, or padding. Text output shows the total and the first ten ranges. JSON includes all ranges with
 inclusive `unit:offset` endpoints, the starting linear address, and byte counts.
 
@@ -104,18 +130,18 @@ data references. `callers` and `callees` accept any address inside an analyzed f
 resolved call sites. Callers target the function entry. JSON includes the source and target addresses,
 reference type, operand index, and enclosing functions when available.
 
-`func` reports the function entry, inclusive body ranges, total body size in bytes, and callers. It gives
-Ghidra's DS, ES, and SS values at the requested address. Unknown values appear as `?` in text and `null`
-in JSON.
+`func` reports the function entry, inclusive body ranges, total body size in bytes, and callers. For DOS
+it gives Ghidra's DS, ES, and SS values at the requested address. Unknown values appear as `?` in text
+and `null` in JSON.
 
-`where-is` searches the relocated bytes of each initialized unit directly from an export. Matches can overlap
-and must fit entirely within a unit. `--string` encodes literal text in DOS code page 437. `--constant` accepts
-a decimal or `0x`-prefixed integer and encodes it little-endian at the specified byte width (1, 2, 4, or 8,
-default 2).
+`where-is` searches relocated, file-backed bytes in the export. Matches can overlap and must fit
+within a unit's file-backed span. `--string` encodes literal text in DOS CP437 or Amiga Latin-1.
+`--constant` accepts a decimal or `0x`-prefixed integer and encodes it in the platform's byte order
+at the specified width (1, 2, 4, or 8 bytes, default 2).
 
 Text output previews up to ten references or matches. Use `--json` for the full results with
-`unit:offset`, segmented, and linear addresses where available. Ghidra queries report the segmented
-address from the analyzed project.
+`unit:offset` and linear addresses where available. Ghidra queries also report the address as
+displayed by the analyzed project.
 
 ## Emulator harness
 
@@ -188,8 +214,10 @@ defined as data, or inside an instruction.
 
 Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Radiance DOS v1.3 from
 `DOS16RE_POR_DIR`, the Phantasie I DOS MZ edition from `DOS16RE_PH1_DIR`, and Phantasie III's
-`MAIN.EXE` from `DOS16RE_PH3_DIR`. The Ghidra tests use `GHIDRA_HOME` and include a synthetic DOS
-executable. Tests skip when their input variables are unset. See the roadmap for upcoming work.
+`MAIN.EXE` from `DOS16RE_PH3_DIR`. Point `DOS16RE_PH1_AMIGA_DIR` and `DOS16RE_PH3_AMIGA_DIR` to
+the extracted Amiga directories containing `game` and `PhantasieIII` respectively. The Ghidra
+tests use `GHIDRA_HOME` and include synthetic DOS and Amiga executables. Tests skip when their
+input variables are unset. See the roadmap for upcoming work.
 [PLAN.md](PLAN.md)
 
 ## License
