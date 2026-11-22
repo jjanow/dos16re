@@ -4,8 +4,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .amiga import ADDRESS_LIMIT
 from .mz import Address
+
+DEFAULT_M68K_BASE = 0x10000
+M68K_ADDRESS_LIMIT = 0x1000000
+M68K_FORMATS = ("HUNK", "PRG")
 
 
 class ImageError(ValueError):
@@ -36,7 +39,7 @@ def read_map(export: Path) -> dict:
         program = json.loads((export / "map.json").read_text(encoding="utf-8"))
         if program["version"] != 1:
             raise ValueError("unsupported map version")
-        if program.get("format", "MZ") not in ("MZ", "HUNK"):
+        if program.get("format", "MZ") not in ("MZ", *M68K_FORMATS):
             raise ValueError("unsupported image format")
         return program
     except (KeyError, TypeError, ValueError) as error:
@@ -48,11 +51,11 @@ def read_units(export: Path, image_size: int) -> list[ImageUnit]:
 
 
 def image_units(program: dict, image_size: int) -> list[ImageUnit]:
-    amiga = program.get("format") == "HUNK"
+    flat = program.get("format") in M68K_FORMATS
     try:
         units = program["units"]
         origin = units[0]["linear"]
-        limit = ADDRESS_LIMIT if amiga else 0x100000
+        limit = M68K_ADDRESS_LIMIT if flat else 0x100000
         if type(origin) is not int or not 0 <= origin <= origin + image_size <= limit:
             raise ValueError(f"image extends past the {limit >> 20} MiB image limit")
         placements = []
@@ -67,7 +70,7 @@ def image_units(program: dict, image_size: int) -> list[ImageUnit]:
                 raise ValueError(f"invalid placement for unit {name}")
             segment = None
             file_size = size
-            if amiga:
+            if flat:
                 file_size = unit["file_size"]
                 if type(file_size) is not int or not 0 <= file_size <= size:
                     raise ValueError(f"invalid file size for unit {name}")

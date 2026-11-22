@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "retrore"
 version = "0.1.0"
-description = "Reverse-engineering tools for retro executables (DOS, AmigaDOS and more)"
+description = "Reverse-engineering tools for DOS, AmigaDOS, and Atari ST executables"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["capstone>=5,<6", "unicorn>=2.1,<3"]

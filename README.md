@@ -1,7 +1,7 @@
 # retrore
 
-Standalone reverse-engineering tools for retro executables: 16-bit real-mode DOS programs and AmigaDOS
-Hunk executables so far, with more platforms to come.
+Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
+and Atari ST GEMDOS executables.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -73,6 +73,29 @@ uses its big-endian 68k language, imports the symbols, and analyzes from the exe
 produce an unsupported-format diagnostic. The `call` and `trace` commands are DOS-specific.
 [Amiga ROM Kernel Reference Manual, DOS, chapter 11](https://developer.amigaos3.net/sites/default/files/downloads/2024-10/Amiga_ROM_Kernel_Reference_Manual_DOS.pdf)
 
+## Atari ST loader
+
+`info` and `load` detect GEMDOS executables by their `0x601a` header. Pass an executable from the
+original disk, such as a `.PRG`, `.TOS`, or `.TTP` file.
+
+```sh
+.venv/bin/retrore info PROGRAM.PRG --json
+.venv/bin/retrore load PROGRAM.PRG --base-address 10000 -o out/atari-st
+.venv/bin/retrore ghidra import out/atari-st out/atari-st-project
+.venv/bin/retrore decomp text:0000 --project out/atari-st-project --json
+```
+
+The loader places TEXT, DATA, and zero-filled BSS consecutively. Use `--base-address HEX` to set the
+even TEXT base in the 24-bit address space. The default is `0x10000`. Use `0` to match notes that use
+TEXT-relative addresses throughout. The loader adds the base to each longword in the GEMDOS relocation
+table and preserves the original values in `map.json`. Files marked absolute keep their original TEXT
+and DATA bytes. The map includes program flags, file spans, and available DRI/GST symbols with offsets
+relative to their sections.
+[Atari GEMDOS developer manual, Executable Files](https://www.bitsavers.org/pdf/atari/ST/Atari_ST_GEM_Programming_1986/GEM_0042.pdf)
+
+Ghidra imports the symbols and starts 68k analysis at `text:0000`. Use `text:offset`, `data:offset`,
+`bss:offset`, or a flat hexadecimal address in queries. This layout covers the resident GEMDOS image.
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -136,7 +159,8 @@ it gives Ghidra's DS, ES, and SS values at the requested address. Unknown values
 and `null` in JSON.
 
 `where-is` searches relocated, file-backed bytes in the export. Matches can overlap and must fit
-within a unit's file-backed span. `--string` encodes literal text in DOS CP437 or Amiga Latin-1.
+within a unit's file-backed span. `--string` uses DOS CP437, Amiga Latin-1, or Atari ST ASCII. Use
+`--bytes` to search for Atari ST text containing bytes above `0x7f`.
 `--constant` accepts a decimal or `0x`-prefixed integer and encodes it in the platform's byte order
 at the specified width (1, 2, 4, or 8 bytes, default 2).
 
@@ -216,9 +240,10 @@ defined as data, or inside an instruction.
 Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Radiance DOS v1.3 from
 `RETRORE_POR_DIR`, the Phantasie I DOS MZ edition from `RETRORE_PH1_DIR`, and Phantasie III's
 `MAIN.EXE` from `RETRORE_PH3_DIR`. Point `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR` to
-the extracted Amiga directories containing `game` and `PhantasieIII` respectively. The Ghidra
-tests use `GHIDRA_HOME` and include synthetic DOS and Amiga executables. Tests skip when their
-input variables are unset. See the roadmap for upcoming work.
+the extracted Amiga directories containing `game` and `PhantasieIII` respectively. Set
+`RETRORE_PH2_ST_DIR` to the extracted Phantasie II v1.0 Atari ST disk directory with `PHANT.PRG` and
+`UTILIT2.PRG`. The Ghidra tests use `GHIDRA_HOME` and include synthetic DOS, Amiga, and Atari ST
+executables. Tests skip when their input variables are unset. See the roadmap for upcoming work.
 [PLAN.md](PLAN.md)
 
 ## License

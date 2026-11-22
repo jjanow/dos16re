@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
-from .image import image_units, read_map
+from .image import M68K_FORMATS, image_units, read_map
+
+_STRING_ENCODINGS = {"MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii"}
 
 
 class SearchError(ValueError):
@@ -14,11 +16,11 @@ def find_bytes(export: Path, pattern: bytes | str | int, *, width: int = 2, limi
     try:
         program = read_map(export)
         units = image_units(program, len(image))
-        amiga = program.get("format") == "HUNK"
+        image_format = program.get("format", "MZ")
         if isinstance(pattern, str):
-            pattern = pattern.encode("latin-1" if amiga else "cp437")
+            pattern = pattern.encode(_STRING_ENCODINGS[image_format])
         elif isinstance(pattern, int):
-            pattern = pattern.to_bytes(width, "big" if amiga else "little", signed=pattern < 0)
+            pattern = pattern.to_bytes(width, "big" if image_format in M68K_FORMATS else "little", signed=pattern < 0)
     except (ValueError, OverflowError) as error:
         raise SearchError(str(error)) from error
     if not pattern:

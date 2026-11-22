@@ -1,4 +1,4 @@
-// Rebuild the Amiga hunk layout and seed 68k analysis.
+// Rebuild the exported 68k memory layout and seed analysis.
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -15,7 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
-public class RetroreAmigaImport extends HeadlessScript {
+public class RetroreM68kImport extends HeadlessScript {
     @Override
     public void run() throws Exception {
         setHeadlessContinuationOption(HeadlessContinuationOption.ABORT_AND_DELETE);
@@ -34,6 +34,8 @@ public class RetroreAmigaImport extends HeadlessScript {
     }
 
     private Map<String, Object> loadMap(JsonObject map) throws Exception {
+        String format = map.get("format").getAsString();
+        int relocationType = format.equals("HUNK") ? 0x3ec : 1;
         var memory = currentProgram.getMemory();
         var bytes = memory.getAllFileBytes().getFirst();
         var units = map.getAsJsonArray("units");
@@ -72,7 +74,7 @@ public class RetroreAmigaImport extends HeadlessScript {
                 var site = start.addNoWrap(fixup.get("offset").getAsLong());
                 long value = fixup.get("value").getAsLong();
                 byte[] original = ByteBuffer.allocate(4).putInt(fixup.get("original").getAsInt()).array();
-                currentProgram.getRelocationTable().add(site, Relocation.Status.APPLIED, 0x3ec,
+                currentProgram.getRelocationTable().add(site, Relocation.Status.APPLIED, relocationType,
                     new long[] {value}, original, null);
                 relocations++;
                 if (!block.isExecute() && memory.contains(address(value)) &&
@@ -93,13 +95,13 @@ public class RetroreAmigaImport extends HeadlessScript {
 
         var entry = address(map.getAsJsonObject("entry").get("linear").getAsLong());
         if (!memory.contains(entry) || !memory.getBlock(entry).isExecute()) {
-            throw new IllegalArgumentException("Amiga entry point is outside executable memory");
+            throw new IllegalArgumentException("Entry point is outside executable memory");
         }
         currentProgram.getSymbolTable().addExternalEntryPoint(entry);
         disassemble(entry);
         createFunction(entry, null);
 
-        return Map.of("program", currentProgram.getName(), "format", "HUNK",
+        return Map.of("program", currentProgram.getName(), "format", format,
             "units", units.size(), "relocations", relocations);
     }
 

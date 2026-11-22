@@ -1,8 +1,9 @@
 # retrore plan
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
-packers and overlay systems) and AmigaDOS Hunk executables, as used by 1980s–early–1990s games. It handles formats and compiler patterns shared across projects and uses games
-to validate that support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
+packers and overlay systems), AmigaDOS Hunk executables, and Atari ST GEMDOS executables. It handles formats and
+compiler patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
+Ghidra's decompiler and agents driving it one whole-program image to work on.
 
 ## Why
 
@@ -159,10 +160,12 @@ across separated overlay units.
 | Phantasie III (DOS) | MZ, far data segment `0x1820` | Segment tracking, far globals |
 | Phantasie I (Amiga) | AmigaDOS Hunk, 240 resident hunks | Cross-hunk relocation and palette routine callers |
 | Phantasie III (Amiga) | AmigaDOS Hunk, CODE/DATA/BSS | Flat memory layout, main-loop decompilation and global reference |
+| Phantasie II (Atari ST v1.0) | GEMDOS PRG, resident TEXT/DATA/BSS | Longword fixups, DRI symbols, startup decompilation and references |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
-The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. Headless tests
-also use `GHIDRA_HOME`. Tests skip when their inputs are unset. The default suite uses synthetic files.
+The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
+tests use `RETRORE_PH2_ST_DIR`. Headless tests also use `GHIDRA_HOME`. Tests skip when their inputs
+are unset. The default suite uses synthetic files.
 
 ## Setup
 
@@ -173,7 +176,7 @@ also use `GHIDRA_HOME`. Tests skip when their inputs are unset. The default suit
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga milestone is complete for the validated releases. Atari ST is next.
+The Commodore Amiga and Atari ST milestones are complete for the validated releases. Commodore 64 is next.
 
 ## Post-DOS stretch goals
 
@@ -214,3 +217,15 @@ executables. Ghidra recovered Phantasie I's call from `h20:018c` to the palette 
 `h77:0466`. For Phantasie III, a zero-based export placed DATA at `0x21890`, and Ghidra
 decompiled the main loop at `h0:736c` and resolved its write to `h1:286c`.
 Both releases keep their hunks resident. The loader diagnoses AmigaDOS overlay trees as unsupported.
+
+### Atari ST
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` detect GEMDOS executables, place TEXT,
+DATA, and BSS consecutively, and apply the delta-encoded longword relocations. The shared 68k importer
+restores this layout and imports available DRI/GST symbols. Analysis queries use `text:offset`,
+`data:offset`, `bss:offset`, or a flat address.
+
+Phantasie II v1.0 uses a resident `PHANT.PRG` with 6,485 fixups. Ghidra decompiled the startup routine at
+`text:ec36`, found its call from `text:ec8e` to the title-music wait at `text:b8f2`, and resolved a relocated
+pointer from `data:02ec` to `data:0718`. The separate `UTILIT2.PRG` validated DRI symbols in all three
+sections. The release runs its loader, game, and utility as separate GEMDOS programs.

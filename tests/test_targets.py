@@ -198,3 +198,54 @@ def test_ghidra_analyzes_phantasie_amiga(amiga_export, capsys):
     result = query("decomp", routine)
     assert result["unit_address"] == routine
     assert result["decompilation"].strip()
+
+
+@pytest.fixture
+def phantasie_ii_atari_export(tmp_path, capsys):
+    files = _game_files("RETRORE_PH2_ST_DIR")
+    assert main(["load", str(files["PHANT.PRG"]), "-o", str(tmp_path), "--json"]) == 0
+    return tmp_path, json.loads(capsys.readouterr().out)
+
+
+def test_phantasie_ii_atari_st_layout(phantasie_ii_atari_export):
+    output, program = phantasie_ii_atari_export
+    text, data, bss = program["units"]
+    assert program["entry"] == {"unit_address": "text:0000", "linear": 0x10000}
+    assert (text["size"], data["linear"], bss["linear"]) == (0x1E298, 0x2E298, 0x3468C)
+    assert bss["size"] == 0x3CBC
+    assert sum(len(unit["relocations"]) for unit in (text, data, bss)) == 6485
+    image = (output / "image.bin").read_bytes()
+    assert unpack_from(">I", image, 8) == (bss["linear"],)
+    assert unpack_from(">I", image, data["image_offset"] + 0x2EC) == (data["linear"] + 0x718,)
+    assert image[bss["image_offset"]:] == bytes(bss["size"])
+
+
+def test_phantasie_ii_atari_st_utility_symbols(capsys):
+    utility = _game_files("RETRORE_PH2_ST_DIR")["UTILIT2.PRG"]
+    assert main(["info", str(utility), "--json"]) == 0
+    text, data, bss = json.loads(capsys.readouterr().out)["units"]
+    assert {"name": "_main", "offset": 0x116} in text["symbols"]
+    assert {"name": "_ctrl_cn", "offset": 0} in data["symbols"]
+    assert {"name": "__base", "offset": 0} in bss["symbols"]
+
+
+def test_ghidra_analyzes_phantasie_ii_atari_st(phantasie_ii_atari_export, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    output, _ = phantasie_ii_atari_export
+    project = output / "phantasie-ii"
+    assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["relocations"] == 6485
+
+    def query(command, address):
+        assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)
+
+    call, = query("xrefs", "text:ec8e")["outgoing"]
+    assert call["from_function"]["entry"]["unit_address"] == "text:ec36"
+    assert call["to"]["unit_address"] == "text:b8f2"
+    assert call["type"] == "UNCONDITIONAL_CALL"
+    assert any(ref["to"]["unit_address"] == "data:0718" for ref in query("xrefs", "data:02ec")["outgoing"])
+    result = query("decomp", "text:ec36")
+    assert result["unit_address"] == "text:ec36"
+    assert "FUN_0001b8f2()" in result["decompilation"]

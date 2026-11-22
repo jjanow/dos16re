@@ -1,4 +1,4 @@
-"""Inspect and analyze DOS and Amiga executables."""
+"""Inspect and analyze DOS, AmigaDOS, and Atari ST executables."""
 
 import argparse
 import json
@@ -6,10 +6,11 @@ import sys
 from contextlib import ExitStack
 from pathlib import Path
 
-from .amiga import DEFAULT_BASE_ADDRESS, HUNK_MAGIC, HunkError, build_hunk_image
+from .amiga import HUNK_MAGIC, HunkError, build_hunk_image
+from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
-from .image import ImageError
+from .image import DEFAULT_M68K_BASE, ImageError
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 from .search import SearchError, find_bytes
@@ -209,9 +210,9 @@ def _trace(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retrore", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    load_parser = commands.add_parser("load", help="export a relocated DOS or Amiga program")
+    load_parser = commands.add_parser("load", help="export a relocated executable image")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
-    info_parser = commands.add_parser("info", help="summarize a DOS MZ or Amiga Hunk executable")
+    info_parser = commands.add_parser("info", help="summarize a DOS MZ, Amiga Hunk, or Atari ST GEMDOS executable")
 
     for command in (load_parser, info_parser):
         command.add_argument("program", type=Path, metavar="PROGRAM")
@@ -224,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         base.add_argument(
             "--base-address", type=_hex_address, metavar="HEX",
-            help=f"Amiga load address (default: {DEFAULT_BASE_ADDRESS:06x})",
+            help=f"Amiga or Atari ST load address (default: {DEFAULT_M68K_BASE:06x})",
         )
         command.add_argument("--json", action="store_true", help="print JSON")
         command.add_argument(
@@ -250,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     for name, help_text in address_queries.items():
         query_parser = commands.add_parser(name, help=help_text)
-        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, DOS seg:off, or Amiga address")
+        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, DOS seg:off, or 68k address")
         query_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
         query_parser.add_argument("--json", action="store_true", help="print JSON")
 
@@ -258,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     pattern = search_parser.add_mutually_exclusive_group(required=True)
     pattern.add_argument("--bytes", metavar="HEX", help="hexadecimal bytes")
-    pattern.add_argument("--string", metavar="TEXT", help="literal string (DOS CP437 or Amiga Latin-1)")
+    pattern.add_argument("--string", metavar="TEXT", help="literal string (DOS CP437, Amiga Latin-1, or Atari ST ASCII)")
     pattern.add_argument("--constant", metavar="N", help="decimal or 0x-prefixed integer in the image's byte order")
     search_parser.add_argument("--width", type=int, choices=(1, 2, 4, 8), help="constant width in bytes (default 2)")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
@@ -325,14 +326,16 @@ def main(argv: list[str] | None = None) -> int:
             _trace(args)
             return 0
         data = args.program.read_bytes()
-        if data.startswith(HUNK_MAGIC):
+        hunk = data.startswith(HUNK_MAGIC)
+        if hunk or data.startswith(PRG_MAGIC):
             if args.base_segment is not None or args.overlay:
-                raise HunkError("--base-segment and --overlay apply to DOS executables")
-            base_address = DEFAULT_BASE_ADDRESS if args.base_address is None else args.base_address
-            image, program_map = build_hunk_image(data, args.program.name, base_address)
+                raise MZError("--base-segment and --overlay apply to DOS executables")
+            base_address = DEFAULT_M68K_BASE if args.base_address is None else args.base_address
+            loader = build_hunk_image if hunk else build_prg_image
+            image, program_map = loader(data, args.program.name, base_address)
         else:
             if args.base_address is not None:
-                raise MZError("--base-address applies to Amiga Hunk executables")
+                raise MZError("--base-address applies to Amiga Hunk and Atari ST GEMDOS executables")
             executable = MZExecutable.parse(data)
             base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
             loaded = executable.load(base_segment)
@@ -343,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (EmulatorError, GhidraError, HunkError, ImageError, MZError, SearchError, TraceError, OSError) as error:
+    except (EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError, TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
@@ -357,6 +360,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote image.bin and map.json to {args.output}")
     elif program_map["format"] == "HUNK":
         print(f"Amiga Hunk  entry h0:0000 ({base_address:06x})  {len(program_map['units'])} hunks")
+    elif program_map["format"] == "PRG":
+        print(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
+        print("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
     else:
         packer = f" ({loaded.packer})" if loaded.packer else ""
         print(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")

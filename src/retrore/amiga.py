@@ -2,10 +2,11 @@
 
 from struct import pack_into, unpack_from
 
+from .image import DEFAULT_M68K_BASE as DEFAULT_BASE_ADDRESS
+from .image import M68K_ADDRESS_LIMIT as ADDRESS_LIMIT
+
 HUNK_HEADER = 0x3F3
 HUNK_MAGIC = HUNK_HEADER.to_bytes(4, "big")
-DEFAULT_BASE_ADDRESS = 0x10000
-ADDRESS_LIMIT = 0x1000000
 _ALIGNMENT = 16
 _SIZE_MASK = 0x3FFFFFFF
 _LOAD_TYPES = {0x3E9: "code", 0x3EA: "data", 0x3EB: "bss"}
