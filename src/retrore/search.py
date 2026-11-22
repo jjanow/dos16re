@@ -2,9 +2,9 @@
 
 from pathlib import Path
 
-from .image import C64_FORMAT, M68K_FORMATS, image_units, read_map
+from .image import M68K_FORMATS, MOS6502_FORMATS, image_units, read_map
 
-_STRING_ENCODINGS = {"MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii", C64_FORMAT: "ascii"}
+_STRING_ENCODINGS = {"MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii"} | dict.fromkeys(MOS6502_FORMATS, "ascii")
 
 
 class SearchError(ValueError):

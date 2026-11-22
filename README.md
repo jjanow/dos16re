@@ -1,7 +1,7 @@
 # retrore
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
-Atari ST GEMDOS executables, and Commodore 64 PRGs.
+Atari ST GEMDOS executables, Commodore 64 PRGs, and Apple II binaries.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -130,6 +130,41 @@ entry inside the payload. Use repeatable `--entry HEX` to specify entry points f
 more complex programs. The Ghidra importer uses its 6502 language for 6510 instructions. Queries accept
 a flat hexadecimal address or `unit:offset`. `where-is --string` uses literal ASCII bytes. Use `--bytes`
 for other PETSCII characters.
+
+## Apple II loader
+
+`info` and `load` read named binary (type B) members of 35-track Apple DOS 3.3 or SSI RDOS 2.1/3.3
+sector images. Use `--disk-file NAME` to select a member by its case-insensitive name. `.dsk` and `.do`
+default to DOS sector order, and `.po` selects ProDOS sector order. RDOS 2.1 supports native 13-sector
+images (`.d13`) and padded 16-sector images. For padded images, the reader checks the catalog code to
+identify the order and defaults to physical order if the marker is absent. Use `--apple2-disk-order`
+with `dos`, `prodos`, or `physical` to select the order explicitly.
+[Beneath Apple DOS](https://www.duxburysystems.org/downloads/library/texas/apple/manuals/beneathdos.pdf)
+[CiderPress II RDOS format notes](https://github.com/fadden/CiderPress2/blob/main/DiskArc/FS/RDOS-notes.md)
+
+```sh
+.venv/bin/retrore info DISK.dsk --disk-file MAIN --json
+.venv/bin/retrore load DISK.dsk --disk-file MAIN --disk-file HELPERS --entry 0800 -o out/apple2
+.venv/bin/retrore ghidra import out/apple2 out/apple2-project
+.venv/bin/retrore decomp 0800 --project out/apple2-project --json
+```
+
+The loader takes the address and length from the DOS binary header or the RDOS catalog. Use `--apple2`
+for a standalone DOS binary with a four-byte header, or `--apple2-raw --base-address HEX` for raw bytes.
+The first `--disk-file` is `root`. Repeat it for co-resident binaries on the same disk, or add a DOS
+binary with `--apple2-unit FILE` or raw bytes with `--apple2-unit FILE@HEX`. `--base-address HEX` also
+overrides the root's recorded load address. Export each alternative that reuses a load address separately.
+
+Each export captures one Apple II Plus CPU view. `--apple2-lc` selects the effective Language Card
+switch state from `c080` through `c08f`. The default `c082` exposes ROM. `c083` and `c08b` expose
+writable bank 2 and bank 1 respectively at `$D000`–`$DFFF`, with shared Language Card RAM above them.
+The map records read and write destinations. Ghidra creates placeholder blocks for unloaded ranges,
+including ROM and soft switches. Export a separate view for each bank needed during analysis.
+[Apple Language Card manual, appendix D](https://www.applelogic.org/files/LANGCARDMAN.pdf)
+
+Use repeatable `--entry HEX` to seed 6502 code analysis at known entry points. Queries accept a flat
+hexadecimal address or `unit:offset`. `where-is --string` matches literal ASCII bytes. Use `--bytes`
+for high-bit Apple II text.
 
 ## Ghidra
 
@@ -278,9 +313,11 @@ Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Ra
 the extracted Amiga directories containing `game` and `PhantasieIII` respectively. Set
 `RETRORE_PH2_ST_DIR` to the extracted Phantasie II v1.0 Atari ST disk directory with `PHANT.PRG` and
 `UTILIT2.PRG`. Set `RETRORE_PH1_C64_DIR` to the directory containing
-`Phantasie_I_1986_SSI_Side_A.d64`. The Ghidra tests use `GHIDRA_HOME` and include synthetic DOS,
-Amiga, Atari ST, and C64 programs. Tests skip when their input variables are unset. See the roadmap
-for upcoming work.
+`Phantasie_I_1986_SSI_Side_A.d64`. Set `RETRORE_PH1_APPLE2_DIR` to the directory containing
+`phantasie1-4am-side-a-boot.dsk` and `RETRORE_PH3_APPLE2_DIR` to the directory containing
+`Phantasie_III_1987_SSI_cr_Disk_1_of_3_Side_A.dsk`. The Ghidra tests use `GHIDRA_HOME` and include
+synthetic DOS, Amiga, Atari ST, C64, and Apple II programs. Tests skip when their input variables are unset.
+See the roadmap for upcoming work.
 [PLAN.md](PLAN.md)
 
 ## License

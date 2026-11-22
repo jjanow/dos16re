@@ -297,3 +297,58 @@ def test_ghidra_analyzes_phantasie_c64(phantasie_c64_disk, tmp_path, capsys):
     assert vic_write["type"] == "WRITE"
     assert "FUN_c0cc()" in query("decomp", "root:05c3")["decompilation"]
     assert query("decomp", "FAST:0000")["linear"] == 0xCC00
+
+
+def test_phantasie_apple2_rdos21_loads(tmp_path, capsys):
+    disk = str(_game_files("RETRORE_PH1_APPLE2_DIR")["PHANTASIE1-4AM-SIDE-A-BOOT.DSK"])
+    output = tmp_path / "out"
+    assert main(["load", disk, "--disk-file", "INFO", "--disk-file", "SHAPES", "--entry", "0302",
+                 "-o", str(output), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    assert program["disk"] == {"filesystem": "RDOS 2.1", "sector_order": "physical"}
+    info, shapes = program["units"]
+    assert (info["linear"], info["file_size"]) == (0x0302, 238)
+    assert (shapes["linear"], shapes["file_size"]) == (0x451F, 2930)
+
+
+@pytest.fixture
+def phantasie3_apple2_disk():
+    files = _game_files("RETRORE_PH3_APPLE2_DIR")
+    return str(files["PHANTASIE_III_1987_SSI_CR_DISK_1_OF_3_SIDE_A.DSK"])
+
+
+def test_phantasie3_apple2_alternative_loads(phantasie3_apple2_disk, tmp_path, capsys):
+    disk = phantasie3_apple2_disk
+    for member in ("IMPTEXT", "IMPREVERSE"):
+        output = tmp_path / member
+        assert main(["load", disk, "--disk-file", "INFO", "--disk-file", member, "-o", str(output), "--json"]) == 0
+        program = json.loads(capsys.readouterr().out)
+        assert program["disk"] == {"filesystem": "RDOS 3.3", "sector_order": "dos"}
+        helper = program["units"][1]
+        assert (helper["disk_file"], helper["linear"], helper["file_size"]) == (member, 0x1828, 472)
+    assert (tmp_path / "IMPTEXT" / "image.bin").read_bytes() != (tmp_path / "IMPREVERSE" / "image.bin").read_bytes()
+    assert main(["info", disk, "--disk-file", "IMPTEXT", "--disk-file", "IMPREVERSE", "--json"]) == 1
+    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]
+
+
+def test_ghidra_analyzes_phantasie3_apple2(phantasie3_apple2_disk, tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    output = tmp_path / "out"
+    project = tmp_path / "phantasie3-apple2"
+    assert main(["load", phantasie3_apple2_disk, "--disk-file", "INFO", "--disk-file", "IMPTEXT", "--entry", "0302",
+                 "--entry", "0320", "-o", str(output)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["entries"] == 2
+
+    def query(command, address):
+        assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)
+
+    call, = query("callees", "0320")["callees"]
+    assert call["from"]["linear"] == 0x0328
+    assert call["to_function"]["entry"]["unit_address"] == "IMPTEXT:0000"
+    speaker, = query("xrefs", "0302")["outgoing"]
+    assert (speaker["type"], speaker["to"]["linear"]) == ("READ", 0xC030)
+    assert "FUN_1828(" in query("decomp", "root:001e")["decompilation"]

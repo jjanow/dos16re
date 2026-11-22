@@ -1,4 +1,4 @@
-// Restore the selected C64 CPU memory view and seed 6502 analysis.
+// Restore the selected 6502 CPU memory view and seed analysis.
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -12,7 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
-public class RetroreC64Import extends HeadlessScript {
+public class Retrore6502Import extends HeadlessScript {
     @Override
     public void run() throws Exception {
         setHeadlessContinuationOption(HeadlessContinuationOption.ABORT_AND_DELETE);
@@ -38,13 +38,16 @@ public class RetroreC64Import extends HeadlessScript {
 
         var initialized = new AddressSet();
         var units = map.getAsJsonArray("units");
+        String format = map.get("format").getAsString();
+        boolean c64 = format.equals("C64_PRG");
+        String prefix = c64 ? "c64_" : "apple2_";
         for (var element : units) {
             monitor.checkCancelled();
             var unit = element.getAsJsonObject();
             var block = memory.createInitializedBlock(unit.get("name").getAsString(),
                 address(unit.get("linear").getAsLong()), bytes, unit.get("image_offset").getAsLong(),
                 unit.get("size").getAsLong(), false);
-            block.setWrite(true);
+            block.setWrite(!unit.has("writable") || unit.get("writable").getAsBoolean());
             block.setExecute(true);
             initialized.add(block.getStart(), block.getEnd());
         }
@@ -57,33 +60,40 @@ public class RetroreC64Import extends HeadlessScript {
             var available = new AddressSet(start, end).subtract(initialized);
             for (var range : available.getAddressRanges()) {
                 var base = range.getMinAddress();
-                String name = "c64_" + region.get("name").getAsString();
+                String name = prefix + region.get("name").getAsString();
                 if (!base.equals(start)) {
                     name += "_" + base;
                 }
                 var block = memory.createUninitializedBlock(name, base, range.getLength(), false);
                 String read = region.get("read").getAsString();
-                block.setWrite(!read.equals("rom"));
+                block.setWrite(!read.equals("rom") && !region.get("write").getAsString().equals("none"));
                 block.setVolatile(read.equals("io"));
             }
         }
 
         var symbols = currentProgram.getSymbolTable();
-        symbols.createLabel(address(0), "CPU_PORT_DDR", SourceType.IMPORTED);
-        symbols.createLabel(address(1), "CPU_PORT_DATA", SourceType.IMPORTED);
+        if (c64) {
+            symbols.createLabel(address(0), "CPU_PORT_DDR", SourceType.IMPORTED);
+            symbols.createLabel(address(1), "CPU_PORT_DATA", SourceType.IMPORTED);
+        } else {
+            symbols.createLabel(address(0xc000), "KBD", SourceType.IMPORTED);
+            symbols.createLabel(address(0xc010), "KBDSTRB", SourceType.IMPORTED);
+            symbols.createLabel(address(0xc030), "SPKR", SourceType.IMPORTED);
+        }
         var entries = map.getAsJsonArray("entries");
         for (var element : entries) {
             monitor.checkCancelled();
             var entry = address(element.getAsJsonObject().get("linear").getAsLong());
             if (!initialized.contains(entry)) {
-                throw new IllegalArgumentException("Entry point is outside the loaded PRGs");
+                throw new IllegalArgumentException("Entry point is outside the initialized memory");
             }
             symbols.addExternalEntryPoint(entry);
             disassemble(entry);
             createFunction(entry, null);
         }
-        return Map.of("program", currentProgram.getName(), "format", map.get("format").getAsString(),
-            "units", units.size(), "entries", entries.size(), "bank", map.get("bank").getAsInt());
+        String bankKey = c64 ? "bank" : "language_card";
+        return Map.of("program", currentProgram.getName(), "format", format,
+            "units", units.size(), "entries", entries.size(), bankKey, map.get(bankKey).getAsInt());
     }
 
     private Address address(long value) {

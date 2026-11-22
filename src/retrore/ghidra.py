@@ -8,7 +8,7 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .image import C64_FORMAT, M68K_FORMATS, image_units, read_map
+from .image import M68K_FORMATS, MOS6502_FORMATS, image_units, read_map
 
 
 class GhidraError(ValueError):
@@ -72,10 +72,10 @@ def import_program(export: Path, project: Path) -> dict:
         return _run(
             project, [*options, "68000:BE:32:MC68020"], None, str(manifest), pre_script="RetroreM68kImport.java",
         )
-    if program.get("format") == C64_FORMAT:
+    if program.get("format") in MOS6502_FORMATS:
         image_units(program, image.stat().st_size)
         return _run(
-            project, [*options, "6502:LE:16:default"], None, str(manifest), pre_script="RetroreC64Import.java",
+            project, [*options, "6502:LE:16:default"], None, str(manifest), pre_script="Retrore6502Import.java",
         )
     return _run(
         project, [*options, "x86:LE:16:Real Mode"],

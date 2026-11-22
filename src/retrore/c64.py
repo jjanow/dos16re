@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from itertools import accumulate
 from struct import unpack_from
 
-from .image import C64_ADDRESS_LIMIT, C64_FORMAT
+from .image import C64_FORMAT, MOS6502_ADDRESS_LIMIT
 
 DEFAULT_BANK = 7
 _SECTOR_SIZE = 256
@@ -102,7 +102,7 @@ def memory_map(bank: int) -> list[dict]:
     else:
         rom = bool(loram or hiram)
         regions.append((0xD000, 0xE000, "character_rom" if rom else "io_ram", "rom" if rom else "ram", "ram"))
-    regions.append((0xE000, C64_ADDRESS_LIMIT, "kernal_rom" if hiram else "kernal_ram", "rom" if hiram else "ram", "ram"))
+    regions.append((0xE000, MOS6502_ADDRESS_LIMIT, "kernal_rom" if hiram else "kernal_ram", "rom" if hiram else "ram", "ram"))
     return [
         {"name": name, "linear": start, "size": end - start, "read": read, "write": write}
         for start, end, name, read, write in regions
@@ -144,7 +144,7 @@ def build_c64_image(
         address = file_address if unit.address is None else unit.address
         payload = unit.data[2:]
         end = address + len(payload)
-        if not 0 <= address < end <= C64_ADDRESS_LIMIT:
+        if not 0 <= address < end <= MOS6502_ADDRESS_LIMIT:
             raise C64Error(f"C64 PRG {unit.name!r} exceeds the 16-bit address space")
         for region in regions:
             start = region["linear"]

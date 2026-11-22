@@ -10,8 +10,10 @@ DEFAULT_M68K_BASE = 0x10000
 M68K_ADDRESS_LIMIT = 0x1000000
 M68K_FORMATS = ("HUNK", "PRG")
 C64_FORMAT = "C64_PRG"
-C64_ADDRESS_LIMIT = 0x10000
-_FLAT_LIMITS = dict.fromkeys(M68K_FORMATS, M68K_ADDRESS_LIMIT) | {C64_FORMAT: C64_ADDRESS_LIMIT}
+APPLE2_FORMAT = "APPLE2"
+MOS6502_FORMATS = (C64_FORMAT, APPLE2_FORMAT)
+MOS6502_ADDRESS_LIMIT = 0x10000
+_FLAT_LIMITS = dict.fromkeys(M68K_FORMATS, M68K_ADDRESS_LIMIT) | dict.fromkeys(MOS6502_FORMATS, MOS6502_ADDRESS_LIMIT)
 
 
 class ImageError(ValueError):
@@ -57,7 +59,7 @@ def read_units(export: Path, image_size: int) -> list[ImageUnit]:
 def image_units(program: dict, image_size: int) -> list[ImageUnit]:
     image_format = program.get("format", "MZ")
     flat = image_format in _FLAT_LIMITS
-    address_width = 4 if image_format == C64_FORMAT else 8
+    address_width = 4 if image_format in MOS6502_FORMATS else 8
     try:
         units = program["units"]
         origin = units[0]["linear"]

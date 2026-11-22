@@ -1,4 +1,4 @@
-"""Inspect and analyze DOS, AmigaDOS, Atari ST, and Commodore 64 programs."""
+"""Inspect and analyze DOS, AmigaDOS, Atari ST, Commodore 64, and Apple II programs."""
 
 import argparse
 import json
@@ -7,11 +7,12 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from .amiga import HUNK_MAGIC, HunkError, build_hunk_image
+from .apple2 import DEFAULT_LC, DISK_SUFFIXES, Apple2Error, Apple2Unit, Binary, SectorImage, build_apple2_image
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
-from .image import C64_FORMAT, DEFAULT_M68K_BASE, ImageError
+from .image import APPLE2_FORMAT, DEFAULT_M68K_BASE, MOS6502_FORMATS, ImageError
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 from .search import SearchError, find_bytes
@@ -44,7 +45,7 @@ def _overlay(value: str) -> tuple[Path, int | None]:
     return Path(value), None
 
 
-def _c64_unit(value: str) -> tuple[Path, int | None]:
+def _unit_path(value: str) -> tuple[Path, int | None]:
     path, suffix, address = value.rpartition("@")
     if suffix:
         return Path(path), _hex_address(address)
@@ -71,6 +72,43 @@ def _c64_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     units.extend(PrgUnit(path.stem, path.name, path.read_bytes(), address) for path, address in args.c64_unit)
     bank = DEFAULT_BANK if args.c64_bank is None else args.c64_bank
     return build_c64_image(units, source, bank=bank, entries=args.entry)
+
+
+def _apple2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
+    if args.base_segment is not None or args.overlay:
+        raise Apple2Error("--base-segment and --overlay apply to DOS executables")
+    if args.c64 or args.c64_unit or args.c64_bank is not None:
+        raise Apple2Error("C64 options require a Commodore 64 program")
+    source = args.program.name
+    disk = None
+    if args.apple2_raw:
+        if args.disk_file or args.apple2_disk_order:
+            raise Apple2Error("--apple2-raw cannot be used with Apple II disk options")
+        units = [Apple2Unit("root", source, Binary(data, None), args.base_address)]
+    elif args.disk_file or args.program.suffix.lower() in DISK_SUFFIXES or args.apple2_disk_order:
+        if not args.disk_file:
+            raise Apple2Error("select an Apple II disk binary with --disk-file NAME")
+        order = args.apple2_disk_order
+        if order is None and args.program.suffix.lower() == ".po":
+            order = "prodos"
+        disk = SectorImage(data, order=order)
+        units = [
+            Apple2Unit("root" if index == 0 else name, source, disk.read_binary(name),
+                       args.base_address if index == 0 else None, name.upper())
+            for index, name in enumerate(args.disk_file)
+        ]
+    else:
+        units = [Apple2Unit("root", source, Binary.from_dos(data, source), args.base_address)]
+
+    for path, address in args.apple2_unit:
+        contents = path.read_bytes()
+        binary = Binary.from_dos(contents, path.name) if address is None else Binary(contents, None)
+        units.append(Apple2Unit(path.stem, path.name, binary, address))
+    lc = DEFAULT_LC if args.apple2_lc is None else args.apple2_lc
+    image, program = build_apple2_image(units, source, lc=lc, entries=args.entry)
+    if disk is not None:
+        program["disk"] = {"filesystem": disk.filesystem, "sector_order": disk.order}
+    return image, program
 
 
 def _export_image(output: Path, image: bytes, program_map: dict) -> None:
@@ -242,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     load_parser = commands.add_parser("load", help="export a program image")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
-    info_parser = commands.add_parser("info", help="summarize a DOS, AmigaDOS, Atari ST, or Commodore 64 program")
+    info_parser = commands.add_parser("info", help="summarize a program image")
 
     for command in (load_parser, info_parser):
         command.add_argument("program", type=Path, metavar="PROGRAM")
@@ -255,20 +293,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         base.add_argument(
             "--base-address", type=_hex_address, metavar="HEX",
-            help=f"Amiga/Atari ST load address (default {DEFAULT_M68K_BASE:06x}) or C64 root load address override",
+            help=f"Amiga/Atari ST load address (default {DEFAULT_M68K_BASE:06x}) or C64/Apple II root load address",
         )
         command.add_argument("--json", action="store_true", help="print JSON")
         command.add_argument(
             "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
             help="add a Turbo Pascal overlay bank or raw overlay (optionally at hex SEG)",
         )
-        command.add_argument("--c64", action="store_true", help="interpret the input as a Commodore 64 program")
+        platform = command.add_mutually_exclusive_group()
+        platform.add_argument("--c64", action="store_true", help="interpret the input as a Commodore 64 program")
+        platform.add_argument("--apple2", action="store_true", help="interpret the input as an Apple II program")
+        platform.add_argument("--apple2-raw", action="store_true", help="load raw Apple II bytes at --base-address")
         command.add_argument(
             "--disk-file", action="append", default=[], metavar="NAME",
-            help="select a PRG from a D64 image (first is root, repeat for co-resident PRGs)",
+            help="select a D64 PRG or Apple II binary (first is root, repeat for co-resident files)",
         )
         command.add_argument(
-            "--c64-unit", type=_c64_unit, action="append", default=[], metavar="FILE[@HEX]",
+            "--c64-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
             help="add a co-resident PRG file (optional hex load address override)",
         )
         command.add_argument(
@@ -276,8 +317,20 @@ def main(argv: list[str] | None = None) -> int:
             help=f"effective C64 bank bits CHAREN/HIRAM/LORAM (0–7, default {DEFAULT_BANK})",
         )
         command.add_argument(
+            "--apple2-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
+            help="add a co-resident DOS binary or raw Apple II file at @HEX",
+        )
+        command.add_argument(
+            "--apple2-disk-order", choices=("dos", "prodos", "physical"),
+            help="override Apple II sector ordering and interpret the input as a sector image",
+        )
+        command.add_argument(
+            "--apple2-lc", type=_hex_address, metavar="HEX",
+            help=f"effective Apple II Language Card switch (c080–c08f, default {DEFAULT_LC:04x})",
+        )
+        command.add_argument(
             "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
-            help="seed C64 machine-code analysis at this address (repeatable)",
+            help="seed C64 or Apple II machine-code analysis at this address (repeatable)",
         )
 
     ghidra_parser = commands.add_parser("ghidra", help="manage a headless Ghidra import")
@@ -376,12 +429,16 @@ def main(argv: list[str] | None = None) -> int:
         hunk = data.startswith(HUNK_MAGIC)
         m68k = hunk or data.startswith(PRG_MAGIC)
         extension = args.program.suffix.lower()
-        if args.c64 or args.disk_file or extension == ".d64" or (
+        if args.apple2 or args.apple2_raw or args.apple2_disk_order or (not args.c64 and extension in DISK_SUFFIXES):
+            image, program_map = _apple2_image(args, data)
+        elif args.apple2_unit or args.apple2_lc is not None:
+            raise Apple2Error("--apple2-unit and --apple2-lc require an Apple II program")
+        elif args.c64 or args.disk_file or extension == ".d64" or (
             extension == ".prg" and not (m68k or data.startswith(b"MZ"))
         ):
             image, program_map = _c64_image(args, data)
         elif args.c64_unit or args.c64_bank is not None or args.entry:
-            raise C64Error("--c64-unit, --c64-bank, and --entry require a Commodore 64 program")
+            raise C64Error("--c64-unit and --c64-bank require C64, while --entry accepts C64 or Apple II")
         elif m68k:
             if args.base_segment is not None or args.overlay:
                 raise MZError("--base-segment and --overlay apply to DOS executables")
@@ -390,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = loader(data, args.program.name, base_address)
         else:
             if args.base_address is not None:
-                raise MZError("--base-address applies to Amiga, Atari ST, and Commodore 64 programs")
+                raise MZError("--base-address applies to Amiga, Atari ST, Commodore 64, and Apple II programs")
             executable = MZExecutable.parse(data)
             base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
             loaded = executable.load(base_segment)
@@ -401,8 +458,8 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError, TraceError,
-            OSError) as error:
+    except (Apple2Error, C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError,
+            TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
@@ -419,9 +476,11 @@ def main(argv: list[str] | None = None) -> int:
     elif program_map["format"] == "PRG":
         print(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
         print("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
-    elif program_map["format"] == C64_FORMAT:
+    elif program_map["format"] in MOS6502_FORMATS:
         entries = program_map["entries"]
-        print(f"C64 PRG  bank {program_map['bank']}  {len(program_map['units'])} units  {len(entries)} entry points")
+        platform = (f"Apple II  LC {program_map['language_card']:04x}" if program_map["format"] == APPLE2_FORMAT
+                    else f"C64 PRG  bank {program_map['bank']}")
+        print(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")
         if entries:
             addresses = ", ".join(f"{entry['linear']:04x}" for entry in entries[:_PREVIEW_LIMIT])
             print(f"  entries  {addresses}")
