@@ -1,7 +1,7 @@
-# dos16re plan
+# retrore plan
 
-A reverse-engineering toolkit for 16-bit real-mode DOS programs: MZ executables, packers and overlay systems, as
-used by 1980s–early–1990s games. It handles formats and compiler patterns shared across projects and uses games
+A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
+packers and overlay systems) and AmigaDOS Hunk executables, as used by 1980s–early–1990s games. It handles formats and compiler patterns shared across projects and uses games
 to validate that support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
 
 ## Why
@@ -23,7 +23,7 @@ platforms used by the remaster projects, starting with AmigaDOS.
 
 ## Design
 
-- **Python 3 package + CLI** (`dos16re`), standard library plus `capstone` and `unicorn`. Every command can print
+- **Python 3 package + CLI** (`retrore`), standard library plus `capstone` and `unicorn`. Every command can print
   JSON (`--json`) so agents can call it cheaply. The package and its default test suite run independently of
   sibling projects. Game-specific addresses and expectations belong in opt-in validation tests.
 - **Ghidra integration through headless scripts**, not a full Ghidra extension at first: the loader writes a flat
@@ -49,7 +49,7 @@ platforms used by the remaster projects, starting with AmigaDOS.
    root. Later formats include Borland VROOMM, Microsoft LINK overlays, and `.COM` programs.
 4. **Implemented.** Rewrite direct far calls identified by relocations. Convert each overlay stub to a far jump
    for indirect callers. Preserve original bytes and targets in the map.
-5. **Implemented.** `dos16re load PROGRAM -o OUT/` exports `image.bin` and `map.json`. Both `load` and `info`
+5. **Implemented.** `retrore load PROGRAM -o OUT/` exports `image.bin` and `map.json`. Both `load` and `info`
    accept repeatable `--overlay` and support `--json`.
 
 **Validated.** PoR `START.EXE` and `GAME.OVR` load 35 distinct overlay units and resolve all 406 stubs.
@@ -61,8 +61,8 @@ The documented stub `0085:0039` resolves to `GAME.OVR` file offset `0x21AED`. Ph
 1. **Implemented.** A headless pre-script creates memory blocks per unit, sets entry points, and seeds
    disassembly before auto-analysis.
 2. **Implemented.** Name stubs and unit entries and comment rewritten sites with the original bytes.
-3. **Implemented.** `dos16re ghidra import OUT/ PROJECT` wraps `analyzeHeadless`. To decompile an analyzed
-   function, run `dos16re decomp ADDR --project PROJECT` with a `unit:offset` or `seg:off` address.
+3. **Implemented.** `retrore ghidra import OUT/ PROJECT` wraps `analyzeHeadless`. To decompile an analyzed
+   function, run `retrore decomp ADDR --project PROJECT` with a `unit:offset` or `seg:off` address.
 
 **Validated on Ghidra 12.2.** The Pool of Radiance loot handler decompiles with its View call named
 `tpov_0085_0ab3` directly after import.
@@ -93,12 +93,12 @@ base. Pool of Radiance's `LOADPIECES` decompilation names DGROUP flags at `0x443
    auto-analysis to find the routines those blocks call.
 2. **Implemented.** Recognize `push cs` + direct near call when the analyzed callee returns with `RETF` and
    its returns agree on stack cleanup. Assign the 16-bit far calling convention in Ghidra.
-3. **Implemented.** `dos16re gaps --project PROJECT` reports undefined ranges per loaded unit. These are
+3. **Implemented.** `retrore gaps --project PROJECT` reports undefined ranges per loaded unit. These are
    candidates for further analysis and may contain code, data, or padding.
 
 **Validated on Ghidra 12.2.** The Phantasie I Mystic dispatcher at `OV1:20a5` has seven computed jump
 targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of those cases, and
-`dos16re decomp OV1:20bb` returns the function.
+`retrore decomp OV1:20bb` returns the function.
 
 ### Phase 5: runtime signatures
 
@@ -107,7 +107,7 @@ targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of
 2. **Implemented.** Ghidra names and types matches at analyzed function entries. The Pascal catalog includes
    Real48 addition, string copy and concatenation, set union, `Write` for strings, `WriteLn`, `GetMem`,
    `FreeMem`, and `OvrInit`. The C catalog covers selected string, output, and heap routines.
-3. **Implemented.** `dos16re info` identifies runtimes from startup code and corroborating runtime strings or
+3. **Implemented.** `retrore info` identifies runtimes from startup code and corroborating runtime strings or
    a recognized Turbo Pascal overlay directory. JSON records the evidence and any identified version.
 
 **Validated.** The signatures come from original toolchains and purpose-built DOS probes. The Pascal probe
@@ -128,9 +128,9 @@ object against its 6.0a DOS runtime library.
    or the instruction limit.
 2. **Implemented.** Python hooks handle interrupts, port I/O, and execution at specific addresses.
    INT 3Fh at a known Turbo Pascal stub redirects to the resident unit.
-3. **Implemented.** `dos16re call ADDR --export OUT --regs ... --mem ... --read ...` reports register
+3. **Implemented.** `retrore call ADDR --export OUT --regs ... --mem ... --read ...` reports register
    and memory results, with `--json` for scripts.
-4. **Implemented.** `dos16re trace LOGCPU.TXT --export OUT` maps DOSBox-X debugger CS:IP logs to the
+4. **Implemented.** `retrore trace LOGCPU.TXT --export OUT` maps DOSBox-X debugger CS:IP logs to the
    exported image using the runtime root and overlay segments. Add `--project PROJECT` to report
    executed functions and traced addresses missed by static disassembly.
 
@@ -160,8 +160,8 @@ across separated overlay units.
 | Phantasie I (Amiga) | AmigaDOS Hunk, 240 resident hunks | Cross-hunk relocation and palette routine callers |
 | Phantasie III (Amiga) | AmigaDOS Hunk, CODE/DATA/BSS | Flat memory layout, main-loop decompilation and global reference |
 
-The opt-in DOS tests use `DOS16RE_POR_DIR`, `DOS16RE_PH1_DIR`, and `DOS16RE_PH3_DIR`.
-The opt-in Amiga tests use `DOS16RE_PH1_AMIGA_DIR` and `DOS16RE_PH3_AMIGA_DIR`. Headless tests
+The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
+The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. Headless tests
 also use `GHIDRA_HOME`. Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 ## Setup

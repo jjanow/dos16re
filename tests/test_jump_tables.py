@@ -2,9 +2,9 @@ from struct import pack_into
 
 import pytest
 
-from dos16re.jump_tables import JumpTable, recover_jump_tables
-from dos16re.mz import Address, LoadedMZ
-from dos16re.overlays import Overlay, build_image
+from retrore.jump_tables import JumpTable, recover_jump_tables
+from retrore.mz import Address, LoadedMZ
+from retrore.overlays import Overlay, build_image
 
 
 def _separate_table():

@@ -15,7 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
-public class Dos16reAmigaImport extends HeadlessScript {
+public class RetroreAmigaImport extends HeadlessScript {
     @Override
     public void run() throws Exception {
         setHeadlessContinuationOption(HeadlessContinuationOption.ABORT_AND_DELETE);

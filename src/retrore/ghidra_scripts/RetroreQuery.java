@@ -1,4 +1,4 @@
-// Query an analyzed dos16re project.
+// Query an analyzed retrore project.
 import com.google.gson.FieldNamingPolicy;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
@@ -19,7 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-public class Dos16reQuery extends GhidraScript {
+public class RetroreQuery extends GhidraScript {
     private record Location(String address, String unitAddress, Long linear) {}
     private record Routine(String name, Location entry) {}
     private record BodyRange(Location start, Location end) {}

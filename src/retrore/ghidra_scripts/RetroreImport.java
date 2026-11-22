@@ -1,4 +1,4 @@
-// Import a dos16re program map before auto-analysis.
+// Import a retrore program map before auto-analysis.
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -20,7 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
-public class Dos16reImport extends HeadlessScript {
+public class RetroreImport extends HeadlessScript {
     private SegmentedAddressSpace space;
 
     @Override
@@ -40,7 +40,7 @@ public class Dos16reImport extends HeadlessScript {
 
     private void loadMap(JsonObject map) throws Exception {
         if (map.get("version").getAsInt() != 1) {
-            throw new IllegalArgumentException("unsupported dos16re map version");
+            throw new IllegalArgumentException("unsupported retrore map version");
         }
         space = (SegmentedAddressSpace) currentProgram.getAddressFactory().getDefaultAddressSpace();
         Memory memory = currentProgram.getMemory();

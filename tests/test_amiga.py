@@ -4,8 +4,8 @@ from struct import pack, unpack_from
 
 import pytest
 
-from dos16re.amiga import HunkError, build_hunk_image
-from dos16re.cli import main
+from retrore.amiga import HunkError, build_hunk_image
+from retrore.cli import main
 
 
 def _words(*values):

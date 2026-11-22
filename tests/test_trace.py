@@ -1,7 +1,7 @@
 import json
 from struct import pack_into
 
-from dos16re.cli import main
+from retrore.cli import main
 
 
 def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):

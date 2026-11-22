@@ -8,7 +8,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Map;
 
-public class Dos16reGaps extends GhidraScript {
+public class RetroreGaps extends GhidraScript {
     @Override
     public void run() throws Exception {
         var ranges = new ArrayList<Map<String, Object>>();

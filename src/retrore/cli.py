@@ -207,7 +207,7 @@ def _trace(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="dos16re", description=__doc__)
+    parser = argparse.ArgumentParser(prog="retrore", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     load_parser = commands.add_parser("load", help="export a relocated DOS or Amiga program")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
@@ -255,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         query_parser.add_argument("--json", action="store_true", help="print JSON")
 
     search_parser = commands.add_parser("where-is", help="find a byte pattern across exported units")
-    search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
+    search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     pattern = search_parser.add_mutually_exclusive_group(required=True)
     pattern.add_argument("--bytes", metavar="HEX", help="hexadecimal bytes")
     pattern.add_argument("--string", metavar="TEXT", help="literal string (DOS CP437 or Amiga Latin-1)")
@@ -263,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument("--width", type=int, choices=(1, 2, 4, 8), help="constant width in bytes (default 2)")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
-    call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
+    call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     call_parser.add_argument("--far", action="store_true", help="expect RETF (default: near RET)")
     call_parser.add_argument("--regs", action="append", default=[], metavar="REG=HEX,...", help="set initial registers")
     call_parser.add_argument(
@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     trace_parser = commands.add_parser("trace", help="map a DOSBox-X CPU log to an exported DOS image")
     trace_parser.add_argument("trace", metavar="LOGCPU.TXT", type=Path)
-    trace_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
+    trace_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     trace_parser.add_argument("--project", metavar="PROJECT", type=Path, help="compare with the analyzed Ghidra project")
     trace_parser.add_argument(
         "--runtime-base", metavar="HEX", type=_hex_segment, help="runtime root load segment (defaults to the export base)",
@@ -347,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
-        message = json.dumps(report) if args.json else f"dos16re: {error}"
+        message = json.dumps(report) if args.json else f"retrore: {error}"
         print(message, file=sys.stderr)
         return 1
 

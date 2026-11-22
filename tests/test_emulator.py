@@ -4,10 +4,10 @@ from struct import pack, pack_into
 import pytest
 from unicorn.x86_const import UC_X86_REG_AX, UC_X86_REG_CX, UC_X86_REG_DX
 
-from dos16re.cli import main
-from dos16re.emulator import Emulator, EmulatorError
-from dos16re.mz import Address, LoadedMZ
-from dos16re.overlays import Overlay, build_image
+from retrore.cli import main
+from retrore.emulator import Emulator, EmulatorError
+from retrore.mz import Address, LoadedMZ
+from retrore.overlays import Overlay, build_image
 
 
 def _emulator(code):

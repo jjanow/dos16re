@@ -5,7 +5,7 @@ from struct import unpack_from
 
 import pytest
 
-from dos16re.cli import main
+from retrore.cli import main
 
 
 def _game_files(variable):
@@ -17,7 +17,7 @@ def _game_files(variable):
 
 @pytest.fixture
 def por_export(tmp_path, capsys):
-    files = _game_files("DOS16RE_POR_DIR")
+    files = _game_files("RETRORE_POR_DIR")
     root = files.get("START.EXE") or files["GAME.EXE"]
     bank = files["GAME.OVR"]
     assert main(["load", str(root), "--overlay", str(bank), "-o", str(tmp_path), "--json"]) == 0
@@ -60,7 +60,7 @@ def test_pool_of_radiance_overlay_directory_and_view_call(por_export):
 
 @pytest.fixture
 def phantasie_export(tmp_path, capsys):
-    files = _game_files("DOS16RE_PH1_DIR")
+    files = _game_files("RETRORE_PH1_DIR")
     main_program, ov1, ov2 = (files[name] for name in ("PHANTASI.EXE", "OV1.OVR", "OV2.OVR"))
     assert main([
         "load", str(main_program), "--overlay", str(ov1), "--overlay", str(ov2),
@@ -139,8 +139,8 @@ def test_ghidra_decompiles_cross_overlay_call(por_export, capsys):
 
 
 @pytest.fixture(params=[
-    ("DOS16RE_PH1_AMIGA_DIR", "GAME"),
-    ("DOS16RE_PH3_AMIGA_DIR", "PHANTASIEIII"),
+    ("RETRORE_PH1_AMIGA_DIR", "GAME"),
+    ("RETRORE_PH3_AMIGA_DIR", "PHANTASIEIII"),
 ], ids=["phantasie-i", "phantasie-iii"])
 def amiga_export(request, tmp_path, capsys):
     variable, filename = request.param

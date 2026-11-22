@@ -35,7 +35,7 @@ def _run(
     project: Path, options: list[str], script: str | None, *arguments: str, pre_script: str | None = None,
 ) -> dict:
     launcher = _headless()
-    scripts = files("dos16re").joinpath("ghidra_scripts")
+    scripts = files("retrore").joinpath("ghidra_scripts")
     with as_file(scripts) as script_dir, TemporaryDirectory() as temp:
         result_file = Path(temp) / "result.json"
         script_args = [*arguments, str(result_file)]
@@ -70,11 +70,11 @@ def import_program(export: Path, project: Path) -> dict:
     if program.get("format") == "HUNK":
         image_units(program, image.stat().st_size)
         return _run(
-            project, [*options, "68000:BE:32:MC68020"], None, str(manifest), pre_script="Dos16reAmigaImport.java",
+            project, [*options, "68000:BE:32:MC68020"], None, str(manifest), pre_script="RetroreAmigaImport.java",
         )
     return _run(
         project, [*options, "x86:LE:16:Real Mode"],
-        "Dos16reSegments.java", str(manifest), pre_script="Dos16reImport.java",
+        "RetroreSegments.java", str(manifest), pre_script="RetroreImport.java",
     )
 
 
@@ -85,18 +85,18 @@ def decompile(address: str, project: Path) -> dict:
 def query_address(command: str, address: str, project: Path) -> dict:
     if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
         raise GhidraError("expected a hexadecimal unit:offset, DOS seg:off, or Amiga address")
-    return _query(project, "Dos16reQuery.java", command, address)
+    return _query(project, "RetroreQuery.java", command, address)
 
 
 def analysis_gaps(project: Path) -> dict:
-    return _query(project, "Dos16reGaps.java")
+    return _query(project, "RetroreGaps.java")
 
 
 def trace_coverage(project: Path, coverage: dict) -> dict:
     with TemporaryDirectory() as temp:
         positions = Path(temp) / "positions.json"
         positions.write_text(json.dumps(coverage), encoding="utf-8")
-        return _query(project, "Dos16reQuery.java", "trace", str(positions))
+        return _query(project, "RetroreQuery.java", "trace", str(positions))
 
 
 def _query(project: Path, script: str, *arguments: str) -> dict:

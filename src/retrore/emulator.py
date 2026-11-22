@@ -59,7 +59,7 @@ def _pc(uc: Uc) -> Address:
 
 
 class Emulator:
-    """Launch independent calls with a copy of an image built by `dos16re load`."""
+    """Launch independent calls with a copy of an image built by `retrore load`."""
 
     def __init__(self, image: bytes, program_map: dict) -> None:
         self._image = bytes(image)

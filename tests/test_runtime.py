@@ -2,8 +2,8 @@ from struct import pack_into
 
 import pytest
 
-from dos16re.mz import MZExecutable
-from dos16re.overlays import Overlay, build_image
+from retrore.mz import MZExecutable
+from retrore.overlays import Overlay, build_image
 
 
 @pytest.mark.parametrize("base", [0, 0x1000, 0xAA55])

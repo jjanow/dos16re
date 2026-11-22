@@ -6,8 +6,8 @@ from struct import pack_into
 
 import pytest
 
-from dos16re.cli import main
-from dos16re.ghidra import _headless
+from retrore.cli import main
+from retrore.ghidra import _headless
 
 
 @pytest.fixture(autouse=True)
@@ -99,9 +99,9 @@ def test_tracks_segment_values_and_drops_conflicting_or_mutable_values(tmp_path,
 
 
 def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
-    directory = os.environ.get("DOS16RE_PH3_DIR")
+    directory = os.environ.get("RETRORE_PH3_DIR")
     if not directory:
-        pytest.skip("set DOS16RE_PH3_DIR to run the real-game test")
+        pytest.skip("set RETRORE_PH3_DIR to run the real-game test")
     exe = next(path for path in Path(directory).iterdir() if path.name.upper() == "MAIN.EXE")
     project, _ = _import_program(tmp_path, capsys, exe)
 

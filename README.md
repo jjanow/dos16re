@@ -1,7 +1,8 @@
-# dos16re
+# retrore
 
-Standalone reverse-engineering tools for 16-bit real-mode DOS programs and AmigaDOS Hunk executables.
-Install and run `dos16re` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
+Standalone reverse-engineering tools for retro executables: 16-bit real-mode DOS programs and AmigaDOS
+Hunk executables so far, with more platforms to come.
+Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
 ## DOS loader
@@ -13,10 +14,10 @@ packers such as PKLITE produce a diagnostic.
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -e . pytest
-.venv/bin/dos16re info PROGRAM.EXE
-.venv/bin/dos16re load PROGRAM.EXE -o out/program --json
-.venv/bin/dos16re load START.EXE --overlay GAME.OVR -o out/pool
-.venv/bin/dos16re load PHANTASI.EXE --overlay OV1.OVR --overlay OV2.OVR -o out/phantasie
+.venv/bin/retrore info PROGRAM.EXE
+.venv/bin/retrore load PROGRAM.EXE -o out/program --json
+.venv/bin/retrore load START.EXE --overlay GAME.OVR -o out/pool
+.venv/bin/retrore load PHANTASI.EXE --overlay OV1.OVR --overlay OV2.OVR -o out/phantasie
 ```
 
 Both commands accept `--json`, `--base-segment HEX` (default `1000`), and repeatable `--overlay FILE`.
@@ -51,13 +52,13 @@ includes a version when supported by the evidence. See the validation notes in [
 ## Amiga loader
 
 `info` and `load` detect classic AmigaDOS Hunk executables by their header. If starting from an ADF,
-unpack it with `xdftool DISK.adf unpack out/disk` and pass the extracted executable to `dos16re`.
+unpack it with `xdftool DISK.adf unpack out/disk` and pass the extracted executable to `retrore`.
 
 ```sh
-.venv/bin/dos16re info out/disk/PROGRAM --json
-.venv/bin/dos16re load out/disk/PROGRAM -o out/amiga
-.venv/bin/dos16re ghidra import out/amiga out/amiga-project
-.venv/bin/dos16re decomp h0:0000 --project out/amiga-project --json
+.venv/bin/retrore info out/disk/PROGRAM --json
+.venv/bin/retrore load out/disk/PROGRAM -o out/amiga
+.venv/bin/retrore ghidra import out/amiga out/amiga-project
+.venv/bin/retrore decomp h0:0000 --project out/amiga-project --json
 ```
 
 The loader places resident CODE, DATA, and BSS hunks at distinct 16-byte-aligned addresses.
@@ -99,11 +100,11 @@ disagree. A resolved direct write invalidates any overlapping relocation-backed 
 Re-export images made by older versions to include the relocation metadata.
 
 ```sh
-.venv/bin/dos16re ghidra import out/pool out/pool-project
-.venv/bin/dos16re decomp tpov_0025:1036 --project out/pool-project --json
-.venv/bin/dos16re ghidra import out/phantasie out/phantasie-project
-.venv/bin/dos16re decomp OV1:20bb --project out/phantasie-project --json
-.venv/bin/dos16re gaps --project out/phantasie-project --json
+.venv/bin/retrore ghidra import out/pool out/pool-project
+.venv/bin/retrore decomp tpov_0025:1036 --project out/pool-project --json
+.venv/bin/retrore ghidra import out/phantasie out/phantasie-project
+.venv/bin/retrore decomp OV1:20bb --project out/phantasie-project --json
+.venv/bin/retrore gaps --project out/phantasie-project --json
 ```
 
 `decomp` accepts any address in an analyzed function. For DOS, use a hexadecimal `unit:offset` or
@@ -116,13 +117,13 @@ inclusive `unit:offset` endpoints, the starting linear address, and byte counts.
 ## Program queries
 
 ```sh
-.venv/bin/dos16re xrefs OV1:20bb --project out/phantasie-project --json
-.venv/bin/dos16re callers OV1:20bb --project out/phantasie-project
-.venv/bin/dos16re callees OV1:20bb --project out/phantasie-project
-.venv/bin/dos16re func OV1:20bb --project out/phantasie-project --json
-.venv/bin/dos16re where-is --export out/phantasie --bytes 'b8 00 4c'
-.venv/bin/dos16re where-is --export out/phantasie --string 'Mystic'
-.venv/bin/dos16re where-is --export out/phantasie --constant 0x1234 --width 2 --json
+.venv/bin/retrore xrefs OV1:20bb --project out/phantasie-project --json
+.venv/bin/retrore callers OV1:20bb --project out/phantasie-project
+.venv/bin/retrore callees OV1:20bb --project out/phantasie-project
+.venv/bin/retrore func OV1:20bb --project out/phantasie-project --json
+.venv/bin/retrore where-is --export out/phantasie --bytes 'b8 00 4c'
+.venv/bin/retrore where-is --export out/phantasie --string 'Mystic'
+.venv/bin/retrore where-is --export out/phantasie --constant 0x1234 --width 2 --json
 ```
 
 `xrefs` reports incoming and outgoing references Ghidra recorded at the exact address, including code and
@@ -152,7 +153,7 @@ configured `SP`, so stack arguments start at the configured `SS:SP`. Use `--far`
 ends in `RETF`. The default is a near `RET`.
 
 ```sh
-.venv/bin/dos16re call root:1234 --export out/program --regs ax=10,ds=2000 \
+.venv/bin/retrore call root:1234 --export out/program --regs ax=10,ds=2000 \
   --mem 2000:0100=3412 --read 2000:0100=2 --json
 ```
 
@@ -169,7 +170,7 @@ from pathlib import Path
 
 from unicorn.x86_const import UC_X86_REG_AX
 
-from dos16re.emulator import Emulator
+from retrore.emulator import Emulator
 
 
 def read_key(cpu, vector):
@@ -195,7 +196,7 @@ and `LOGC` output from builds that provide those commands. Start the capture aft
 when working with a packed executable. [DOSBox-X debugger source](https://github.com/joncampbell123/dosbox-x/blob/master/src/debug/debug.cpp#L2940-L2975)
 
 ```sh
-.venv/bin/dos16re trace LOGCPU.TXT --export out/program --runtime-base 0813 \
+.venv/bin/retrore trace LOGCPU.TXT --export out/program --runtime-base 0813 \
   --overlay-segment OV1=4200 --project out/program-project --json
 ```
 
@@ -213,8 +214,8 @@ defined as data, or inside an instruction.
 ## Tests
 
 Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Radiance DOS v1.3 from
-`DOS16RE_POR_DIR`, the Phantasie I DOS MZ edition from `DOS16RE_PH1_DIR`, and Phantasie III's
-`MAIN.EXE` from `DOS16RE_PH3_DIR`. Point `DOS16RE_PH1_AMIGA_DIR` and `DOS16RE_PH3_AMIGA_DIR` to
+`RETRORE_POR_DIR`, the Phantasie I DOS MZ edition from `RETRORE_PH1_DIR`, and Phantasie III's
+`MAIN.EXE` from `RETRORE_PH3_DIR`. Point `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR` to
 the extracted Amiga directories containing `game` and `PhantasieIII` respectively. The Ghidra
 tests use `GHIDRA_HOME` and include synthetic DOS and Amiga executables. Tests skip when their
 input variables are unset. See the roadmap for upcoming work.

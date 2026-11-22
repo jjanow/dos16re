@@ -4,8 +4,8 @@ from struct import pack
 
 import pytest
 
-from dos16re.cli import main
-from dos16re.mz import Address, MZError, MZExecutable
+from retrore.cli import main
+from retrore.mz import Address, MZError, MZExecutable
 
 
 def make_packed_mz(image, *, decoder_segment, decoder_ip, extra_header=b""):

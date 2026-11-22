@@ -2,8 +2,8 @@ from struct import pack, pack_into, unpack_from
 
 import pytest
 
-from dos16re.mz import Address, LoadedMZ, MZError
-from dos16re.overlays import Overlay, build_image
+from retrore.mz import Address, LoadedMZ, MZError
+from retrore.overlays import Overlay, build_image
 
 
 def make_overlay(signature=b"FBOV"):

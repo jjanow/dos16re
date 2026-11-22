@@ -1,7 +1,7 @@
 import json
 from struct import pack_into
 
-from dos16re.cli import main
+from retrore.cli import main
 
 
 def test_searches_each_exported_unit_without_crossing_its_boundary(tmp_path, capsys):

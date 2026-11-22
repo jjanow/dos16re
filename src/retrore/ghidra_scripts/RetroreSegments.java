@@ -45,7 +45,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 
-public class Dos16reSegments extends HeadlessScript {
+public class RetroreSegments extends HeadlessScript {
     private static final int WORD_MASK = 0xffff;
     private static final int STACK_LIMIT = 8;
     private SegmentedAddressSpace space;
