@@ -8,9 +8,16 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .image import M68K_FORMATS, MOS6502_FORMATS, image_units, read_map
+from .image import FLAT16_FORMATS, M68K_FORMATS, MSX2_FORMAT, image_units, read_map
 
-_ADDRESS_QUERIES = frozenset({"decomp", "xrefs", "callers", "callees", "func"})
+_QUERY_FIELDS = {
+    "decomp": {"address", "unit_address", "linear", "name", "decompilation"},
+    "xrefs": {"address", "incoming", "outgoing"},
+    "callers": {"function", "callers"},
+    "callees": {"function", "callees"},
+    "func": {"function", "ranges", "size", "address", "segments", "callers"},
+}
+_REFERENCE_OPTIONS = {"limit", "offset", "ref_types", "compact"}
 
 
 class GhidraError(ValueError):
@@ -74,10 +81,11 @@ def import_program(export: Path, project: Path) -> dict:
         return _run(
             project, [*options, "68000:BE:32:MC68020"], None, str(manifest), pre_script="RetroreM68kImport.java",
         )
-    if program.get("format") in MOS6502_FORMATS:
+    if program.get("format") in FLAT16_FORMATS:
         image_units(program, image.stat().st_size)
+        language = "z80:LE:16:default" if program["format"] == MSX2_FORMAT else "6502:LE:16:default"
         return _run(
-            project, [*options, "6502:LE:16:default"], None, str(manifest), pre_script="Retrore6502Import.java",
+            project, [*options, language], None, str(manifest), pre_script="Retrore8BitImport.java",
         )
     return _run(
         project, [*options, "x86:LE:16:Real Mode"],
@@ -85,18 +93,51 @@ def import_program(export: Path, project: Path) -> dict:
     )
 
 
-def decompile(address: str, project: Path) -> dict:
-    return query_address("decomp", address, project)
+def decompile(address: str, project: Path, **options: object) -> dict:
+    return query_address("decomp", address, project, **options)
 
 
-def query_address(command: str, address: str, project: Path) -> dict:
-    _validate_address(address)
-    return _query(project, "RetroreQuery.java", command, address)
+def query_address(command: str, address: str, project: Path, **options: object) -> dict:
+    request = dict(command=command, address=address, **options)
+    _validate_query(request)
+    return _query_json(project, "single", request)
 
 
-def _validate_address(address: str) -> None:
+def _validate_query(request: object) -> None:
+    if not isinstance(request, dict) or not {"command", "address"} <= request.keys():
+        raise GhidraError("expected a query object with command and address")
+    command, address = request["command"], request["address"]
+    if not isinstance(command, str) or command not in _QUERY_FIELDS:
+        raise GhidraError("command must use decomp, xrefs, callers, callees, or func")
+    if not isinstance(address, str):
+        raise GhidraError("address must be a string")
     if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
         raise GhidraError("expected a hexadecimal unit:offset, DOS seg:off, or flat address")
+    allowed = {"command", "address", "fields"}
+    if command != "decomp":
+        allowed.update(_REFERENCE_OPTIONS)
+    if command == "xrefs":
+        allowed.add("direction")
+    unknown = request.keys() - allowed
+    if unknown:
+        raise GhidraError(f"unsupported options for {command}: {', '.join(sorted(unknown))}")
+    if "fields" in request:
+        fields = request["fields"]
+        if (not isinstance(fields, list) or not fields
+                or any(not isinstance(field, str) or field not in _QUERY_FIELDS[command] for field in fields)):
+            raise GhidraError(f"fields for {command} must be a nonempty list chosen from {', '.join(sorted(_QUERY_FIELDS[command]))}")
+    if "direction" in request and request["direction"] not in ("incoming", "outgoing", "both"):
+        raise GhidraError("direction must be incoming, outgoing, or both")
+    if "ref_types" in request:
+        types = request["ref_types"]
+        if (not isinstance(types, list) or not types
+                or any(not isinstance(kind, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", kind) for kind in types)):
+            raise GhidraError("ref_types must be a nonempty list of Ghidra reference type names")
+    if "compact" in request and type(request["compact"]) is not bool:
+        raise GhidraError("compact must be a boolean")
+    for name, minimum in (("offset", 0), ("limit", 1)):
+        if name in request and (type(request[name]) is not int or not minimum <= request[name] <= 0x7FFFFFFF):
+            raise GhidraError(f"{name} must be an integer between {minimum} and 2147483647")
 
 
 def query_batch(project: Path, requests: object) -> dict:
@@ -104,22 +145,12 @@ def query_batch(project: Path, requests: object) -> dict:
     if not isinstance(requests, list) or not requests:
         raise GhidraError("expected a nonempty JSON array of queries")
     for index, request in enumerate(requests, 1):
-        if not isinstance(request, dict) or request.keys() != {"command", "address"}:
-            raise GhidraError(f"query {index} must be an object with command and address")
-        command, address = request["command"], request["address"]
-        if not isinstance(command, str) or command not in _ADDRESS_QUERIES:
-            raise GhidraError(f"query {index} must use decomp, xrefs, callers, callees, or func")
-        if not isinstance(address, str):
-            raise GhidraError(f"query {index} address must be a string")
         try:
-            _validate_address(address)
+            _validate_query(request)
         except GhidraError as error:
             raise GhidraError(f"query {index}: {error}") from error
 
-    with TemporaryDirectory() as temp:
-        input_file = Path(temp) / "queries.json"
-        input_file.write_text(json.dumps(requests), encoding="utf-8")
-        return _query(project, "RetroreQuery.java", "batch", str(input_file))
+    return _query_json(project, "batch", requests)
 
 
 def analysis_gaps(project: Path) -> dict:
@@ -127,10 +158,14 @@ def analysis_gaps(project: Path) -> dict:
 
 
 def trace_coverage(project: Path, coverage: dict) -> dict:
+    return _query_json(project, "trace", coverage)
+
+
+def _query_json(project: Path, mode: str, request: object) -> dict:
     with TemporaryDirectory() as temp:
-        positions = Path(temp) / "positions.json"
-        positions.write_text(json.dumps(coverage), encoding="utf-8")
-        return _query(project, "RetroreQuery.java", "trace", str(positions))
+        input_file = Path(temp) / "input.json"
+        input_file.write_text(json.dumps(request), encoding="utf-8")
+        return _query(project, "RetroreQuery.java", mode, str(input_file))
 
 
 def _query(project: Path, script: str, *arguments: str) -> dict:

@@ -10,3 +10,7 @@ AmigaDOS Hunk executables, and other platforms as they are added. See `PLAN.md` 
   environment variables and skip when unset.
 - Every CLI command supports `--json`; keep default output short.
 - Keep `README.md` and `PLAN.md` current as phases land.
+- **“wrap it”** is a session command. Update `PLAN.md` with open items and a short “Last session”
+  entry covering completed work, verification, and where to resume. Remove stale session notes and
+  markers. Verify the changes, commit and push the session’s retrore work, and prune merged agent
+  worktrees that are clean and unused. Keep unrelated changes and private game inputs out of the commit.

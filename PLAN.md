@@ -2,12 +2,23 @@
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
-binaries, and Atari 8-bit executables. It handles formats and compiler patterns shared across 1980s and early 1990s games and uses those games to
-validate support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
+binaries, Atari 8-bit executables, and MSX2 programs. It handles formats and compiler patterns shared
+across 1980s and early 1990s games and uses those games to validate support. It gives Ghidra's decompiler
+and agents driving it one whole-program image to work on.
 
 The primary goal is to help LLMs reverse 16-bit binaries faster and with fewer tokens. Prioritize the
 work Ghidra leaves to the analyst: recovering the runtime layout, resolving segmented and indirect
 references, and returning compact evidence that an agent can verify against the original bytes.
+
+## Last session
+
+On 2026-11-22, added MSX2 FAT12 loading and Z80 analysis for snapshots with resident copies and
+overlays. Validated both Phantasie III overlay layouts in Ghidra 12.2. Added field selection, filters,
+compact addresses, and reference paging to single and batch Ghidra queries. The Ghidra suite passed
+136 tests with 21 skipped, and the installed wheel passed an MSX2 import and reference query.
+
+Resume with NEC PC-88 for platform support or decompilation excerpts and targeted data-flow slices
+for Phase 8.
 
 ## Why
 
@@ -168,12 +179,14 @@ across separated overlay units.
 | Phantasie I (Commodore 64) | D64 disk, PRGs with 16-bit load addresses | Co-resident helpers, RAM under BASIC ROM, alternative program loads, 6510 code and VIC references |
 | Phantasie I and III (Apple II) | RDOS 2.1 and 3.3 sector disks | Native binary load addresses, alternative helper loads, 6502 calls and soft-switch references |
 | Phantasie I and II (Atari 8-bit) | Atari DOS boot disks and segmented executables in ATR images | Boot and RUNAD entry points, alternative helper loads, 6502 calls and ANTIC references |
+| Phantasie III (MSX2) | FAT12 Scenario Disk, MSX-DOS `.COM` and `.OVR` files | Resident code copy, alternative overlays, Z80 decompilation and cross-unit transfers |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
 tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. The opt-in Apple II tests use
 `RETRORE_PH1_APPLE2_DIR` and `RETRORE_PH3_APPLE2_DIR`. The opt-in Atari 8-bit tests use
-`RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. Headless tests also use `GHIDRA_HOME`.
+`RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. The opt-in MSX2 tests use `RETRORE_PH3_MSX2_DIR`.
+Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 ## Setup
@@ -185,8 +198,8 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga, Atari ST, Commodore 64, Apple II, and Atari 8-bit milestones are complete for the
-validated releases. MSX2 is the next platform milestone. The analysis backlog below applies to existing
+The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, and MSX2 milestones are complete for the
+validated releases. NEC PC-88 is the next platform milestone. The analysis backlog below applies to existing
 and future platforms.
 
 ## Analysis backlog
@@ -198,8 +211,9 @@ and future platforms.
 - **Implemented.** `retrore batch` runs decompilation and address queries against one project in
   one read-only headless session. It shares the decompiler, preserves request order, and returns
   individual failures alongside successful results.
-- Add result limits, field selection, reference direction and type filters, and compact address
-  records. Include counts and continuation information so an agent can narrow a large result.
+- **Implemented.** Single and batch Ghidra address queries support field selection. Reference lists
+  support paging with filtered totals and next offsets, exact reference type filters, direction selection
+  for `xrefs`, and compact address records.
 - Offer decompilation excerpts and targeted data-flow slices around one call, branch, or memory
   access. Include stable addresses for retrieving the supporting instructions or full function.
 - Add bounded bulk function and symbol lookups, unit-scoped inventories, limited call-graph walks,
@@ -280,11 +294,12 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga and Atari ST | C64, Apple II, and Atari 8-bit |
+| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, and MSX2 |
 |---|---|---|---|
 | Load, export, and byte search | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented |
 | Batch Ghidra address queries | Implemented | Implemented | Implemented |
+| Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented |
 | Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export |
 | Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Extend for relevant targets | Extend for relevant targets |
 | Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned |
@@ -383,3 +398,15 @@ The SSI Phantasie I and II disks boot at `$0706`. Their `AUTORUN.SYS` files cont
 `$A7BD`. Ghidra decompiled that entry in Phantasie I, resolving the call from `$A7F4` to the block
 containing `$4702` and a write from `$A892` to the ANTIC register `NMIEN` at `$D40E`.
 `CAST.COM` and `LOOK.COM` supply two alternative overlays at `$A7C0` in both releases.
+
+### MSX2
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` accept MSX-DOS `.COM` files, raw
+files at explicit addresses, and root-directory members from raw FAT12 disk images. Exports represent
+one MSX-DOS RAM layout with declared resident copies and explicit overlay load order. The Z80 importer
+creates the unit blocks, seeds entries, and labels the BDOS entry and selected I/O ports.
+
+Phantasie III's `PM3.COM` starts at `$0100` and copies `$5F13` bytes to `$7000`. The `INIT1.OVR` and
+`INIT2.OVR` snapshots place each overlay at `$0100` with the same resident copy. Ghidra resolves the
+resident transfer from `$B684` to each overlay entry and decompiles the overlay bodies at `$0103` and
+`$01A5`. Cartridge formats and slot or mapper transition analysis are future loader work.

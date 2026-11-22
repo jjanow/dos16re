@@ -1,4 +1,4 @@
-"""Inspect and analyze DOS, AmigaDOS, Atari ST, Commodore 64, Apple II, and Atari 8-bit programs."""
+"""Inspect and analyze executables from DOS and other retro platforms."""
 
 import argparse
 import json
@@ -15,7 +15,8 @@ from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
-from .image import APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, MOS6502_FORMATS, ImageError
+from .image import APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, ImageError
+from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 from .search import SearchError, find_bytes
@@ -53,6 +54,14 @@ def _unit_path(value: str) -> tuple[Path, int | None]:
     if suffix:
         return Path(path), _hex_address(address)
     return Path(value), None
+
+
+def _msx2_copy(value: str) -> tuple[int, int, int]:
+    span, at, destination = value.partition("@")
+    address, colon, size = span.partition(":")
+    if not at or not colon:
+        raise argparse.ArgumentTypeError("expected hexadecimal SRC:SIZE@DEST")
+    return _hex_address(address), _hex_address(size), _hex_address(destination)
 
 
 def _c64_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
@@ -154,6 +163,68 @@ def _atari8_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     return image, program
 
 
+def _msx2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
+    if args.base_segment is not None or args.overlay:
+        raise Msx2Error("--base-segment and --overlay apply to DOS executables")
+    if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
+            or args.apple2_disk_order or args.atari8_unit or args.atari8_portb is not None):
+        raise Msx2Error("C64, Apple II, and Atari 8-bit options cannot be used with --msx2")
+    disk = bool(args.disk_file) or args.program.suffix.lower() == ".dsk"
+    name = args.program.name
+    entries = args.entry
+    sources = []
+    if disk:
+        if not args.disk_file:
+            raise Msx2Error("select an MSX-DOS disk member with --disk-file NAME[@HEX]")
+        filesystem = MsxDosDisk(data)
+        for index, spec in enumerate(args.disk_file):
+            member, separator, suffix = spec.rpartition("@")
+            if separator:
+                try:
+                    address = _hex_address(suffix)
+                except argparse.ArgumentTypeError as error:
+                    raise Msx2Error(f"invalid MSX-DOS member load address in {spec!r}") from error
+            else:
+                member, address = spec, None
+            if index == 0 and args.base_address is not None:
+                if address is not None:
+                    raise Msx2Error("specify the root member address once with @HEX or --base-address")
+                address = args.base_address
+            com = member.lower().endswith(".com")
+            if address is None:
+                if index != 0 or not com:
+                    raise Msx2Error(f"specify an MSX2 load address for {member!r} with @HEX")
+                address = COM_ADDRESS
+            if index == 0 and com and not entries:
+                entries = [address]
+            sources.append(Msx2Source("root" if index == 0 else member.upper(), name, address,
+                                      filesystem.read_file(member), member.upper()))
+    else:
+        com = args.program.suffix.lower() == ".com"
+        address = args.base_address
+        if address is None:
+            if not com:
+                raise Msx2Error("--base-address is required for raw MSX2 files")
+            address = COM_ADDRESS
+        if com and not entries:
+            entries = [address]
+        sources.append(Msx2Source("root", name, address, data))
+    for path, address in args.msx2_unit:
+        if address is None:
+            raise Msx2Error(f"specify an MSX2 load address for {path.name!r} with @HEX")
+        sources.append(Msx2Source(path.stem, path.name, address, path.read_bytes()))
+    root = sources[0]
+    copies = []
+    for address, size, destination in args.msx2_copy:
+        offset = address - root.address
+        if not 0 <= offset < offset + size <= len(root.data):
+            raise Msx2Error(f"MSX2 copy {address:x}:{size:x} is outside the root file")
+        copies.append(Msx2Source(f"copy_{destination:04x}", root.source, destination, root.data[offset:offset + size],
+                                 root.disk_file, offset))
+    sources[1:1] = copies
+    return build_msx2_image(sources, name, entries, disk=disk)
+
+
 def _export_image(output: Path, image: bytes, program_map: dict) -> None:
     output.mkdir(parents=True, exist_ok=True)
     image_path = output / "image.bin"
@@ -211,15 +282,20 @@ def _call(args: argparse.Namespace) -> None:
             print(f"{address}  {data.hex()}")
 
 
-def _location(record: dict) -> str:
+def _location(record: dict | str) -> str:
+    if isinstance(record, str):
+        return record
     return record["unit_address"] or record["address"]
 
 
 def _print_references(groups: tuple[str, ...], report: dict) -> None:
     remaining = _PREVIEW_LIMIT
+    pages = report.get("pagination", {})
     for group in groups:
         references = report[group]
-        print(f"{len(references)} {group}")
+        page = pages.get(group)
+        count = f"{page['returned']}/{page['total']}" if page else str(len(references))
+        print(f"{count} {group}")
         for reference in references[:remaining]:
             source = _location(reference["from"])
             target = _location(reference["to"])
@@ -227,18 +303,33 @@ def _print_references(groups: tuple[str, ...], report: dict) -> None:
             name = f"  {peer['name']}" if peer else ""
             print(f"  {source} -> {target}  {reference['type']}{name}")
         remaining = max(0, remaining - len(references))
+        if page and page["next_offset"] is not None:
+            direction = f" --direction {group}" if group in ("incoming", "outgoing") else ""
+            print(f"  Continue with --offset {page['next_offset']}{direction}")
     if sum(len(report[group]) for group in groups) > _PREVIEW_LIMIT:
-        print("Use --json for all references.")
+        print("Use --json for the full page." if pages else "Use --json for all references.")
+
+
+def _query_options(args: argparse.Namespace) -> dict:
+    fields = args.fields
+    if fields is not None and not args.json:
+        raise GhidraError("--fields requires --json")
+    options = {"fields": fields.split(",")} if fields is not None else {}
+    for name in ("limit", "offset", "direction", "ref_types", "compact"):
+        value = getattr(args, name, None)
+        if value is not None:
+            options[name] = value
+    return options
 
 
 def _address_query(args: argparse.Namespace) -> None:
-    report = query_address(args.command, args.address, args.project)
+    report = query_address(args.command, args.address, args.project, **_query_options(args))
     if args.json:
         print(json.dumps(report))
         return
     if args.command == "xrefs":
         print(_location(report["address"]))
-        _print_references(("incoming", "outgoing"), report)
+        _print_references(tuple(group for group in ("incoming", "outgoing") if group in report), report)
         return
 
     function = report["function"]
@@ -355,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         base.add_argument(
             "--base-address", type=_hex_address, metavar="HEX",
-            help=f"Amiga/Atari ST base (default {DEFAULT_M68K_BASE:06x}) or C64/Apple II/raw Atari 8-bit load address",
+            help=f"Amiga/Atari ST base (default {DEFAULT_M68K_BASE:06x}) or 8-bit program load address",
         )
         command.add_argument("--json", action="store_true", help="print JSON")
         command.add_argument(
@@ -368,9 +459,10 @@ def main(argv: list[str] | None = None) -> int:
         platform.add_argument("--apple2-raw", action="store_true", help="load raw Apple II bytes at --base-address")
         platform.add_argument("--atari8", action="store_true", help="interpret the input as an Atari 8-bit program")
         platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
+        platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
         command.add_argument(
-            "--disk-file", action="append", default=[], metavar="NAME",
-            help="select a D64 PRG, Apple II binary, or ATR XEX (first is root, repeat for additional files)",
+            "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
+            help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
         )
         command.add_argument(
             "--c64-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
@@ -401,8 +493,16 @@ def main(argv: list[str] | None = None) -> int:
             help=f"effective Atari XL/XE PORTB byte (default {DEFAULT_PORTB:02x})",
         )
         command.add_argument(
+            "--msx2-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
+            help="load an additional MSX2 file at its runtime address",
+        )
+        command.add_argument(
+            "--msx2-copy", type=_msx2_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
+            help="copy a hexadecimal root RAM span to DEST before loading MSX2 overlays",
+        )
+        command.add_argument(
             "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
-            help="seed C64, Apple II, or Atari 8-bit machine-code analysis at this address (repeatable)",
+            help="seed 8-bit machine-code analysis at this address (repeatable)",
         )
 
     ghidra_parser = commands.add_parser("ghidra", help="manage a headless Ghidra import")
@@ -413,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser = commands.add_parser("decomp", help="decompile a function in a Ghidra project")
     decomp_parser.add_argument("address", metavar="ADDR")
     decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    decomp_parser.add_argument("--fields", metavar="FIELD,...", help="select top-level JSON fields")
     gaps_parser = commands.add_parser("gaps", help="report undefined ranges in an analyzed Ghidra project")
     gaps_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     batch_parser = commands.add_parser("batch", help="run multiple address queries in one Ghidra session")
@@ -429,6 +530,15 @@ def main(argv: list[str] | None = None) -> int:
         query_parser.add_argument("address", metavar="ADDR", help="hexadecimal unit:offset, DOS seg:off, or flat address")
         query_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
         query_parser.add_argument("--json", action="store_true", help="print JSON")
+        query_parser.add_argument("--fields", metavar="FIELD,...", help="select top-level JSON fields")
+        query_parser.add_argument("--limit", type=int, metavar="N", help="maximum references per list")
+        query_parser.add_argument("--offset", type=int, metavar="N", help="skip N references per list after filtering")
+        query_parser.add_argument("--ref-type", dest="ref_types", action="append", metavar="TYPE",
+                                  help="filter by exact Ghidra reference type (repeatable)")
+        query_parser.add_argument("--compact", action="store_true", default=None,
+                                  help="return addresses as unit:offset strings where available")
+        if name == "xrefs":
+            query_parser.add_argument("--direction", choices=("incoming", "outgoing", "both"), help="select reference direction")
 
     search_parser = commands.add_parser("where-is", help="find a byte pattern across exported units")
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
@@ -475,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report) if args.json else summary)
             return 0
         if args.command == "decomp":
-            report = decompile(args.address, args.project)
+            report = decompile(args.address, args.project, **_query_options(args))
             print(json.dumps(report) if args.json else report["decompilation"].strip())
             return 0
         if args.command == "gaps":
@@ -511,7 +621,11 @@ def main(argv: list[str] | None = None) -> int:
             and (extension in (".atr", ".xex") or
                  extension not in (".d64", ".prg") and data.startswith((ATR_MAGIC, XEX_MAGIC)))
         )
-        if atari8:
+        if args.msx2:
+            image, program_map = _msx2_image(args, data)
+        elif args.msx2_unit or args.msx2_copy:
+            raise Msx2Error("--msx2-unit and --msx2-copy require --msx2")
+        elif atari8:
             image, program_map = _atari8_image(args, data)
         elif args.atari8_unit or args.atari8_portb is not None:
             raise Atari8Error("--atari8-unit and --atari8-portb require an Atari 8-bit program")
@@ -524,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             image, program_map = _c64_image(args, data)
         elif args.c64_unit or args.c64_bank is not None or args.entry:
-            raise C64Error("--c64-unit and --c64-bank require C64, while --entry accepts C64, Apple II, or Atari 8-bit")
+            raise C64Error("--c64-unit and --c64-bank require C64, while --entry accepts 8-bit programs")
         elif m68k:
             if args.base_segment is not None or args.overlay:
                 raise MZError("--base-segment and --overlay apply to DOS executables")
@@ -533,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = loader(data, args.program.name, base_address)
         else:
             if args.base_address is not None:
-                raise MZError("--base-address applies to Amiga, Atari ST, C64, Apple II, and raw Atari 8-bit programs")
+                raise MZError("--base-address applies to Amiga, Atari ST, and 8-bit programs")
             executable = MZExecutable.parse(data)
             base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
             loaded = executable.load(base_segment)
@@ -544,8 +658,8 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (Apple2Error, Atari8Error, C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError,
-            TraceError, OSError) as error:
+    except (Apple2Error, Atari8Error, C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
+            Msx2Error, PrgError, SearchError, TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
@@ -562,12 +676,14 @@ def main(argv: list[str] | None = None) -> int:
     elif program_map["format"] == "PRG":
         print(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
         print("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
-    elif program_map["format"] in MOS6502_FORMATS:
+    elif program_map["format"] in FLAT16_FORMATS:
         entries = program_map["entries"]
         if program_map["format"] == APPLE2_FORMAT:
             platform = f"Apple II  LC {program_map['language_card']:04x}"
         elif program_map["format"] == ATARI8_FORMAT:
             platform = f"Atari 8-bit  PORTB {program_map['portb']:02x}"
+        elif program_map["format"] == MSX2_FORMAT:
+            platform = "MSX2  MSX-DOS RAM"
         else:
             platform = f"C64 PRG  bank {program_map['bank']}"
         print(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")

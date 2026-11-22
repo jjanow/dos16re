@@ -204,6 +204,29 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, mo
     ]
     assert function["callers"] == callers["callers"]
 
+    narrow = [
+        {"command": "callees", "address": "root:0", "compact": True, "limit": 1, "fields": ["callees"]},
+        {"command": "callees", "address": "root:0", "compact": True, "limit": 1, "offset": 1},
+        {"command": "callees", "address": "root:0", "limit": 1, "offset": 20},
+        {"command": "xrefs", "address": "root:5", "direction": "outgoing", "ref_types": ["READ"], "limit": 1},
+        {"command": "decomp", "address": "root:10", "fields": ["unit_address", "name"]},
+    ]
+    pages = [row["result"] for row in ghidra.query_batch(project, narrow)["results"]]
+    assert set(pages[0]) == {"callees", "pagination"}
+    assert pages[0]["callees"][0]["to"] == "root:0010"
+    assert pages[0]["pagination"]["callees"] == {"offset": 0, "total": 2, "returned": 1, "next_offset": 1}
+    assert pages[1]["callees"][0]["to"] == "root:001c"
+    assert pages[1]["pagination"]["callees"]["next_offset"] is None
+    assert pages[2]["callees"] == []
+    assert pages[2]["pagination"]["callees"] == {"offset": 20, "total": 2, "returned": 0, "next_offset": None}
+    assert "incoming" not in pages[3]
+    assert pages[3]["outgoing"] == []
+    assert pages[3]["pagination"]["outgoing"]["total"] == 0
+    assert pages[4] == {key: result[key] for key in ("unit_address", "name")}
+    assert main(["callees", "root:0", "--project", str(project), "--limit", "1", "--compact",
+                 "--fields", "callees", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == pages[0]
+
     assert main(["func", "root:e", "--project", str(project), "--json"]) == 1
     assert "no analyzed function" in json.loads(capsys.readouterr().err)["error"]
 

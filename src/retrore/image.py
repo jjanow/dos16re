@@ -12,9 +12,11 @@ M68K_FORMATS = ("HUNK", "PRG")
 C64_FORMAT = "C64_PRG"
 APPLE2_FORMAT = "APPLE2"
 ATARI8_FORMAT = "ATARI8"
+MSX2_FORMAT = "MSX2"
 MOS6502_FORMATS = (C64_FORMAT, APPLE2_FORMAT, ATARI8_FORMAT)
-MOS6502_ADDRESS_LIMIT = 0x10000
-_FLAT_LIMITS = dict.fromkeys(M68K_FORMATS, M68K_ADDRESS_LIMIT) | dict.fromkeys(MOS6502_FORMATS, MOS6502_ADDRESS_LIMIT)
+FLAT16_FORMATS = (*MOS6502_FORMATS, MSX2_FORMAT)
+FLAT16_ADDRESS_LIMIT = MOS6502_ADDRESS_LIMIT = 0x10000
+_FLAT_LIMITS = dict.fromkeys(M68K_FORMATS, M68K_ADDRESS_LIMIT) | dict.fromkeys(FLAT16_FORMATS, FLAT16_ADDRESS_LIMIT)
 
 
 class ImageError(ValueError):
@@ -60,7 +62,7 @@ def read_units(export: Path, image_size: int) -> list[ImageUnit]:
 def image_units(program: dict, image_size: int) -> list[ImageUnit]:
     image_format = program.get("format", "MZ")
     flat = image_format in _FLAT_LIMITS
-    address_width = 4 if image_format in MOS6502_FORMATS else 8
+    address_width = 4 if image_format in FLAT16_FORMATS else 8
     try:
         units = program["units"]
         origin = units[0]["linear"]

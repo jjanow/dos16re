@@ -1,4 +1,4 @@
-// Restore the selected 6502 CPU memory view and seed analysis.
+// Restore the selected 8-bit CPU memory view and seed analysis.
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -12,7 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
-public class Retrore6502Import extends HeadlessScript {
+public class Retrore8BitImport extends HeadlessScript {
     @Override
     public void run() throws Exception {
         setHeadlessContinuationOption(HeadlessContinuationOption.ABORT_AND_DELETE);
@@ -43,7 +43,8 @@ public class Retrore6502Import extends HeadlessScript {
             case "C64_PRG" -> "c64_";
             case "APPLE2" -> "apple2_";
             case "ATARI8" -> "atari8_";
-            default -> throw new IllegalArgumentException("Unsupported 6502 image format " + format);
+            case "MSX2" -> "msx2_";
+            default -> throw new IllegalArgumentException("Unsupported 8-bit image format " + format);
         };
         for (var element : units) {
             monitor.checkCancelled();
@@ -75,13 +76,21 @@ public class Retrore6502Import extends HeadlessScript {
             }
         }
 
-        String bankKey = switch (format) {
+        String viewKey = switch (format) {
             case "C64_PRG" -> "bank";
             case "APPLE2" -> "language_card";
+            case "MSX2" -> "memory_view";
             default -> "portb";
         };
-        int bank = map.get(bankKey).getAsInt();
-        addPlatformLabels(format, bank);
+        Object view;
+        if (format.equals("MSX2")) {
+            addMsx2Labels();
+            view = map.get(viewKey).getAsString();
+        } else {
+            int bank = map.get(viewKey).getAsInt();
+            addPlatformLabels(format, bank);
+            view = bank;
+        }
         var symbols = currentProgram.getSymbolTable();
         var entries = map.getAsJsonArray("entries");
         for (var element : entries) {
@@ -95,7 +104,20 @@ public class Retrore6502Import extends HeadlessScript {
             createFunction(entry, null);
         }
         return Map.of("program", currentProgram.getName(), "format", format,
-            "units", units.size(), "entries", entries.size(), bankKey, bank);
+            "units", units.size(), "entries", entries.size(), viewKey, view);
+    }
+
+    private void addMsx2Labels() throws Exception {
+        var symbols = currentProgram.getSymbolTable();
+        symbols.createLabel(address(0x0005), "BDOS", SourceType.IMPORTED);
+        var io = currentProgram.getAddressFactory().getAddressSpace("io");
+        var block = currentProgram.getMemory().createUninitializedBlock("msx2_ports", io.getAddress(0), 0x100, false);
+        block.setVolatile(true);
+        var ports = Map.of(0x98, "VDP_DATA", 0x99, "VDP_CONTROL", 0xa8, "PRIMARY_SLOT",
+            0xfc, "MAPPER_PAGE_0", 0xfd, "MAPPER_PAGE_1", 0xfe, "MAPPER_PAGE_2", 0xff, "MAPPER_PAGE_3");
+        for (var port : ports.entrySet()) {
+            symbols.createLabel(io.getAddress(port.getKey()), port.getValue(), SourceType.IMPORTED);
+        }
     }
 
     private void addPlatformLabels(String format, int bank) throws Exception {

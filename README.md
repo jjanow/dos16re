@@ -1,7 +1,7 @@
 # retrore
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
-Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, and Atari 8-bit executables.
+Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, and MSX2 programs.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -204,6 +204,34 @@ without executing boot or init routines. Queries use flat hexadecimal addresses 
 `where-is --string` searches literal ASCII bytes. For other ATASCII values, use `--bytes`.
 [Atari800 binary loader implementation](https://github.com/atari800/atari800/blob/master/src/binload.c)
 
+## MSX2 loader
+
+Pass `--msx2` to `info` or `load` to select MSX2. A standalone `.COM` or the first `.COM` member
+of a disk loads and starts at `$0100` by default. Raw files use `--base-address HEX`, and raw FAT12
+floppies use `--disk-file NAME[@HEX]` to select a case-insensitive root-directory member. The disk
+reader handles fragmented files on images with a FAT12 BIOS parameter block and 512-byte sectors.
+[MSX Technical Data Book, disk driver chapter](https://sysadminmosaic.ru/_media/msx/msx_technical_data_book/msx_technical_data_book_text.pdf)
+
+```sh
+.venv/bin/retrore info PROGRAM.COM --msx2 --json
+.venv/bin/retrore load DISK.dsk --msx2 --disk-file MAIN.COM --disk-file HELPER.OVR@8000 \
+  --entry 0100 --entry 8000 -o out/msx2
+.venv/bin/retrore ghidra import out/msx2 out/msx2-project
+.venv/bin/retrore decomp HELPER.OVR:0000 --project out/msx2-project --json
+```
+
+Each export represents the four RAM pages visible to an MSX-DOS program. Use explicit addresses for
+additional disk members and for standalone overlays supplied with `--msx2-unit FILE@HEX`. Use
+`--msx2-copy SRC:SIZE@DEST` for a resident copy made from the original root file at runtime. All three
+numbers are hexadecimal. The root loads first, then the resident copies, then the additional disk
+members and standalone units. Later loads replace bytes at overlapping addresses, and the map keeps
+source file offsets for the surviving ranges. Export each alternative overlay in a separate snapshot.
+
+Repeat `--entry HEX` for the routines that should seed Z80 analysis, including any relocated or raw
+entry points. Queries accept flat hexadecimal addresses or `unit:offset`. Ghidra labels `BDOS` and
+selected I/O ports. The exported view uses caller-supplied memory placement and covers MSX-DOS RAM.
+[Ghidra Z80 language definition](https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/Z80/data/languages/z80.ldefs)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -276,6 +304,25 @@ Text output previews up to ten references or matches. Use `--json` for the full 
 `unit:offset` and linear addresses where available. Ghidra queries also report the address as
 displayed by the analyzed project.
 
+### Limit Ghidra address query results
+
+On `xrefs`, `callers`, `callees`, and `func`, use `--limit N` and `--offset N` to page each reference
+list. The offsets start at zero and apply after filtering. `--ref-type TYPE` accepts an exact Ghidra
+reference type such as `READ` or `UNCONDITIONAL_CALL`, ignoring case. Repeat it to keep any of the
+specified types. `xrefs` accepts `--direction incoming` or `--direction outgoing` to select one list.
+
+```sh
+.venv/bin/retrore xrefs OV1:20bb --project out/phantasie-project --json \
+  --direction incoming --ref-type UNCONDITIONAL_CALL --limit 10 --compact --fields incoming
+```
+
+When paging, `pagination` reports `offset`, `total`, `returned`, and `next_offset` for each reference
+list included. Use the same filters and pass `next_offset` as `--offset` to get the next page. A
+`null` offset means you reached the end of that list. `--compact` returns each address record as a
+`unit:offset` string when available, or its Ghidra display address. `--fields FIELD,...` selects
+top-level result fields in JSON, including for `decomp`. Paging metadata accompanies any selected
+reference lists. Request only metadata fields from `decomp` to skip decompiling the body.
+
 ### Batch Ghidra queries
 
 `batch` runs `decomp`, `xrefs`, `callers`, `callees`, and `func` against one project in a single
@@ -287,13 +334,15 @@ from every supported platform and accepts the same addresses as the individual c
 [
   {"command": "decomp", "address": "OV1:20bb"},
   {"command": "callers", "address": "OV1:20bb"},
-  {"command": "xrefs", "address": "OV1:20a5"}
+  {"command": "xrefs", "address": "OV1:20a5", "direction": "outgoing", "limit": 10, "compact": true}
 ]
 EOF
 ```
 
 Pass a UTF-8 JSON file as the positional argument or pipe the array on stdin. Each request contains
-a `command` and an `address`. The JSON response contains a `results` array in request order. Each
+a `command` and an `address`. Optional fields match the individual commands. Use the arrays `fields`
+and `ref_types`, the integers `limit` and `offset`, the boolean `compact`, and the string `direction`
+where supported. The JSON response contains a `results` array in request order. Each
 row echoes those two fields and includes either `result`, with the individual command's JSON, or
 `error`. The CLI writes the whole batch report to stdout and exits with status 1 if any query fails.
 An invalid request array or a headless launch failure uses the command's error stream.
@@ -377,8 +426,9 @@ the extracted Amiga directories containing `game` and `PhantasieIII` respectivel
 `phantasie1-4am-side-a-boot.dsk` and `RETRORE_PH3_APPLE2_DIR` to the directory containing
 `Phantasie_III_1987_SSI_cr_Disk_1_of_3_Side_A.dsk`. Point `RETRORE_PH1_ATARI8_DIR` and
 `RETRORE_PH2_ATARI8_DIR` to directories containing `phantasie1-side-{a,b}.atr` and
-`phantasie2-side-{a,b}.atr` respectively. The Ghidra tests use `GHIDRA_HOME` and include synthetic
-DOS, Amiga, Atari ST, C64, Apple II, and Atari 8-bit programs. Tests skip when their input variables are unset.
+`phantasie2-side-{a,b}.atr` respectively. Set `RETRORE_PH3_MSX2_DIR` to the directory containing
+the Phantasie III MSX2 Scenario Disk `.dsk` image. The Ghidra tests use `GHIDRA_HOME` and include
+synthetic programs for all supported platforms. Tests skip when their input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
 runs the synthetic suites with Ghidra 12.2 and JDK 25. [Release workflow](.github/workflows/release-ci.yml)
 
