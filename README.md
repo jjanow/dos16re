@@ -1,7 +1,7 @@
 # retrore
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
-Atari ST GEMDOS executables, Commodore 64 PRGs, and Apple II binaries.
+Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, and Atari 8-bit executables.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -166,6 +166,44 @@ Use repeatable `--entry HEX` to seed 6502 code analysis at known entry points. Q
 hexadecimal address or `unit:offset`. `where-is --string` matches literal ASCII bytes. Use `--bytes`
 for high-bit Apple II text.
 
+## Atari 8-bit loader
+
+`info` and `load` recognize Atari DOS segmented binaries (XEX, including `.COM` files with an XEX
+header) and ATR disk images. With an ATR, use `--disk-file NAME.EXT` to select a case-insensitive
+Atari DOS 2.x member. Without a member, the loader exports the initial sectors named by the OS disk
+boot header and seeds analysis at the load address plus six. ATR supports 128-byte sectors and
+256-byte data sectors with three 128-byte boot sectors.
+[Atari 400/800 Operating System Manual, section 10](https://www.atarimania.com/documents/atari-800-technical-reference-notes.pdf)
+[Atari800 disk image implementation](https://github.com/atari800/atari800/blob/master/src/sio.c)
+
+```sh
+.venv/bin/retrore info PROGRAM.xex --json
+.venv/bin/retrore load DISK.atr --disk-file MAIN.COM -o out/atari8
+.venv/bin/retrore ghidra import out/atari8 out/atari8-project
+.venv/bin/retrore decomp 2000 --project out/atari8-project --json
+```
+
+Use `--atari8-raw --base-address HEX` for standalone raw bytes. To build a snapshot of co-resident or
+overlaid files, repeat `--disk-file` or add `--atari8-unit FILE` for another XEX and
+`--atari8-unit FILE@HEX` for raw bytes. Segments apply in file order, then additional files apply in
+the order specified. Later writes replace earlier bytes. Export alternative overlays separately
+to analyze each one. The map retains original segment locations and file offsets and groups adjacent
+bytes from the same source for analysis.
+
+`--atari8-portb HEX` selects a static 130XE CPU view. The default `ff` leaves OS ROM visible, exposes
+RAM at `$A000`–`$BFFF`, and selects base RAM at `$4000`–`$7FFF`. The map records ROM, I/O, and
+banked RAM regions. XEX load records that address ROM or I/O appear under `unmapped_writes`.
+Each export captures one CPU view, including when software writes to PORTB during loading or execution.
+[Altirra Hardware Reference Manual](https://www.atari800xl.eu/docs/reference/altirra-hardware-reference-manual.pdf)
+
+Ghidra uses 6502 analysis and labels selected OS vectors and hardware registers. For XEX files,
+the loader looks for RUNAD and INITAD vectors in the load records, with the first segment as the
+default RUNAD. It seeds entries that are present in the snapshot and have not been replaced by a later
+file. Use repeatable `--entry HEX` to supply the seed list explicitly. The loader applies file bytes
+without executing boot or init routines. Queries use flat hexadecimal addresses or `unit:offset`.
+`where-is --string` searches literal ASCII bytes. For other ATASCII values, use `--bytes`.
+[Atari800 binary loader implementation](https://github.com/atari800/atari800/blob/master/src/binload.c)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -315,8 +353,10 @@ the extracted Amiga directories containing `game` and `PhantasieIII` respectivel
 `UTILIT2.PRG`. Set `RETRORE_PH1_C64_DIR` to the directory containing
 `Phantasie_I_1986_SSI_Side_A.d64`. Set `RETRORE_PH1_APPLE2_DIR` to the directory containing
 `phantasie1-4am-side-a-boot.dsk` and `RETRORE_PH3_APPLE2_DIR` to the directory containing
-`Phantasie_III_1987_SSI_cr_Disk_1_of_3_Side_A.dsk`. The Ghidra tests use `GHIDRA_HOME` and include
-synthetic DOS, Amiga, Atari ST, C64, and Apple II programs. Tests skip when their input variables are unset.
+`Phantasie_III_1987_SSI_cr_Disk_1_of_3_Side_A.dsk`. Point `RETRORE_PH1_ATARI8_DIR` and
+`RETRORE_PH2_ATARI8_DIR` to directories containing `phantasie1-side-{a,b}.atr` and
+`phantasie2-side-{a,b}.atr` respectively. The Ghidra tests use `GHIDRA_HOME` and include synthetic
+DOS, Amiga, Atari ST, C64, Apple II, and Atari 8-bit programs. Tests skip when their input variables are unset.
 See the roadmap for upcoming work.
 [PLAN.md](PLAN.md)
 

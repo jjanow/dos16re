@@ -352,3 +352,56 @@ def test_ghidra_analyzes_phantasie3_apple2(phantasie3_apple2_disk, tmp_path, cap
     speaker, = query("xrefs", "0302")["outgoing"]
     assert (speaker["type"], speaker["to"]["linear"]) == ("READ", 0xC030)
     assert "FUN_1828(" in query("decomp", "root:001e")["decompilation"]
+
+
+@pytest.mark.parametrize(("release", "autorun", "segments"), [(1, 0x349F, 121), (2, 0x32DA, 124)])
+def test_phantasie_atari8_dos_loads_and_alternate_helpers(release, autorun, segments, tmp_path, capsys):
+    files = _game_files(f"RETRORE_PH{release}_ATARI8_DIR")
+    boot = str(files[f"PHANTASIE{release}-SIDE-A.ATR"])
+    helpers = str(files[f"PHANTASIE{release}-SIDE-B.ATR"])
+
+    def info(*options):
+        assert main(["info", boot, *options, "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)
+
+    program = info()
+    assert program["disk"] == {"sector_size": 128, "sector_count": 720}
+    assert program["entry"]["linear"] == 0x0706
+    program = info("--disk-file", "AUTORUN.SYS")
+    assert program["entry"]["linear"] == autorun
+    assert program["sources"][0]["unmapped_writes"][0]["linear"] == 0xD301
+    program = info("--disk-file", "DNG.COM")
+    assert program["entry"]["linear"] == 0xA7BD
+    assert len(program["sources"][0]["segments"]) == segments
+
+    loads = []
+    for member in ("CAST.COM", "LOOK.COM"):
+        out = tmp_path / member
+        assert main(["load", helpers, "--disk-file", member, "-o", str(out), "--json"]) == 0
+        program = json.loads(capsys.readouterr().out)
+        assert program["entry"]["linear"] == 0xA7C0
+        loads.append((out / "image.bin").read_bytes())
+    assert loads[0] != loads[1]
+
+
+def test_ghidra_analyzes_phantasie_atari8(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    disk = _game_files("RETRORE_PH1_ATARI8_DIR")["PHANTASIE1-SIDE-A.ATR"]
+    output = tmp_path / "out"
+    project = tmp_path / "phantasie-atari8"
+    assert main(["load", str(disk), "--disk-file", "DNG.COM", "-o", str(output)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["entries"] == 1
+
+    def query(command, address):
+        assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)
+
+    call, = query("xrefs", "a7f4")["outgoing"]
+    assert (call["type"], call["to"]["linear"]) == ("UNCONDITIONAL_CALL", 0x4702)
+    write, = query("xrefs", "a892")["outgoing"]
+    assert (write["type"], write["to"]["unit_address"]) == ("WRITE", "atari8_antic:000e")
+    decompiled = query("decomp", "root_a7b4:0009")["decompilation"]
+    assert "FUN_4702(" in decompiled and "NMIEN" in decompiled

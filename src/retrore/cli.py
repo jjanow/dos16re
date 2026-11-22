@@ -1,4 +1,4 @@
-"""Inspect and analyze DOS, AmigaDOS, Atari ST, Commodore 64, and Apple II programs."""
+"""Inspect and analyze DOS, AmigaDOS, Atari ST, Commodore 64, Apple II, and Atari 8-bit programs."""
 
 import argparse
 import json
@@ -8,11 +8,14 @@ from pathlib import Path
 
 from .amiga import HUNK_MAGIC, HunkError, build_hunk_image
 from .apple2 import DEFAULT_LC, DISK_SUFFIXES, Apple2Error, Apple2Unit, Binary, SectorImage, build_apple2_image
+from .atari8 import (
+    ATR_MAGIC, DEFAULT_PORTB, XEX_MAGIC, Atari8Binary, Atari8Error, Atari8Source, AtrImage, Segment, build_atari8_image,
+)
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
-from .image import APPLE2_FORMAT, DEFAULT_M68K_BASE, MOS6502_FORMATS, ImageError
+from .image import APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, MOS6502_FORMATS, ImageError
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 from .search import SearchError, find_bytes
@@ -108,6 +111,46 @@ def _apple2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     image, program = build_apple2_image(units, source, lc=lc, entries=args.entry)
     if disk is not None:
         program["disk"] = {"filesystem": disk.filesystem, "sector_order": disk.order}
+    return image, program
+
+
+def _atari8_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
+    if args.base_segment is not None or args.overlay:
+        raise Atari8Error("--base-segment and --overlay apply to DOS executables")
+    if args.c64_unit or args.c64_bank is not None:
+        raise Atari8Error("C64 options require a Commodore 64 program")
+    if args.apple2_unit or args.apple2_lc is not None or args.apple2_disk_order:
+        raise Atari8Error("Apple II options require an Apple II program")
+    source = args.program.name
+    is_disk = args.program.suffix.lower() == ".atr" or data.startswith(ATR_MAGIC)
+    disk = None
+    if args.atari8_raw:
+        if args.disk_file or args.base_address is None:
+            raise Atari8Error("--atari8-raw needs --base-address and accepts a standalone file")
+        sources = [Atari8Source("root", source, Atari8Binary((Segment(args.base_address, data),), "raw"))]
+    elif args.base_address is not None:
+        raise Atari8Error("--base-address requires --atari8-raw for Atari 8-bit programs")
+    elif is_disk or args.disk_file:
+        disk = AtrImage(data)
+        if args.disk_file:
+            sources = [
+                Atari8Source("root" if index == 0 else name.upper(), source,
+                             Atari8Binary.from_xex(disk.read_file(name), name), name.upper())
+                for index, name in enumerate(args.disk_file)
+            ]
+        else:
+            sources = [Atari8Source("root", source, disk.boot_binary())]
+    else:
+        sources = [Atari8Source("root", source, Atari8Binary.from_xex(data, source))]
+    for path, address in args.atari8_unit:
+        contents = path.read_bytes()
+        binary = (Atari8Binary.from_xex(contents, path.name) if address is None
+                  else Atari8Binary((Segment(address, contents),), "raw"))
+        sources.append(Atari8Source(path.stem, path.name, binary))
+    portb = DEFAULT_PORTB if args.atari8_portb is None else args.atari8_portb
+    image, program = build_atari8_image(sources, source, portb=portb, entries=args.entry)
+    if disk is not None:
+        program["disk"] = {"sector_size": disk.sector_size, "sector_count": disk.sector_count}
     return image, program
 
 
@@ -293,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         base.add_argument(
             "--base-address", type=_hex_address, metavar="HEX",
-            help=f"Amiga/Atari ST load address (default {DEFAULT_M68K_BASE:06x}) or C64/Apple II root load address",
+            help=f"Amiga/Atari ST base (default {DEFAULT_M68K_BASE:06x}) or C64/Apple II/raw Atari 8-bit load address",
         )
         command.add_argument("--json", action="store_true", help="print JSON")
         command.add_argument(
@@ -304,9 +347,11 @@ def main(argv: list[str] | None = None) -> int:
         platform.add_argument("--c64", action="store_true", help="interpret the input as a Commodore 64 program")
         platform.add_argument("--apple2", action="store_true", help="interpret the input as an Apple II program")
         platform.add_argument("--apple2-raw", action="store_true", help="load raw Apple II bytes at --base-address")
+        platform.add_argument("--atari8", action="store_true", help="interpret the input as an Atari 8-bit program")
+        platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
         command.add_argument(
             "--disk-file", action="append", default=[], metavar="NAME",
-            help="select a D64 PRG or Apple II binary (first is root, repeat for co-resident files)",
+            help="select a D64 PRG, Apple II binary, or ATR XEX (first is root, repeat for additional files)",
         )
         command.add_argument(
             "--c64-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
@@ -329,8 +374,16 @@ def main(argv: list[str] | None = None) -> int:
             help=f"effective Apple II Language Card switch (c080–c08f, default {DEFAULT_LC:04x})",
         )
         command.add_argument(
+            "--atari8-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
+            help="load an additional Atari XEX or raw file at @HEX",
+        )
+        command.add_argument(
+            "--atari8-portb", type=_hex_address, metavar="HEX",
+            help=f"effective Atari XL/XE PORTB byte (default {DEFAULT_PORTB:02x})",
+        )
+        command.add_argument(
             "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
-            help="seed C64 or Apple II machine-code analysis at this address (repeatable)",
+            help="seed C64, Apple II, or Atari 8-bit machine-code analysis at this address (repeatable)",
         )
 
     ghidra_parser = commands.add_parser("ghidra", help="manage a headless Ghidra import")
@@ -429,7 +482,16 @@ def main(argv: list[str] | None = None) -> int:
         hunk = data.startswith(HUNK_MAGIC)
         m68k = hunk or data.startswith(PRG_MAGIC)
         extension = args.program.suffix.lower()
-        if args.apple2 or args.apple2_raw or args.apple2_disk_order or (not args.c64 and extension in DISK_SUFFIXES):
+        atari8 = args.atari8 or args.atari8_raw or (
+            not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or extension in DISK_SUFFIXES)
+            and (extension in (".atr", ".xex") or
+                 extension not in (".d64", ".prg") and data.startswith((ATR_MAGIC, XEX_MAGIC)))
+        )
+        if atari8:
+            image, program_map = _atari8_image(args, data)
+        elif args.atari8_unit or args.atari8_portb is not None:
+            raise Atari8Error("--atari8-unit and --atari8-portb require an Atari 8-bit program")
+        elif args.apple2 or args.apple2_raw or args.apple2_disk_order or (not args.c64 and extension in DISK_SUFFIXES):
             image, program_map = _apple2_image(args, data)
         elif args.apple2_unit or args.apple2_lc is not None:
             raise Apple2Error("--apple2-unit and --apple2-lc require an Apple II program")
@@ -438,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             image, program_map = _c64_image(args, data)
         elif args.c64_unit or args.c64_bank is not None or args.entry:
-            raise C64Error("--c64-unit and --c64-bank require C64, while --entry accepts C64 or Apple II")
+            raise C64Error("--c64-unit and --c64-bank require C64, while --entry accepts C64, Apple II, or Atari 8-bit")
         elif m68k:
             if args.base_segment is not None or args.overlay:
                 raise MZError("--base-segment and --overlay apply to DOS executables")
@@ -447,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = loader(data, args.program.name, base_address)
         else:
             if args.base_address is not None:
-                raise MZError("--base-address applies to Amiga, Atari ST, Commodore 64, and Apple II programs")
+                raise MZError("--base-address applies to Amiga, Atari ST, C64, Apple II, and raw Atari 8-bit programs")
             executable = MZExecutable.parse(data)
             base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
             loaded = executable.load(base_segment)
@@ -458,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (Apple2Error, C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError,
+    except (Apple2Error, Atari8Error, C64Error, EmulatorError, GhidraError, HunkError, ImageError, MZError, PrgError, SearchError,
             TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
@@ -478,8 +540,12 @@ def main(argv: list[str] | None = None) -> int:
         print("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
     elif program_map["format"] in MOS6502_FORMATS:
         entries = program_map["entries"]
-        platform = (f"Apple II  LC {program_map['language_card']:04x}" if program_map["format"] == APPLE2_FORMAT
-                    else f"C64 PRG  bank {program_map['bank']}")
+        if program_map["format"] == APPLE2_FORMAT:
+            platform = f"Apple II  LC {program_map['language_card']:04x}"
+        elif program_map["format"] == ATARI8_FORMAT:
+            platform = f"Atari 8-bit  PORTB {program_map['portb']:02x}"
+        else:
+            platform = f"C64 PRG  bank {program_map['bank']}"
         print(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")
         if entries:
             addresses = ", ".join(f"{entry['linear']:04x}" for entry in entries[:_PREVIEW_LIMIT])

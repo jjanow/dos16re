@@ -1,8 +1,8 @@
 # retrore plan
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
-packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, and Apple II
-binaries. It handles formats and compiler patterns shared across 1980s and early 1990s games and uses those games to
+packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
+binaries, and Atari 8-bit executables. It handles formats and compiler patterns shared across 1980s and early 1990s games and uses those games to
 validate support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
 
 ## Why
@@ -163,11 +163,13 @@ across separated overlay units.
 | Phantasie II (Atari ST v1.0) | GEMDOS PRG, resident TEXT/DATA/BSS | Longword fixups, DRI symbols, startup decompilation and references |
 | Phantasie I (Commodore 64) | D64 disk, PRGs with 16-bit load addresses | Co-resident helpers, RAM under BASIC ROM, alternative program loads, 6510 code and VIC references |
 | Phantasie I and III (Apple II) | RDOS 2.1 and 3.3 sector disks | Native binary load addresses, alternative helper loads, 6502 calls and soft-switch references |
+| Phantasie I and II (Atari 8-bit) | Atari DOS boot disks and segmented executables in ATR images | Boot and RUNAD entry points, alternative helper loads, 6502 calls and ANTIC references |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
 tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. The opt-in Apple II tests use
-`RETRORE_PH1_APPLE2_DIR` and `RETRORE_PH3_APPLE2_DIR`. Headless tests also use `GHIDRA_HOME`.
+`RETRORE_PH1_APPLE2_DIR` and `RETRORE_PH3_APPLE2_DIR`. The opt-in Atari 8-bit tests use
+`RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 ## Setup
@@ -179,8 +181,8 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga, Atari ST, Commodore 64, and Apple II milestones are complete for the validated releases.
-Atari 8-bit is next.
+The Commodore Amiga, Atari ST, Commodore 64, Apple II, and Atari 8-bit milestones are complete for the
+validated releases. MSX2 is next.
 
 ## Post-DOS stretch goals
 
@@ -258,3 +260,17 @@ Phantasie I's RDOS 2.1 boot disk supplied `INFO` at `$0302` and `SHAPES` at `$45
 disk supplied `INFO` with two alternative text helpers, `IMPTEXT` and `IMPREVERSE`, both at `$1828`.
 Ghidra decompiled the routine at `$0320` with the cross-unit call from `$0328` to `IMPTEXT` and resolved
 the speaker soft-switch read at `$C030` from `$0302`.
+
+### Atari 8-bit
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` read standalone XEX files and
+Atari DOS 2.x members from ATR disks, or export the initial sectors specified by the OS boot header.
+Segments and explicit additional files apply in load order. Each export captures one XL/XE PORTB
+state for OS ROM, BASIC ROM, Self-Test, and the 130XE extended RAM window. The shared 6502 importer
+uses the recovered boot or XEX entry points to seed analysis.
+
+The SSI Phantasie I and II disks boot at `$0706`. Their `AUTORUN.SYS` files contain a write to
+`PORTB` and have RUNAD entries at `$349F` and `$32DA` respectively. Both `DNG.COM` files run at
+`$A7BD`. Ghidra decompiled that entry in Phantasie I, resolving the call from `$A7F4` to the block
+containing `$4702` and a write from `$A892` to the ANTIC register `NMIEN` at `$D40E`.
+`CAST.COM` and `LOOK.COM` supply two alternative overlays at `$A7C0` in both releases.

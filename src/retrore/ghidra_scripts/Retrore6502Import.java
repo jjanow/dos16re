@@ -39,8 +39,12 @@ public class Retrore6502Import extends HeadlessScript {
         var initialized = new AddressSet();
         var units = map.getAsJsonArray("units");
         String format = map.get("format").getAsString();
-        boolean c64 = format.equals("C64_PRG");
-        String prefix = c64 ? "c64_" : "apple2_";
+        String prefix = switch (format) {
+            case "C64_PRG" -> "c64_";
+            case "APPLE2" -> "apple2_";
+            case "ATARI8" -> "atari8_";
+            default -> throw new IllegalArgumentException("Unsupported 6502 image format " + format);
+        };
         for (var element : units) {
             monitor.checkCancelled();
             var unit = element.getAsJsonObject();
@@ -71,15 +75,14 @@ public class Retrore6502Import extends HeadlessScript {
             }
         }
 
+        String bankKey = switch (format) {
+            case "C64_PRG" -> "bank";
+            case "APPLE2" -> "language_card";
+            default -> "portb";
+        };
+        int bank = map.get(bankKey).getAsInt();
+        addPlatformLabels(format, bank);
         var symbols = currentProgram.getSymbolTable();
-        if (c64) {
-            symbols.createLabel(address(0), "CPU_PORT_DDR", SourceType.IMPORTED);
-            symbols.createLabel(address(1), "CPU_PORT_DATA", SourceType.IMPORTED);
-        } else {
-            symbols.createLabel(address(0xc000), "KBD", SourceType.IMPORTED);
-            symbols.createLabel(address(0xc010), "KBDSTRB", SourceType.IMPORTED);
-            symbols.createLabel(address(0xc030), "SPKR", SourceType.IMPORTED);
-        }
         var entries = map.getAsJsonArray("entries");
         for (var element : entries) {
             monitor.checkCancelled();
@@ -91,9 +94,25 @@ public class Retrore6502Import extends HeadlessScript {
             disassemble(entry);
             createFunction(entry, null);
         }
-        String bankKey = c64 ? "bank" : "language_card";
         return Map.of("program", currentProgram.getName(), "format", format,
-            "units", units.size(), "entries", entries.size(), bankKey, map.get(bankKey).getAsInt());
+            "units", units.size(), "entries", entries.size(), bankKey, bank);
+    }
+
+    private void addPlatformLabels(String format, int bank) throws Exception {
+        var labels = switch (format) {
+            case "C64_PRG" -> Map.of(0, "CPU_PORT_DDR", 1, "CPU_PORT_DATA");
+            case "APPLE2" -> Map.of(0xc000, "KBD", 0xc010, "KBDSTRB", 0xc030, "SPKR");
+            default -> Map.of(0x02e0, "RUNAD", 0x02e2, "INITAD", 0xd01a, "COLBK",
+                0xd301, "PORTB", 0xd400, "DMACTL", 0xd40a, "WSYNC", 0xd40e, "NMIEN");
+        };
+        var symbols = currentProgram.getSymbolTable();
+        for (var label : labels.entrySet()) {
+            symbols.createLabel(address(label.getKey()), label.getValue(), SourceType.IMPORTED);
+        }
+        if (format.equals("ATARI8") && (bank & 1) != 0) {
+            symbols.createLabel(address(0xe456), "CIOV", SourceType.IMPORTED);
+            symbols.createLabel(address(0xe459), "SIOV", SourceType.IMPORTED);
+        }
     }
 
     private Address address(long value) {
