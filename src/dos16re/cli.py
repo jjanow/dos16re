@@ -8,9 +8,11 @@ from pathlib import Path
 
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
+from .image import ImageError
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
 from .search import SearchError, find_bytes
+from .trace import TraceError, import_trace
 
 _PREVIEW_LIMIT = 10
 
@@ -159,6 +161,43 @@ def _where_is(args: argparse.Namespace) -> None:
         print("Use --json for all matches.")
 
 
+def _trace(args: argparse.Namespace) -> None:
+    overlay_segments = {}
+    try:
+        for value in args.overlay_segment:
+            name, segment = _assignment(value, "UNIT=HEX")
+            name = name.casefold()
+            if name in overlay_segments:
+                raise ValueError(f"runtime segment specified twice for {name}")
+            overlay_segments[name] = _hex_segment(segment)
+    except (ValueError, argparse.ArgumentTypeError) as error:
+        raise TraceError(str(error)) from error
+    report = import_trace(
+        args.trace, args.export, runtime_base=args.runtime_base, overlay_segments=overlay_segments, project=args.project,
+    )
+    if args.json:
+        print(json.dumps(report))
+        return
+    mapped, unmapped = report["mapped"], report["unmapped"]
+    print(f"{report['instructions']} instruction records, {len(mapped)} mapped addresses, {len(unmapped)} unmapped")
+    analysis = report["analysis"]
+    if analysis is None:
+        rows = [f"{_location(hit)}  {hit['count']} hits" for hit in mapped[:_PREVIEW_LIMIT]]
+        total = len(mapped)
+    else:
+        functions, missed = analysis["functions"], analysis["missed"]
+        print(f"{len(functions)} executed functions, {len(missed)} addresses missed by disassembly")
+        rows = [f"{_location(hit)}  {hit['reason']}" for hit in missed[:_PREVIEW_LIMIT]]
+        for entry in functions[:_PREVIEW_LIMIT - len(rows)]:
+            function = entry["function"]
+            rows.append(f"{_location(function['entry'])}  {function['name']}  {entry['count']} hits")
+        total = len(functions) + len(missed)
+    for row in rows:
+        print(f"  {row}")
+    if total > _PREVIEW_LIMIT or unmapped or report["ignored_lines"]:
+        print("Use --json for the full trace report.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dos16re", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -225,7 +264,17 @@ def main(argv: list[str] | None = None) -> int:
         "--limit", default=DEFAULT_INSTRUCTION_LIMIT, metavar="N",
         help=f"maximum instructions (default: {DEFAULT_INSTRUCTION_LIMIT})",
     )
-    for command in (import_parser, decomp_parser, gaps_parser, search_parser, call_parser):
+    trace_parser = commands.add_parser("trace", help="map a DOSBox-X CPU log to an exported DOS image")
+    trace_parser.add_argument("trace", metavar="LOGCPU.TXT", type=Path)
+    trace_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
+    trace_parser.add_argument("--project", metavar="PROJECT", type=Path, help="compare with the analyzed Ghidra project")
+    trace_parser.add_argument(
+        "--runtime-base", metavar="HEX", type=_hex_segment, help="runtime root load segment (defaults to the export base)",
+    )
+    trace_parser.add_argument(
+        "--overlay-segment", metavar="UNIT=HEX", action="append", default=[], help="map an overlay at its runtime segment",
+    )
+    for command in (import_parser, decomp_parser, gaps_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
 
     args = parser.parse_args(argv)
@@ -260,6 +309,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "where-is":
             _where_is(args)
             return 0
+        if args.command == "trace":
+            _trace(args)
+            return 0
         executable = MZExecutable.parse(args.program.read_bytes())
         loaded = executable.load(args.base_segment)
         overlays = [
@@ -269,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
         image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (EmulatorError, GhidraError, MZError, SearchError, OSError) as error:
+    except (EmulatorError, GhidraError, ImageError, MZError, SearchError, TraceError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer

@@ -1,6 +1,8 @@
 // Query an analyzed dos16re project.
 import com.google.gson.FieldNamingPolicy;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
@@ -33,13 +35,59 @@ public class Dos16reQuery extends GhidraScript {
         String[] args = getScriptArgs();
         Map<String, Object> report;
         try {
-            report = query(args[0], args[1]);
+            report = args[0].equals("trace") ? trace(Path.of(args[1])) : query(args[0], args[1]);
         } catch (IllegalArgumentException error) {
             report = Map.of("error", error.getMessage());
         }
         var gson = new GsonBuilder().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .serializeNulls().create();
         Files.writeString(Path.of(args[2]), gson.toJson(report));
+    }
+
+    private Map<String, Object> trace(Path input) throws Exception {
+        var trace = JsonParser.parseString(Files.readString(input)).getAsJsonObject();
+        if (!trace.get("sha256").getAsString().equals(currentProgram.getExecutableSHA256())) {
+            throw new IllegalArgumentException("Ghidra project was imported from a different image.bin");
+        }
+        var memory = currentProgram.getMemory();
+        for (var item : trace.getAsJsonArray("units")) {
+            var unit = item.getAsJsonObject();
+            var name = unit.get("name").getAsString();
+            var block = memory.getBlock(name);
+            if (block == null || !block.isInitialized() ||
+                    block.getStart().getOffset() != 16L * unit.get("segment").getAsInt() ||
+                    block.getSize() != unit.get("size").getAsLong()) {
+                throw new IllegalArgumentException("Ghidra project has a different placement for unit " + name);
+            }
+        }
+
+        var space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+        var listing = currentProgram.getListing();
+        var misses = new ArrayList<JsonObject>();
+        var executed = new LinkedHashMap<Function, Long>();
+        for (var item : trace.getAsJsonArray("hits")) {
+            monitor.checkCancelled();
+            var hit = item.getAsJsonObject();
+            var address = space.getAddress(hit.get("linear").getAsLong());
+            if (listing.getInstructionAt(address) == null) {
+                String reason = "undefined";
+                if (listing.getInstructionContaining(address) != null) {
+                    reason = "instruction_offcut";
+                } else if (listing.getDefinedDataContaining(address) != null) {
+                    reason = "defined_data";
+                }
+                hit.addProperty("reason", reason);
+                misses.add(hit);
+                continue;
+            }
+            var function = getFunctionContaining(address);
+            if (function != null) {
+                executed.merge(function, hit.get("count").getAsLong(), Long::sum);
+            }
+        }
+        var functions = executed.entrySet().stream().map(entry ->
+            Map.of("function", routine(entry.getKey()), "count", entry.getValue())).toList();
+        return Map.of("functions", functions, "missed", misses);
     }
 
     private Map<String, Object> query(String command, String input) throws Exception {

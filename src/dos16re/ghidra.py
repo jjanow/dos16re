@@ -84,6 +84,13 @@ def analysis_gaps(project: Path) -> dict:
     return _query(project, "Dos16reGaps.java")
 
 
+def trace_coverage(project: Path, coverage: dict) -> dict:
+    with TemporaryDirectory() as temp:
+        positions = Path(temp) / "positions.json"
+        positions.write_text(json.dumps(coverage), encoding="utf-8")
+        return _query(project, "Dos16reQuery.java", "trace", str(positions))
+
+
 def _query(project: Path, script: str, *arguments: str) -> dict:
     project_dir, project_name = _project_parts(project)
     if not Path(project_dir, project_name + ".gpr").is_file():

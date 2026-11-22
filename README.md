@@ -161,6 +161,29 @@ at that address. These callbacks receive the live Unicorn CPU. Turbo Pascal stub
 overlays, including when an original `INT 3Fh` stub is restored. Unhandled interrupts and port I/O
 stop the call with an error.
 
+## DOSBox-X traces
+
+In a heavy-debug build of DOSBox-X, break in the loaded program and run `LOGS 100` to write
+`LOGCPU.TXT` for the next 0x100 instruction records. The importer also accepts `LOG`, `LOGL`,
+and `LOGC` output from builds that provide those commands. Start the capture after unpacking
+when working with a packed executable. [DOSBox-X debugger source](https://github.com/joncampbell123/dosbox-x/blob/master/src/debug/debug.cpp#L2940-L2975)
+
+```sh
+.venv/bin/dos16re trace LOGCPU.TXT --export out/program --runtime-base 0813 \
+  --overlay-segment OV1=4200 --project out/program-project --json
+```
+
+Set `--runtime-base` to the hexadecimal segment where DOS loaded the root module. It defaults to
+the export's base segment. Map each captured overlay with `--overlay-segment UNIT=HEX` using the
+unit name from `map.json` and its runtime load segment. Use one capture per layout when overlays
+reuse a load address.
+
+The report counts hits at each address, combining equivalent segment:offset pairs and showing the
+first observed pair. JSON includes unmapped addresses and the count of ignored nonblank lines.
+With `--project`, a read-only Ghidra query lists executed functions and hit counts. It also lists
+traced addresses where disassembly has no instruction start because the address is undefined,
+defined as data, or inside an instruction.
+
 ## Tests
 
 Run tests with `.venv/bin/python -m pytest`. The real-game tests read Pool of Radiance DOS v1.3 from

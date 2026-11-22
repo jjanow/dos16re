@@ -178,3 +178,17 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
         {"unit": "root", "size": 2, "linear": 0x1000E, "start": "root:000e", "end": "root:000f"},
         {"unit": "root", "size": 2, "linear": 0x1001A, "start": "root:001a", "end": "root:001b"},
     ]
+
+    trace = tmp_path / "LOGCPU.TXT"
+    trace.write_text("1000:0000\n1000:0001\n1000:0013\n1001:0003\n1000:000e\n3000:0000\n")
+    assert main([
+        "trace", str(trace), "--export", str(export), "--project", str(project),
+        "--overlay-segment", "OV1=3000", "--json",
+    ]) == 0, capsys.readouterr().err
+    analysis = json.loads(capsys.readouterr().out)["analysis"]
+    assert [(row["function"]["entry"]["unit_address"], row["count"]) for row in analysis["functions"]] == [
+        ("root:0000", 1), ("root:0010", 2), ("OV1:0000", 1),
+    ]
+    assert [(row["unit_address"], row["reason"]) for row in analysis["missed"]] == [
+        ("root:0001", "instruction_offcut"), ("root:000e", "undefined"),
+    ]

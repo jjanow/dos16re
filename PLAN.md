@@ -130,8 +130,9 @@ object against its 6.0a DOS runtime library.
    INT 3Fh at a known Turbo Pascal stub redirects to the resident unit.
 3. **Implemented.** `dos16re call ADDR --export OUT --regs ... --mem ... --read ...` reports register
    and memory results, with `--json` for scripts.
-4. Optional: import DOSBox-X debugger traces (CS:IP logs) and map them onto the static image, marking which
-   functions ran and listing reached code the static analysis missed.
+4. **Implemented.** `dos16re trace LOGCPU.TXT --export OUT` maps DOSBox-X debugger CS:IP logs to the
+   exported image using the runtime root and overlay segments. Add `--project PROJECT` to report
+   executed functions and traced addresses missed by static disassembly.
 
 **Validated.** Synthetic tests cover near and far calls, nested calls, overlay dispatch, and I/O hooks.
 The Phantasie I revive routine runs from a loaded overlay and updates a caller-supplied character record.
@@ -169,31 +170,30 @@ Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 
 ## Order of work
 
-Phases 1–7 are implemented for the initial DOS scope. The DOSBox-X trace import in Phase 6 remains
-optional. The platform work below is the next extension of the roadmap.
+Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
+Work through the post-DOS platforms below in order, one at a time, beginning with Commodore Amiga.
 
 ## Post-DOS stretch goals
 
-Begin after the DOS phases are complete. For each source platform, validate the executable or ROM loader,
-memory map, bank or overlay handling, and analysis on a representative release. Keep original media and
-platform-specific game expectations in opt-in validation.
+For each source platform, validate the executable or ROM loader, memory map, applicable bank or overlay
+handling, and analysis on a representative release before starting the next platform. Keep original media
+outside this repository and platform-specific game expectations in opt-in validation.
 
-| Original source platform | Phantasie remaster | Gold Box remaster |
-|---|---|---|
-| IBM PC compatibles running DOS | Yes, current scope | Yes, current scope |
-| Commodore Amiga | Yes | Yes |
-| Atari ST | Yes | Yes |
-| Commodore 64 | Yes | Yes |
-| Apple II | Yes | Yes |
-| Atari 8-bit | Yes | |
-| MSX2 | Yes | |
-| NEC PC-88 | Yes | Yes |
-| NEC PC-98 | Yes | Yes |
-| Sharp X1 / X1turbo | X1 | X1turbo |
-| Sharp X68000 | Yes | |
-| Classic Macintosh | | Yes |
-| Nintendo NES / Famicom | | Yes |
-| Sega Genesis / Mega Drive | | Yes |
+| Order | Original source platform | Phantasie remaster | Gold Box remaster |
+|---|---|---|---|
+| 1 | Commodore Amiga | Yes | Yes |
+| 2 | Atari ST | Yes | Yes |
+| 3 | Commodore 64 | Yes | Yes |
+| 4 | Apple II | Yes | Yes |
+| 5 | Atari 8-bit | Yes | |
+| 6 | MSX2 | Yes | |
+| 7 | NEC PC-88 | Yes | Yes |
+| 8 | NEC PC-98 | Yes | Yes |
+| 9 | Sharp X1 / X1turbo | X1 | X1turbo |
+| 10 | Sharp X68000 | Yes | |
+| 11 | Classic Macintosh | | Yes |
+| 12 | Nintendo NES / Famicom | | Yes |
+| 13 | Sega Genesis / Mega Drive | | Yes |
 
 The matrix follows OpenPhantasie's supported copies and planned source platforms, and the Gold Box
 remaster's port matrix. Gold Box PC-88 and X1turbo validation depends on finding copies of the releases.
