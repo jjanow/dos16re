@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from struct import Struct, pack, unpack_from
 
+from .jump_tables import recover_jump_tables
 from .mz import Address, LoadedMZ, MZError
 
 _DESCRIPTOR = Struct("<4xI3H")
@@ -180,6 +181,30 @@ def _rewrite(image: bytearray, index: int, opcode: int, target: Address) -> str:
     return original
 
 
+def _add_jump_tables(image: bytes, program_map: dict) -> None:
+    tables = []
+    for unit in program_map["units"]:
+        is_root = unit["name"] == "root"
+        segment = program_map["entry"]["segment"] if is_root else unit["segment"]
+        start = unit["image_offset"] + (segment - unit["segment"]) * 16
+        end = unit["image_offset"] + unit["size"]
+        if not unit["image_offset"] <= start < end:
+            continue
+        for table in recover_jump_tables(
+            image[start:end], flat_overlay=not is_root and "file_offset" not in unit,
+        ):
+            tables.append({
+                "unit": unit["name"],
+                "address": address_record(Address(segment, table.jump)),
+                "guard": address_record(Address(segment, table.guard)),
+                "table": address_record(Address(segment, table.table)),
+                "default": address_record(Address(segment, table.default)),
+                "targets": [address_record(Address(segment, offset)) for offset in table.targets],
+            })
+    if tables:
+        program_map["jump_tables"] = tables
+
+
 def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[bytes, dict]:
     origin = root.base_segment * 16
     root_record = _unit_record("root", root.base_segment, origin, len(root.image))
@@ -191,6 +216,7 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     if root.packer:
         program_map["packer"] = root.packer
     if not overlays:
+        _add_jump_tables(root.image, program_map)
         return root.image, program_map
 
     units = _read_units(root.image, overlays)
@@ -254,4 +280,6 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     if stub_records:
         program_map["stubs"] = stub_records
         program_map["calls"] = call_records
-    return bytes(image), program_map
+    relocated = bytes(image)
+    _add_jump_tables(relocated, program_map)
+    return relocated, program_map

@@ -83,12 +83,16 @@ Phase 3 a second validation case alongside Phantasie III.
 
 ### Phase 4: code recovery
 
-1. **Next.** Jump-table recovery: CS-relative word tables (`jmp cs:[bx+tbl]`, `shl bx,1` patterns, Turbo Pascal `case`, MSC
-   switch). Bounds from the preceding `cmp`/`ja`. Create the target functions and add the references Ghidra lost.
+1. **Implemented for bounded CS-relative word tables.** Recover case targets from a preceding `cmp` and
+   `ja` or `jae` and a scaled 16-bit register index. Infer the runtime offset of adjacent tables in flat
+   overlays. The Ghidra importer disassembles case blocks and adds computed jump references, allowing
+   auto-analysis to find the routines those blocks call.
 2. Far procedures called as `push cs` + near call (seen in Borland C/C++ code).
 3. Report code no analysis reached (`dos16re gaps`), so nothing is silently dropped.
 
-**Done when:** Phantasie Mystic SCORE (OV1 `0x20bb..0x225a`) appears as a function without manual work.
+**Validated on Ghidra 12.2.** The Phantasie I Mystic dispatcher at `OV1:20a5` has seven computed jump
+targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of those cases, and
+`dos16re decomp OV1:20bb` returns the function.
 
 ### Phase 5: runtime signatures
 
@@ -132,6 +136,6 @@ Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 
 ## Order of work
 
-Phases 1 and 2 are complete for the initial targets. Next is Phase 4 jump-table recovery for Mystic SCORE,
-followed by Phase 3 segment tracking for Phantasie III and the Pool of Radiance LOADPIECES data references.
+Phases 1 and 2 are complete for the initial targets, and Phase 4 jump-table recovery is validated on Mystic
+SCORE. Next is Phase 3 segment tracking for Phantasie III and the Pool of Radiance LOADPIECES data references.
 Then continue with Phase 6 for emulator reuse and Phases 5 and 7 for signatures and queries.

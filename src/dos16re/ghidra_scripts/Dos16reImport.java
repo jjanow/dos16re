@@ -1,5 +1,6 @@
 // Import a dos16re program map before auto-analysis.
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -8,13 +9,15 @@ import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.SegmentedAddressSpace;
+import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.symbol.RefType;
+import ghidra.program.model.symbol.SourceType;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashSet;
 import java.util.Map;
 
 public class Dos16reImport extends HeadlessScript {
@@ -75,6 +78,9 @@ public class Dos16reImport extends HeadlessScript {
         if (!memory.contains(entry)) {
             throw new IllegalArgumentException("entry point is outside the image");
         }
+        if (map.has("jump_tables")) {
+            recoverSwitches(map.getAsJsonArray("jump_tables"));
+        }
         seed(entry, "entry");
         for (JsonElement item : units) {
             JsonObject unit = item.getAsJsonObject();
@@ -108,6 +114,49 @@ public class Dos16reImport extends HeadlessScript {
                 Address stub = address(call.getAsJsonObject("stub"));
                 comment(start, "Originally called " + stub + ". Original bytes " +
                     call.get("original").getAsString());
+            }
+        }
+    }
+
+    private void recoverSwitches(JsonArray switches) throws Exception {
+        var listing = currentProgram.getListing();
+        var references = currentProgram.getReferenceManager();
+
+        // Reserve table bytes before following any code through the switch.
+        for (JsonElement item : switches) {
+            monitor.checkCancelled();
+            JsonObject record = item.getAsJsonObject();
+            Address table = address(record.getAsJsonObject("table"));
+            int count = record.getAsJsonArray("targets").size();
+            for (int index = 0; index < count; index++) {
+                Address word = table.addNoWrap(2L * index);
+                if (listing.getUndefinedDataAt(word) != null &&
+                        listing.getUndefinedDataAt(word.addNoWrap(1)) != null) {
+                    listing.createData(word, WordDataType.dataType);
+                }
+            }
+        }
+        for (JsonElement item : switches) {
+            monitor.checkCancelled();
+            JsonObject record = item.getAsJsonObject();
+            Address jump = address(record.getAsJsonObject("address"));
+            Address table = address(record.getAsJsonObject("table"));
+            disassemble(address(record.getAsJsonObject("guard")));
+            var instruction = listing.getInstructionAt(jump);
+            if (instruction == null || !instruction.getFlowType().isJump() ||
+                    !instruction.getFlowType().isComputed()) {
+                continue;
+            }
+            instruction.addOperandReference(0, table, RefType.READ, SourceType.ANALYSIS);
+            int index = 0;
+            for (JsonElement target : record.getAsJsonArray("targets")) {
+                Address destination = address(target.getAsJsonObject());
+                Address word = table.addNoWrap(2L * index++);
+                references.addMemoryReference(word, destination, RefType.DATA, SourceType.ANALYSIS, 0);
+                instruction.addMnemonicReference(destination, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+            }
+            for (Address destination : instruction.getFlows()) {
+                disassemble(destination);
             }
         }
     }

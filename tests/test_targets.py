@@ -56,7 +56,8 @@ def test_pool_of_radiance_overlay_directory_and_view_call(por_export):
     )
 
 
-def test_phantasie_i_raw_overlays(tmp_path, capsys):
+@pytest.fixture
+def phantasie_export(tmp_path, capsys):
     files = _game_files("DOS16RE_PH1_DIR")
     main_program, ov1, ov2 = (files[name] for name in ("PHANTASI.EXE", "OV1.OVR", "OV2.OVR"))
     assert main([
@@ -64,13 +65,37 @@ def test_phantasie_i_raw_overlays(tmp_path, capsys):
         "-o", str(tmp_path), "--json",
     ]) == 0
     program = json.loads(capsys.readouterr().out)
-    image = (tmp_path / "image.bin").read_bytes()
+    return tmp_path, program, (ov1, ov2)
+
+
+def test_phantasie_i_raw_overlays(phantasie_export):
+    output, program, sources = phantasie_export
+    image = (output / "image.bin").read_bytes()
     assert program["packer"] == "LZEXE 0.90"
     assert len({unit["segment"] for unit in program["units"]}) == 3
-    for name, unit, source in zip(("OV1", "OV2"), program["units"][1:], (ov1, ov2), strict=True):
+    for name, unit, source in zip(("OV1", "OV2"), program["units"][1:], sources, strict=True):
         assert unit["name"] == name
         offset = unit["image_offset"]
         assert image[offset:offset + unit["size"]] == source.read_bytes()
+
+    mystic = next(table for table in program["jump_tables"]
+                  if table["unit"] == "OV1" and table["address"]["offset"] == 0x20A5)
+    assert mystic["table"]["offset"] == 0x208F
+    assert len(mystic["targets"]) == 7
+    assert mystic["targets"][2]["offset"] == 0x1F5A
+
+
+def test_ghidra_recovers_mystic_score(phantasie_export, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    output, program, _ = phantasie_export
+    project = output / "phantasie"
+    assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["units"] == len(program["units"])
+    assert main(["decomp", "OV1:20bb", "--project", str(project), "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["unit_address"] == "OV1:20bb"
+    assert "0x5bf6" in result["decompilation"]
 
 
 def test_ghidra_decompiles_cross_overlay_call(por_export, capsys):
