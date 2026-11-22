@@ -87,6 +87,36 @@ are hexadecimal. The JSON response includes the function's entry address and dec
 data, or padding. Text output shows the total and the first ten ranges. JSON includes all ranges with
 inclusive `unit:offset` endpoints, the starting linear address, and byte counts.
 
+## Program queries
+
+```sh
+.venv/bin/dos16re xrefs OV1:20bb --project out/phantasie-project --json
+.venv/bin/dos16re callers OV1:20bb --project out/phantasie-project
+.venv/bin/dos16re callees OV1:20bb --project out/phantasie-project
+.venv/bin/dos16re func OV1:20bb --project out/phantasie-project --json
+.venv/bin/dos16re where-is --export out/phantasie --bytes 'b8 00 4c'
+.venv/bin/dos16re where-is --export out/phantasie --string 'Mystic'
+.venv/bin/dos16re where-is --export out/phantasie --constant 0x1234 --width 2 --json
+```
+
+`xrefs` reports incoming and outgoing references Ghidra recorded at the exact address, including code and
+data references. `callers` and `callees` accept any address inside an analyzed function and list individual
+resolved call sites. Callers target the function entry. JSON includes the source and target addresses,
+reference type, operand index, and enclosing functions when available.
+
+`func` reports the function entry, inclusive body ranges, total body size in bytes, and callers. It gives
+Ghidra's DS, ES, and SS values at the requested address. Unknown values appear as `?` in text and `null`
+in JSON.
+
+`where-is` searches the relocated bytes of each initialized unit directly from an export. Matches can overlap
+and must fit entirely within a unit. `--string` encodes literal text in DOS code page 437. `--constant` accepts
+a decimal or `0x`-prefixed integer and encodes it little-endian at the specified byte width (1, 2, 4, or 8,
+default 2).
+
+Text output previews up to ten references or matches. Use `--json` for the full results with
+`unit:offset`, segmented, and linear addresses where available. Ghidra queries report the segmented
+address from the analyzed project.
+
 ## Emulator harness
 
 `call` runs a routine from an exported image with Unicorn. Each call starts with a fresh copy of the

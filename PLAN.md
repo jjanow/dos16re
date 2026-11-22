@@ -138,8 +138,16 @@ The Phantasie I revive routine runs from a loaded overlay and updates a caller-s
 
 ### Phase 7: agent-facing queries
 
-`xrefs`, `callers`, `callees`, `where-is` (find a byte/string/constant across all units), `func` (bounds, segment
-context, callers), all with `--json`. Keep outputs short by default so they fit in an agent's context.
+1. **Implemented.** `xrefs` reports references to and from an address in an analyzed Ghidra project.
+   `callers` and `callees` list resolved call sites. `func` reports the function body ranges, segment
+   context at the requested address, and callers.
+2. **Implemented.** `where-is` searches an exported image for hexadecimal bytes, DOS CP437 strings,
+   or little-endian integer constants. Matches stay within individual loaded units.
+3. **Implemented.** Every query supports `--json`. Text output previews up to ten references or matches.
+
+**Validated.** Synthetic DOS programs cover code and data references, incoming and outgoing calls
+including a far overlay call, function bounds and segment context in Ghidra 12.2, and byte searches
+across separated overlay units.
 
 ## Test targets
 
@@ -161,8 +169,8 @@ Unit tests on hand-built tiny MZ/overlay files run everywhere (CI).
 
 ## Order of work
 
-Phases 1–6 are implemented for the initial scope. Next is Phase 7 for agent-facing queries. The DOSBox-X
-trace import in Phase 6 remains optional.
+Phases 1–7 are implemented for the initial DOS scope. The DOSBox-X trace import in Phase 6 remains
+optional. The platform work below is the next extension of the roadmap.
 
 ## Post-DOS stretch goals
 

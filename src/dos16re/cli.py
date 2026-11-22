@@ -7,9 +7,12 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
-from .ghidra import GhidraError, analysis_gaps, decompile, import_program
+from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address
 from .mz import DEFAULT_BASE_SEGMENT, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
+from .search import SearchError, find_bytes
+
+_PREVIEW_LIMIT = 10
 
 
 def _hex_segment(value: str) -> int:
@@ -86,6 +89,76 @@ def _call(args: argparse.Namespace) -> None:
             print(f"{address}  {data.hex()}")
 
 
+def _location(record: dict) -> str:
+    return record["unit_address"] or record["address"]
+
+
+def _print_references(groups: tuple[str, ...], report: dict) -> None:
+    remaining = _PREVIEW_LIMIT
+    for group in groups:
+        references = report[group]
+        print(f"{len(references)} {group}")
+        for reference in references[:remaining]:
+            source = _location(reference["from"])
+            target = _location(reference["to"])
+            peer = reference["to_function" if group in ("outgoing", "callees") else "from_function"]
+            name = f"  {peer['name']}" if peer else ""
+            print(f"  {source} -> {target}  {reference['type']}{name}")
+        remaining = max(0, remaining - len(references))
+    if sum(len(report[group]) for group in groups) > _PREVIEW_LIMIT:
+        print("Use --json for all references.")
+
+
+def _address_query(args: argparse.Namespace) -> None:
+    report = query_address(args.command, args.address, args.project)
+    if args.json:
+        print(json.dumps(report))
+        return
+    if args.command == "xrefs":
+        print(_location(report["address"]))
+        _print_references(("incoming", "outgoing"), report)
+        return
+
+    function = report["function"]
+    print(f"{_location(function['entry'])}  {function['name']}")
+    if args.command == "func":
+        ranges = report["ranges"]
+        start = _location(ranges[0]["start"])
+        end = _location(ranges[-1]["end"])
+        print(f"{start}–{end}  {report['size']} bytes in {len(ranges)} ranges")
+        segments = " ".join(
+            f"{name}={value:04x}" if value is not None else f"{name}=?"
+            for name, value in report["segments"].items()
+        )
+        print(f"{_location(report['address'])}  {segments}")
+    _print_references(("callers" if args.command == "func" else args.command,), report)
+
+
+def _where_is(args: argparse.Namespace) -> None:
+    if args.width is not None and args.constant is None:
+        raise SearchError("--width requires --constant")
+    try:
+        if args.bytes is not None:
+            pattern = bytes.fromhex(args.bytes)
+        elif args.string is not None:
+            pattern = args.string.encode("cp437")
+        else:
+            base = 16 if args.constant.lstrip("+-").lower().startswith("0x") else 10
+            value = int(args.constant, base)
+            pattern = value.to_bytes(args.width or 2, "little", signed=value < 0)
+    except (ValueError, OverflowError) as error:
+        raise SearchError(str(error)) from error
+    report = find_bytes(args.export, pattern, limit=None if args.json else _PREVIEW_LIMIT)
+    if args.json:
+        print(json.dumps(report))
+        return
+    print(f"{report['count']} matches")
+    for match in report["matches"]:
+        print(f"{match['unit_address']}  {match['address']}")
+    if report["count"] > _PREVIEW_LIMIT:
+        print("Use --json for all matches.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dos16re", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -118,6 +191,25 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     gaps_parser = commands.add_parser("gaps", help="report undefined ranges in an analyzed Ghidra project")
     gaps_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    address_queries = {
+        "xrefs": "list references to and from an address",
+        "callers": "list calls to a function",
+        "callees": "list calls made by a function",
+        "func": "report a function's bounds, segment context, and callers",
+    }
+    for name, help_text in address_queries.items():
+        query_parser = commands.add_parser(name, help=help_text)
+        query_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
+        query_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+        query_parser.add_argument("--json", action="store_true", help="print JSON")
+
+    search_parser = commands.add_parser("where-is", help="find a byte pattern across exported units")
+    search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
+    pattern = search_parser.add_mutually_exclusive_group(required=True)
+    pattern.add_argument("--bytes", metavar="HEX", help="hexadecimal bytes")
+    pattern.add_argument("--string", metavar="TEXT", help="literal DOS code page 437 string")
+    pattern.add_argument("--constant", metavar="N", help="decimal or 0x-prefixed integer, encoded little-endian")
+    search_parser.add_argument("--width", type=int, choices=(1, 2, 4, 8), help="constant width in bytes (default 2)")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
     call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from dos16re load")
@@ -133,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit", default=DEFAULT_INSTRUCTION_LIMIT, metavar="N",
         help=f"maximum instructions (default: {DEFAULT_INSTRUCTION_LIMIT})",
     )
-    for command in (import_parser, decomp_parser, gaps_parser, call_parser):
+    for command in (import_parser, decomp_parser, gaps_parser, search_parser, call_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
 
     args = parser.parse_args(argv)
@@ -162,6 +254,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "call":
             _call(args)
             return 0
+        if args.command in address_queries:
+            _address_query(args)
+            return 0
+        if args.command == "where-is":
+            _where_is(args)
+            return 0
         executable = MZExecutable.parse(args.program.read_bytes())
         loaded = executable.load(args.base_segment)
         overlays = [
@@ -171,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (EmulatorError, GhidraError, MZError, OSError) as error:
+    except (EmulatorError, GhidraError, MZError, SearchError, OSError) as error:
         report = {"error": str(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer

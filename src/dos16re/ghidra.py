@@ -71,9 +71,13 @@ def import_program(export: Path, project: Path) -> dict:
 
 
 def decompile(address: str, project: Path) -> dict:
+    return query_address("decomp", address, project)
+
+
+def query_address(command: str, address: str, project: Path) -> dict:
     if not re.fullmatch(r"[^:]+:[0-9a-fA-F]{1,8}", address):
         raise GhidraError("expected a hexadecimal seg:off or unit:offset address")
-    return _query(project, "Dos16reDecompile.java", address)
+    return _query(project, "Dos16reQuery.java", command, address)
 
 
 def analysis_gaps(project: Path) -> dict:

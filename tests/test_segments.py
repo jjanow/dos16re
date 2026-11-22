@@ -81,6 +81,22 @@ def test_tracks_segment_values_and_drops_conflicting_or_mutable_values(tmp_path,
         "2000:0031,ES,?",
     )
 
+    assert main(["xrefs", "2020:0010", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    refs = json.loads(capsys.readouterr().out)
+    assert refs["address"]["unit_address"] == "root:0210"
+    assert refs["outgoing"] == []
+    assert [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]] == [("root:0009", "READ")]
+
+    assert main(["func", "root:0d", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["function"]["entry"]["unit_address"] == "root:0009"
+    assert report["address"]["unit_address"] == "root:000d"
+    assert report["segments"] == {"DS": 0x2020, "ES": 0x2030, "SS": 0x2040}
+    assert report["callers"][0]["from_function"]["entry"]["unit_address"] == "root:0000"
+
+    assert main(["func", "root:24", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["segments"]["ES"] is None
+
 
 def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
     directory = os.environ.get("DOS16RE_PH3_DIR")
@@ -104,15 +120,17 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
         " 9d d7"                   # 0x0e, no incoming flow
         " 55 8b ec 8b 46 06 5d ca 02 00"  # 0x10, far routine returns its argument
         " 9e d7"                   # 0x1a, no incoming flow
-        " b8 01 00 c3"             # 0x1c, near routine
+        " 9a 00 00 00 11 c3"       # 0x1c, near routine calls a raw overlay
     )
     header = bytearray(32)
     pack_into("<2s13H", header, 0, b"MZ", len(header) + len(image), 1, 0, 2, 32, 32, 2, 0x200, 0, 0, 0, 28, 0)
     exe = tmp_path / "sample.exe"
     exe.write_bytes(header + image)
+    overlay = tmp_path / "OV1.ovr"
+    overlay.write_bytes(b"\xcb")
     export = tmp_path / "export"
     project = tmp_path / "recovery"
-    assert main(["load", str(exe), "-o", str(export)]) == 0
+    assert main(["load", str(exe), "-o", str(export), "--overlay", f"{overlay}@1100"]) == 0
     capsys.readouterr()
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
     assert json.loads(capsys.readouterr().out)["far_procedures"] == 1
@@ -120,6 +138,38 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys):
     assert main(["decomp", "root:10", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     result = json.loads(capsys.readouterr().out)
     assert "__stdcall16far" in result["decompilation"]
+
+    assert main(["callers", "1000:0013", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    callers = json.loads(capsys.readouterr().out)
+    assert callers["function"]["entry"]["unit_address"] == "root:0010"
+    call, = callers["callers"]
+    assert call["from"]["unit_address"] == "root:0005"
+    assert call["to_function"] == callers["function"]
+
+    assert main(["callees", "root:0", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    callees = json.loads(capsys.readouterr().out)
+    assert callees["callees"][0] == call
+    assert [edge["to"]["unit_address"] for edge in callees["callees"]] == ["root:0010", "root:001c"]
+
+    assert main(["callees", "root:1c", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    overlay_call, = json.loads(capsys.readouterr().out)["callees"]
+    entry = overlay_call["to_function"]["entry"]
+    assert entry["unit_address"] == "OV1:0000"
+    assert entry["linear"] == 0x11000
+
+    assert main(["xrefs", "root:5", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    assert call in json.loads(capsys.readouterr().out)["outgoing"]
+
+    assert main(["func", "root:10", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    function = json.loads(capsys.readouterr().out)
+    assert function["size"] == 10
+    assert [(span["start"]["unit_address"], span["end"]["unit_address"]) for span in function["ranges"]] == [
+        ("root:0010", "root:0019"),
+    ]
+    assert function["callers"] == callers["callers"]
+
+    assert main(["func", "root:e", "--project", str(project), "--json"]) == 1
+    assert "no analyzed function" in json.loads(capsys.readouterr().err)["error"]
 
     assert main(["gaps", "--project", str(project) + ".gpr", "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)
