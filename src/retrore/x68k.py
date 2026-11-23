@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from struct import Struct, pack_into, unpack_from
 
 from .image import DEFAULT_M68K_BASE, M68K_ADDRESS_LIMIT, X68K_FORMAT
+from .jump_tables import m68k_jump_table_records
 
 X_MAGIC = b"HU"
 # Magic, reserved byte, load mode, link base, entry, TEXT, DATA, BSS, relocation and symbol table sizes.
@@ -324,7 +325,7 @@ def build_x_image(data: bytes, program: str, base: int = DEFAULT_M68K_BASE) -> t
             word_sites += 1
         unit["relocations"].append(record)
     image.extend(bytes(bss_size))
-    return bytes(image), {
+    program_map = {
         "version": 1, "format": X68K_FORMAT, "program": program, "base_address": base,
         "header": {"load_mode": _LOAD_MODES.get(load_mode, load_mode), "link_base": link_base,
                    "relocation_table_size": relocation_size, "symbol_table_size": symbol_size,
@@ -349,3 +350,7 @@ def build_x_image(data: bytes, program: str, base: int = DEFAULT_M68K_BASE) -> t
             },
         },
     }
+    tables = m68k_jump_table_records(image, units[0])
+    if tables:
+        program_map["jump_tables"] = tables
+    return bytes(image), program_map

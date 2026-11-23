@@ -311,6 +311,7 @@ public class RetroreQuery extends GhidraScript {
             case "gaps" -> gaps(request, options);
             case "coverage" -> coverage(request, options);
             case "layout" -> layout(request, options);
+            case "indirect" -> indirect(request, options);
             default -> addressQuery(command, request, options);
         };
     }
@@ -896,6 +897,9 @@ public class RetroreQuery extends GhidraScript {
 
     private Map<String, Object> gaps(JsonObject request, Options options) throws Exception {
         var filter = unit(request);
+        if (request.has("classify") && request.get("classify").getAsBoolean()) {
+            return classifiedGaps(filter, options);
+        }
         var listing = currentProgram.getListing();
         var ranges = new ArrayList<Map<String, Object>>();
         long undefinedBytes = 0;
@@ -969,6 +973,158 @@ public class RetroreQuery extends GhidraScript {
         report.put("units", select(rows, options));
         report.put("pagination", pages);
         return report;
+    }
+
+    /** Gaps with a likely class and evidence, scored by RetroreGaps.java in this session. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> classifiedGaps(MemoryBlock filter, Options options) throws Exception {
+        var file = Files.createTempFile("retrore-gaps", ".json");
+        Map<String, Object> scored;
+        try {
+            runScript("RetroreGaps.java", new String[] {file.toString(), "classify",
+                filter == null ? "" : filter.getName()});
+            scored = GSON.fromJson(Files.readString(file), Map.class);
+        } finally {
+            Files.deleteIfExists(file);
+        }
+        var ranges = new ArrayList<Map<String, Object>>();
+        for (var range : (List<Map<String, Object>>) scored.get("ranges")) {
+            ranges.add((Map<String, Object>) integral(range));
+        }
+        var pages = new LinkedHashMap<String, Page>();
+        var report = new LinkedHashMap<String, Object>();
+        report.put("program", currentProgram.getName());
+        report.put("undefined_bytes", ((Number) scored.get("undefined_bytes")).longValue());
+        report.put("ranges", select(page("ranges", ranges, options, pages), options));
+        report.put("pagination", pages);
+        return report;
+    }
+
+    /** Gson reads every JSON number as a double; the gap report only holds integers. */
+    @SuppressWarnings("unchecked")
+    private static Object integral(Object value) {
+        if (value instanceof Double number) {
+            return number.longValue();
+        }
+        if (value instanceof Map<?, ?> map) {
+            ((Map<String, Object>) map).replaceAll((key, item) -> integral(item));
+        } else if (value instanceof List<?> list) {
+            ((List<Object>) list).replaceAll(RetroreQuery::integral);
+        }
+        return value;
+    }
+
+    // ---- indirect: computed calls and jumps, with candidates recorded by RetroreIndirect.java ----
+
+    private Map<String, Object> indirect(JsonObject request, Options options) throws Exception {
+        var filter = unit(request);
+        String status = request.has("status") ? request.get("status").getAsString() : null;
+        var listing = currentProgram.getListing();
+        var store = currentProgram.getUsrPropertyManager().getStringPropertyMap("retrore.indirect");
+        var sites = new ArrayList<Instruction>();
+        if (request.has("at")) {
+            var instruction = listing.getInstructionContaining(resolve(request.get("at").getAsString()));
+            if (instruction == null || !indirectSite(instruction)) {
+                throw new QueryError("address_not_found", "no indirect call or jump at " + request.get("at").getAsString());
+            }
+            sites.add(instruction);
+        } else {
+            for (var block : currentProgram.getMemory().getBlocks()) {
+                if ((filter != null && !block.equals(filter)) || !block.isExecute()) {
+                    continue;
+                }
+                for (var instruction : listing.getInstructions(span(block), true)) {
+                    monitor.checkCancelled();
+                    if (indirectSite(instruction)) {
+                        sites.add(instruction);
+                    }
+                }
+            }
+        }
+        var rows = new ArrayList<Map<String, Object>>();
+        var counts = new LinkedHashMap<String, Integer>();
+        for (String name : List.of("resolved", "candidate", "unresolved")) {
+            counts.put(name, 0);
+        }
+        boolean compact = options.compact();
+        for (var instruction : sites) {
+            var record = new LinkedHashMap<String, Object>();
+            record.put("address", addressRecord(instruction.getAddress(), compact));
+            record.put("function", routine(getFunctionContaining(instruction.getAddress()), compact));
+            record.put("instruction", instruction.toString());
+            record.put("kind", instruction.getFlowType().isCall() ? "call" : "jump");
+            var flows = instruction.getFlows();
+            String json = store == null ? null : store.getString(instruction.getAddress());
+            JsonObject stored = json == null ? null : JsonParser.parseString(json).getAsJsonObject();
+            boolean candidates = stored != null && stored.has("candidates") && stored.getAsJsonArray("candidates").size() > 0;
+            String state = flows.length > 0 ? "resolved" : candidates ? "candidate" : "unresolved";
+            counts.merge(state, 1, Integer::sum);
+            if (status != null && !status.equals(state)) {
+                continue;
+            }
+            record.put("status", state);
+            var targets = new ArrayList<Object>();
+            for (var flow : flows) {
+                targets.add(addressRecord(flow, compact));
+            }
+            record.put("targets", targets);
+            record.put("table", stored != null && stored.has("table")
+                ? addressRecord(linearAddress(stored.get("table").getAsLong()), compact) : null);
+            Map<String, Object> segment = null;
+            if (stored != null && stored.has("segment")) {
+                var value = stored.getAsJsonObject("segment");
+                segment = new LinkedHashMap<>();
+                segment.put("register", value.get("register").getAsString());
+                segment.put("value", value.has("value") && !value.get("value").isJsonNull()
+                    ? value.get("value").getAsInt() : null);
+            }
+            record.put("segment", segment);
+            var entries = new ArrayList<Map<String, Object>>();
+            if (candidates) {
+                for (var item : stored.getAsJsonArray("candidates")) {
+                    var entry = item.getAsJsonObject();
+                    var target = linearAddress(entry.get("target").getAsLong());
+                    var row = new LinkedHashMap<String, Object>();
+                    row.put("slot", addressRecord(linearAddress(entry.get("slot").getAsLong()), compact));
+                    row.put("target", addressRecord(target, compact));
+                    row.put("function", routine(getFunctionAt(target), compact));
+                    var evidence = new ArrayList<String>();
+                    entry.getAsJsonArray("evidence").forEach(element -> evidence.add(element.getAsString()));
+                    row.put("evidence", evidence);
+                    row.put("writer", entry.has("writer")
+                        ? addressRecord(linearAddress(entry.get("writer").getAsLong()), compact) : null);
+                    entries.add(row);
+                }
+            }
+            record.put("candidates", entries);
+            record.put("stop", stored != null && stored.has("stop") ? stored.get("stop").getAsString() : null);
+            String reason = null;
+            if (state.equals("unresolved")) {
+                reason = stored == null ? "not_analyzed"
+                    : stored.has("reason") ? stored.get("reason").getAsString() : "no_valid_entries";
+            }
+            record.put("reason", reason);
+            rows.add(record);
+        }
+        var pages = new LinkedHashMap<String, Page>();
+        var report = new LinkedHashMap<String, Object>();
+        report.put("program", currentProgram.getName());
+        report.put("counts", counts);
+        report.put("sites", select(page("sites", rows, options, pages), options));
+        report.put("pagination", pages);
+        return report;
+    }
+
+    private static boolean indirectSite(Instruction instruction) {
+        var flow = instruction.getFlowType();
+        String mnemonic = instruction.getMnemonicString().toUpperCase(Locale.ROOT);
+        // Software interrupts and traps are computed calls through vectors, not program tables.
+        return flow.isComputed() && (flow.isCall() || flow.isJump()) &&
+            !mnemonic.startsWith("INT") && !mnemonic.startsWith("TRAP");
+    }
+
+    private Address linearAddress(long linear) {
+        return currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(linear);
     }
 
     private Routine routine(Function function, boolean compact) {

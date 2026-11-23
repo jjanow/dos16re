@@ -187,26 +187,54 @@ def _rewrite(image: bytearray, index: int, opcode: int, target: Address) -> str:
     return original
 
 
+def _root_code_segments(image: bytes, program_map: dict) -> list[int]:
+    """Possible code segments in the root: its load segment, the entry CS, and every relocated segment word.
+
+    Relocated words name far call targets, but also segments loaded into registers or stored in far
+    pointers, such as a driver entered through an interrupt vector."""
+    root = program_map["units"][0]
+    segments = {root["segment"], program_map["entry"]["segment"]}
+    for position in program_map.get("relocations", ()):
+        if 0 <= position < root["size"] - 1:
+            segments.add(unpack_from("<H", image, position)[0])
+    return sorted(
+        segment for segment in segments
+        if 0 <= (segment - root["segment"]) * 16 < root["size"]
+    )
+
+
+def _jump_table_record(unit: str, segment: int, table) -> dict:
+    record = {
+        "unit": unit,
+        "kind": table.kind,
+        "bound": table.bound,
+        "address": address_record(Address(segment, table.jump)),
+        "guard": address_record(Address(segment, table.guard)),
+        "table": address_record(Address(segment, table.table)),
+    }
+    if table.default is not None:
+        record["default"] = address_record(Address(segment, table.default))
+    record["targets"] = [address_record(Address(segment, offset)) for offset in table.targets]
+    return record
+
+
 def _add_jump_tables(image: bytes, program_map: dict) -> None:
     tables = []
     for unit in program_map["units"]:
         is_root = unit["name"] == "root"
-        segment = program_map["entry"]["segment"] if is_root else unit["segment"]
-        start = unit["image_offset"] + (segment - unit["segment"]) * 16
         end = unit["image_offset"] + unit["size"]
-        if not unit["image_offset"] <= start < end:
-            continue
-        for table in recover_jump_tables(
-            image[start:end], flat_overlay=not is_root and "file_offset" not in unit,
-        ):
-            tables.append({
-                "unit": unit["name"],
-                "address": address_record(Address(segment, table.jump)),
-                "guard": address_record(Address(segment, table.guard)),
-                "table": address_record(Address(segment, table.table)),
-                "default": address_record(Address(segment, table.default)),
-                "targets": [address_record(Address(segment, offset)) for offset in table.targets],
-            })
+        segments = _root_code_segments(image, program_map) if is_root else [unit["segment"]]
+        found = {}
+        # A site belongs to the nearest code segment at or below it whose table validates.
+        for segment in segments:
+            start = unit["image_offset"] + (segment - unit["segment"]) * 16
+            if not unit["image_offset"] <= start < end:
+                continue
+            for table in recover_jump_tables(
+                image[start:end], flat_overlay=not is_root and "file_offset" not in unit,
+            ):
+                found[segment * 16 + table.jump] = _jump_table_record(unit["name"], segment, table)
+        tables.extend(found[linear] for linear in sorted(found))
     if tables:
         program_map["jump_tables"] = tables
 

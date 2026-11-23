@@ -170,8 +170,14 @@ QUERIES = {
     },
     "gaps": {
         "description": "report undefined ranges in executable units",
-        "parameters": {"unit": _UNIT_FILTER, **_paging(1000, 100, "ranges")},
+        "parameters": {
+            "unit": _UNIT_FILTER, **_paging(1000, 100, "ranges"),
+            "classify": {"type": "boolean", "default": False,
+                         "description": "score each range as likely code, data, or padding and list the evidence"},
+        },
         "fields": ["unit", "size", "linear", "start", "end"],
+        "conditional_fields": {"classify": ["class", "code_score", "data_score", "conflict", "entry", "evidence",
+                                            "counts"]},
         "fields_scope": "record",
         "echo": ["unit"],
     },
@@ -200,6 +206,22 @@ QUERIES = {
                    "proposal"],
         "fields_scope": "result",
         "echo": ["address"],
+    },
+    "indirect": {
+        "description": "list indirect calls and jumps with their proved targets, or candidate table entries "
+                       "and the evidence for each",
+        "parameters": {
+            "unit": _UNIT_FILTER,
+            "at": _address("report only the indirect instruction at this address"),
+            "status": {"type": "string", "enum": ["resolved", "candidate", "unresolved"],
+                       "description": "keep sites with this status"},
+            **_paging(1000, 100, "sites"),
+            "compact": _COMPACT,
+        },
+        "fields": ["address", "function", "instruction", "kind", "status", "targets", "table", "segment",
+                   "candidates", "stop", "reason"],
+        "fields_scope": "record",
+        "echo": ["unit", "at"],
     },
 }
 

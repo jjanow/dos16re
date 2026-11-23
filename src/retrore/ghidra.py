@@ -90,21 +90,20 @@ def launch_environment(java_home: str | None) -> dict:
 
 
 def _run(
-    project: Path, options: list[str], script: str | None, *arguments: str, pre_script: str | None = None,
-    timeout: float | None = QUERY_TIMEOUT, setup: dict | None = None, post_scripts: tuple[str, ...] = (),
+    project: Path, options: list[str], script: str | tuple[str, ...] | None, *arguments: str,
+    pre_script: str | None = None, timeout: float | None = QUERY_TIMEOUT, setup: dict | None = None,
 ) -> dict:
     """Run analyzeHeadless once. setup is a worker.launch_setup() record of another process's launcher and
-    JAVA_HOME to use instead of this process's, for a worker host answering that process. post_scripts run
-    after script with the same arguments and add to its result file."""
+    JAVA_HOME to use instead of this process's, for a worker host answering that process. Several post
+    scripts run in order with the same arguments; each later one may extend the result file."""
     launcher = setup["launcher"] if setup else _headless()
     scripts = files("retrore").joinpath("ghidra_scripts")
-    label = script or pre_script
+    post_scripts = (script,) if isinstance(script, str) else tuple(script or ())
+    label = post_scripts[0] if post_scripts else pre_script
     with as_file(scripts) as script_dir, TemporaryDirectory() as temp:
         result_file = Path(temp) / "result.json"
         script_args = [*arguments, str(result_file)]
-        script_options = ["-postScript", script, *script_args] if script else []
-        for extra in post_scripts:
-            script_options += ["-postScript", extra, *script_args]
+        script_options = [option for name in post_scripts for option in ("-postScript", name, *script_args)]
         if pre_script:
             script_options = ["-preScript", pre_script, *script_args, *script_options]
         command = [str(launcher), *_project_parts(project), *options, "-scriptPath", str(script_dir), *script_options]
@@ -271,11 +270,16 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
         )
     if program.get("format") == PC98_FORMAT:
         image_units(program, image.stat().st_size)
-    return _run(
+    report = _run(
         project, [*options, "x86:LE:16:Real Mode"],
-        "RetroreSegments.java", str(manifest), pre_script="RetroreImport.java", timeout=timeout,
-        post_scripts=("RetroreConventions.java",),
+        ("RetroreSegments.java", "RetroreIndirect.java", "RetroreConventions.java"), str(manifest),
+        pre_script="RetroreImport.java", timeout=timeout,
     )
+    # A post script that fails to compile leaves no result of its own.
+    for key, script in (("indirect", "RetroreIndirect.java"), ("calling_conventions", "RetroreConventions.java")):
+        if key not in report:
+            raise GhidraError(f"Ghidra {script} did not run", code="script_error")
+    return report
 
 
 def decompile(address: str, project: Path, *, timeout: float | None = QUERY_TIMEOUT, **options: object) -> dict:

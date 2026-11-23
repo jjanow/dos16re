@@ -438,7 +438,7 @@ def test_ghidra_analyzes_phantasie_iv_x68k(phantasie_iv_x68k_export, capsys):
     assert report["relocations"] == 11122
     calls = report["line_f"]["calls"]
     # Every XC multiply and float-to-double call that a linear sweep finds in reachable code is patched.
-    assert (calls["__CLMUL"], calls["__CFTOD"], calls["_EXIT2"]) == (1521, 133, 2)
+    assert (calls["__CLMUL"], calls["__CFTOD"], calls["_EXIT2"]) == (1531, 133, 2)  # Switch cases are reachable too
     assert "_CHANGE_PR" not in calls  # $FFFF words in data embedded in TEXT stay untouched
 
     def query(command, address):

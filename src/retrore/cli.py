@@ -597,7 +597,7 @@ def _batch(args: argparse.Namespace) -> int:
     return int(bool(errors))
 
 
-_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "layout")
+_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "layout", "indirect")
 
 
 def _add_query_parser(commands: argparse._SubParsersAction, command: str) -> argparse.ArgumentParser:
@@ -656,6 +656,20 @@ def _print_continue(report: dict) -> None:
         print(f"Continue with --offset {min(offsets)}")
 
 
+def _indirect_row(row: dict) -> str:
+    """One line per indirect site: where, what, and its targets, candidates, or the reason for neither."""
+    head = f"{_location(row['address'])}  {row['instruction']}  {row['status']}"
+    if row.get("targets"):
+        return f"{head}: {', '.join(_location(target) for target in row['targets'][:4])}" + (
+            " ..." if len(row["targets"]) > 4 else "")
+    if row.get("candidates"):
+        shown = ", ".join(
+            f"{_location(entry['target'])} ({'/'.join(entry['evidence'])})" for entry in row["candidates"][:3])
+        more = f" +{len(row['candidates']) - 3}" if len(row["candidates"]) > 3 else ""
+        return f"{head}: {shown}{more}; table {_location(row['table'])}, stop {row['stop']}"
+    return f"{head}: {row.get('reason')}"
+
+
 def _registry_query(args: argparse.Namespace) -> int:
     if args.command == "layout" and args.apply:
         report = apply_layout(args.project, _registry_request(args), timeout=args.timeout)
@@ -707,6 +721,9 @@ def _registry_query(args: argparse.Namespace) -> int:
             " ".join(filter(None, (_location(row["address"]), row["name"], row["type"], "/".join(row["access"]))))
             for row in report["data"]
         ])
+    elif command == "indirect":
+        print("  ".join(f"{count} {name}" for name, count in report["counts"].items()))
+        _print_page(report, "sites", [_indirect_row(row) for row in report["sites"]])
     else:
         _print_page(report, "units", [
             f"{row['unit']}  {row['size']} bytes  {row['instruction_bytes']} code  {row['data_bytes']} data  "
@@ -726,7 +743,8 @@ def _paged_gaps(args: argparse.Namespace) -> None:
     page = report["pagination"]["ranges"]
     print(f"{report['undefined_bytes']} undefined bytes in {page['total']} ranges")
     for gap in report["ranges"][:_PREVIEW_LIMIT]:
-        print(f"{gap['start']}–{gap['end']}  {gap['size']} bytes")
+        kind = f"  {gap['class']}" + (" (conflict)" if gap.get("conflict") else "") if "class" in gap else ""
+        print(f"{gap['start']}–{gap['end']}  {gap['size']} bytes{kind}")
     if len(report["ranges"]) > _PREVIEW_LIMIT:
         print("Use --json for the full page.")
     _print_continue(report)
@@ -1167,6 +1185,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{parameter['description']} ({parameter['minimum']}–{parameter['maximum']}"
             f", default {parameter['default']})"))
     gaps_parser.add_argument("--fields", metavar="FIELD,...", help="select record JSON fields")
+    gaps_parser.add_argument("--classify", action="store_true", default=None,
+                             help=gaps_paging["classify"]["description"])
     batch_parser = commands.add_parser("batch", help="run multiple address queries in one Ghidra session")
     batch_parser.add_argument("input", metavar="FILE", nargs="?", default="-", help="JSON request file (default: stdin)")
     batch_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
@@ -1309,7 +1329,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command in _REGISTRY_COMMANDS:
             return _registry_query(args)
-        paging = ("unit", "limit", "offset", "fields")
+        paging = ("unit", "limit", "offset", "fields", "classify")
         if args.command == "gaps" and any(getattr(args, name) is not None for name in paging):
             _paged_gaps(args)
             return 0

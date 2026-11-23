@@ -84,6 +84,9 @@ public class RetroreImport extends HeadlessScript {
         if (entryBlock == null || !entryBlock.isExecute()) {
             throw new IllegalArgumentException("entry point is outside the image");
         }
+        if (map.has("relocations")) {
+            markRelocations(map.getAsJsonArray("relocations"), origin, memory);
+        }
         if (map.has("jump_tables")) {
             recoverSwitches(map.getAsJsonArray("jump_tables"));
         }
@@ -189,6 +192,27 @@ public class RetroreImport extends HeadlessScript {
         }
     }
 
+    /**
+     * Record the relocated segment words as an address property for evidence queries such as `gaps
+     * --classify`. Ghidra's own relocation table is left alone: its analyzers turn relocated 16-bit
+     * immediates into references.
+     */
+    private void markRelocations(JsonArray relocations, long origin, Memory memory) throws Exception {
+        var properties = currentProgram.getUsrPropertyManager();
+        var marks = properties.getVoidPropertyMap(RELOCATIONS);
+        if (marks == null) {
+            marks = properties.createVoidPropertyMap(RELOCATIONS);
+        }
+        for (JsonElement item : relocations) {
+            Address site = space.getAddress(origin + item.getAsLong());
+            if (memory.contains(site)) {
+                marks.add(site);
+            }
+        }
+    }
+
+    static final String RELOCATIONS = "retrore.relocations";
+
     private void recoverSwitches(JsonArray switches) throws Exception {
         var listing = currentProgram.getListing();
         var references = currentProgram.getReferenceManager();
@@ -214,8 +238,10 @@ public class RetroreImport extends HeadlessScript {
             Address table = address(record.getAsJsonObject("table"));
             disassemble(address(record.getAsJsonObject("guard")));
             var instruction = listing.getInstructionAt(jump);
-            if (instruction == null || !instruction.getFlowType().isJump() ||
-                    !instruction.getFlowType().isComputed()) {
+            // Call tables ("kind": "call") dispatch to subroutines; older maps hold only jump tables.
+            boolean call = record.has("kind") && record.get("kind").getAsString().equals("call");
+            if (instruction == null || !instruction.getFlowType().isComputed() ||
+                    (call ? !instruction.getFlowType().isCall() : !instruction.getFlowType().isJump())) {
                 continue;
             }
             instruction.addOperandReference(0, table, RefType.READ, SourceType.ANALYSIS);
@@ -224,10 +250,14 @@ public class RetroreImport extends HeadlessScript {
                 Address destination = address(target.getAsJsonObject());
                 Address word = table.addNoWrap(2L * index++);
                 references.addMemoryReference(word, destination, RefType.DATA, SourceType.ANALYSIS, 0);
-                instruction.addMnemonicReference(destination, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+                instruction.addMnemonicReference(destination,
+                    call ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
             }
             for (Address destination : instruction.getFlows()) {
                 disassemble(destination);
+                if (call && getFunctionAt(destination) == null) {
+                    createFunction(destination, null);
+                }
             }
         }
     }
