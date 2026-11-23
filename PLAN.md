@@ -23,8 +23,7 @@ Windows is only partly verified (see Phase 8). The full suite with Ghidra 12.2 p
 skipped before the Windows merge. After it the standalone suite passed 340 with 51 skipped, and the
 worker, X68000, and segment tests passed with Ghidra (57 passed, 1 skipped).
 
-Resume with Phase 9. A Windows job for release CI is drafted on the unmerged `ci/windows-worker`
-branch; trigger CI only for a tagged release. Classic Macintosh is the next platform milestone.
+Resume with Phase 9. Release CI has no Windows job yet; trigger CI only for a tagged release. Classic Macintosh is the next platform milestone.
 
 ## Why
 
