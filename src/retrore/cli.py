@@ -35,6 +35,7 @@ from .pc88 import (
 from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build_pc98_image
 from .queries import QUERIES, option_names
 from .schema import DIALECT, query_schema
+from .layout import apply_layout, layout_lines
 from .search import (
     ENCODINGS, WIDTHS, SearchError, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols,
     search_pattern,
@@ -594,7 +595,7 @@ def _batch(args: argparse.Namespace) -> int:
     return int(bool(errors))
 
 
-_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage")
+_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "layout")
 
 
 def _add_query_parser(commands: argparse._SubParsersAction, command: str) -> argparse.ArgumentParser:
@@ -654,10 +655,15 @@ def _print_continue(report: dict) -> None:
 
 
 def _registry_query(args: argparse.Namespace) -> int:
-    report = query(args.project, _registry_request(args), timeout=args.timeout)
+    if args.command == "layout" and args.apply:
+        report = apply_layout(args.project, _registry_request(args), timeout=args.timeout)
+    else:
+        report = query(args.project, _registry_request(args), timeout=args.timeout)
     command = args.command
     if args.json:
         print(json.dumps(report))
+    elif command == "layout":
+        print("\n".join(layout_lines(report)))
     elif command == "functions":
         _print_page(report, "functions", [
             f"{row['query']}: {row['error']['message']}" if "error" in row else f"{_location(row['entry'])}  {row['prototype']}"
@@ -1184,6 +1190,9 @@ def main(argv: list[str] | None = None) -> int:
             query_parser.add_argument("--direction", choices=("incoming", "outgoing", "both"), help="select reference direction")
     for name in _REGISTRY_COMMANDS:
         _add_query_parser(commands, name)
+    commands.choices["layout"].add_argument(
+        "--apply", action="store_true",
+        help="apply the proposed structure or array in Ghidra (saves the project; default: preview only)")
 
     schema_parser = commands.add_parser("schema", help="print the JSON Schema of query requests and errors")
     schema_parser.add_argument("--json", action="store_true", help="print the JSON Schema document")

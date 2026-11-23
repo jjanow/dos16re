@@ -310,6 +310,7 @@ public class RetroreQuery extends GhidraScript {
             case "context" -> context(request, options);
             case "gaps" -> gaps(request, options);
             case "coverage" -> coverage(request, options);
+            case "layout" -> layout(request, options);
             default -> addressQuery(command, request, options);
         };
     }
@@ -1126,5 +1127,845 @@ public class RetroreQuery extends GhidraScript {
             return segmented.getAddress(Integer.parseInt(parts[0], 16), (int) offset);
         }
         throw new IllegalArgumentException("unknown unit or invalid segment address " + input);
+    }
+
+    // ---- layout: data layout recovery from access patterns ----------------------------------------------------
+    //
+    // For a global range, decompile every function that references it and evaluate the address of each LOAD
+    // and STORE in high p-code as constant + sum(scale * variable). Scales come from INT_MULT, INT_LEFT, PTRADD,
+    // and loop induction variables (a MULTIEQUAL of an initial value and itself plus a constant step). Accesses
+    // whose constant falls in the range give field offsets and widths; scales give element strides; compares of
+    // induction variables against constants give count bounds. Direct ram varnodes in the range are accesses with
+    // constant offsets.
+
+    private static final int LAYOUT_DEPTH = 48;
+    private static final long LAYOUT_MAX_SIZE = 0x100000;
+
+    private record LayoutIndex(String variable, long scale, List<String> evidence) {}
+    private record LayoutAccess(Object address, String function, String instruction, String access, int width,
+            long offset, List<LayoutIndex> index, String matchedBy) {}
+    private record LayoutBound(String variable, String address, String compare, long constant, boolean incremented,
+            Long initial, long step, Long count) {}
+    private record LayoutStride(long stride, int accesses, List<String> evidence, int evidenceTotal) {}
+    private record LayoutConflict(long offset, String kind, List<Integer> widths, Long overlaps,
+            List<Object> instructions) {}
+
+    /** An affine expression over named variables, with notes on where each scale came from. */
+    private static final class Affine {
+        long constant;
+        boolean anchored;
+        boolean segmentOffset;
+        final Set<Address> anchors = new HashSet<>();
+        final Map<String, Long> terms = new LinkedHashMap<>();
+        final Map<String, List<String>> evidence = new LinkedHashMap<>();
+        final Map<String, LoopInfo> loops = new LinkedHashMap<>();
+
+        static Affine constant(long value) {
+            var result = new Affine();
+            result.constant = value;
+            result.anchored = value != 0;
+            return result;
+        }
+
+        static Affine variable(String name) {
+            var result = new Affine();
+            result.terms.put(name, 1L);
+            return result;
+        }
+
+        Affine plus(Affine other, long sign) {
+            var result = copy();
+            result.constant += sign * other.constant;
+            result.anchored |= other.anchored;
+            result.segmentOffset |= other.segmentOffset;
+            result.anchors.addAll(other.anchors);
+            other.terms.forEach((name, scale) -> result.terms.merge(name, sign * scale, Long::sum));
+            result.terms.values().removeIf(scale -> scale == 0);
+            other.evidence.forEach((name, notes) -> result.evidence.computeIfAbsent(name, key -> new ArrayList<>())
+                .addAll(notes));
+            result.loops.putAll(other.loops);
+            return result;
+        }
+
+        Affine times(long factor, String note) {
+            var result = copy();
+            result.constant *= factor;
+            result.terms.replaceAll((name, scale) -> scale * factor);
+            for (var name : result.terms.keySet()) {
+                result.evidence.computeIfAbsent(name, key -> new ArrayList<>()).add(note);
+            }
+            return result;
+        }
+
+        Affine copy() {
+            var result = new Affine();
+            result.constant = constant;
+            result.anchored = anchored;
+            result.segmentOffset = segmentOffset;
+            result.anchors.addAll(anchors);
+            result.terms.putAll(terms);
+            evidence.forEach((name, notes) -> result.evidence.put(name, new ArrayList<>(notes)));
+            result.loops.putAll(loops);
+            return result;
+        }
+    }
+
+    private record LoopInfo(Long initial, long step, List<PcodeOp> values) {}
+
+    private final class LayoutEvaluator {
+        private final Map<Varnode, Affine> cache = new HashMap<>();
+
+        Affine eval(Varnode varnode, int depth) {
+            if (varnode == null) {
+                return Affine.variable("unknown");
+            }
+            if (varnode.isConstant()) {
+                return Affine.constant(signed(varnode.getOffset(), varnode.getSize()));
+            }
+            var cached = cache.get(varnode);
+            if (cached != null) {
+                return cached;
+            }
+            cache.put(varnode, leaf(varnode));  // Breaks cycles through MULTIEQUAL.
+            var result = depth > LAYOUT_DEPTH ? leaf(varnode) : define(varnode, depth);
+            cache.put(varnode, result);
+            return result;
+        }
+
+        private Affine define(Varnode varnode, int depth) {
+            var op = varnode.getDef();
+            if (op == null) {
+                return leaf(varnode);
+            }
+            String at = layoutWhere(op);
+            var result = defineOp(varnode, op, at, depth);
+            for (var input : op.getInputs()) {
+                if (input.isConstant() && input.getOffset() != 0 && op.getOpcode() != PcodeOp.PTRADD) {
+                    result = result.copy();
+                    result.anchors.add(op.getSeqnum().getTarget());
+                    break;
+                }
+            }
+            return result;
+        }
+
+        private Affine defineOp(Varnode varnode, PcodeOp op, String at, int depth) {
+            switch (op.getOpcode()) {
+                case PcodeOp.COPY, PcodeOp.CAST, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT:
+                    return eval(op.getInput(0), depth + 1);
+                case PcodeOp.SUBPIECE:
+                    return op.getInput(1).getOffset() == 0 ? eval(op.getInput(0), depth + 1) : leaf(varnode);
+                case PcodeOp.INT_ADD, PcodeOp.PTRSUB:
+                    return eval(op.getInput(0), depth + 1).plus(eval(op.getInput(1), depth + 1), 1);
+                case PcodeOp.INT_SUB:
+                    return eval(op.getInput(0), depth + 1).plus(eval(op.getInput(1), depth + 1), -1);
+                case PcodeOp.PTRADD: {
+                    long size = op.getInput(2).getOffset();
+                    var index = eval(op.getInput(1), depth + 1)
+                        .times(size, at + " PTRADD element size 0x" + Long.toHexString(size));
+                    return eval(op.getInput(0), depth + 1).plus(index, 1);
+                }
+                case PcodeOp.INT_MULT: {
+                    var left = op.getInput(0);
+                    var right = op.getInput(1);
+                    var constant = right.isConstant() ? right : left.isConstant() ? left : null;
+                    if (constant == null) {
+                        var a = eval(left, depth + 1);
+                        var b = eval(right, depth + 1);
+                        if (b.terms.isEmpty()) {
+                            return a.times(b.constant, at + " INT_MULT by 0x" + Long.toHexString(b.constant));
+                        }
+                        if (a.terms.isEmpty()) {
+                            return b.times(a.constant, at + " INT_MULT by 0x" + Long.toHexString(a.constant));
+                        }
+                        return leaf(varnode);
+                    }
+                    long factor = signed(constant.getOffset(), constant.getSize());
+                    var other = constant == right ? left : right;
+                    return eval(other, depth + 1).times(factor, at + " INT_MULT by 0x" + Long.toHexString(factor));
+                }
+                case PcodeOp.INT_LEFT: {
+                    var amount = op.getInput(1);
+                    if (!amount.isConstant() || amount.getOffset() > 31) {
+                        return leaf(varnode);
+                    }
+                    long factor = 1L << amount.getOffset();
+                    return eval(op.getInput(0), depth + 1)
+                        .times(factor, at + " INT_LEFT by " + amount.getOffset() + " (x" + factor + ")");
+                }
+                case PcodeOp.SEGMENTOP: {
+                    var offset = eval(op.getInput(2), depth + 1).copy();
+                    offset.segmentOffset = true;
+                    return offset;
+                }
+                case PcodeOp.MULTIEQUAL:
+                    return induction(varnode, op, depth);
+                default:
+                    return leaf(varnode);
+            }
+        }
+
+        // A loop variable: one initial value and every other input equal to the variable plus the same step.
+        private Affine induction(Varnode varnode, PcodeOp phi, int depth) {
+            Varnode initial = null;
+            Long step = null;
+            var values = new ArrayList<PcodeOp>();
+            for (var input : phi.getInputs()) {
+                var increment = increment(input, varnode);
+                if (increment != null) {
+                    if (step != null && !step.equals(increment)) {
+                        return leaf(varnode);
+                    }
+                    step = increment;
+                    values.add(input.getDef());
+                } else if (initial == null) {
+                    initial = input;
+                } else if (!sameValue(initial, input)) {
+                    return leaf(varnode);
+                }
+            }
+            if (initial == null || step == null) {
+                return leaf(varnode);
+            }
+            var start = eval(initial, depth + 1);
+            String name = "loop " + variableName(varnode);
+            var counter = Affine.variable(name);
+            counter.evidence.computeIfAbsent(name, key -> new ArrayList<>()).add(String.format(
+                "%s MULTIEQUAL steps by %s%s", layoutWhere(phi), step < 0 ? "-0x" : "0x", Long.toHexString(Math.abs(step))));
+            counter = counter.times(step, layoutWhere(values.get(0)) + " increment by " + step);
+            var result = start.plus(counter, 1);
+            values.add(0, phi);
+            result.loops.put(name, new LoopInfo(start.terms.isEmpty() ? start.constant : null, step, values));
+            return result;
+        }
+
+        // The constant step if input is phi output plus or minus a constant.
+        private Long increment(Varnode input, Varnode phiOutput) {
+            var op = input.getDef();
+            if (op == null) {
+                return null;
+            }
+            int opcode = op.getOpcode();
+            if (opcode == PcodeOp.INT_ADD || opcode == PcodeOp.INT_SUB) {
+                for (int side = 0; side < 2; side++) {
+                    var self = op.getInput(side);
+                    var other = op.getInput(1 - side);
+                    if (other.isConstant() && reaches(self, phiOutput) && (opcode == PcodeOp.INT_ADD || side == 0)) {
+                        long value = signed(other.getOffset(), other.getSize());
+                        return opcode == PcodeOp.INT_SUB ? -value : value;
+                    }
+                }
+            } else if (opcode == PcodeOp.PTRADD && op.getInput(1).isConstant() && reaches(op.getInput(0), phiOutput)) {
+                return signed(op.getInput(1).getOffset(), op.getInput(1).getSize()) * op.getInput(2).getOffset();
+            } else if (opcode == PcodeOp.COPY || opcode == PcodeOp.CAST) {
+                return increment(op.getInput(0), phiOutput);
+            }
+            return null;
+        }
+
+        private boolean reaches(Varnode value, Varnode target) {
+            for (int hops = 0; value != null && hops < 8; hops++) {
+                if (value.equals(target)) {
+                    return true;
+                }
+                var op = value.getDef();
+                if (op == null || (op.getOpcode() != PcodeOp.COPY && op.getOpcode() != PcodeOp.CAST)) {
+                    return false;
+                }
+                value = op.getInput(0);
+            }
+            return false;
+        }
+
+        private boolean sameValue(Varnode left, Varnode right) {
+            if (left.isConstant() && right.isConstant()) {
+                return left.getOffset() == right.getOffset();
+            }
+            return left.equals(right);
+        }
+
+        private Affine leaf(Varnode varnode) {
+            var op = varnode.getDef();
+            String name = variableName(varnode);
+            if (op != null && op.getOpcode() == PcodeOp.LOAD) {
+                name = "load@" + layoutWhere(op);
+            }
+            return Affine.variable(name);
+        }
+    }
+
+    private String variableName(Varnode varnode) {
+        var high = varnode.getHigh();
+        var language = currentProgram.getLanguage();
+        if (high != null) {
+            var representative = high.getRepresentative();
+            String storage = representative == null ? varnode.toString(language) : representative.toString(language);
+            String name = high.getName();
+            return name == null || name.equals("UNNAMED") ? storage : name + "@" + storage;
+        }
+        return varnode.toString(language);
+    }
+
+    private String layoutWhere(PcodeOp op) {
+        var location = location(op.getSeqnum().getTarget());
+        return Objects.requireNonNullElse(location.unitAddress(), location.address());
+    }
+
+    private static long signed(long value, int size) {
+        if (size >= 8) {
+            return value;
+        }
+        long sign = 1L << (size * 8 - 1);
+        long mask = (1L << (size * 8)) - 1;
+        value &= mask;
+        return (value & sign) != 0 ? value - (mask + 1) : value;
+    }
+
+    private Map<String, Object> layout(JsonObject request, Options options) throws Exception {
+        boolean compact = options.compact();
+        var start = resolve(request.get("address").getAsString());
+        var symbols = currentProgram.getSymbolTable();
+        String sizeSource;
+        long size;
+        if (request.has("size")) {
+            size = request.get("size").getAsLong();
+            sizeSource = "given";
+        } else {
+            size = 0x100;
+            sizeSource = "default";
+            var data = currentProgram.getListing().getDataAt(start);
+            if (data != null && data.isDefined() && data.getLength() > 1) {
+                size = data.getLength();
+                sizeSource = "defined data " + data.getDataType().getDisplayName();
+            } else {
+                for (var symbol : symbols.getSymbolIterator(start.addNoWrap(1), true)) {
+                    monitor.checkCancelled();
+                    if (symbol.getSource() == ghidra.program.model.symbol.SourceType.DEFAULT || symbol.isDynamic()) {
+                        continue;
+                    }
+                    long distance = symbol.getAddress().subtract(start);
+                    if (distance > 0 && distance <= LAYOUT_MAX_SIZE && symbol.getAddress().getAddressSpace()
+                            .equals(start.getAddressSpace())) {
+                        size = distance;
+                        sizeSource = "next symbol " + symbol.getName();
+                    }
+                    break;
+                }
+            }
+        }
+        var block = currentProgram.getMemory().getBlock(start);
+        if (block == null) {
+            throw new IllegalArgumentException("address is not in a memory block");
+        }
+        size = Math.min(size, block.getEnd().subtract(start) + 1);
+        var end = start.addNoWrap(size - 1);
+        var range = new AddressSet(start, end);
+        int maxFunctions = request.has("max_functions") ? request.get("max_functions").getAsInt() : 64;
+
+        // Functions that reference the range, and which instructions do.
+        var manager = currentProgram.getReferenceManager();
+        var referencing = new TreeSet<Address>();
+        var functions = new TreeMap<Address, Function>();
+        for (Address target : manager.getReferenceDestinationIterator(range, true)) {
+            monitor.checkCancelled();
+            for (var reference : manager.getReferencesTo(target)) {
+                referencing.add(reference.getFromAddress());
+                var function = getFunctionContaining(reference.getFromAddress());
+                if (function != null) {
+                    functions.put(function.getEntryPoint(), function);
+                }
+            }
+        }
+        // Indexed operands such as [BX+0x200] get no reference; find their displacements and immediates instead.
+        int referencingFunctions = functions.size();
+        long low = start instanceof ghidra.program.model.address.SegmentedAddress segmentedStart
+            ? segmentedStart.getSegmentOffset() : start.getOffset();
+        for (var instruction : currentProgram.getListing().getInstructions(
+                currentProgram.getMemory().getExecuteSet(), true)) {
+            monitor.checkCancelled();
+            var function = getFunctionContaining(instruction.getAddress());
+            if (function == null || functions.containsKey(function.getEntryPoint())) {
+                continue;
+            }
+            scan:
+            for (int operand = 0; operand < instruction.getNumOperands(); operand++) {
+                for (var object : instruction.getOpObjects(operand)) {
+                    if (object instanceof ghidra.program.model.scalar.Scalar scalar
+                            && scalar.getUnsignedValue() >= low && scalar.getUnsignedValue() - low < size) {
+                        functions.put(function.getEntryPoint(), function);
+                        break scan;
+                    }
+                }
+            }
+        }
+        var ordered = new ArrayList<>(functions.values());
+        var prioritized = new ArrayList<Function>();
+        for (var function : ordered) {
+            if (referencing.stream().anyMatch(site -> function.getBody().contains(site))) {
+                prioritized.add(function);
+            }
+        }
+        ordered.removeAll(prioritized);
+        prioritized.addAll(ordered);
+        var scanned = prioritized.subList(0, Math.min(maxFunctions, prioritized.size()));
+        var failed = new ArrayList<Map<String, Object>>();
+        var accesses = new ArrayList<LayoutAccess>();
+        var seen = new HashSet<String>();
+        var loops = new LinkedHashMap<String, LoopInfo>();
+        var listing = currentProgram.getListing();
+        long segmentBase = start instanceof ghidra.program.model.address.SegmentedAddress segmented
+            ? start.getOffset() - segmented.getSegmentOffset() : 0;
+        for (var function : scanned) {
+            monitor.checkCancelled();
+            DecompileResults result;
+            try {
+                result = decompile(function);
+            } catch (IllegalArgumentException error) {
+                var failure = new LinkedHashMap<String, Object>();
+                failure.put("function", function.getName());
+                failure.put("message", error.getMessage());
+                failed.add(failure);
+                continue;
+            }
+            var evaluator = new LayoutEvaluator();
+            var ops = result.getHighFunction().getPcodeOps();
+            while (ops.hasNext()) {
+                var op = ops.next();
+                int opcode = op.getOpcode();
+                var site = op.getSeqnum().getTarget();
+                if (opcode == PcodeOp.LOAD || opcode == PcodeOp.STORE) {
+                    var address = evaluator.eval(op.getInput(1), 0);
+                    if (!address.anchored) {
+                        continue;
+                    }
+                    long linear = address.segmentOffset ? segmentBase + (address.constant & 0xffff) : address.constant;
+                    long offset = linear - start.getOffset();
+                    if (offset < 0 || offset >= size) {
+                        continue;
+                    }
+                    boolean referenced = referencing.contains(site)
+                        || address.anchors.stream().anyMatch(referencing::contains);
+                    boolean explained = address.terms.keySet().stream().allMatch(name -> name.startsWith("loop ")
+                        || !address.evidence.getOrDefault(name, List.of()).isEmpty());
+                    if (!referenced && !explained) {
+                        continue;
+                    }
+                    int width = opcode == PcodeOp.LOAD ? op.getOutput().getSize() : op.getInput(2).getSize();
+                    var index = new ArrayList<LayoutIndex>();
+                    address.terms.forEach((name, scale) -> index.add(new LayoutIndex(name, scale,
+                        List.copyOf(address.evidence.getOrDefault(name, List.of())))));
+                    loops.putAll(address.loops);
+                    addLayoutAccess(accesses, seen, site, function, opcode == PcodeOp.LOAD ? "read" : "write", width,
+                        offset, index, referenced ? "reference" : "constant", compact);
+                } else if (opcode != PcodeOp.MULTIEQUAL && opcode != PcodeOp.INDIRECT) {
+                    var output = op.getOutput();
+                    if (output != null && output.isAddress() && range.contains(output.getAddress())) {
+                        addLayoutAccess(accesses, seen, site, function, "write", output.getSize(),
+                            output.getAddress().subtract(start), List.of(), "direct", compact);
+                    }
+                    for (var input : op.getInputs()) {
+                        if (input.isAddress() && range.contains(input.getAddress())) {
+                            addLayoutAccess(accesses, seen, site, function, "read", input.getSize(),
+                                input.getAddress().subtract(start), List.of(), "direct", compact);
+                        }
+                    }
+                }
+            }
+        }
+        accesses.sort(Comparator.comparingLong(LayoutAccess::offset).thenComparing(access -> access.address().toString()));
+
+        // Stride candidates: scales of loop variables and of multiplied or shifted indexes.
+        var votes = new TreeMap<Long, Set<String>>();
+        var strideNotes = new TreeMap<Long, Set<String>>();
+        for (var access : accesses) {
+            for (var index : access.index()) {
+                long scale = Math.abs(index.scale());
+                if (scale == 0 || (scale == 1 && !index.variable().startsWith("loop "))) {
+                    continue;
+                }
+                votes.computeIfAbsent(scale, key -> new TreeSet<>()).add(access.address().toString());
+                for (var note : index.evidence()) {
+                    if (!note.endsWith(" PTRADD element size 0x1")) {
+                        strideNotes.computeIfAbsent(scale, key -> new TreeSet<>()).add(note);
+                    }
+                }
+            }
+        }
+        var strides = new ArrayList<LayoutStride>();
+        votes.forEach((stride, sites) -> {
+            var notes = List.copyOf(strideNotes.getOrDefault(stride, Set.of()));
+            strides.add(new LayoutStride(stride, sites.size(), notes.subList(0, Math.min(8, notes.size())),
+                notes.size()));
+        });
+        strides.sort(Comparator.comparingInt(LayoutStride::accesses).reversed()
+            .thenComparing(Comparator.comparingLong(LayoutStride::stride).reversed()));
+        Long stride = request.has("stride") ? Long.valueOf(request.get("stride").getAsLong()) : null;
+        String strideSource = stride == null ? null : "given";
+        if (stride == null) {
+            final long limit = size;
+            var choice = strides.stream().filter(candidate -> candidate.stride() > 1 && candidate.stride() <= limit)
+                .findFirst().or(() -> strides.stream().filter(candidate -> candidate.stride() <= limit).findFirst());
+            if (choice.isPresent()) {
+                stride = choice.get().stride();
+                strideSource = "most accesses";
+            }
+        }
+
+        // Fields per offset inside one element.
+        var fields = new TreeMap<Long, Map<String, Object>>();
+        var fieldWidths = new TreeMap<Long, TreeSet<Integer>>();
+        var fieldSites = new TreeMap<Long, List<Object>>();
+        for (var access : accesses) {
+            long fieldOffset = stride == null ? access.offset() : Math.floorMod(access.offset(), stride);
+            var field = fields.computeIfAbsent(fieldOffset, key -> {
+                var record = new LinkedHashMap<String, Object>();
+                record.put("offset", key);
+                record.put("reads", 0);
+                record.put("writes", 0);
+                record.put("elements", new TreeSet<Long>());
+                record.put("inner_strides", new TreeSet<Long>());
+                return record;
+            });
+            field.merge(access.access().equals("read") ? "reads" : "writes", 1, (a, b) -> (Integer) a + (Integer) b);
+            if (stride != null) {
+                ((TreeSet<Long>) field.get("elements")).add(Math.floorDiv(access.offset(), stride));
+            }
+            for (var index : access.index()) {
+                long scale = Math.abs(index.scale());
+                if (scale > 0 && (stride == null || scale < stride) && (scale > 1 || index.variable().startsWith("loop "))) {
+                    ((TreeSet<Long>) field.get("inner_strides")).add(scale);
+                }
+            }
+            fieldWidths.computeIfAbsent(fieldOffset, key -> new TreeSet<>()).add(access.width());
+            var sites = fieldSites.computeIfAbsent(fieldOffset, key -> new ArrayList<>());
+            if (!sites.contains(access.address()) && sites.size() < 8) {
+                sites.add(access.address());
+            }
+        }
+        var conflicts = new ArrayList<LayoutConflict>();
+        Long previous = null;
+        for (var entry : fields.entrySet()) {
+            long fieldOffset = entry.getKey();
+            var widths = fieldWidths.get(fieldOffset);
+            entry.getValue().put("widths", List.copyOf(widths));
+            entry.getValue().put("instructions", fieldSites.get(fieldOffset));
+            if (widths.size() > 1) {
+                conflicts.add(new LayoutConflict(fieldOffset, "widths", List.copyOf(widths), null,
+                    fieldSites.get(fieldOffset)));
+            }
+            if (previous != null && previous + fieldWidths.get(previous).last() > fieldOffset) {
+                conflicts.add(new LayoutConflict(previous, "overlap", List.copyOf(fieldWidths.get(previous)),
+                    fieldOffset, fieldSites.get(previous)));
+            }
+            previous = fieldOffset;
+        }
+
+        // Count bounds from compares of the loop variables that step through elements.
+        var bounds = new ArrayList<LayoutBound>();
+        for (var loop : loops.entrySet()) {
+            bounds.addAll(loopBounds(loop.getKey(), loop.getValue(), compact));
+        }
+        Long count = null;
+        String countSource = null;
+        if (stride != null) {
+            for (var bound : bounds) {
+                if (bound.count() != null && stride.equals(elementStep(bound, accesses))
+                        && (count == null || bound.count() > count)) {
+                    count = bound.count();
+                    countSource = String.format("%s %s %d%s at %s", bound.variable().substring(5), bound.compare(),
+                        bound.constant(), bound.incremented() ? " after the increment" : "", bound.address());
+                }
+            }
+            if (count == null && size % stride == 0) {
+                count = size / stride;
+                countSource = "range size / stride";
+            }
+        }
+
+        boolean writes = accesses.stream().anyMatch(access -> access.access().equals("write"));
+        String text = initialText(start, size);
+        String kind;
+        if (accesses.isEmpty()) {
+            kind = "unknown";
+        } else if (stride != null && fields.size() == 1 && fields.containsKey(0L)
+                && fieldWidths.get(0L).size() == 1 && fieldWidths.get(0L).first() == stride.intValue()) {
+            kind = stride == 1 && text != null ? "string" : "array";
+        } else if (stride != null) {
+            kind = "record_array";
+        } else {
+            kind = fields.size() == 1 && text != null ? "string" : "record";
+        }
+        var layout = new LinkedHashMap<String, Object>();
+        layout.put("kind", kind);
+        layout.put("size_source", sizeSource);
+        layout.put("element_size", stride);
+        layout.put("element_size_source", strideSource);
+        layout.put("count", count);
+        layout.put("count_source", countSource);
+        layout.put("read_only", !writes && block.isInitialized());
+        layout.put("initial_text", text);
+        layout.put("fields", new ArrayList<>(fields.values()));
+
+        var report = new LinkedHashMap<String, Object>();
+        var pages = new LinkedHashMap<String, Page>();
+        if (options.includes("address")) {
+            report.put("address", addressRecord(start, compact));
+        }
+        if (options.includes("size")) {
+            report.put("size", size);
+        }
+        if (options.includes("functions")) {
+            var scannedRecords = new ArrayList<Routine>();
+            for (var function : scanned) {
+                scannedRecords.add(routine(function, compact));
+            }
+            var summary = new LinkedHashMap<String, Object>();
+            summary.put("referencing", referencingFunctions);
+            summary.put("matching_operands", functions.size() - referencingFunctions);
+            summary.put("scanned", scannedRecords);
+            summary.put("failed", failed);
+            report.put("functions", summary);
+        }
+        if (options.includes("accesses")) {
+            report.put("accesses", page("accesses", accesses, options, pages));
+        }
+        if (options.includes("strides")) {
+            report.put("strides", strides);
+        }
+        if (options.includes("bounds")) {
+            report.put("bounds", bounds);
+        }
+        if (options.includes("layout")) {
+            report.put("layout", layout);
+        }
+        if (options.includes("conflicts")) {
+            report.put("conflicts", conflicts);
+        }
+        var proposal = layoutProposal(start, size, stride, count, fields, fieldWidths, request);
+        if (options.includes("proposal")) {
+            report.put("proposal", proposal);
+        }
+        if (request.has("apply") && request.get("apply").getAsBoolean()) {
+            report.put("applied", applyLayout(start, size, stride, count, fields, fieldWidths, request));
+        }
+        if (!pages.isEmpty()) {
+            report.put("pagination", pages);
+        }
+        return report;
+    }
+
+    private void addLayoutAccess(List<LayoutAccess> accesses, Set<String> seen, Address site, Function function,
+            String access, int width, long offset, List<LayoutIndex> index, String matchedBy, boolean compact) {
+        String key = site + "/" + access + "/" + width + "/" + offset + "/" + index;
+        if (!seen.add(key)) {
+            return;
+        }
+        var instruction = currentProgram.getListing().getInstructionAt(site);
+        accesses.add(new LayoutAccess(addressRecord(site, compact), function.getName(),
+            instruction == null ? null : instruction.toString(), access, width, offset, index, matchedBy));
+    }
+
+    // The element step a bound's loop variable takes in the accesses it indexes.
+    private static Long elementStep(LayoutBound bound, List<LayoutAccess> accesses) {
+        for (var access : accesses) {
+            for (var index : access.index()) {
+                if (index.variable().equals(bound.variable())) {
+                    return Math.abs(index.scale());
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<LayoutBound> loopBounds(String name, LoopInfo loop, boolean compact) {
+        var bounds = new ArrayList<LayoutBound>();
+        for (var value : loop.values()) {
+            if (value == null || value.getOutput() == null) {
+                continue;
+            }
+            var pending = new ArrayDeque<Varnode>(List.of(value.getOutput()));
+            var visited = new HashSet<Varnode>();
+            while (!pending.isEmpty()) {
+                var varnode = pending.removeFirst();
+                if (!visited.add(varnode) || visited.size() > 32) {
+                    continue;
+                }
+                for (var it = varnode.getDescendants(); it.hasNext(); ) {
+                    var use = it.next();
+                    int opcode = use.getOpcode();
+                    if (opcode == PcodeOp.COPY || opcode == PcodeOp.CAST || opcode == PcodeOp.INT_ZEXT
+                            || opcode == PcodeOp.INT_SEXT) {
+                        pending.add(use.getOutput());
+                        continue;
+                    }
+                    if (opcode != PcodeOp.INT_LESS && opcode != PcodeOp.INT_SLESS && opcode != PcodeOp.INT_LESSEQUAL
+                            && opcode != PcodeOp.INT_SLESSEQUAL && opcode != PcodeOp.INT_EQUAL
+                            && opcode != PcodeOp.INT_NOTEQUAL) {
+                        continue;
+                    }
+                    var left = use.getInput(0);
+                    var right = use.getInput(1);
+                    boolean variableLeft = left == varnode;
+                    var other = variableLeft ? right : left;
+                    if (!other.isConstant()) {
+                        continue;
+                    }
+                    long constant = signed(other.getOffset(), other.getSize());
+                    boolean next = value != loop.values().get(0);
+                    String compare = (variableLeft ? "" : "constant ") + use.getMnemonic();
+                    Long count = null;
+                    if (loop.initial() != null && loop.step() != 0) {
+                        long span = constant - loop.initial();
+                        long step = loop.step();
+                        if (variableLeft && (opcode == PcodeOp.INT_LESS || opcode == PcodeOp.INT_SLESS
+                                || opcode == PcodeOp.INT_NOTEQUAL)) {
+                            count = Math.floorDiv(span + step - 1, step);
+                        } else if (variableLeft && (opcode == PcodeOp.INT_LESSEQUAL || opcode == PcodeOp.INT_SLESSEQUAL)) {
+                            count = Math.floorDiv(span, step) + 1;
+                        } else if (!variableLeft && (opcode == PcodeOp.INT_LESS || opcode == PcodeOp.INT_SLESS)) {
+                            // constant < variable: the loop continues while the variable stays at or below it.
+                            count = null;
+                        }
+                        if (count != null && count <= 0) {
+                            count = null;
+                        }
+                    }
+                    bounds.add(new LayoutBound(name, layoutWhere(use), compare,
+                        constant, next, loop.initial(), loop.step(), count));
+                }
+            }
+        }
+        return bounds;
+    }
+
+    private String initialText(Address start, long size) {
+        var memory = currentProgram.getMemory();
+        var block = memory.getBlock(start);
+        if (block == null || !block.isInitialized()) {
+            return null;
+        }
+        var text = new StringBuilder();
+        try {
+            for (long index = 0; index < Math.min(size, 256); index++) {
+                int value = memory.getByte(start.addNoWrap(index)) & 0xff;
+                if (value == 0) {
+                    break;
+                }
+                if (value < 0x20 || value > 0x7e) {
+                    return null;
+                }
+                text.append((char) value);
+            }
+        } catch (Exception error) {
+            return null;
+        }
+        return text.length() >= 4 ? text.toString() : null;
+    }
+
+    private static String layoutTypeName(int width) {
+        return switch (width) {
+            case 1 -> "byte";
+            case 2 -> "word";
+            case 4 -> "dword";
+            case 8 -> "qword";
+            default -> "undefined" + width;
+        };
+    }
+
+    private static String layoutName(Address start, JsonObject request) {
+        return request.has("name") ? request.get("name").getAsString()
+            : "layout_" + start.toString().replace(':', '_');
+    }
+
+    // Fields that a structure can hold: the narrowest observed width at each offset, skipping overlaps.
+    private static List<long[]> layoutMembers(long length, Map<Long, Map<String, Object>> fields,
+            Map<Long, TreeSet<Integer>> widths) {
+        var members = new ArrayList<long[]>();
+        long next = 0;
+        for (var offset : fields.keySet()) {
+            int width = widths.get(offset).first();
+            if (offset < next || offset + width > length) {
+                continue;
+            }
+            members.add(new long[] {offset, width});
+            next = offset + width;
+        }
+        return members;
+    }
+
+    private Map<String, Object> layoutProposal(Address start, long size, Long stride, Long count,
+            Map<Long, Map<String, Object>> fields, Map<Long, TreeSet<Integer>> widths, JsonObject request) {
+        String name = layoutName(start, request);
+        long length = stride == null ? size : stride;
+        var text = new StringBuilder("struct ").append(name).append(" {  /* 0x")
+            .append(Long.toHexString(length)).append(" bytes */\n");
+        long next = 0;
+        for (var member : layoutMembers(length, fields, widths)) {
+            if (member[0] > next) {
+                text.append(String.format("    undefined1 pad_%04x[0x%x];%n", next, member[0] - next));
+            }
+            var field = fields.get(member[0]);
+            text.append(String.format("    %s field_%04x;  /* %s reads, %s writes%s */%n",
+                layoutTypeName((int) member[1]), member[0], field.get("reads"), field.get("writes"),
+                widths.get(member[0]).size() > 1 ? ", widths " + widths.get(member[0]) : ""));
+            next = member[0] + member[1];
+        }
+        if (next < length) {
+            text.append(String.format("    undefined1 pad_%04x[0x%x];%n", next, length - next));
+        }
+        text.append("};\n");
+        if (stride != null) {
+            text.append(String.format("struct %s %s_array[%s];%n", name, name, count == null ? "" : count));
+        }
+        var proposal = new LinkedHashMap<String, Object>();
+        proposal.put("name", name);
+        proposal.put("length", length);
+        proposal.put("count", stride == null ? null : count);
+        proposal.put("c", text.toString());
+        return proposal;
+    }
+
+    private Map<String, Object> applyLayout(Address start, long size, Long stride, Long count,
+            Map<Long, Map<String, Object>> fields, Map<Long, TreeSet<Integer>> widths, JsonObject request)
+            throws Exception {
+        if (fields.isEmpty()) {
+            throw new IllegalArgumentException("no accesses to build a layout from");
+        }
+        if (stride != null && count == null) {
+            throw new IllegalArgumentException("element count unknown; give size or stride so the count follows");
+        }
+        String name = layoutName(start, request);
+        long length = stride == null ? size : stride;
+        var types = currentProgram.getDataTypeManager();
+        var structure = new ghidra.program.model.data.StructureDataType(
+            new ghidra.program.model.data.CategoryPath("/retrore"), name, (int) length, types);
+        for (var member : layoutMembers(length, fields, widths)) {
+            var type = switch ((int) member[1]) {
+                case 1 -> ghidra.program.model.data.ByteDataType.dataType;
+                case 2 -> ghidra.program.model.data.WordDataType.dataType;
+                case 4 -> ghidra.program.model.data.DWordDataType.dataType;
+                case 8 -> ghidra.program.model.data.QWordDataType.dataType;
+                default -> ghidra.program.model.data.Undefined.getUndefinedDataType((int) member[1]);
+            };
+            structure.replaceAtOffset((int) member[0], type, (int) member[1], String.format("field_%04x", member[0]),
+                null);
+        }
+        var resolved = types.addDataType(structure, ghidra.program.model.data.DataTypeConflictHandler.REPLACE_HANDLER);
+        ghidra.program.model.data.DataType applied = resolved;
+        if (stride != null) {
+            applied = new ghidra.program.model.data.ArrayDataType(resolved, count.intValue(), (int) length, types);
+        }
+        var end = start.addNoWrap(applied.getLength() - 1);
+        var listing = currentProgram.getListing();
+        if (listing.getInstructions(new AddressSet(start, end), true).hasNext()) {
+            throw new IllegalArgumentException("the proposed type would cover instructions");
+        }
+        listing.clearCodeUnits(start, end, false);
+        listing.createData(start, applied);
+        var result = new LinkedHashMap<String, Object>();
+        result.put("data_type", applied.getDisplayName());
+        result.put("path", resolved.getPathName());
+        result.put("length", applied.getLength());
+        return result;
     }
 }
