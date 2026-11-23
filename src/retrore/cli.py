@@ -16,7 +16,10 @@ from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
-from .ghidra import BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
+from .ghidra import (
+    BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, decompile, import_program,
+    query, query_address, query_batch,
+)
 from .image import (
     APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT,
     ImageError,
@@ -29,6 +32,7 @@ from .pc88 import (
     Pc88Error, boot_source, build_pc88_image, copy_source, disk_source,
 )
 from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build_pc98_image
+from .queries import QUERIES, option_names
 from .search import SearchError, find_bytes
 from .trace import TraceError, import_trace
 from .x1 import DISK_SUFFIXES as X1_DISK_SUFFIXES
@@ -489,7 +493,7 @@ def _query_options(args: argparse.Namespace) -> dict:
     if fields is not None and not args.json:
         raise GhidraError("--fields requires --json")
     options = {"fields": fields.split(",")} if fields is not None else {}
-    for name in ("limit", "offset", "direction", "ref_types", "compact", "context", "slice"):
+    for name in option_names():
         value = getattr(args, name, None)
         if value is not None:
             options[name] = value
@@ -566,8 +570,139 @@ def _batch(args: argparse.Namespace) -> int:
     else:
         print(f"{len(results) - len(errors)}/{len(results)} queries succeeded")
         for row in errors[:_PREVIEW_LIMIT]:
-            print(f"  {row['command']} {row['address']}: {row['error']['code']}: {row['error']['message']}")
+            target = "".join(f" {value}" for key, value in row.items() if key not in ("command", "error"))
+            print(f"  {row['command']}{target}: {row['error']['code']}: {row['error']['message']}")
     return int(bool(errors))
+
+
+_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage")
+
+
+def _add_query_parser(commands: argparse._SubParsersAction, command: str) -> argparse.ArgumentParser:
+    """Add a subcommand whose arguments come from the query registry."""
+    definition = QUERIES[command]
+    parser = commands.add_parser(command, help=definition["description"])
+    for name, parameter in definition["parameters"].items():
+        flag = "--" + name.replace("_", "-")
+        text = parameter["description"]
+        if parameter["type"] == "integer":
+            default = f", default {parameter['default']}" if "default" in parameter else ""
+            text = f"{text} ({parameter['minimum']}–{parameter['maximum']}{default})"
+        if parameter.get("required"):
+            parser.add_argument(name, metavar="ADDR" if name == "address" else name.upper(), help=text)
+        elif name == "addresses":
+            parser.add_argument(name, metavar="ADDR", nargs="*", help=text)
+        elif parameter["type"] == "array":
+            parser.add_argument(flag.removesuffix("s"), dest=name, action="append", metavar=name[:-1].upper(),
+                                help=f"{text} (repeatable)")
+        elif parameter["type"] == "boolean":
+            parser.add_argument(flag, action="store_true", default=None, help=text)
+        elif parameter["type"] == "integer":
+            parser.add_argument(flag, type=int, metavar="N", help=text)
+        else:
+            parser.add_argument(flag, choices=parameter.get("enum"), metavar=None if "enum" in parameter else name.upper(),
+                                help=text)
+    parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    parser.add_argument("--json", action="store_true", help="print JSON")
+    scope = "record" if definition["fields_scope"] == "record" else "top-level"
+    parser.add_argument("--fields", metavar="FIELD,...", help=f"select {scope} JSON fields")
+    return parser
+
+
+def _registry_request(args: argparse.Namespace) -> dict:
+    request = {"command": args.command}
+    for name, parameter in QUERIES[args.command]["parameters"].items():
+        if parameter.get("required"):
+            request[name] = getattr(args, name)
+    request.update(_query_options(args))
+    return {name: value for name, value in request.items() if value != []}
+
+
+def _print_page(report: dict, group: str, rows: list[str]) -> None:
+    page = report.get("pagination", {}).get(group)
+    count = f"{page['returned']}/{page['total']}" if page else str(len(rows))
+    print(f"{count} {group}")
+    for row in rows[:_PREVIEW_LIMIT]:
+        print(f"  {row}")
+    if len(rows) > _PREVIEW_LIMIT:
+        print("  Use --json for the full page.")
+
+
+def _print_continue(report: dict) -> None:
+    offsets = [page["next_offset"] for page in report.get("pagination", {}).values() if page["next_offset"] is not None]
+    if offsets:
+        print(f"Continue with --offset {min(offsets)}")
+
+
+def _registry_query(args: argparse.Namespace) -> int:
+    report = query(args.project, _registry_request(args), timeout=args.timeout)
+    command = args.command
+    if args.json:
+        print(json.dumps(report))
+    elif command == "functions":
+        _print_page(report, "functions", [
+            f"{row['query']}: {row['error']['message']}" if "error" in row else f"{_location(row['entry'])}  {row['prototype']}"
+            for row in report["functions"]
+        ])
+    elif command == "symbols":
+        _print_page(report, "symbols", [
+            f"{_location(row['address'])}  {row['name']}  {row['kind']}" for row in report["symbols"]
+        ])
+    elif command == "inventory":
+        unit = report["unit"]
+        print(f"{unit['name']}  {_location(unit['start'])}–{_location(unit['end'])}  {unit['size']} bytes")
+        _print_page(report, "functions", [f"{_location(row['entry'])}  {row['name']}" for row in report["functions"]])
+        _print_page(report, "labels", [f"{_location(row['address'])}  {row['name']}" for row in report["labels"]])
+        _print_page(report, "data", [
+            f"{_location(row['address'])}  {row['type']}  {row['name'] or ''}".rstrip() for row in report["data"]
+        ])
+    elif command == "callgraph":
+        root, truncated = report["root"], report["truncated"]
+        print(f"{_location(root['entry'])}  {root['name']}")
+        limits = [name for name in ("depth", "nodes") if truncated[name]]
+        if limits:
+            print(f"Walk truncated by {' and '.join(limits)} limit.")
+        if report["unresolved"]:
+            print(f"{report['unresolved']} calls without an analyzed function")
+        _print_page(report, "nodes", [
+            f"{'  ' * node['depth']}{_location(node['function']['entry'])}  {node['function']['name']}"
+            for node in report["nodes"]
+        ])
+        page = report["pagination"]["edges"]
+        print(f"{page['returned']}/{page['total']} edges")
+    elif command == "context":
+        print(report["prototype"])
+        _print_page(report, "callees", [
+            f"{_location(row['target'])}  {row['function']['name'] if row['function'] else '?'}  {row['calls']} calls"
+            for row in report["callees"]
+        ])
+        _print_page(report, "data", [
+            " ".join(filter(None, (_location(row["address"]), row["name"], row["type"], "/".join(row["access"]))))
+            for row in report["data"]
+        ])
+    else:
+        _print_page(report, "units", [
+            f"{row['unit']}  {row['size']} bytes  {row['instruction_bytes']} code  {row['data_bytes']} data  "
+            f"{row['undefined_bytes']} undefined  {row['functions']} functions"
+            for row in report["units"]
+        ])
+    if not args.json:
+        _print_continue(report)
+    return int(command == "functions" and any("error" in row for row in report["functions"]))
+
+
+def _paged_gaps(args: argparse.Namespace) -> None:
+    report = query(args.project, _registry_request(args), timeout=args.timeout)
+    if args.json:
+        print(json.dumps(report))
+        return
+    page = report["pagination"]["ranges"]
+    print(f"{report['undefined_bytes']} undefined bytes in {page['total']} ranges")
+    for gap in report["ranges"][:_PREVIEW_LIMIT]:
+        print(f"{gap['start']}–{gap['end']}  {gap['size']} bytes")
+    if len(report["ranges"]) > _PREVIEW_LIMIT:
+        print("Use --json for the full page.")
+    _print_continue(report)
 
 
 def _where_is(args: argparse.Namespace) -> None:
@@ -781,6 +916,14 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser.add_argument("--slice", type=int, metavar="N", help="trace up to N backward p-code operations (1–128)")
     gaps_parser = commands.add_parser("gaps", help="report undefined ranges in an analyzed Ghidra project")
     gaps_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    gaps_paging = QUERIES["gaps"]["parameters"]
+    gaps_parser.add_argument("--unit", metavar="UNIT", help=gaps_paging["unit"]["description"])
+    for name in ("limit", "offset"):
+        parameter = gaps_paging[name]
+        gaps_parser.add_argument(f"--{name}", type=int, metavar="N", help=(
+            f"{parameter['description']} ({parameter['minimum']}–{parameter['maximum']}"
+            f", default {parameter['default']})"))
+    gaps_parser.add_argument("--fields", metavar="FIELD,...", help="select record JSON fields")
     batch_parser = commands.add_parser("batch", help="run multiple address queries in one Ghidra session")
     batch_parser.add_argument("input", metavar="FILE", nargs="?", default="-", help="JSON request file (default: stdin)")
     batch_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
@@ -804,6 +947,8 @@ def main(argv: list[str] | None = None) -> int:
                                   help="return addresses as unit:offset strings where available")
         if name == "xrefs":
             query_parser.add_argument("--direction", choices=("incoming", "outgoing", "both"), help="select reference direction")
+    for name in _REGISTRY_COMMANDS:
+        _add_query_parser(commands, name)
 
     search_parser = commands.add_parser("where-is", help="find a byte pattern across exported units")
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
@@ -839,7 +984,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
-    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries)):
+    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries),
+                    *map(commands.choices.get, _REGISTRY_COMMANDS)):
         default = IMPORT_TIMEOUT if command is import_parser else None if command is batch_parser else QUERY_TIMEOUT
         described = (f"the larger of {QUERY_TIMEOUT} and {BATCH_SECONDS_PER_QUERY} per query"
                      if default is None else default)
@@ -859,6 +1005,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "decomp":
             _decomp(args)
+            return 0
+        if args.command in _REGISTRY_COMMANDS:
+            return _registry_query(args)
+        paging = ("unit", "limit", "offset", "fields")
+        if args.command == "gaps" and any(getattr(args, name) is not None for name in paging):
+            _paged_gaps(args)
             return 0
         if args.command == "gaps":
             report = analysis_gaps(args.project, timeout=args.timeout)
