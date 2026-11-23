@@ -304,3 +304,47 @@ def test_cli_queries_reach_a_hosting_process(hosted):
 def test_worker_stop_needs_a_project_or_all(capsys):
     assert main(["worker", "stop", "--json"]) == 1
     assert json.loads(capsys.readouterr().err)["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
+def test_real_worker_matches_one_shot_queries(tmp_path, monkeypatch, capsys):
+    # The README walkthrough program: JSR $C004, RTS; LDA #$07; STA $D020; RTS.
+    source, export, project = tmp_path / "demo.prg", tmp_path / "export", tmp_path / "project"
+    source.write_bytes(bytes.fromhex("00c0 2004c060 a907 8d20d060"))
+    assert main(["load", str(source), "--entry", "c000", "-o", str(export)]) == 0
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0
+    capsys.readouterr()
+    requests = [
+        {"command": "decomp", "address": "c004", "context": 1},
+        {"command": "callers", "address": "c004"},
+        {"command": "xrefs", "address": "d020", "direction": "incoming", "compact": True},
+        {"command": "func", "address": "ffff"},
+    ]
+
+    def answers() -> list:
+        rows = [ghidra.query_batch(project, requests), ghidra.analysis_gaps(project)]
+        for request in requests:
+            try:
+                rows.append(ghidra.query(project, request))
+            except GhidraError as error:
+                rows.append({"code": error.code, "message": str(error)})
+        return rows
+
+    monkeypatch.setenv("RETRORE_WORKER", "0")
+    expected = answers()
+    monkeypatch.delenv("RETRORE_WORKER")
+    starts = worker.STARTS
+    with worker.hosting("test"):
+        assert answers() == expected
+        started = time.monotonic()
+        ghidra.query(project, requests[0])
+        assert time.monotonic() - started < 2
+        assert worker.STARTS == starts + 1
+        record = worker.status(project)
+        assert record["requests"] == len(requests) + 3 and record["fallbacks"] == 0
+        # Re-importing stops the worker first instead of failing on the project lock.
+        with pytest.raises(GhidraError) as caught:
+            ghidra.import_program(export, project)
+        assert caught.value.code == "headless_failed" and "conflicting program file" in str(caught.value)
+        _wait_dead(record["ghidra_pid"])
+        assert worker.status(project) is None
