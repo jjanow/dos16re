@@ -2,7 +2,7 @@
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
-NEC PC-88 and PC-98 programs, and Sharp X1 programs.
+NEC PC-88 and PC-98 programs, Sharp X1 programs, and Sharp X68000 Human68k executables.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -517,6 +517,48 @@ at `$BF80` and runs `$C000`. The example `load` above adds the second stage. The
 reads `$70` sectors from LSN `$80` to `$0100`, and `$C465` jumps there.
 [MAME X1 memory and I/O maps](https://github.com/mamedev/mame/blob/master/src/mame/sharp/x1.cpp)
 
+## Sharp X68000 loader
+
+`info` and `load` detect Human68k `.X` executables by their `HU` header. Pass the executable from the
+original disk.
+
+```sh
+.venv/bin/retrore info P4.X --json
+.venv/bin/retrore load P4.X -o out/x68k
+.venv/bin/retrore ghidra import out/x68k out/x68k-project
+.venv/bin/retrore decomp text:1714 --project out/x68k-project --json
+```
+
+The loader places TEXT, DATA, and zero-filled BSS consecutively at `--base-address` (default
+`0x10000`, even, 24-bit). It applies the relocation table against the header's link base: 16-bit
+deltas, `0x0001` followed by a 32-bit delta, and an odd delta for a 16-bit site. `map.json` keeps
+the original values, the entry point from the header, and the linker symbol table. Text, data, and
+BSS symbols get section offsets, and common symbols land in BSS. Strings use Shift-JIS (CP932) in
+`where-is`. `.X` files inside `.dim` or `.xdf` disk images must be extracted first.
+
+Ghidra imports the program with the MC68020 language, the X68000 address map (main RAM, graphics and
+text VRAM, I/O devices, SRAM, CG ROM, and IPL ROM), and register labels such as
+`CRTC_MODE_RESOLUTION`, `OPM_DATA`, and `MFP_GPDR`. Human68k programs call DOS (`$FFxx`) and the FLOAT2/FPACK
+library (`$FExx`) with line-F words, which Ghidra cannot decode. The importer follows control flow
+from the entry and from text symbols and patches each reached line-F word in Ghidra's copy of the
+program. The original bytes stay in `image.bin`.
+
+- A call becomes `jsr (sp)` with a call-override reference to a stub function in the
+  `human68k_calls` block at `$01000000`, outside the 24-bit bus. Stubs are named `DOS::_OPEN`,
+  `FPACK::__CDADD`, and so on. `callers 0100007a` lists every `_OPEN` site. DOS stubs return D0,
+  and `_EXIT`, `_KEEPPR`, and `_EXIT2` don't return. The end-of-line comment records the original word.
+- XC compiles 32-bit multiply and divide as `movem.l Da/Db,-(sp)`, an FPACK call, and
+  `movem.l (sp)+,Da/Db`. The importer rewrites those 10 bytes as the equivalent `muls.l`, `mulu.l`,
+  `divs.l`, or `divu.l` and NOPs, so the decompiler shows the arithmetic. The comment keeps the
+  original bytes.
+- XC enters routines through `bra` to a trailing `link` and `bra` back. The importer rejoins the
+  pieces that analysis splits off, so each routine decompiles as one function.
+
+The decompiler doesn't show DOS call arguments, because Human68k pushes mixed word and long
+arguments. Read them from the listing. The other stacked FPACK calls (remainder, float, and double
+helpers) write their result over the first stacked argument, which the decompiler doesn't track.
+[Human68k DOS and FPACK call numbers, from XEiJ's include files](https://stdkmd.net/xeij/)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -588,7 +630,7 @@ it gives Ghidra's DS, ES, and SS values at the requested address. Unknown values
 and `null` in JSON.
 
 `where-is` searches relocated, file-backed bytes in the export. Matches can overlap and must fit
-within a unit's file-backed span. `--string` uses DOS CP437, Amiga Latin-1, PC-98 CP932, or ASCII
+within a unit's file-backed span. `--string` uses DOS CP437, Amiga Latin-1, PC-98 and X68000 CP932, or ASCII
 on the other platforms. Use
 `--bytes` to search for Atari ST text containing bytes above `0x7f`.
 `--constant` accepts a decimal or `0x`-prefixed integer and encodes it in the platform's byte order
@@ -935,7 +977,8 @@ the Phantasie III MSX2 Scenario Disk `.dsk` image. Set `RETRORE_PH3_PC88_DIR` to
 containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. Set
 `RETRORE_PH3_PC98_DIR` to the directory containing the Phantasie III PC-98 Program and Utility Disk
 `.d88` images. Set `RETRORE_PH1_X1_DIR` to the directory containing the Phantasie I X1 Program and
-Player Disk `.d88` images. The Ghidra tests use
+Player Disk `.d88` images. Set `RETRORE_PH4_X68K_DIR` to the directory containing Phantasie IV's
+X68000 `P4.X`, extracted from Disk 1. The Ghidra tests use
 `GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
 input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and

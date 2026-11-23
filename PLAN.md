@@ -2,7 +2,8 @@
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
-binaries, Atari 8-bit executables, MSX2 programs, NEC PC-88 and PC-98 programs, and Sharp X1 disks. It handles formats and compiler
+binaries, Atari 8-bit executables, MSX2 programs, NEC PC-88 and PC-98 programs, Sharp X1 disks, and Sharp X68000
+Human68k executables. It handles formats and compiler
 patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
 Ghidra's decompiler and agents driving it one whole-program image to work on.
 
@@ -191,6 +192,7 @@ across separated overlay units.
 | Phantasie III (NEC PC-88) | D88 Program and Utility Disks | IPL, alternative Z80 payloads, cross-unit transfers and hardware port references |
 | Phantasie III (NEC PC-98) | D88 Program and Utility Disks | Real-mode IPL, alternative payloads, cross-unit far jumps and segment context |
 | Phantasie I (Sharp X1) | D88 Program and Player Disks | IPL header boot, logical-sector second stage, cross-unit transfer and 16-bit I/O port references |
+| Phantasie IV (Sharp X68000) | Human68k `HU` executable with XC symbols | Relocations and symbols, line-F DOS and FPACK calls, XC arithmetic and split entries, save routine decompilation |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
@@ -198,7 +200,7 @@ tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. 
 `RETRORE_PH1_APPLE2_DIR` and `RETRORE_PH3_APPLE2_DIR`. The opt-in Atari 8-bit tests use
 `RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. The opt-in MSX2 tests use `RETRORE_PH3_MSX2_DIR`.
 The opt-in PC-88 and PC-98 tests use `RETRORE_PH3_PC88_DIR` and `RETRORE_PH3_PC98_DIR`.
-The opt-in X1 tests use `RETRORE_PH1_X1_DIR`.
+The opt-in X1 tests use `RETRORE_PH1_X1_DIR`. The opt-in X68000 tests use `RETRORE_PH4_X68K_DIR`.
 Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
@@ -211,9 +213,9 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98, and
-Sharp X1 milestones are complete for the validated releases. X1turbo validation waits for a copy of
-the Gold Box release. Sharp X68000 is the next platform milestone.
+The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
+Sharp X1, and Sharp X68000 milestones are complete for the validated releases. X1turbo validation
+waits for a copy of the Gold Box release. Classic Macintosh is the next platform milestone.
 The analysis backlog below applies to existing and future platforms.
 
 ## Analysis backlog
@@ -335,7 +337,7 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, MSX2, PC-88, and X1 | PC-98 |
+| Capability | DOS | Amiga, Atari ST, and X68000 | C64, Apple II, Atari 8-bit, MSX2, PC-88, and X1 | PC-98 |
 |---|---|---|---|---|
 | Load, export, and byte search | Implemented | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
@@ -344,7 +346,7 @@ underlying analysis uses each machine's conventions and available emulator or tr
 | Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
 | Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
 | Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
-| Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Extend for relevant targets | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
+| Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Human68k DOS and FPACK call stubs and XC arithmetic on X68000; extend for relevant targets | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
 | Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned | Planned |
 
 For each new capability, use shared synthetic contract checks where possible and add fixtures for
@@ -498,3 +500,22 @@ and resolved the CRTC write at `$C04F`, the PPI control write at `$C05B`, and th
 control write at `$011D`. The Player Disk has no IPL entry, and neither disk has a filesystem. Future
 loader work includes X1turbo bank memory and devices, filesystem member selection, and runtime-computed
 disk loads.
+
+### Sharp X68000
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` detect Human68k `HU` executables, place
+TEXT, DATA, and BSS consecutively, apply the relocation table (word deltas, long escapes, and word
+sites) against the link base, and import the linker symbol table. The importer adds the X68000
+address map and register labels. It patches the line-F DOS (`$FFxx`) and FPACK (`$FExx`) calls that
+control flow reaches into calls to named stubs outside the 24-bit bus, keeping the original bytes in
+`image.bin` and in comments. XC's stacked 32-bit multiply and divide calls become 68020 `muls.l` and
+`divs.l`, and routines entered through a `bra` to a trailing `link` are rejoined.
+
+Phantasie IV's `P4.X` (Star Craft, 1991) has 11,122 relocations and 1,015 symbols. Ghidra reached
+2,222 line-F sites, including all 1,521 `__CLMUL` and 133 `__CFTOD` calls that a linear sweep finds in
+code, without touching the `$FFFF` words in data embedded in TEXT. `_save` at `text:1714` decompiles
+with the 190-byte character stride and the 314-, 1,900-, 1,330-, and 308-byte save file writes, and the
+callers of `DOS::_OPEN` resolve to `text:3c094`. The decompiler doesn't show DOS arguments, which mix
+word and long pushes, or the results of stacked remainder and floating-point FPACK calls. Future work
+includes those prototypes, `.dim`/`.xdf` Human68k disk members, `.Z`/`.R` programs, and IOCS
+(`trap #15`) call names.
