@@ -17,8 +17,8 @@ from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
 from .ghidra import (
-    BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, decompile, import_program,
-    query, query_address, query_batch,
+    BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, check_timeout, decompile,
+    import_program, query, query_address, query_batch,
 )
 from .image import (
     APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT,
@@ -33,7 +33,8 @@ from .pc88 import (
 )
 from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build_pc98_image
 from .queries import QUERIES, option_names
-from .search import SearchError, find_bytes
+from .schema import DIALECT, query_schema
+from .search import WIDTHS, SearchError, find_bytes, search_pattern
 from .trace import TraceError, import_trace
 from .x1 import DISK_SUFFIXES as X1_DISK_SUFFIXES
 from .x1 import MEMORY_VIEWS as X1_VIEWS
@@ -45,6 +46,20 @@ from .x1 import lsn_source as x1_lsn_source
 from .z80 import Z80Source
 
 _PREVIEW_LIMIT = 10
+
+# Errors that commands report as coded error objects instead of tracebacks.
+HANDLED_ERRORS = (
+    Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
+    Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error, OSError,
+)
+
+
+def error_report(error: BaseException) -> dict:
+    """Return the `--json` error object for a handled error."""
+    report = {"contract": CONTRACT_VERSION, "error": error_record(error)}
+    if isinstance(error, UnsupportedPacker):
+        report["packer"] = error.packer
+    return report
 
 
 def _hex_segment(value: str) -> int:
@@ -706,19 +721,8 @@ def _paged_gaps(args: argparse.Namespace) -> None:
 
 
 def _where_is(args: argparse.Namespace) -> None:
-    if args.width is not None and args.constant is None:
-        raise SearchError("--width requires --constant")
-    try:
-        if args.bytes is not None:
-            pattern = bytes.fromhex(args.bytes)
-        elif args.string is not None:
-            pattern = args.string
-        else:
-            base = 16 if args.constant.lstrip("+-").lower().startswith("0x") else 10
-            pattern = int(args.constant, base)
-    except ValueError as error:
-        raise SearchError(str(error)) from error
-    report = find_bytes(args.export, pattern, width=args.width or 2, limit=None if args.json else _PREVIEW_LIMIT)
+    pattern, width = search_pattern(hex_bytes=args.bytes, string=args.string, constant=args.constant, width=args.width)
+    report = find_bytes(args.export, pattern, width=width, limit=None if args.json else _PREVIEW_LIMIT)
     if args.json:
         print(json.dumps(report))
         return
@@ -766,11 +770,23 @@ def _trace(args: argparse.Namespace) -> None:
         print("Use --json for the full trace report.")
 
 
+def _schema(args: argparse.Namespace) -> None:
+    document = query_schema()
+    if args.json:
+        print(json.dumps(document, indent=2))
+        return
+    print(f"Query contract {document['contract']}, JSON Schema {DIALECT}")
+    width = max(map(len, document["commands"]))
+    for command, description in document["commands"].items():
+        print(f"  {command:<{width}}  {description}")
+    print("Use --json for the request, batch, and error schemas.")
+
+
 def _seconds(value: str) -> float:
-    seconds = float(value)
-    if not seconds >= 0:
-        raise argparse.ArgumentTypeError("expected a nonnegative number of seconds")
-    return seconds
+    try:
+        return check_timeout(float(value))
+    except GhidraError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -950,13 +966,17 @@ def main(argv: list[str] | None = None) -> int:
     for name in _REGISTRY_COMMANDS:
         _add_query_parser(commands, name)
 
+    schema_parser = commands.add_parser("schema", help="print the JSON Schema of query requests and errors")
+    schema_parser.add_argument("--json", action="store_true", help="print the JSON Schema document")
+    mcp_parser = commands.add_parser("mcp", help="serve queries to MCP clients over stdio")
+    mcp_parser.add_argument("--json", action="store_true", help="accepted for consistency; output is always JSON-RPC")
     search_parser = commands.add_parser("where-is", help="find a byte pattern across exported units")
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     pattern = search_parser.add_mutually_exclusive_group(required=True)
     pattern.add_argument("--bytes", metavar="HEX", help="hexadecimal bytes")
     pattern.add_argument("--string", metavar="TEXT", help="literal string in the image's supported encoding")
     pattern.add_argument("--constant", metavar="N", help="decimal or 0x-prefixed integer in the image's byte order")
-    search_parser.add_argument("--width", type=int, choices=(1, 2, 4, 8), help="constant width in bytes (default 2)")
+    search_parser.add_argument("--width", type=int, choices=WIDTHS, help="constant width in bytes (default 2)")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
     call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
@@ -995,6 +1015,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     args = parser.parse_args(argv)
+    if args.command == "schema":
+        _schema(args)
+        return 0
+    if args.command == "mcp":
+        from .mcp import serve  # The adapter imports this module.
+        return serve()
     try:
         if args.command == "batch":
             return _batch(args)
@@ -1096,11 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
             image, program_map = build_image(loaded, args.program.name, overlays)
         if args.command == "load":
             _export_image(args.output, image, program_map)
-    except (Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
-            Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error, OSError) as error:
-        report = {"contract": CONTRACT_VERSION, "error": error_record(error)}
-        if isinstance(error, UnsupportedPacker):
-            report["packer"] = error.packer
+    except HANDLED_ERRORS as error:
+        report = error_report(error)
         message = json.dumps(report) if args.json else f"retrore: {error}"
         print(message, file=sys.stderr)
         return EXIT_FAILURE
