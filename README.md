@@ -2,8 +2,8 @@
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
-NEC PC-88 and PC-98 programs, Sharp X1 programs, Sharp X68000 Human68k executables, and Classic
-Macintosh 68k applications.
+NEC PC-88 and PC-98 programs, Sharp X1 programs, Sharp X68000 Human68k executables, Classic
+Macintosh 68k applications, and NES / Famicom cartridges.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -597,6 +597,32 @@ with `CREL` and `DREL` fixups. The export records original fixup values and sour
 noncontiguous HFS spans. Ghidra resolves direct and recognized indexed calls through A5 and names
 common A-line Toolbox traps. `where-is --string` searches MacRoman. The current scope is uncompressed
 near-model 68k code. Far-model MPW, CFM and PowerPC, partitioned disks, MFS, and HFS+ remain open.
+
+## Nintendo NES / Famicom loader
+
+`info` and `load` recognize iNES and NES 2.0 cartridges with mapper 0 (NROM) or standard mapper 4
+(MMC3). Use `--nes` to select the cartridge loader explicitly. NROM maps 32 KiB of PRG ROM at
+`$8000`–`$FFFF` or mirrors a 16 KiB PRG ROM at `$C000`. MMC3 maps four 8 KiB windows.
+`--nes-r6 HEX` and `--nes-r7 HEX` select banks. `--nes-prg-mode 0` places R6 at `$8000` and the
+second-to-last bank at `$C000`. Mode 1 swaps those two windows. R7 stays at `$A000` and the last
+bank stays at `$E000`. The default analysis view uses mode 0, R6 bank 0, and R7 bank 1.
+[iNES header](https://www.nesdev.org/wiki/INES) · [NES 2.0 header](https://www.nesdev.org/wiki/NES_2.0) · [MMC3 banking](https://www.nesdev.org/wiki/INES_Mapper_004)
+
+```sh
+.venv/bin/retrore info GAME.nes --json
+.venv/bin/retrore load GAME.nes --nes-prg-mode 1 --nes-r6 2a --nes-r7 12 -o out/nes --json
+.venv/bin/retrore ghidra import out/nes out/nes-project
+.venv/bin/retrore address-map c000 --export out/nes --json
+```
+
+The map records PRG bank numbers, source offsets, cartridge RAM sizes, and the CHR ROM file span.
+Legacy iNES headers that omit the MMC3 PRG RAM size use an 8 KiB default. Image bytes cover the
+selected CPU view, including an optional trainer at `$7000`. Ghidra uses 6502 analysis, labels the
+hardware vectors and common PPU and APU registers, and seeds the reset, NMI, and IRQ targets that
+fall in the exported code. Repeat `--entry HEX` to select the seed addresses yourself. Use a
+separate export and project for each MMC3 bank configuration. Cross-window references reflect
+the selected banks. Runtime mapper changes, CHR mapping, and CPU RAM and PPU register mirror
+aliasing remain open.
 
 ## Ghidra
 
@@ -1193,9 +1219,10 @@ containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. Set
 Player Disk `.d88` images. Set `RETRORE_PH4_X68K_DIR` to the directory containing Phantasie IV's
 X68000 `P4.X`, extracted from Disk 1. Set `RETRORE_POR_MAC_DIR` to the directory containing
 `Pool of Radiance v1.1.rsrc` and `RETRORE_SOTSB_MAC_DIR` to the directory containing
-`Secret of the Silver Blade.img`. The Ghidra tests use
-`GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
-input variables are unset.
+`Secret of the Silver Blade.img`. Set `RETRORE_POR_NES_DIR` and `RETRORE_POR_FAMICOM_DIR` to
+directories containing one Pool of Radiance `.nes` cartridge image each, for the U.S. and Japanese
+releases respectively. The Ghidra tests use `GHIDRA_HOME` and include synthetic programs for all
+supported platforms. Tests skip when their input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
 runs the synthetic suites with the headless tests enabled. [Release workflow](.github/workflows/release-ci.yml)
 

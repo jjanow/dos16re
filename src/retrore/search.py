@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .image import (
     APPLE2_FORMAT, ATARI8_FORMAT, C64_FORMAT, FLAT16_FORMATS, M68K_FORMATS, MAC68K_FORMAT, MOS6502_FORMATS, MSX2_FORMAT,
+    NES_FORMAT,
     PC88_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError, ImageUnit, image_units, read_map,
 )
 
@@ -111,6 +112,7 @@ PLATFORM_ENCODINGS = {
     C64_FORMAT: ("petscii", "petscii-shifted", "c64-screen", "c64-screen-shifted"),
     APPLE2_FORMAT: ("apple2", "ascii"),
     ATARI8_FORMAT: ("atascii", "atari-screen"),
+    NES_FORMAT: ("ascii",),
     MSX2_FORMAT: ("ascii", "shift-jis"),
     PC88_FORMAT: ("ascii", "shift-jis"),
     X1_FORMAT: ("ascii", "shift-jis"),

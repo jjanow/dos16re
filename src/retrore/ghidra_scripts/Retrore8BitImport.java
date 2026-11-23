@@ -6,6 +6,7 @@ import com.google.gson.JsonParser;
 import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.symbol.SourceType;
 
 import java.nio.file.Files;
@@ -43,6 +44,7 @@ public class Retrore8BitImport extends HeadlessScript {
             case "C64_PRG" -> "c64_";
             case "APPLE2" -> "apple2_";
             case "ATARI8" -> "atari8_";
+            case "NES" -> "nes_";
             case "MSX2" -> "msx2_";
             case "PC88" -> "pc88_";
             case "X1" -> "x1_";
@@ -81,12 +83,15 @@ public class Retrore8BitImport extends HeadlessScript {
         String viewKey = switch (format) {
             case "C64_PRG" -> "bank";
             case "APPLE2" -> "language_card";
-            case "MSX2", "PC88", "X1" -> "memory_view";
+            case "MSX2", "PC88", "X1", "NES" -> "memory_view";
             default -> "portb";
         };
         Object view;
         if (map.has("io_map")) {
             addIoMap(map.getAsJsonArray("io_map"), prefix);
+            view = map.get(viewKey).getAsString();
+        } else if (format.equals("NES")) {
+            addNesLabels(map);
             view = map.get(viewKey).getAsString();
         } else if (viewKey.equals("memory_view")) {
             addZ80Labels(format, prefix);
@@ -110,6 +115,21 @@ public class Retrore8BitImport extends HeadlessScript {
         }
         return Map.of("program", currentProgram.getName(), "format", format,
             "units", units.size(), "entries", entries.size(), viewKey, view);
+    }
+
+    private void addNesLabels(JsonObject map) throws Exception {
+        var symbols = currentProgram.getSymbolTable();
+        for (var element : map.getAsJsonArray("hardware_labels")) {
+            var label = element.getAsJsonObject();
+            symbols.createLabel(address(label.get("linear").getAsLong()), label.get("name").getAsString(),
+                SourceType.IMPORTED);
+        }
+        for (var element : map.getAsJsonArray("vectors")) {
+            var vector = element.getAsJsonObject();
+            var location = address(vector.get("linear").getAsLong());
+            createData(location, PointerDataType.dataType);
+            symbols.createLabel(location, vector.get("name").getAsString(), SourceType.IMPORTED).setPrimary();
+        }
     }
 
     private void addZ80Labels(String format, String prefix) throws Exception {

@@ -3,9 +3,9 @@
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
 binaries, Atari 8-bit executables, MSX2 programs, NEC PC-88 and PC-98 programs, Sharp X1 disks, Sharp X68000
-Human68k executables, and Classic Macintosh 68k applications. It handles formats and compiler
-patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
-Ghidra's decompiler and agents driving it one whole-program image to work on.
+Human68k executables, Classic Macintosh 68k applications, and NES / Famicom cartridges. It handles
+formats and compiler patterns shared across 1980s and early 1990s games and uses those games to
+validate support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
 
 The primary goal is to help LLMs reverse 16-bit binaries faster and with fewer tokens. Prioritize the
 work Ghidra leaves to the analyst: recovering the runtime layout, resolving segmented and indirect
@@ -13,17 +13,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, Classic Macintosh 68k loading and Ghidra analysis were validated against Pool of
-Radiance and Secret of the Silver Blades. Phase 9 gained DOS segment and stack fixes, MSC medium-model
-signatures, far-table and 68k switch recovery, trace-backed gap evidence, pointer searches, and safer
-layout application. Phase 10 gained export address and byte evidence, bounded Ghidra disassembly and C
-line maps, named-program queries, evidence bundles, function comparison, and transactional annotation replay.
+On 2026-11-23, NES / Famicom gained iNES and NES 2.0 loading, NROM mirroring, selectable MMC3 PRG
+banks, and Ghidra hardware labels and vector entries. Both Pool of Radiance releases validated
+the bank views, file offsets, and startup and interrupt analysis.
 
-Verification used Python 3.14, Ghidra 12.2, JDK 25, and 18 opt-in game directories. All 484 tests
-passed across the parallel suites and the final Ghidra layout rerun.
+The standalone suite passed 416 tests with 87 skipped. All 503 tests passed across the Ghidra 12.2
+and opt-in suites with Python 3.14 and JDK 25.
 
-Resume with the remaining Phase 9 and Phase 10 items, or start the Nintendo NES / Famicom loader.
-CI runs for tagged releases. Start it by hand only for a check that needs CI.
+Resume with the Sega Genesis / Mega Drive loader or the remaining Phase 9 and Phase 10 items.
+X1turbo validation still awaits the Gold Box release.
 
 ## Why
 
@@ -195,6 +193,7 @@ across separated overlay units.
 | Phantasie III (NEC PC-98) | D88 Program and Utility Disks | Real-mode IPL, alternative payloads, cross-unit far jumps and segment context |
 | Phantasie I (Sharp X1) | D88 Program and Player Disks | IPL header boot, logical-sector second stage, cross-unit transfer and 16-bit I/O port references |
 | Phantasie IV (Sharp X68000) | Human68k `HU` executable with XC symbols | Relocations and symbols, line-F DOS and FPACK calls, XC arithmetic and split entries, save routine decompilation |
+| Pool of Radiance (NES and Famicom) | U.S. and Japanese NES 2.0 cartridges | MMC3 bank placement and file provenance, hardware vectors, Ghidra startup and IRQ analysis |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
@@ -203,6 +202,8 @@ tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. 
 `RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. The opt-in MSX2 tests use `RETRORE_PH3_MSX2_DIR`.
 The opt-in PC-88 and PC-98 tests use `RETRORE_PH3_PC88_DIR` and `RETRORE_PH3_PC98_DIR`.
 The opt-in X1 tests use `RETRORE_PH1_X1_DIR`. The opt-in X68000 tests use `RETRORE_PH4_X68K_DIR`.
+The opt-in Macintosh tests use `RETRORE_POR_MAC_DIR` and `RETRORE_SOTSB_MAC_DIR`.
+The opt-in NES / Famicom tests use `RETRORE_POR_NES_DIR` and `RETRORE_POR_FAMICOM_DIR`.
 Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
@@ -216,8 +217,9 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
-Sharp X1, Sharp X68000, and Classic Macintosh milestones are complete for the validated releases.
-X1turbo validation waits for a copy of the Gold Box release. Nintendo NES / Famicom is the next platform milestone.
+Sharp X1, Sharp X68000, Classic Macintosh, and Nintendo NES / Famicom milestones are complete for
+the validated releases. X1turbo validation waits for a copy of the Gold Box release.
+Sega Genesis / Mega Drive is the next platform milestone.
 The analysis backlog below applies to existing and future platforms.
 
 ## Analysis backlog
@@ -394,7 +396,7 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga, Atari ST, X68000, and Macintosh | C64, Apple II, Atari 8-bit, MSX2, PC-88, and X1 | PC-98 |
+| Capability | DOS | Amiga, Atari ST, X68000, and Macintosh | C64, Apple II, Atari 8-bit, MSX2, PC-88, X1, and NES | PC-98 |
 |---|---|---|---|---|
 | Load, export, byte, string, pointer, relocation, and symbol search | Implemented | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
@@ -588,3 +590,18 @@ Its startup at `code1:003c` resolves an indexed A5 transfer. Secret of the Silve
 segments and 859 jump entries. The imports applied 1,345 and 1,601 THINK C fixups respectively.
 Open: compressed CODE, split STRS heaps, MPW far-model code, CFM and PowerPC, partitioned media,
 MFS and HFS+, full Toolbox prototypes, and dynamic analysis.
+
+### Nintendo NES / Famicom
+
+**Implemented for NROM and standard MMC3.** The loader reads iNES and NES 2.0 cartridges, includes
+optional trainers, and preserves file offsets for every selected PRG window. It maps the NROM
+16 KiB mirror and either MMC3 PRG mode with explicit R6 and R7 selections. Ghidra imports one
+CPU view with hardware labels, named vectors, and entries for mapped vector targets.
+
+**Validated on Ghidra 12.2.** The U.S. and Japanese Pool of Radiance releases each have 64 PRG banks,
+128 KiB of CHR ROM, and 8 KiB of battery-backed PRG RAM. Both default views recover startup calls
+and decompile the IRQ handler. An alternate MMC3 mode maps the selected banks to the expected
+source offsets in each cartridge. Synthetic analysis verifies a cross-bank call and a PPU write.
+
+Open work includes more mappers, CHR banking, analysis of runtime bank changes and RAM and I/O
+mirrors, and an NES trace and emulation backend.

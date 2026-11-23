@@ -26,12 +26,13 @@ from .ghidra import (
 )
 from .hfs import HfsError
 from .image import (
-    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MAC68K_FORMAT, MSX2_FORMAT, PC88_FORMAT,
+    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MAC68K_FORMAT, MSX2_FORMAT, NES_FORMAT, PC88_FORMAT,
     PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError,
 )
 from .macintosh import MacintoshError, build_macintosh_image, is_macintosh
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, MZExecutable, UnsupportedPacker
+from .nes import NES_MAGIC, NesError, build_nes_image
 from .overlays import Overlay, address_record, build_image
 from .pc88 import (
     BOOT_ADDRESS as PC88_BOOT_ADDRESS, DISK_SUFFIXES as PC88_DISK_SUFFIXES, HIGH_BANKS, LOW_BANKS,
@@ -60,8 +61,8 @@ _PREVIEW_LIMIT = 10
 # Errors that commands report as coded error objects instead of tracebacks.
 HANDLED_ERRORS = (
     Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, EvidenceError, GhidraError, HfsError, HunkError,
-    ImageError, MacintoshError, MZError, Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error,
-    XError, OSError,
+    ImageError, MacintoshError, MZError, Msx2Error, NesError, Pc88Error, Pc98Error, PrgError, SearchError, TraceError,
+    X1Error, XError, OSError,
 )
 
 
@@ -976,6 +977,11 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     human68k = data.startswith(X_MAGIC)
     m68k = hunk or human68k or data.startswith(PRG_MAGIC)
     extension = args.program.suffix.lower()
+    nes = args.nes or (
+        not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or args.atari8 or args.atari8_raw
+             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or args.x1)
+        and (data.startswith(NES_MAGIC) or extension == ".nes")
+    )
     macintosh = args.macintosh or (
         not (m68k or data.startswith(b"MZ") or args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order
              or args.atari8 or args.atari8_raw)
@@ -994,6 +1000,8 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     if not args.x1 and (args.x1_disk is not None or args.x1_ipl or args.x1_sector or args.x1_copy
                         or args.x1_unit or args.x1_view):
         raise X1Error("X1 options require --x1")
+    if not nes and any(value is not None for value in (args.nes_prg_mode, args.nes_r6, args.nes_r7)):
+        raise NesError("NES PRG options require an NES cartridge")
     if args.x1:
         image, program_map = _x1_image(args, data)
     elif args.pc98:
@@ -1004,6 +1012,15 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         image, program_map = _msx2_image(args, data)
     elif args.msx2_unit or args.msx2_copy:
         raise Msx2Error("--msx2-unit and --msx2-copy require --msx2")
+    elif nes:
+        if args.base_segment is not None or args.base_address is not None or args.overlay or args.disk_file:
+            raise NesError("NES cartridges use mapper windows and accept no base, overlay, or disk member options")
+        if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
+                or args.atari8_unit or args.atari8_portb is not None):
+            raise NesError("C64, Apple II, and Atari 8-bit options require their respective platforms")
+        image, program_map = build_nes_image(
+            data, args.program.name, mode=args.nes_prg_mode, r6=args.nes_r6, r7=args.nes_r7, entries=args.entry,
+        )
     elif macintosh:
         if args.base_segment is not None or args.overlay:
             raise MacintoshError("--base-segment and --overlay apply to DOS executables")
@@ -1068,6 +1085,8 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
             platform = f"Apple II  LC {program_map['language_card']:04x}"
         elif program_map["format"] == ATARI8_FORMAT:
             platform = f"Atari 8-bit  PORTB {program_map['portb']:02x}"
+        elif program_map["format"] == NES_FORMAT:
+            platform = f"NES / Famicom  {program_map['memory_view']}"
         elif program_map["format"] == MSX2_FORMAT:
             platform = "MSX2  MSX-DOS RAM"
         elif program_map["format"] == PC88_FORMAT:
@@ -1123,6 +1142,7 @@ def program_options() -> argparse.ArgumentParser:
     platform.add_argument("--apple2-raw", action="store_true", help="load raw Apple II bytes at --base-address")
     platform.add_argument("--atari8", action="store_true", help="interpret the input as an Atari 8-bit program")
     platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
+    platform.add_argument("--nes", action="store_true", help="interpret the input as an NES / Famicom cartridge")
     platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
     platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
     platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
@@ -1162,6 +1182,9 @@ def program_options() -> argparse.ArgumentParser:
         "--atari8-portb", type=_hex_address, metavar="HEX",
         help=f"effective Atari XL/XE PORTB byte (default {DEFAULT_PORTB:02x})",
     )
+    command.add_argument("--nes-prg-mode", type=int, metavar="0|1", help="MMC3 PRG mode (default 0)")
+    command.add_argument("--nes-r6", type=_hex_address, metavar="HEX", help="MMC3 R6 PRG bank (default 0)")
+    command.add_argument("--nes-r7", type=_hex_address, metavar="HEX", help="MMC3 R7 PRG bank (default 1)")
     command.add_argument(
         "--msx2-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
         help="load an additional MSX2 file at its runtime address",
