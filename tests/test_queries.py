@@ -255,7 +255,10 @@ def test_dos_bulk_queries(dos_project, capsys, monkeypatch):
         "offset": 0, "total": len(full_gaps["ranges"]), "returned": 2, "next_offset": 2,
     }
     assert overlay_gaps["ranges"] == [] and overlay_gaps["undefined_bytes"] == 0
-    root_coverage, overlay_coverage = coverage["units"]
+    # The root's uninitialized data and stack sit between the root and the overlay.
+    root_coverage, bss_coverage, overlay_coverage = coverage["units"]
+    assert bss_coverage["unit"] == "root_bss" and not bss_coverage["initialized"]
+    assert bss_coverage["functions"] == bss_coverage["instruction_bytes"] == 0
     assert root_coverage["functions"] == 4 and root_coverage["data_bytes"] == 3
     assert root_coverage["undefined_bytes"] == full_gaps["undefined_bytes"]
     assert root_coverage["instruction_bytes"] + 3 + full_gaps["undefined_bytes"] == 0x104

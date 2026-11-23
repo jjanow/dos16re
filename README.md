@@ -178,7 +178,10 @@ packers such as PKLITE produce a diagnostic.
 
 Both commands accept `--json`, `--base-segment HEX` (default `1000`), and repeatable `--overlay FILE`.
 For a raw overlay, use `--overlay FILE@SEG` to choose a hexadecimal segment above the root image.
-The loader assigns each remaining overlay unit a distinct paragraph-aligned segment.
+The loader assigns each remaining overlay unit a distinct paragraph-aligned segment above the root's
+memory: its file image, its initial stack, and for unpacked programs the header's minimum allocation.
+`map.json` records that limit as `memory_end`, and the Ghidra importer backs the root's uninitialized
+data and stack below it with an uninitialized `root_bss` block, so globals there get names and references.
 
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the

@@ -65,6 +65,15 @@ class LoadedMZ:
     stack: Address
     relocations: tuple[Address, ...] = ()
     packer: str | None = None
+    min_alloc_paragraphs: int = 0
+
+    @property
+    def memory_end(self) -> int:
+        """First linear address above the program's image, minimum allocation, and initial stack."""
+        image_end = self.base_segment * _PARAGRAPH_SIZE + len(self.image)
+        allocation_end = image_end + self.min_alloc_paragraphs * _PARAGRAPH_SIZE
+        stack_top = self.stack.segment * _PARAGRAPH_SIZE + (self.stack.offset or 0x10000)
+        return max(image_end, allocation_end, stack_top)
 
 
 @dataclass(frozen=True)
@@ -106,6 +115,8 @@ class MZExecutable:
         entry = Address(header.initial_cs, header.initial_ip)
         stack = Address(header.initial_ss, header.initial_sp)
         image, relocations = self.image, self.relocations
+        # A packed header's minimum allocation describes the packed module, not the program.
+        min_alloc = 0 if self.packer else header.min_alloc_paragraphs
         if self.packer == "EXEPACK":
             from .packers import unpack_exepack
 
@@ -128,7 +139,7 @@ class MZExecutable:
 
         entry = Address((base_segment + entry.segment) & _SEGMENT_MASK, entry.offset)
         stack = Address((base_segment + stack.segment) & _SEGMENT_MASK, stack.offset)
-        return LoadedMZ(base_segment, bytes(image), entry, stack, relocations, self.packer)
+        return LoadedMZ(base_segment, bytes(image), entry, stack, relocations, self.packer, min_alloc)
 
 
 class UnsupportedPacker(MZError):

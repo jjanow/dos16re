@@ -73,6 +73,9 @@ public class RetroreImport extends HeadlessScript {
             block.setExecute(true);
             block.setWrite(true);
         }
+        if (map.has("memory_end")) {
+            addRootAllocation(units, root, map.get("memory_end").getAsLong(), memory);
+        }
         if (pc98) {
             addPc98Hardware(map.getAsJsonArray("memory_map"), memory);
         }
@@ -130,6 +133,44 @@ public class RetroreImport extends HeadlessScript {
                     call.get("original").getAsString());
             }
         }
+    }
+
+    /** Back the root's uninitialized data and stack with memory, skipping explicitly placed units. */
+    private void addRootAllocation(JsonArray units, JsonObject root, long end, Memory memory)
+            throws Exception {
+        long start = root.get("linear").getAsLong() + root.get("size").getAsLong();
+        var used = new java.util.ArrayList<long[]>();
+        for (JsonElement item : units) {
+            JsonObject unit = item.getAsJsonObject();
+            long linear = unit.get("linear").getAsLong();
+            used.add(new long[] {linear, linear + unit.get("size").getAsLong()});
+        }
+        used.sort((left, right) -> Long.compare(left[0], right[0]));
+        int part = 0;
+        for (long[] range : used) {
+            if (start >= end) {
+                break;
+            }
+            if (range[1] <= start) {
+                continue;
+            }
+            long stop = Math.min(range[0], end);
+            if (stop > start) {
+                createAllocation(memory, start, stop - start, part++);
+            }
+            start = Math.max(start, range[1]);
+        }
+        if (start < end) {
+            createAllocation(memory, start, end - start, part);
+        }
+    }
+
+    private void createAllocation(Memory memory, long linear, long size, int part) throws Exception {
+        String name = part == 0 ? "root_bss" : "root_bss_" + part;
+        var block = memory.createUninitializedBlock(name, space.getAddress(linear), size, false);
+        block.setRead(true);
+        block.setWrite(true);
+        block.setExecute(false);
     }
 
     private void addPc98Hardware(JsonArray layout, Memory memory) throws Exception {
