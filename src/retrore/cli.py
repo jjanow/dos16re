@@ -337,7 +337,7 @@ def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         if args.x1_ipl or not args.x1_sector:
             boot, header = x1_boot_source(disk, filename)
             sources.append(boot)
-            entries = entries or [header.exec_address]
+            entries = [header.exec_address, *entries]
         for kind, *selection in args.x1_sector:
             if kind == "chr":
                 cylinder, head, record, count, address = selection
