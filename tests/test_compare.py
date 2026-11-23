@@ -5,7 +5,7 @@ import pytest
 
 from retrore import worker
 from retrore.cli import main
-from retrore.compare import _compare
+from retrore.compare import _compare, _storage_blocks
 
 
 def _listing(language, *functions):
@@ -48,6 +48,32 @@ def test_duplicate_bodies_remain_ambiguous_and_paged():
     assert unpaired["candidate_count"] == 2
     assert [row["address"] for row in unpaired["candidates"]] == ["110", "120"]
     assert unpaired["candidates"][0]["matched_by"] == ["normalized_instructions"]
+
+
+def test_storage_block_matches_require_unique_names_or_contents():
+    def block(unit, start, digest=None, **overrides):
+        return {"unit": unit, "start": start, "size": 32, "space": "ram", "type": "DEFAULT",
+                "initialized": True, "read": True, "write": True, "execute": False,
+                "content_sha256": digest} | overrides
+
+    before = [block("stable", "1000"), block("renamed", "1100", "one"),
+              block("shrunk", "1200", "old"), block("changed", "1300", "three"),
+              block("padding", "1400"), block("repeated", "1500", "four"),
+              block("duplicate", "1600", "five"), block("duplicate", "1700", "six"),
+              block("already_matched", "1800", "seven"), block("also_seven", "1900", "seven")]
+    after = [block("stable", "2000"), block("new_name", "2100", "one"),
+             block("shrunk", "2200", "new", size=16), block("changed", "2300", "three", execute=True),
+             block("different_padding", "2400"), block("first_copy", "2500", "four"),
+             block("second_copy", "2600", "four"), block("would_match", "2700", "five"),
+             block("already_matched", "2800", "seven"), block("new_seven", "2900", "seven")]
+    assert _storage_blocks(before, after) == [
+        {"unit": "stable", "space": "ram", "size": 32, "before_start": "1000", "after_start": "2000"},
+        {"unit": "renamed", "space": "ram", "size": 32, "before_start": "1100", "after_start": "2100",
+         "after_unit": "new_name", "after_size": 32},
+        {"unit": "shrunk", "space": "ram", "size": 32, "before_start": "1200", "after_start": "2200",
+         "after_unit": "shrunk", "after_size": 16},
+        {"unit": "already_matched", "space": "ram", "size": 32, "before_start": "1800", "after_start": "2800"},
+    ]
 
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")

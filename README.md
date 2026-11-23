@@ -1048,21 +1048,26 @@ custom storage.
 ```
 
 With `--storage`, same-body matches on the same language and compiler specification can carry custom
-return, parameter, and local storage in a version 5 transfer document. Register pieces and stack
-offsets retain their original order and values. Absolute storage follows offsets within uniquely
-named memory blocks with matching size, space, type, and permissions. Local first-use offsets follow
-the corresponding instructions when their positions change. Preview shows the resolved storage
-and reports conflicts when a storage range cannot be mapped or when the destination block's address
-or size differs from the comparison. Export the applied destination project before transferring its
-custom storage again.
+return, parameter, and local storage. Register pieces and stack offsets retain their original order
+and values. Absolute storage follows block-relative offsets. A uniquely named block may grow or
+shrink. A renamed block can match by identical, non-uniform initialized bytes when that content
+identifies one compatible block in each project. Block matches require the same address space,
+block type, initialization state, and permissions. Local first-use offsets follow the corresponding
+instructions when their positions change. Preview shows the resolved storage and reports conflicts
+if a piece extends beyond either block or if the destination block's geometry differs from the
+comparison. Export the applied destination project before transferring its custom storage again.
 
-`compare --storage` also lets `annotations transfer` carry fixed-size data layouts in a version 6
-document, alongside any matched function annotations or custom storage. Layouts use the same
-offset within a uniquely named matching memory block and can transfer regardless of function
-pagination. Transfer reports unmatched blocks and layouts that cross block boundaries among the
-skips. Preview checks the destination block's address space, start, and size, and reports overlaps
-with instructions or defined data before apply. Check that the record still occupies the same
+`compare --storage` also lets `annotations transfer` carry fixed-size data layouts alongside any
+matched function annotations or custom storage. Layouts use the same offset within a matching
+memory block and can transfer regardless of function pagination. Transfer lists unmatched blocks
+and layouts that cross either block boundary among the skips. Preview reports overlaps with
+instructions or defined data before apply. Check that the record still occupies the same
 block-relative offset in the destination revision.
+
+Comparisons with renamed or resized block pairs use `comparison_version: 2`. In those pairs,
+`unit` and `size` describe the source, and `after_unit` and `after_size` describe the destination.
+Transfers based on those pairs use version 7. Version 5 custom storage and version 6 data layout
+transfers remain supported.
 
 ### Persistent query workers
 

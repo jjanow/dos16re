@@ -106,14 +106,24 @@ public class RetroreAnnotations extends GhidraScript {
                 && noreturn == actual.noreturn && stackPurge == actual.stackPurge;
         }
     }
-    private record StorageBlock(String unit, String space, String beforeStart, String afterStart, long size) {
+    private record StorageBlock(String unit, String space, String beforeStart, String afterStart, long size,
+            String afterUnit, Long afterSize) {
         long sourceOffset(Address address) {
             return address.getOffset() - Long.parseUnsignedLong(beforeStart, 16);
         }
 
+        String destinationUnit() {
+            return afterUnit == null ? unit : afterUnit;
+        }
+
+        long sharedSize() {
+            return afterSize == null ? size : Math.min(size, afterSize);
+        }
+
         boolean matchesDestination(MemoryBlock block) {
             return block != null && space.equals(block.getStart().getAddressSpace().getName()) &&
-                block.getStart().getOffset() == Long.parseUnsignedLong(afterStart, 16) && block.getSize() == size;
+                block.getStart().getOffset() == Long.parseUnsignedLong(afterStart, 16) &&
+                block.getSize() == (afterSize == null ? size : afterSize);
         }
     }
     private record TypeArchive(String format, List<TypePath> types, String archive) {}
@@ -428,24 +438,27 @@ public class RetroreAnnotations extends GhidraScript {
             throw new IllegalArgumentException("annotation executable SHA-256 differs from the Ghidra program");
         }
         int version = document.get("version").getAsBigDecimal().intValueExact();
-        if (version < 1 || version > 6 || document.has("data_types") != (version >= 2) ||
+        if (version < 1 || version > 7 || document.has("data_types") != (version >= 2) ||
                 document.has("storage_blocks") != (version >= 5)) {
-            throw new IllegalArgumentException("expected a version 1 through 6 annotation document");
+            throw new IllegalArgumentException("expected a version 1 through 7 annotation document");
         }
         try (var staged = version >= 2 ? readTypes(document, version) : null) {
-            var blocks = version >= 5 ? readStorageBlocks(document) : null;
+            var blocks = version >= 5 ? readStorageBlocks(document, version) : null;
             return replay(document, apply, version, staged, blocks);
         }
     }
 
-    private static Map<String, StorageBlock> readStorageBlocks(JsonObject document) {
+    private static Map<String, StorageBlock> readStorageBlocks(JsonObject document, int version) {
         var records = document.getAsJsonArray("storage_blocks");
         var blocks = new LinkedHashMap<String, StorageBlock>();
+        var sources = new HashSet<String>();
         for (var record : records) {
             var block = GSON.fromJson(record, StorageBlock.class);
-            if (block == null || !GSON.toJsonTree(block).equals(record) || block.unit() == null ||
+            if (block == null || !GSON.toJsonTree(block).equals(record) || block.unit() == null || block.unit().isEmpty() ||
                     block.space() == null || block.beforeStart() == null || block.afterStart() == null ||
-                    block.size() <= 0 || blocks.putIfAbsent(block.unit(), block) != null) {
+                    block.size() <= 0 || (block.afterUnit() == null) != (block.afterSize() == null) ||
+                    (block.afterUnit() != null && (version < 7 || block.afterUnit().isEmpty() || block.afterSize() <= 0)) ||
+                    !sources.add(block.unit()) || blocks.putIfAbsent(block.destinationUnit(), block) != null) {
                 throw new IllegalArgumentException("invalid annotation storage block");
             }
             Long.parseUnsignedLong(block.beforeStart(), 16);
@@ -511,7 +524,7 @@ public class RetroreAnnotations extends GhidraScript {
             if (row.has("custom_storage")) {
                 if (version < 3 || !kind.equals("signature") || prototype != null ||
                         !row.get("custom_storage").isJsonObject()) {
-                    throw new IllegalArgumentException("custom storage requires a version 3 through 6 signature annotation");
+                    throw new IllegalArgumentException("custom storage requires a version 3 through 7 signature annotation");
                 }
                 customStorage = GSON.fromJson(row.get("custom_storage"), CustomStorage.class);
                 if (!GSON.toJsonTree(customStorage).equals(row.get("custom_storage")) ||
@@ -577,9 +590,9 @@ public class RetroreAnnotations extends GhidraScript {
         if (!kind.equals("data_layout") && !row.has("data_layout")) {
             return null;
         }
-        if ((version != 4 && version != 6) || !kind.equals("data_layout") || !row.has("data_layout") ||
+        if ((version != 4 && version < 6) || !kind.equals("data_layout") || !row.has("data_layout") ||
                 !row.get("data_layout").isJsonObject()) {
-            throw new IllegalArgumentException("data layouts require a version 4 or 6 data_layout annotation");
+            throw new IllegalArgumentException("data layouts require a version 4, 6, or 7 data_layout annotation");
         }
         var layout = GSON.fromJson(row.get("data_layout"), DataLayout.class);
         if (!GSON.toJsonTree(layout).equals(row.get("data_layout")) || layout.type() == null || layout.length() < 1) {
@@ -611,8 +624,8 @@ public class RetroreAnnotations extends GhidraScript {
     private Change check(Item item, DataTypeManager staged, AddressSet layoutRanges,
             Map<String, StorageBlock> storageBlocks, Set<String> ambiguousUnits) throws Exception {
         var block = currentProgram.getMemory().getBlock(item.unit());
+        var pair = item.dataLayout() != null && storageBlocks != null ? storageBlocks.get(item.unit()) : null;
         if (item.dataLayout() != null && storageBlocks != null) {
-            var pair = storageBlocks.get(item.unit());
             if (pair == null) {
                 return new Change(item, null, "conflict", "the data layout has no matching memory block");
             }
@@ -625,7 +638,8 @@ public class RetroreAnnotations extends GhidraScript {
         }
         Address address = block.getStart().addNoWrap(item.offset());
         if (item.dataLayout() != null) {
-            return checkLayout(item, address, block.getSize() - item.offset(), staged, layoutRanges);
+            long size = pair == null ? block.getSize() : pair.sharedSize();
+            return checkLayout(item, address, size - item.offset(), staged, layoutRanges);
         }
         var listing = currentProgram.getListing();
         var symbols = currentProgram.getSymbolTable();
@@ -686,7 +700,8 @@ public class RetroreAnnotations extends GhidraScript {
             if (item.customStorage() != null) {
                 try {
                     if (storageBlocks != null) {
-                        var storage = remapCustomStorage(item.customStorage(), function, storageBlocks.values());
+                        var storage = remapCustomStorage(item.customStorage(), function, storageBlocks.values(),
+                            ambiguousUnits);
                         item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
                             item.callingConvention(), null, storage, null, null);
                     }
@@ -854,13 +869,13 @@ public class RetroreAnnotations extends GhidraScript {
         return storage;
     }
 
-    private CustomStorage remapCustomStorage(CustomStorage storage, Function function, Collection<StorageBlock> blocks)
-            throws InvalidInputException {
-        var returnStorage = remapStorage(storage.returnStorage(), blocks);
+    private CustomStorage remapCustomStorage(CustomStorage storage, Function function, Collection<StorageBlock> blocks,
+            Set<String> ambiguousUnits) throws InvalidInputException {
+        var returnStorage = remapStorage(storage.returnStorage(), blocks, ambiguousUnits);
         var parameters = new ArrayList<StoredVariable>();
         var locals = new ArrayList<StoredVariable>();
         for (var parameter : storage.parameters()) {
-            parameters.add(remapVariable(parameter, blocks));
+            parameters.add(remapVariable(parameter, blocks, ambiguousUnits));
         }
         for (var local : storage.locals()) {
             if (local == null) {
@@ -876,22 +891,24 @@ public class RetroreAnnotations extends GhidraScript {
                     throw new InvalidInputException("custom local first use is out of range: " + local.name());
                 }
             }
-            locals.add(remapVariable(local, blocks));
+            locals.add(remapVariable(local, blocks, ambiguousUnits));
         }
         return new CustomStorage(storage.returnType(), returnStorage, parameters, locals, storage.varargs(),
             storage.noreturn(), storage.stackPurge());
     }
 
-    private StoredVariable remapVariable(StoredVariable variable, Collection<StorageBlock> blocks)
-            throws InvalidInputException {
+    private StoredVariable remapVariable(StoredVariable variable, Collection<StorageBlock> blocks,
+            Set<String> ambiguousUnits) throws InvalidInputException {
         if (variable == null) {
             throw new InvalidInputException("invalid custom variable record");
         }
-        return new StoredVariable(variable.name(), variable.type(), remapStorage(variable.storage(), blocks),
-            variable.firstUse(), variable.comment(), variable.source());
+        var storage = remapStorage(variable.storage(), blocks, ambiguousUnits);
+        return new StoredVariable(variable.name(), variable.type(), storage, variable.firstUse(), variable.comment(),
+            variable.source());
     }
 
-    private String remapStorage(String encoded, Collection<StorageBlock> blocks) throws InvalidInputException {
+    private String remapStorage(String encoded, Collection<StorageBlock> blocks, Set<String> ambiguousUnits)
+            throws InvalidInputException {
         var pieces = variableStorage(encoded).getVarnodes();
         for (int i = 0; i < pieces.length; i++) {
             var piece = pieces[i];
@@ -904,13 +921,14 @@ public class RetroreAnnotations extends GhidraScript {
             }
             var register = currentProgram.getLanguage().getRegister(address, piece.getSize());
             if (register == null || register instanceof UnknownRegister) {
-                pieces[i] = remapMemoryPiece(piece, blocks);
+                pieces[i] = remapMemoryPiece(piece, blocks, ambiguousUnits);
             }
         }
         return pieces.length == 0 ? encoded : new VariableStorage(currentProgram, pieces).getSerializationString();
     }
 
-    private Varnode remapMemoryPiece(Varnode piece, Collection<StorageBlock> blocks) throws InvalidInputException {
+    private Varnode remapMemoryPiece(Varnode piece, Collection<StorageBlock> blocks, Set<String> ambiguousUnits)
+            throws InvalidInputException {
         var address = piece.getAddress();
         var space = address.getAddressSpace().getName();
         for (var pair : blocks) {
@@ -918,11 +936,12 @@ public class RetroreAnnotations extends GhidraScript {
             if (!space.equals(pair.space()) || offset < 0 || offset >= pair.size()) {
                 continue;
             }
-            var block = currentProgram.getMemory().getBlock(pair.unit());
-            if (!pair.matchesDestination(block)) {
-                throw new InvalidInputException("destination storage block differs from the comparison: " + pair.unit());
+            var unit = pair.destinationUnit();
+            var block = currentProgram.getMemory().getBlock(unit);
+            if (ambiguousUnits.contains(unit) || !pair.matchesDestination(block)) {
+                throw new InvalidInputException("destination storage block differs from the comparison: " + unit);
             }
-            if (piece.getSize() > pair.size() - offset) {
+            if (piece.getSize() > pair.sharedSize() - offset) {
                 throw new InvalidInputException("custom storage crosses the block boundary: " + address.toString(true));
             }
             return new Varnode(block.getStart().add(offset), piece.getSize());

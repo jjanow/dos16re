@@ -7,6 +7,8 @@ import ghidra.program.model.address.SegmentedAddress;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.SourceType;
 
@@ -31,7 +33,7 @@ public class RetroreFingerprints extends GhidraScript {
             List<Location> instructionSites) {}
     private record Location(String unit, long offset) {}
     private record StorageBlock(String unit, String space, String start, long size, String type,
-            boolean initialized, boolean read, boolean write, boolean execute) {}
+            boolean initialized, boolean read, boolean write, boolean execute, String contentSha256) {}
 
     private final Map<Address, List<String>> dataCache = new HashMap<>();
     private final HashSet<String> ambiguousUnits = new HashSet<>();
@@ -59,11 +61,14 @@ public class RetroreFingerprints extends GhidraScript {
             "sha256", Objects.toString(currentProgram.getExecutableSHA256(), ""), "functions", functions));
         if (storage) {
             var blocks = new ArrayList<StorageBlock>();
+            var digest = MessageDigest.getInstance("SHA-256");
+            var buffer = new byte[64 * 1024];
             for (var block : currentProgram.getMemory().getBlocks()) {
                 var start = block.getStart();
                 blocks.add(new StorageBlock(block.getName(), start.getAddressSpace().getName(),
                     Long.toUnsignedString(start.getOffset(), 16), block.getSize(), block.getType().name(),
-                    block.isInitialized(), block.isRead(), block.isWrite(), block.isExecute()));
+                    block.isInitialized(), block.isRead(), block.isWrite(), block.isExecute(),
+                    contentFingerprint(block, digest, buffer)));
             }
             report.put("compiler", currentProgram.getCompilerSpec().getCompilerSpecID().toString());
             report.put("storage_blocks", blocks);
@@ -71,6 +76,37 @@ public class RetroreFingerprints extends GhidraScript {
         var gson = new GsonBuilder().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .serializeNulls().create();
         Files.writeString(Path.of(args.getFirst()), gson.toJson(report));
+    }
+
+    private String contentFingerprint(MemoryBlock block, MessageDigest digest, byte[] buffer) throws Exception {
+        if (!block.isInitialized() || block.getSize() < 2) {
+            return null;
+        }
+        digest.reset();
+        byte first = 0;
+        boolean distinct = false;
+        try {
+            for (long offset = 0; offset < block.getSize();) {
+                monitor.checkCancelled();
+                int count = (int) Math.min(buffer.length, block.getSize() - offset);
+                if (block.getBytes(block.getStart().addNoWrap(offset), buffer, 0, count) != count) {
+                    return null;
+                }
+                digest.update(buffer, 0, count);
+                if (offset == 0) {
+                    first = buffer[0];
+                }
+                if (!distinct) {
+                    for (int i = 0; i < count && !distinct; i++) {
+                        distinct = buffer[i] != first;
+                    }
+                }
+                offset += count;
+            }
+        } catch (MemoryAccessException e) {
+            return null;
+        }
+        return distinct ? HexFormat.of().formatHex(digest.digest()) : null;
     }
 
     private Shape fingerprint(Function function, boolean storage, boolean includeSites) throws Exception {

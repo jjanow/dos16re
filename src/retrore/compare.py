@@ -89,16 +89,44 @@ def _routine(function: dict) -> dict:
 
 
 def _storage_blocks(before: list[dict], after: list[dict]) -> list[dict]:
-    first, second = (_index(dict(enumerate(blocks)), lambda block: block["unit"]) for blocks in (before, after))
+    first, second = (dict(enumerate(blocks)) for blocks in (before, after))
+    old_names, new_names = (_index(side, lambda block: block["unit"]) for side in (first, second))
+
+    def attributes(block):
+        return tuple(block[key] for key in ("space", "type", "initialized", "read", "write", "execute"))
+
+    def contents(block):
+        if digest := block.get("content_sha256"):
+            return attributes(block), block["size"], digest
+        return None
+
+    old_contents, new_contents = (_index(side, contents) for side in (first, second))
     pairs = []
-    for unit, indices in first.items():
-        destinations = second.get(unit, ())
-        if len(indices) != 1 or len(destinations) != 1:
+
+    for old in before:
+        unit = old["unit"]
+        if len(old_names[unit]) != 1:
             continue
-        old, new = before[indices[0]], after[destinations[0]]
-        if all(old[key] == new[key] for key in ("space", "size", "type", "initialized", "read", "write", "execute")):
-            pairs.append({"unit": unit, "space": old["space"], "size": old["size"],
-                          "before_start": old["start"], "after_start": new["start"]})
+        if unit in new_names:
+            destinations = new_names[unit]
+        else:
+            signature = contents(old)
+            if signature is None or len(old_contents[signature]) != 1:
+                continue
+            destinations = new_contents.get(signature, ())
+        if len(destinations) != 1:
+            continue
+        new = after[destinations[0]]
+        new_unit = new["unit"]
+        if new_unit != unit and (new_unit in old_names or len(new_names[new_unit]) != 1):
+            continue
+        if attributes(old) != attributes(new):
+            continue
+        pair = {"unit": unit, "space": old["space"], "size": old["size"],
+                "before_start": old["start"], "after_start": new["start"]}
+        if unit != new_unit or old["size"] != new["size"]:
+            pair.update(after_unit=new_unit, after_size=new["size"])
+        pairs.append(pair)
     return pairs
 
 
@@ -241,7 +269,10 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
     counts["ambiguous_after"] = sum(row["candidate_count"] > 0 for row in unpaired_after)
     report = {"comparison_version": 1}
     if storage:
-        report["storage_blocks"] = _storage_blocks(before["storage_blocks"], after["storage_blocks"])
+        blocks = _storage_blocks(before["storage_blocks"], after["storage_blocks"])
+        report["storage_blocks"] = blocks
+        if any("after_unit" in block for block in blocks):
+            report["comparison_version"] = 2
     for side, listing in (("before", before), ("after", after)):
         report[side] = {key: listing[key] for key in ("program", "language", "sha256")} | {
             "function_count": len(listing["functions"])}

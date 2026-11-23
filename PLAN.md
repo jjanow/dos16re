@@ -14,14 +14,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `annotations transfer` gained fixed-size data layout replay through
-`compare --storage`. Layouts keep their block-relative offsets and retain the type archive and
-source evidence. Replay checks the destination block and listing before applying the document.
-The standalone suite passed 423 tests with 95 skipped. The comparison, evidence, and layout
-suites passed 28 tests with 2 skipped on Ghidra 12.2, including rebased placement, conflict
-handling, and repeat replay.
+On 2026-11-23, `compare --storage` gained matches for resized blocks by unique name and for
+renamed blocks by unique, identical initialized content. Version 7 transfer documents carry the
+destination name and size. Replay checks the destination geometry and requires each storage or
+data layout range to fit within both blocks. The standalone suite passed 424 tests with 97 skipped.
+The comparison, evidence, and layout suites on Ghidra 12.2 passed 31 tests with 2 skipped.
 
-Resume Phase 10 with mapping custom storage in renamed or resized memory blocks.
+Resume Phase 10 with locating data that moved within a memory block.
 
 ## Why
 
@@ -378,9 +377,10 @@ release. Continue with the analysis backlog below.
   storage within matching memory blocks and align local first-use positions by instruction.
   Preview reports unmapped storage as a conflict. Version 6 uses the same block matches to transfer
   fixed-size data layouts at their original block-relative offsets. Preview checks the destination
-  block geometry and listing overlaps before replay. Version 1 remains supported. Open work
-  includes mapping custom storage in renamed or resized blocks and locating data that moved within
-  a block.
+  block geometry and listing overlaps before replay. Version 7 extends both transfers to uniquely
+  named blocks that grew or shrank and to renamed blocks with unique, identical non-uniform bytes.
+  Replay checks each range against both block sizes. Older documents remain supported. Open work
+  includes locating data that moved within a block and matching renamed blocks with changed bytes.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay

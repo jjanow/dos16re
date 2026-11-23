@@ -1,5 +1,6 @@
 // Seed and inspect a synthetic function with custom variable storage.
 import ghidra.app.script.GhidraScript;
+import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.ByteDataType;
 import ghidra.program.model.data.UnsignedShortDataType;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
@@ -24,6 +25,7 @@ public class AnnotationStorage extends GhidraScript {
         var pair = new VariableStorage(currentProgram, x, y);
         var word = UnsignedShortDataType.dataType;
         var byteType = ByteDataType.dataType;
+        var variant = args.length > 3 ? args[3] : "";
         var manual = SourceType.USER_DEFINED;
         switch (args[0]) {
             case "seed" -> {
@@ -38,13 +40,18 @@ public class AnnotationStorage extends GhidraScript {
                 function.addLocalVariable(local, manual);
                 function.addLocalVariable(new LocalVariableImpl("reused_x", 2, byteType, x, currentProgram), manual);
                 function.addLocalVariable(
-                    new LocalVariableImpl("scratch", 0, byteType, scratch, currentProgram), manual);
+                    new LocalVariableImpl("scratch", 0, variant.equals("resized") ? word : byteType,
+                        scratch, currentProgram), manual);
+                if (variant.equals("renamed")) {
+                    createData(entry.add(0x10), new ArrayDataType(byteType, 4, 1));
+                }
                 function.setVarArgs(true);
                 function.setNoReturn(true);
                 function.setStackPurgeSize(2);
             }
             case "conflict" -> function.addLocalVariable(
                 new LocalVariableImpl("manual_cache", word, -4, currentProgram), manual);
+            case "rename" -> currentProgram.getMemory().getBlock(entry).setName("renamed_root");
             case "check" -> {
                 check(function.hasCustomVariableStorage(), "custom storage mode");
                 check(function.getReturn().getRegister().equals(accumulator), "return register");

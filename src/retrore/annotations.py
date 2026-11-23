@@ -20,13 +20,13 @@ def _read_json(path: Path) -> dict:
 
 def _read_annotations(path: Path) -> dict:
     content = _read_json(path)
-    if (type(content.get("version")) is not int or not 1 <= content["version"] <= 6
+    if (type(content.get("version")) is not int or not 1 <= content["version"] <= 7
             or not isinstance(content.get("annotations"), list)
             or ("data_types" in content) != (content["version"] >= 2)
             or (content["version"] >= 2 and not isinstance(content["data_types"], dict))
             or ("storage_blocks" in content) != (content["version"] >= 5)
             or (content["version"] >= 5 and not isinstance(content["storage_blocks"], list))):
-        raise ghidra.GhidraError("expected a version 1 through 6 annotation document")
+        raise ghidra.GhidraError("expected a version 1 through 7 annotation document")
     return content
 
 
@@ -123,7 +123,8 @@ def _layout_transfer_conflict(item: dict, blocks: dict | None) -> str | None:
         raise ghidra.GhidraError("invalid annotation data layout length")
     if unit not in blocks:
         return "data_layout_has_no_matching_block"
-    if offset + length > blocks[unit]["size"]:
+    block = blocks[unit]
+    if offset + length > min(block["size"], block.get("after_size", block["size"])):
         return "data_layout_crosses_block_boundary"
     return None
 
@@ -132,8 +133,9 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
     """Make a replay document using function, instruction, and memory block matches."""
     source = _read_annotations(document)
     comparison = _read_json(comparison)
-    if type(comparison.get("comparison_version")) is not int or comparison["comparison_version"] != 1:
-        raise ghidra.GhidraError("expected a version 1 comparison report")
+    version = comparison.get("comparison_version")
+    if type(version) is not int or version not in (1, 2):
+        raise ghidra.GhidraError("expected a version 1 or 2 comparison report")
     try:
         before, after = comparison["before"], comparison["after"]
         if (before["language"] != source.get("language") or not before["sha256"]
@@ -154,11 +156,20 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
         blocks = None
         if same_language and "storage_blocks" in comparison:
             blocks = {}
+            destination_units = set()
             for block in comparison["storage_blocks"]:
                 unit = block["unit"]
-                if unit in blocks:
+                after_unit = block.get("after_unit", unit)
+                after_size = block.get("after_size", block["size"])
+                if ("after_unit" in block) != ("after_size" in block) or (version == 1 and "after_unit" in block):
+                    raise ghidra.GhidraError("invalid comparison memory block match")
+                if any(not isinstance(name, str) or not name for name in (unit, after_unit)) or any(
+                        type(size) is not int or size <= 0 for size in (block["size"], after_size)):
+                    raise ghidra.GhidraError("invalid comparison memory block match")
+                if unit in blocks or after_unit in destination_units:
                     raise ghidra.GhidraError("comparison contains duplicate memory block matches")
                 blocks[unit] = block
+                destination_units.add(after_unit)
         annotations, skipped = [], []
         for item in source["annotations"]:
             key = item["unit"], item["offset"]
@@ -178,7 +189,8 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
             reason = None
             if kind == "data_layout":
                 reason = _layout_transfer_conflict(item, blocks)
-                destination = item
+                if reason is None:
+                    destination = {"unit": blocks[key[0]].get("after_unit", key[0]), "offset": key[1]}
                 matched_by = "memory_block"
             elif custom_storage and blocks is None:
                 reason = "custom_variable_storage_requires_original_layout"
@@ -223,9 +235,11 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
         report = {"version": 1, "language": after["language"], "sha256": after["sha256"],
                   "annotations": annotations, "transfer": {"skipped": skipped}}
         if any(item["kind"] == "data_layout" for item in annotations):
-            report.update(version=6, data_types=source["data_types"], storage_blocks=comparison["storage_blocks"])
+            report.update(version=7 if version == 2 else 6, data_types=source["data_types"],
+                          storage_blocks=comparison["storage_blocks"])
         elif any("custom_storage" in item for item in annotations):
-            report.update(version=5, data_types=source["data_types"], storage_blocks=comparison["storage_blocks"])
+            report.update(version=7 if version == 2 else 5, data_types=source["data_types"],
+                          storage_blocks=comparison["storage_blocks"])
         elif any(item["kind"] == "signature" and "prototype" in item for item in annotations):
             report.update(version=2, data_types=source["data_types"])
         return report

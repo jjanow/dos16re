@@ -215,6 +215,20 @@ def test_annotation_transfer_preserves_anchors_and_skips_changed_bodies(tmp_path
         "data_layout_has_no_matching_block", "data_layout_crosses_block_boundary",
     ]
 
+    comparison.write_text(json.dumps(json.loads(comparison.read_text(encoding="utf-8")) | {
+        "comparison_version": 2,
+        "storage_blocks": [blocks[0] | {"after_unit": "root", "after_size": 19}],
+    }), encoding="utf-8")
+    assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
+    shrunk = json.loads(capsys.readouterr().out)
+    assert shrunk["annotations"] == []
+    assert [(row["offset"], row["reason"]) for row in shrunk["transfer"]["skipped"]
+            if row["kind"] == "data_layout"] == [
+        (16, "data_layout_crosses_block_boundary"),
+        (16, "data_layout_has_no_matching_block"),
+        (17, "data_layout_crosses_block_boundary"),
+    ]
+
 
 def test_annotation_transfer_maps_local_first_use_by_instruction(tmp_path, capsys):
     annotations, comparison = (tmp_path / name for name in ("annotations.json", "compare.json"))
@@ -501,39 +515,69 @@ def test_annotation_custom_storage_round_trip(tmp_path, capsys):
 
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
-def test_annotation_custom_storage_transfer_rebases_memory(tmp_path, capsys):
-    source = tmp_path / "storage.prg"
-    source.write_bytes(bytes.fromhex("00 c0 a9 07 ea 60") + bytes(0x20))
+@pytest.mark.parametrize("variant", ["unchanged", "renamed", "resized"])
+def test_annotation_custom_storage_transfer_rebases_memory(tmp_path, capsys, variant):
+    code = bytes.fromhex("00 c0 a9 07 ea 60")
     before, after = (tmp_path / name for name in ("before", "after"))
     for project, entry in ((before, "c000"), (after, "c400")):
         export = project.with_name(project.name + "-export")
+        source = tmp_path / f"{project.name}.prg"
+        source.write_bytes(code + bytes(0x1e if project == after and variant == "resized" else 0x20))
         assert main(["load", str(source), "--base-address", entry, "--entry", entry, "-o", str(export)]) == 0
         assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
     capsys.readouterr()
 
-    _edit_storage(before, "seed", "c000", "relative")
+    _edit_storage(before, "seed", "c000", "relative", variant)
+    if variant == "renamed":
+        _edit_storage(after, "rename", "c400")
     original = tmp_path / "annotations.json"
     original.write_text(json.dumps(export_annotations(before)), encoding="utf-8")
     assert main(["compare", str(before), str(after), "--storage", "--json"]) == 0, capsys.readouterr().err
     comparison = tmp_path / "comparison.json"
-    comparison.write_text(capsys.readouterr().out, encoding="utf-8")
+    mapping = json.loads(capsys.readouterr().out)
+    assert mapping["comparison_version"] == (1 if variant == "unchanged" else 2)
+    comparison.write_text(json.dumps(mapping), encoding="utf-8")
     assert main(["annotations", "transfer", str(original), str(comparison), "--json"]) == 0
     transferred = json.loads(capsys.readouterr().out)
-    assert transferred["version"] == 5
-    signature, = transferred["annotations"]
-    assert signature["kind"] == "signature"
+    assert transferred["version"] == (5 if variant == "unchanged" else 7)
+    signature, = [row for row in transferred["annotations"] if row["kind"] == "signature"]
     block, = [pair for pair in transferred["storage_blocks"] if pair["unit"] == "root"]
     assert (block["before_start"], block["after_start"]) == ("c000", "c400")
+    if variant == "renamed":
+        assert (block["after_unit"], block["after_size"]) == ("renamed_root", block["size"])
+        layout, = [row for row in transferred["annotations"] if row["kind"] == "data_layout"]
+        assert (layout["unit"], layout["offset"], layout["provenance"]["unit"]) == ("renamed_root", 0x10, "root")
+    elif variant == "resized":
+        assert (block["after_unit"], block["after_size"]) == ("root", block["size"] - 2)
     path = tmp_path / "transferred.json"
 
     path.write_text(json.dumps(transferred | {"storage_blocks": []}), encoding="utf-8")
     conflict = import_annotations(after, path, apply=True)
-    assert not conflict["applied"] and conflict["conflicts"] == 1
-    assert "no matching memory block" in conflict["changes"][0]["reason"]
+    count = 2 if variant == "renamed" else 1
+    assert not conflict["applied"] and conflict["conflicts"] == count
+    assert all("no matching memory block" in change["reason"] for change in conflict["changes"])
+
+    if variant == "resized":
+        scratch, = [row for row in signature["custom_storage"]["locals"] if row["name"] == "scratch"]
+        storage = scratch["storage"]
+        assert "c020" in storage
+        scratch["storage"] = storage.replace("c020", "c021")
+        path.write_text(json.dumps(transferred), encoding="utf-8")
+        conflict = import_annotations(after, path, apply=True)
+        assert not conflict["applied"] and conflict["conflicts"] == 1
+        assert "crosses the block boundary" in conflict["changes"][0]["reason"]
+        scratch["storage"] = storage
+
+        block["after_size"] += 1
+        path.write_text(json.dumps(transferred), encoding="utf-8")
+        stale = import_annotations(after, path)
+        assert stale["conflicts"] == 1
+        assert "destination storage block differs from the comparison" in stale["changes"][0]["reason"]
+        block["after_size"] -= 1
 
     path.write_text(json.dumps(transferred), encoding="utf-8")
     preview = import_annotations(after, path)
-    assert not preview["applied"] and preview["additions"] == 1 and preview["conflicts"] == 0
+    assert not preview["applied"] and preview["additions"] == count and preview["conflicts"] == 0
     assert import_annotations(after, path, apply=True)["applied"]
     _edit_storage(after, "check", "c400", "relative")
     again = import_annotations(after, path)
