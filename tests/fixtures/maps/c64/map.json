@@ -1,0 +1,123 @@
+{
+  "format": "C64_PRG",
+  "program": "demo.prg",
+  "base_address": 49152,
+  "bank": 7,
+  "memory_map": [
+    {
+      "name": "cpu_port",
+      "linear": 0,
+      "size": 2,
+      "read": "io",
+      "write": "io"
+    },
+    {
+      "name": "zero_page",
+      "linear": 2,
+      "size": 254,
+      "read": "ram",
+      "write": "ram"
+    },
+    {
+      "name": "stack",
+      "linear": 256,
+      "size": 256,
+      "read": "ram",
+      "write": "ram"
+    },
+    {
+      "name": "low_ram",
+      "linear": 512,
+      "size": 40448,
+      "read": "ram",
+      "write": "ram"
+    },
+    {
+      "name": "basic_rom",
+      "linear": 40960,
+      "size": 8192,
+      "read": "rom",
+      "write": "ram"
+    },
+    {
+      "name": "high_ram",
+      "linear": 49152,
+      "size": 4096,
+      "read": "ram",
+      "write": "ram"
+    },
+    {
+      "name": "vic",
+      "linear": 53248,
+      "size": 1024,
+      "read": "io",
+      "write": "io"
+    },
+    {
+      "name": "sid",
+      "linear": 54272,
+      "size": 1024,
+      "read": "io",
+      "write": "io"
+    },
+    {
+      "name": "color_ram",
+      "linear": 55296,
+      "size": 1024,
+      "read": "io",
+      "write": "io"
+    },
+    {
+      "name": "cia1",
+      "linear": 56320,
+      "size": 256,
+      "read": "io",
+      "write": "io"
+    },
+    {
+      "name": "cia2",
+      "linear": 56576,
+      "size": 256,
+      "read": "io",
+      "write": "io"
+    },
+    {
+      "name": "expansion_io",
+      "linear": 56832,
+      "size": 512,
+      "read": "io",
+      "write": "io"
+    },
+    {
+      "name": "kernal_rom",
+      "linear": 57344,
+      "size": 8192,
+      "read": "rom",
+      "write": "ram"
+    }
+  ],
+  "units": [
+    {
+      "name": "root",
+      "kind": "ram",
+      "linear": 49152,
+      "size": 10,
+      "image_offset": 0,
+      "file_offset": 2,
+      "file_size": 10,
+      "load_address": 49152,
+      "source": "demo.prg",
+      "disk_file": null
+    }
+  ],
+  "entry": {
+    "linear": 49152,
+    "unit_address": "root:0000"
+  },
+  "entries": [
+    {
+      "linear": 49152,
+      "unit_address": "root:0000"
+    }
+  ]
+}

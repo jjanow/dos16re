@@ -1,0 +1,30 @@
+{
+  "format": "MZ",
+  "program": "demo.exe",
+  "entry": {
+    "segment": 4097,
+    "offset": 3,
+    "linear": 65555
+  },
+  "stack": {
+    "segment": 4095,
+    "offset": 65534,
+    "linear": 131054
+  },
+  "relocation_count": 2,
+  "units": [
+    {
+      "name": "root",
+      "segment": 4096,
+      "linear": 65536,
+      "image_offset": 0,
+      "size": 32
+    }
+  ],
+  "relocations": [
+    1,
+    20
+  ],
+  "compiler": null,
+  "runtime_signatures": []
+}

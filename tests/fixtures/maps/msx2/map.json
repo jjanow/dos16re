@@ -1,0 +1,69 @@
+{
+  "format": "MSX2",
+  "program": "DEMO.COM",
+  "memory_view": "msxdos",
+  "memory_map": [
+    {
+      "name": "page_0",
+      "linear": 0,
+      "size": 16384,
+      "read": "ram",
+      "write": "ram"
+    },
+    {
+      "name": "page_1",
+      "linear": 16384,
+      "size": 16384,
+      "read": "ram",
+      "write": "ram"
+    },
+    {
+      "name": "page_2",
+      "linear": 32768,
+      "size": 16384,
+      "read": "ram",
+      "write": "ram"
+    },
+    {
+      "name": "page_3",
+      "linear": 49152,
+      "size": 16384,
+      "read": "ram",
+      "write": "ram"
+    }
+  ],
+  "base_address": 256,
+  "sources": [
+    {
+      "name": "root",
+      "source": "DEMO.COM",
+      "disk_file": null,
+      "linear": 256,
+      "size": 9,
+      "file_offset": 0
+    }
+  ],
+  "units": [
+    {
+      "name": "root",
+      "kind": "ram",
+      "linear": 256,
+      "size": 9,
+      "image_offset": 0,
+      "file_size": 9,
+      "file_offset": 0,
+      "source": "DEMO.COM",
+      "disk_file": null
+    }
+  ],
+  "entry": {
+    "linear": 256,
+    "unit_address": "root:0000"
+  },
+  "entries": [
+    {
+      "linear": 256,
+      "unit_address": "root:0000"
+    }
+  ]
+}
