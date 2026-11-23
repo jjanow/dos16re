@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from retrore import ghidra
+from retrore import evidence, ghidra
 from retrore.annotations import export_annotations, import_annotations
 from retrore.cli import main
 from retrore.evidence import inspect_bytes, map_address
@@ -41,6 +41,30 @@ def test_hunk_file_mapping_and_bss():
     ]
     bss = inspect_bytes(export, "h3:1", size=4)
     assert bss["truncated"] and not bss["address"]["initialized"] and bss["loaded"] == ""
+
+
+def test_bundle_distinguishes_uninitialized_ranges_from_byte_conflicts(monkeypatch):
+    export = FIXTURES / "hunk"
+    addresses = ["h3:1", "h0:2", "h3:1", "h0:2"]
+    rows = [
+        {"kind": "uninitialized"},
+        {"kind": "data", "bytes": "ffffffff"},
+        {"kind": "data", "bytes": "00000000"},
+        {"kind": "uninitialized"},
+    ]
+    results = [{"result": {"program": "demo"}}]
+    for address, row in zip(addresses, rows, strict=True):
+        start, = map_address(export, address)["matches"]
+        results.append({"result": {"start": start, "size": 4, "rows": [row]}})
+    monkeypatch.setattr(evidence, "query_batch", lambda *args, **kwargs: {"results": results})
+
+    requests = [{"command": "disasm", "address": address} for address in addresses]
+    bundle = evidence.evidence_bundle(Path("demo.gpr"), requests, export=export)
+
+    comparisons = [row["export_evidence"] for row in bundle["results"]]
+    assert [item["status"] for item in comparisons] == ["unavailable", "conflict", "conflict", "conflict"]
+    assert comparisons[0]["reason"] == "range is uninitialized"
+    assert comparisons[0]["bytes"]["loaded"] == ""
 
 
 def test_fragmented_file_mapping_and_mcp(tmp_path):

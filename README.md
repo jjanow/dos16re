@@ -945,7 +945,8 @@ stream. A batch launches Ghidra once, so it costs about the same as one single q
 `batch --evidence --json` includes a compact project summary and the original requests in a
 versioned evidence bundle. Add `--export OUT` to compare each complete `disasm` result with the
 corresponding loader range and include its file spans and fixups. The bundle flags differences
-between the Ghidra bytes and the export, including changes to Ghidra's analysis copy.
+between the Ghidra bytes and the export, including changes to Ghidra's analysis copy. If the range
+is uninitialized in both, its byte comparison is marked `unavailable` with a reason.
 
 ### Reuse Ghidra annotations
 

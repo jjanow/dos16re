@@ -235,7 +235,13 @@ def evidence_bundle(project: Path, requests: list, *, export: Path | None = None
             row["export_evidence"] = {"status": "unavailable", "reason": str(error)}
             continue
         project_bytes = "".join(part.get("bytes", "") for part in result["rows"])
-        same = (observed["address"]["linear"] == location["linear"]
-                and observed["size"] == result["size"] and observed["loaded"] == project_bytes)
-        row["export_evidence"] = {"status": "consistent" if same else "conflict", "bytes": observed}
+        same_address = observed["address"]["linear"] == location["linear"]
+        if (same_address and not observed["address"]["initialized"]
+                and all(part["kind"] == "uninitialized" for part in result["rows"])):
+            row["export_evidence"] = {"status": "unavailable", "reason": "range is uninitialized",
+                                      "bytes": observed}
+            continue
+        same_bytes = observed["size"] == result["size"] and observed["loaded"] == project_bytes
+        row["export_evidence"] = {"status": "consistent" if same_address and same_bytes else "conflict",
+                                  "bytes": observed}
     return bundle

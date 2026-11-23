@@ -14,14 +14,11 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, DOS indirect analysis gained explicit segment override handling, support for
-indexed memory operands without a displacement, and segment loss diagnostics in `indirect`.
-Phantasie III's call at `root:42df` now reports a relocation-backed candidate at `root:11914`.
-
-Synthetic Ghidra tests verified the override and loss diagnostics. Opt-in checks verified the
-Phantasie III result in `batch --evidence` and Pool of Radiance's stored procedure pointer candidates.
-The standalone suite passed 418 tests with 90 skipped. All 508 tests passed with Ghidra 12.2
-and the opt-in suites enabled, using Python 3.14 and JDK 25.
+On 2026-11-23, `batch --evidence` gained an explicit unavailable byte comparison for ranges
+that are uninitialized in both the Ghidra project and the export. A regression test covers
+the unavailable result, changed bytes, and initialization mismatches. The standalone suite
+passed 419 tests with 90 skipped. The focused decompilation and evidence suites passed all
+13 tests with Ghidra 12.2 and JDK 25.
 
 Resume with Phase 10's shared evidence categories, or use runtime observations to investigate
 Phantasie III's unresolved dispatch at `root:13721` in Phase 9.
@@ -360,8 +357,9 @@ release. Continue with the analysis backlog below.
   `decomp --map-lines` maps C lines to contributing instruction ranges. Open: source offsets for
   older maps and formats with incomplete provenance, and generalized runtime placement.
 - **Partly implemented.** `batch --evidence` bundles selected results and their requests. It can
-  attach loader evidence to disassembly and flag byte conflicts. Gap classification can include
-  observed runtime hits. Open: shared evidence categories across all analyses and annotations.
+  attach loader evidence to disassembly and flag byte conflicts. A range uninitialized in both the
+  export and Ghidra reports an unavailable byte comparison. Gap classification can include observed
+  runtime hits. Open: shared evidence categories across all analyses and annotations.
 - **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
   entry points. Replay previews conflicts and applies changes in one transaction. Open: user data
   types, custom storage, and layout hints.
