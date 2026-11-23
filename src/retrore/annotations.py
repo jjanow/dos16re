@@ -20,13 +20,13 @@ def _read_json(path: Path) -> dict:
 
 def _read_annotations(path: Path) -> dict:
     content = _read_json(path)
-    if (type(content.get("version")) is not int or not 1 <= content["version"] <= 5
+    if (type(content.get("version")) is not int or not 1 <= content["version"] <= 6
             or not isinstance(content.get("annotations"), list)
             or ("data_types" in content) != (content["version"] >= 2)
             or (content["version"] >= 2 and not isinstance(content["data_types"], dict))
-            or ("storage_blocks" in content) != (content["version"] == 5)
-            or (content["version"] == 5 and not isinstance(content["storage_blocks"], list))):
-        raise ghidra.GhidraError("expected a version 1 through 5 annotation document")
+            or ("storage_blocks" in content) != (content["version"] >= 5)
+            or (content["version"] >= 5 and not isinstance(content["storage_blocks"], list))):
+        raise ghidra.GhidraError("expected a version 1 through 6 annotation document")
     return content
 
 
@@ -114,8 +114,22 @@ def _instruction_matches(matches: dict) -> dict:
     return locations
 
 
+def _layout_transfer_conflict(item: dict, blocks: dict | None) -> str | None:
+    if blocks is None:
+        return "data_layout_requires_block_comparison"
+    unit, offset = _site(item)
+    length = item["data_layout"]["length"]
+    if type(length) is not int or length < 1:
+        raise ghidra.GhidraError("invalid annotation data layout length")
+    if unit not in blocks:
+        return "data_layout_has_no_matching_block"
+    if offset + length > blocks[unit]["size"]:
+        return "data_layout_crosses_block_boundary"
+    return None
+
+
 def transfer_annotations(document: Path, comparison: Path) -> dict:
-    """Make a replay document for same-body function entries and mapped instructions."""
+    """Make a replay document using function, instruction, and memory block matches."""
     source = _read_annotations(document)
     comparison = _read_json(comparison)
     if type(comparison.get("comparison_version")) is not int or comparison["comparison_version"] != 1:
@@ -137,6 +151,14 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
             destinations.add(destination)
         same_language = before["language"] == after["language"]
         instructions = _instruction_matches(matches) if same_language else {}
+        blocks = None
+        if same_language and "storage_blocks" in comparison:
+            blocks = {}
+            for block in comparison["storage_blocks"]:
+                unit = block["unit"]
+                if unit in blocks:
+                    raise ghidra.GhidraError("comparison contains duplicate memory block matches")
+                blocks[unit] = block
         annotations, skipped = [], []
         for item in source["annotations"]:
             key = item["unit"], item["offset"]
@@ -153,10 +175,13 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
                 destination = match["after"] if match is not None else None
             custom_storage = "custom_storage" in item
             mapped_storage = None
-            if custom_storage and "storage_blocks" not in comparison:
+            reason = None
+            if kind == "data_layout":
+                reason = _layout_transfer_conflict(item, blocks)
+                destination = item
+                matched_by = "memory_block"
+            elif custom_storage and blocks is None:
                 reason = "custom_variable_storage_requires_original_layout"
-            elif kind == "data_layout":
-                reason = "data_layout_requires_original_layout"
             elif kind not in ("function_name", "signature", "comment", "label", "local_label"):
                 reason = "unsupported_annotation_kind"
             elif needs_instruction and site is None:
@@ -170,33 +195,36 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
                 reason = "function_match_requires_review"
             elif destination["unit"] is None or type(destination["offset"]) is not int:
                 reason = "destination_has_no_unit"
-            elif custom_storage and source["version"] == 5:
+            elif custom_storage and source["version"] >= 5:
                 reason = "custom_storage_requires_fresh_export"
             elif custom_storage and ("storage_offsets" not in match or
                     (mapped_storage := _transfer_storage(item["custom_storage"], match["storage_offsets"])) is None):
                 reason = "custom_storage_first_use_unmapped"
             else:
-                transferred = {**item, "unit": destination["unit"], "offset": destination["offset"]}
-                if mapped_storage is not None:
-                    transferred["custom_storage"] = mapped_storage
-                provenance = {"sha256": before["sha256"], "unit": key[0], "offset": key[1],
-                              "matched_by": match["matched_by"]}
-                if entry is not None:
-                    transferred["function"] = {name: match["after"][name] for name in ("unit", "offset")}
-                    provenance["function"] = {"unit": entry[0], "offset": entry[1]}
-                if "export_evidence" in transferred:
-                    provenance["export_evidence"] = transferred.pop("export_evidence")
-                    if "export" in source:
-                        provenance["export"] = source["export"]
-                if "provenance" in item:
-                    provenance["previous"] = item["provenance"]
-                transferred["provenance"] = provenance
-                annotations.append(transferred)
+                matched_by = match["matched_by"]
+            if reason is not None:
+                skipped.append({"unit": key[0], "offset": key[1], "kind": kind, "reason": reason})
                 continue
-            skipped.append({"unit": key[0], "offset": key[1], "kind": kind, "reason": reason})
+            transferred = {**item, "unit": destination["unit"], "offset": destination["offset"]}
+            if mapped_storage is not None:
+                transferred["custom_storage"] = mapped_storage
+            provenance = {"sha256": before["sha256"], "unit": key[0], "offset": key[1], "matched_by": matched_by}
+            if entry is not None:
+                transferred["function"] = {name: match["after"][name] for name in ("unit", "offset")}
+                provenance["function"] = {"unit": entry[0], "offset": entry[1]}
+            if "export_evidence" in transferred:
+                provenance["export_evidence"] = transferred.pop("export_evidence")
+                if "export" in source:
+                    provenance["export"] = source["export"]
+            if "provenance" in item:
+                provenance["previous"] = item["provenance"]
+            transferred["provenance"] = provenance
+            annotations.append(transferred)
         report = {"version": 1, "language": after["language"], "sha256": after["sha256"],
                   "annotations": annotations, "transfer": {"skipped": skipped}}
-        if any("custom_storage" in item for item in annotations):
+        if any(item["kind"] == "data_layout" for item in annotations):
+            report.update(version=6, data_types=source["data_types"], storage_blocks=comparison["storage_blocks"])
+        elif any("custom_storage" in item for item in annotations):
             report.update(version=5, data_types=source["data_types"], storage_blocks=comparison["storage_blocks"])
         elif any(item["kind"] == "signature" and "prototype" in item for item in annotations):
             report.update(version=2, data_types=source["data_types"])

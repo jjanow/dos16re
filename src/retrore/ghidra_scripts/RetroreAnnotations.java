@@ -38,6 +38,7 @@ import ghidra.program.model.listing.ReturnParameterImpl;
 import ghidra.program.model.listing.Variable;
 import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.listing.VariableUtilities;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolType;
@@ -49,6 +50,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -107,6 +109,11 @@ public class RetroreAnnotations extends GhidraScript {
     private record StorageBlock(String unit, String space, String beforeStart, String afterStart, long size) {
         long sourceOffset(Address address) {
             return address.getOffset() - Long.parseUnsignedLong(beforeStart, 16);
+        }
+
+        boolean matchesDestination(MemoryBlock block) {
+            return block != null && space.equals(block.getStart().getAddressSpace().getName()) &&
+                block.getStart().getOffset() == Long.parseUnsignedLong(afterStart, 16) && block.getSize() == size;
         }
     }
     private record TypeArchive(String format, List<TypePath> types, String archive) {}
@@ -421,36 +428,34 @@ public class RetroreAnnotations extends GhidraScript {
             throw new IllegalArgumentException("annotation executable SHA-256 differs from the Ghidra program");
         }
         int version = document.get("version").getAsBigDecimal().intValueExact();
-        if (version < 1 || version > 5 || document.has("data_types") != (version >= 2) ||
-                document.has("storage_blocks") != (version == 5)) {
-            throw new IllegalArgumentException("expected a version 1 through 5 annotation document");
+        if (version < 1 || version > 6 || document.has("data_types") != (version >= 2) ||
+                document.has("storage_blocks") != (version >= 5)) {
+            throw new IllegalArgumentException("expected a version 1 through 6 annotation document");
         }
         try (var staged = version >= 2 ? readTypes(document, version) : null) {
-            var blocks = version == 5 ? readStorageBlocks(document) : null;
+            var blocks = version >= 5 ? readStorageBlocks(document) : null;
             return replay(document, apply, version, staged, blocks);
         }
     }
 
-    private static List<StorageBlock> readStorageBlocks(JsonObject document) {
+    private static Map<String, StorageBlock> readStorageBlocks(JsonObject document) {
         var records = document.getAsJsonArray("storage_blocks");
-        var blocks = new ArrayList<StorageBlock>();
-        var units = new HashSet<String>();
+        var blocks = new LinkedHashMap<String, StorageBlock>();
         for (var record : records) {
             var block = GSON.fromJson(record, StorageBlock.class);
             if (block == null || !GSON.toJsonTree(block).equals(record) || block.unit() == null ||
                     block.space() == null || block.beforeStart() == null || block.afterStart() == null ||
-                    block.size() <= 0 || !units.add(block.unit())) {
+                    block.size() <= 0 || blocks.putIfAbsent(block.unit(), block) != null) {
                 throw new IllegalArgumentException("invalid annotation storage block");
             }
             Long.parseUnsignedLong(block.beforeStart(), 16);
             Long.parseUnsignedLong(block.afterStart(), 16);
-            blocks.add(block);
         }
         return blocks;
     }
 
     private Map<String, Object> replay(JsonObject document, boolean apply, int version,
-            DataTypeManager staged, List<StorageBlock> storageBlocks) throws Exception {
+            DataTypeManager staged, Map<String, StorageBlock> storageBlocks) throws Exception {
         var changes = new ArrayList<Change>();
         var typeChanges = new ArrayList<TypeChange>();
         var typesToAdd = new ArrayList<DataType>();
@@ -506,7 +511,7 @@ public class RetroreAnnotations extends GhidraScript {
             if (row.has("custom_storage")) {
                 if (version < 3 || !kind.equals("signature") || prototype != null ||
                         !row.get("custom_storage").isJsonObject()) {
-                    throw new IllegalArgumentException("custom storage requires a version 3 through 5 signature annotation");
+                    throw new IllegalArgumentException("custom storage requires a version 3 through 6 signature annotation");
                 }
                 customStorage = GSON.fromJson(row.get("custom_storage"), CustomStorage.class);
                 if (!GSON.toJsonTree(customStorage).equals(row.get("custom_storage")) ||
@@ -572,9 +577,9 @@ public class RetroreAnnotations extends GhidraScript {
         if (!kind.equals("data_layout") && !row.has("data_layout")) {
             return null;
         }
-        if (version != 4 || !kind.equals("data_layout") || !row.has("data_layout") ||
+        if ((version != 4 && version != 6) || !kind.equals("data_layout") || !row.has("data_layout") ||
                 !row.get("data_layout").isJsonObject()) {
-            throw new IllegalArgumentException("data layouts require a version 4 data_layout annotation");
+            throw new IllegalArgumentException("data layouts require a version 4 or 6 data_layout annotation");
         }
         var layout = GSON.fromJson(row.get("data_layout"), DataLayout.class);
         if (!GSON.toJsonTree(layout).equals(row.get("data_layout")) || layout.type() == null || layout.length() < 1) {
@@ -604,8 +609,17 @@ public class RetroreAnnotations extends GhidraScript {
     }
 
     private Change check(Item item, DataTypeManager staged, AddressSet layoutRanges,
-            List<StorageBlock> storageBlocks, Set<String> ambiguousUnits) throws Exception {
+            Map<String, StorageBlock> storageBlocks, Set<String> ambiguousUnits) throws Exception {
         var block = currentProgram.getMemory().getBlock(item.unit());
+        if (item.dataLayout() != null && storageBlocks != null) {
+            var pair = storageBlocks.get(item.unit());
+            if (pair == null) {
+                return new Change(item, null, "conflict", "the data layout has no matching memory block");
+            }
+            if (ambiguousUnits.contains(item.unit()) || !pair.matchesDestination(block)) {
+                return new Change(item, null, "conflict", "destination data layout block differs from the comparison");
+            }
+        }
         if (block == null || item.offset() < 0 || item.offset() >= block.getSize()) {
             return new Change(item, null, "conflict", "unit or offset is missing");
         }
@@ -672,7 +686,7 @@ public class RetroreAnnotations extends GhidraScript {
             if (item.customStorage() != null) {
                 try {
                     if (storageBlocks != null) {
-                        var storage = remapCustomStorage(item.customStorage(), function, storageBlocks);
+                        var storage = remapCustomStorage(item.customStorage(), function, storageBlocks.values());
                         item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
                             item.callingConvention(), null, storage, null, null);
                     }
@@ -840,7 +854,7 @@ public class RetroreAnnotations extends GhidraScript {
         return storage;
     }
 
-    private CustomStorage remapCustomStorage(CustomStorage storage, Function function, List<StorageBlock> blocks)
+    private CustomStorage remapCustomStorage(CustomStorage storage, Function function, Collection<StorageBlock> blocks)
             throws InvalidInputException {
         var returnStorage = remapStorage(storage.returnStorage(), blocks);
         var parameters = new ArrayList<StoredVariable>();
@@ -868,7 +882,7 @@ public class RetroreAnnotations extends GhidraScript {
             storage.noreturn(), storage.stackPurge());
     }
 
-    private StoredVariable remapVariable(StoredVariable variable, List<StorageBlock> blocks)
+    private StoredVariable remapVariable(StoredVariable variable, Collection<StorageBlock> blocks)
             throws InvalidInputException {
         if (variable == null) {
             throw new InvalidInputException("invalid custom variable record");
@@ -877,7 +891,7 @@ public class RetroreAnnotations extends GhidraScript {
             variable.firstUse(), variable.comment(), variable.source());
     }
 
-    private String remapStorage(String encoded, List<StorageBlock> blocks) throws InvalidInputException {
+    private String remapStorage(String encoded, Collection<StorageBlock> blocks) throws InvalidInputException {
         var pieces = variableStorage(encoded).getVarnodes();
         for (int i = 0; i < pieces.length; i++) {
             var piece = pieces[i];
@@ -896,7 +910,7 @@ public class RetroreAnnotations extends GhidraScript {
         return pieces.length == 0 ? encoded : new VariableStorage(currentProgram, pieces).getSerializationString();
     }
 
-    private Varnode remapMemoryPiece(Varnode piece, List<StorageBlock> blocks) throws InvalidInputException {
+    private Varnode remapMemoryPiece(Varnode piece, Collection<StorageBlock> blocks) throws InvalidInputException {
         var address = piece.getAddress();
         var space = address.getAddressSpace().getName();
         for (var pair : blocks) {
@@ -905,9 +919,7 @@ public class RetroreAnnotations extends GhidraScript {
                 continue;
             }
             var block = currentProgram.getMemory().getBlock(pair.unit());
-            if (block == null || !space.equals(block.getStart().getAddressSpace().getName()) ||
-                    block.getStart().getOffset() != Long.parseUnsignedLong(pair.afterStart(), 16) ||
-                    block.getSize() != pair.size()) {
+            if (!pair.matchesDestination(block)) {
                 throw new InvalidInputException("destination storage block differs from the comparison: " + pair.unit());
             }
             if (piece.getSize() > pair.size() - offset) {

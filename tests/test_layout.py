@@ -221,6 +221,57 @@ def test_layout_recovers_a_record_array(record_project, tmp_path, capsys):
     assert _json(capsys, *apply, "--apply", "--replace")["applied"]["path"] == "/retrore/replacement"
 
 
+@requires_ghidra
+def test_layout_transfer_rebases_placement(record_project, tmp_path, capsys):
+    original = Path(record_project).parent
+    before_dir = tmp_path / "before"
+    shutil.copytree(original, before_dir)
+    before = before_dir / Path(record_project).name
+    _json(capsys, "layout", "root:0200", "--size", "72", "--name", "record", "--apply", "--project", str(before))
+    document = _json(capsys, "annotations", "export", "--project", str(before), "--export", str(before_dir / "export"))
+    layout, = (row for row in document["annotations"] if row["kind"] == "data_layout")
+
+    after, loaded = (tmp_path / name for name in ("after", "loaded"))
+    _json(capsys, "load", str(original / "records.exe"), "-o", str(loaded), "--base-segment", "2000")
+    _json(capsys, "ghidra", "import", str(loaded), str(after))
+    comparison = _json(capsys, "compare", str(before), str(after), "--storage", "--offset", "100")
+    assert comparison["matches"] == []
+    block, = [pair for pair in comparison["storage_blocks"] if pair["unit"] == "root"]
+    assert (block["before_start"], block["after_start"]) == ("10000", "20000")
+
+    source, mapping, path = (tmp_path / name for name in ("source.json", "compare.json", "transferred.json"))
+    source.write_text(json.dumps(document), encoding="utf-8")
+    mapping.write_text(json.dumps(comparison), encoding="utf-8")
+    transferred = _json(capsys, "annotations", "transfer", str(source), str(mapping))
+    placement, = transferred["annotations"]
+    assert transferred["version"] == 6 and placement["offset"] == 0x200
+    assert placement["provenance"]["export_evidence"] == layout["export_evidence"]
+    assert placement["provenance"]["export"] == document["export"]
+    command = ["annotations", "import", str(path), "--project", str(after)]
+
+    path.write_text(json.dumps(transferred), encoding="utf-8")
+    preview = _json(capsys, *command)
+    assert not preview["applied"] and preview["additions"] == 2 and preview["conflicts"] == 0
+    stale = _json(capsys, "annotations", "import", str(path), "--project", str(record_project))
+    assert stale["conflicts"] == 1
+    assert stale["changes"][0]["reason"] == "destination data layout block differs from the comparison"
+
+    conflict = placement | {"offset": 1}
+    path.write_text(json.dumps(transferred | {"annotations": [placement, conflict]}), encoding="utf-8")
+    assert main([*command, "--apply", "--json"]) == 1
+    blocked = json.loads(capsys.readouterr().out)
+    assert not blocked["applied"] and blocked["conflicts"] == 1
+    assert blocked["changes"][1]["reason"] == "the data layout would cover instructions"
+    assert _json(capsys, "annotations", "export", "--project", str(after))["version"] == 1
+
+    path.write_text(json.dumps(transferred), encoding="utf-8")
+    assert _json(capsys, *command, "--apply")["applied"]
+    again = _json(capsys, *command)
+    assert again["additions"] == again["conflicts"] == 0
+    inventory = _json(capsys, "inventory", "root", "--compact", "--project", str(after))
+    assert any(row["address"] == "root:0200" and row["type"] == "record[6]" for row in inventory["data"])
+
+
 @pytest.fixture(scope="module")
 def phantasie_iv_project(tmp_path_factory):
     directory = os.environ.get("RETRORE_PH4_X68K_DIR")

@@ -14,14 +14,14 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `compare --instructions` gained instruction maps for transferring comments and
-global and function-local labels inside matching functions. Replay checks the destination instruction
-and its owning function. A synthetic DOS fixture exercises a moved routine with a wider branch,
-source evidence, atomic conflict handling, and repeat replay. The standalone suite passed 423 tests
-with 94 skipped. The comparison, evidence, and layout suites passed 27 tests with 2 skipped on
-Ghidra 12.2.
+On 2026-11-23, `annotations transfer` gained fixed-size data layout replay through
+`compare --storage`. Layouts keep their block-relative offsets and retain the type archive and
+source evidence. Replay checks the destination block and listing before applying the document.
+The standalone suite passed 423 tests with 95 skipped. The comparison, evidence, and layout
+suites passed 28 tests with 2 skipped on Ghidra 12.2, including rebased placement, conflict
+handling, and repeat replay.
 
-Resume Phase 10 with transferring fixed-size data layouts between projects.
+Resume Phase 10 with mapping custom storage in renamed or resized memory blocks.
 
 ## Why
 
@@ -376,8 +376,11 @@ release. Continue with the analysis backlog below.
   replays fixed-size record and array placements, including `layout --apply` results, with overlap
   checks before applying. Version 5 transfer documents use `compare --storage` to remap custom
   storage within matching memory blocks and align local first-use positions by instruction.
-  Preview reports unmapped storage as a conflict. Version 1 remains supported. Open work includes
-  transferring data layouts and mapping custom storage in renamed or resized blocks.
+  Preview reports unmapped storage as a conflict. Version 6 uses the same block matches to transfer
+  fixed-size data layouts at their original block-relative offsets. Preview checks the destination
+  block geometry and listing overlaps before replay. Version 1 remains supported. Open work
+  includes mapping custom storage in renamed or resized blocks and locating data that moved within
+  a block.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay

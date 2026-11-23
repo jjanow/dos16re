@@ -194,7 +194,26 @@ def test_annotation_transfer_preserves_anchors_and_skips_changed_bodies(tmp_path
     assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["version"] == 1 and [row["kind"] for row in report["annotations"]] == ["function_name"]
-    assert report["transfer"]["skipped"][-1]["reason"] == "data_layout_requires_original_layout"
+    assert report["transfer"]["skipped"][-1]["reason"] == "data_layout_requires_block_comparison"
+
+    source["annotations"].extend([
+        source["annotations"][-1] | {"unit": "unmapped"},
+        source["annotations"][-1] | {"offset": 17},
+    ])
+    annotations.write_text(json.dumps(source), encoding="utf-8")
+    blocks = [{"unit": "root", "space": "ram", "size": 20, "before_start": "100", "after_start": "200"}]
+    comparison.write_text(json.dumps(json.loads(comparison.read_text(encoding="utf-8")) | {
+        "matches": [], "storage_blocks": blocks,
+    }), encoding="utf-8")
+    assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["version"] == 6 and report["storage_blocks"] == blocks
+    assert report["data_types"] == source["data_types"]
+    layout, = report["annotations"]
+    assert (layout["unit"], layout["offset"], layout["provenance"]["matched_by"]) == ("root", 16, "memory_block")
+    assert [row["reason"] for row in report["transfer"]["skipped"][-2:]] == [
+        "data_layout_has_no_matching_block", "data_layout_crosses_block_boundary",
+    ]
 
 
 def test_annotation_transfer_maps_local_first_use_by_instruction(tmp_path, capsys):

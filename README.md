@@ -1025,12 +1025,11 @@ candidates. JSON includes the match method, shared evidence, and unresolved alte
 `--limit` and `--offset` to review another page. The result can identify where a routine changed
 without establishing that the two routines have identical behavior.
 
-`annotations transfer` prepares a new annotation document from one comparison page. It carries
-names, signatures, and comments at same-body function entries, records the source and match method
-for each, and lists skipped entries. Source anchor evidence and the export identity travel with the
-source in `provenance`. If a typed signature transfers, its data type archive travels with the
-document. Data layouts appear among the skipped entries. Use `annotations import` to review
-the transfer against the destination.
+`annotations transfer` prepares a new annotation document from a comparison report. It carries
+names, signatures, and comments at same-body function entries on the comparison page, records
+the source and match method for each, and lists skipped entries. Source anchor evidence and the export
+identity travel with the source in `provenance`. The data type archive travels with typed signatures
+and data layouts. Use `annotations import` to review the transfer against the destination.
 
 `compare --instructions` includes an `instruction_map` for same-body matches with aligned entries.
 Transfer uses that map for comments and global or function-local labels at instruction starts,
@@ -1054,8 +1053,16 @@ offsets retain their original order and values. Absolute storage follows offsets
 named memory blocks with matching size, space, type, and permissions. Local first-use offsets follow
 the corresponding instructions when their positions change. Preview shows the resolved storage
 and reports conflicts when a storage range cannot be mapped or when the destination block's address
-or size differs from the comparison. Export the applied destination project to transfer its
-annotations again.
+or size differs from the comparison. Export the applied destination project before transferring its
+custom storage again.
+
+`compare --storage` also lets `annotations transfer` carry fixed-size data layouts in a version 6
+document, alongside any matched function annotations or custom storage. Layouts use the same
+offset within a uniquely named matching memory block and can transfer regardless of function
+pagination. Transfer reports unmatched blocks and layouts that cross block boundaries among the
+skips. Preview checks the destination block's address space, start, and size, and reports overlaps
+with instructions or defined data before apply. Check that the record still occupies the same
+block-relative offset in the destination revision.
 
 ### Persistent query workers
 
