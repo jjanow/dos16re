@@ -67,6 +67,46 @@ FPACK_CALLS = {
     0xF7: "__CFMOD", 0xF8: "__CDTST", 0xF9: "__CFTST", 0xFA: "__CDINC", 0xFB: "__CFINC", 0xFC: "__CDDEC",
     0xFD: "__CFDEC", 0xFE: "__FEVARG", 0xFF: "__FEVECS",
 }
+# IOCS calls: trap #15 with the call number in the low byte of D0 (names from XEiJ's iocscall.mac).
+IOCS_CALLS = {
+    0x00: "_B_KEYINP", 0x01: "_B_KEYSNS", 0x02: "_B_SFTSNS", 0x03: "_KEY_INIT", 0x04: "_BITSNS", 0x05: "_SKEYSET",
+    0x06: "_LEDCTRL", 0x07: "_LEDSET", 0x08: "_KEYDLY", 0x09: "_KEYREP", 0x0A: "_OPT2TVON", 0x0B: "_OPT2TVOFF",
+    0x0C: "_TVCTRL", 0x0D: "_LEDMOD", 0x0E: "_TGUSEMD", 0x0F: "_DEFCHR", 0x10: "_CRTMOD", 0x11: "_CONTRAST",
+    0x12: "_HSVTORGB", 0x13: "_TPALET", 0x14: "_TPALET2", 0x15: "_TCOLOR", 0x16: "_FNTADR", 0x17: "_VRAMGET",
+    0x18: "_VRAMPUT", 0x19: "_FNTGET", 0x1A: "_TEXTGET", 0x1B: "_TEXTPUT", 0x1C: "_CLIPPUT", 0x1D: "_SCROLL",
+    0x1E: "_B_CURON", 0x1F: "_B_CUROFF", 0x20: "_B_PUTC", 0x21: "_B_PRINT", 0x22: "_B_COLOR", 0x23: "_B_LOCATE",
+    0x24: "_B_DOWN_S", 0x25: "_B_UP_S", 0x26: "_B_UP", 0x27: "_B_DOWN", 0x28: "_B_RIGHT", 0x29: "_B_LEFT",
+    0x2A: "_B_CLR_ST", 0x2B: "_B_ERA_ST", 0x2C: "_B_INS", 0x2D: "_B_DEL", 0x2E: "_B_CONSOL", 0x2F: "_B_PUTMES",
+    0x30: "_SET232C", 0x31: "_LOF232C", 0x32: "_INP232C", 0x33: "_ISNS232C", 0x34: "_OSNS232C", 0x35: "_OUT232C",
+    0x36: "_MS_VCS", 0x37: "_EXESC", 0x38: "_CHR_ADR", 0x39: "_SETBEEP", 0x3A: "_SETPRN", 0x3B: "_JOYGET",
+    0x3C: "_INIT_PRN", 0x3D: "_SNSPRN", 0x3E: "_OUTLPT", 0x3F: "_OUTPRN", 0x40: "_B_SEEK", 0x41: "_B_VERIFY",
+    0x42: "_B_READDI", 0x43: "_B_DSKINI", 0x44: "_B_DRVSNS", 0x45: "_B_WRITE", 0x46: "_B_READ", 0x47: "_B_RECALI",
+    0x48: "_B_ASSIGN", 0x49: "_B_WRITED", 0x4A: "_B_READID", 0x4B: "_B_BADFMT", 0x4C: "_B_READDL",
+    0x4D: "_B_FORMAT", 0x4E: "_B_DRVCHK", 0x4F: "_B_EJECT", 0x50: "_DATEBCD", 0x51: "_DATESET", 0x52: "_TIMEBCD",
+    0x53: "_TIMESET", 0x54: "_DATEGET", 0x55: "_DATEBIN", 0x56: "_TIMEGET", 0x57: "_TIMEBIN", 0x58: "_DATECNV",
+    0x59: "_TIMECNV", 0x5A: "_DATEASC", 0x5B: "_TIMEASC", 0x5C: "_DAYASC", 0x5D: "_ALARMMOD", 0x5E: "_ALARMSET",
+    0x5F: "_ALARMGET", 0x60: "_ADPCMOUT", 0x61: "_ADPCMINP", 0x62: "_ADPCMAOT", 0x63: "_ADPCMAIN",
+    0x64: "_ADPCMLOT", 0x65: "_ADPCMLIN", 0x66: "_ADPCMSNS", 0x67: "_ADPCMMOD", 0x68: "_OPMSET", 0x69: "_OPMSNS",
+    0x6A: "_OPMINTST", 0x6B: "_TIMERDST", 0x6C: "_VDISPST", 0x6D: "_CRTCRAS", 0x6E: "_HSYNCST", 0x6F: "_PRNINTST",
+    0x70: "_MS_INIT", 0x71: "_MS_CURON", 0x72: "_MS_CUROF", 0x73: "_MS_STAT", 0x74: "_MS_GETDT", 0x75: "_MS_CURGT",
+    0x76: "_MS_CURST", 0x77: "_MS_LIMIT", 0x78: "_MS_OFFTM", 0x79: "_MS_ONTM", 0x7A: "_MS_PATST", 0x7B: "_MS_SEL",
+    0x7C: "_MS_SEL2", 0x7D: "_SKEY_MOD", 0x7E: "_DENSNS", 0x7F: "_ONTIME", 0x80: "_B_INTVCS", 0x81: "_B_SUPER",
+    0x82: "_B_BPEEK", 0x83: "_B_WPEEK", 0x84: "_B_LPEEK", 0x85: "_B_MEMSTR", 0x86: "_B_BPOKE", 0x87: "_B_WPOKE",
+    0x88: "_B_LPOKE", 0x89: "_B_MEMSET", 0x8A: "_DMAMOVE", 0x8B: "_DMAMOV_A", 0x8C: "_DMAMOV_L", 0x8D: "_DMAMODE",
+    0x8E: "_BOOTINF", 0x8F: "_ROMVER", 0x90: "_G_CLR_ON", 0x91: "_G_MOD", 0x92: "_PRIORITY", 0x93: "_CRTMOD2",
+    0x94: "_GPALET", 0x95: "_PENCOLOR", 0x96: "_SET_PAGE", 0x97: "_GGET", 0x98: "_MASK_GPUT", 0x99: "_GPUT",
+    0x9A: "_GPTRN", 0x9B: "_BK_GPTRN", 0x9C: "_X_GPTRN", 0xA0: "_SFTJIS", 0xA1: "_JISSFT", 0xA2: "_AKCONV",
+    0xA3: "_RMACNV", 0xA4: "_DAKJOB", 0xA5: "_HANJOB", 0xAC: "_SYS_STAT", 0xAD: "_B_CONMOD", 0xAE: "_OS_CURON",
+    0xAF: "_OS_CUROF", 0xB0: "_DRAWMODE", 0xB1: "_APAGE", 0xB2: "_VPAGE", 0xB3: "_HOME", 0xB4: "_WINDOW",
+    0xB5: "_WIPE", 0xB6: "_PSET", 0xB7: "_POINT", 0xB8: "_LINE", 0xB9: "_BOX", 0xBA: "_FILL", 0xBB: "_CIRCLE",
+    0xBC: "_PAINT", 0xBD: "_SYMBOL", 0xBE: "_GETGRM", 0xBF: "_PUTGRM", 0xC0: "_SP_INIT", 0xC1: "_SP_ON",
+    0xC2: "_SP_OFF", 0xC3: "_SP_CGCLR", 0xC4: "_SP_DEFCG", 0xC5: "_SP_GTPCG", 0xC6: "_SP_REGST", 0xC7: "_SP_REGGT",
+    0xC8: "_BGSCRLST", 0xC9: "_BGSCRLGT", 0xCA: "_BGCTRLST", 0xCB: "_BGCTRLGT", 0xCC: "_BGTEXTCL",
+    0xCD: "_BGTEXTST", 0xCE: "_BGTEXTGT", 0xCF: "_SPALET", 0xD3: "_TXXLINE", 0xD4: "_TXYLINE", 0xD5: "_TXLINE",
+    0xD6: "_TXBOX", 0xD7: "_TXFILL", 0xD8: "_TXREV", 0xDF: "_TXRASCPY", 0xF0: "_OPMDRV", 0xF1: "_RSDRV",
+    0xF2: "_A_JOY", 0xF3: "_MUSICDRV", 0xF5: "_SCSIDRV", 0xF8: "_TS16DRV", 0xFB: "_ROMDB_CMD", 0xFC: "_ROMDB_ASM",
+    0xFD: "_ABORTRST", 0xFE: "_IPLERR", 0xFF: "_ABORTJOB",
+}
 # Stock X68000 address map (24-bit bus). Programs load in main RAM; the rest is video, I/O, SRAM, and ROM.
 MEMORY_MAP = (
     (0x000000, 0xC00000, "main_ram", "ram"), (0xC00000, 0xE00000, "gvram", "ram"), (0xE00000, 0xE80000, "tvram", "ram"),
@@ -122,6 +162,63 @@ HARDWARE_LABELS = (
 )
 # Calls after which control does not return to the caller.
 DOS_NO_RETURN = (0x00, 0x31, 0x4C)
+
+# Stacked DOS call arguments, first (last pushed, lowest address) first: (name, type, size in bytes).
+# Callers push words with move.w and longs with move.l or pea, so the layout is packed without padding.
+# Widths follow call sites in XC's library and the XEiJ sample sources; mode-dependent calls list only the
+# fixed prefix and are variadic. Every call returns in D0.
+_W = 2
+_L = 4
+_NAME = ("name", "char*", _L)
+_HANDLE = ("handle", "short", _W)
+_BUFFER = ("buffer", "void*", _L)
+DOS_PARAMETERS: dict[int, tuple[tuple[tuple[str, str, int], ...], str, bool]] = {
+    0x00: ((), "int", False), 0x01: ((), "int", False), 0x02: ((("code", "short", _W),), "int", False),
+    0x03: ((), "int", False), 0x04: ((("code", "short", _W),), "int", False),
+    0x05: ((("code", "short", _W),), "int", False), 0x06: ((("code", "short", _W),), "int", False),
+    0x07: ((), "int", False), 0x08: ((), "int", False), 0x09: ((("string", "char*", _L),), "int", False),
+    0x0A: ((_BUFFER,), "int", False), 0x0B: ((), "int", False), 0x0C: ((("mode", "short", _W),), "int", True),
+    0x0D: ((), "int", False), 0x0E: ((("drive", "short", _W),), "int", False),
+    0x0F: ((("mode_drive", "short", _W),), "int", True), 0x10: ((), "int", False), 0x11: ((), "int", False),
+    0x12: ((), "int", False), 0x13: ((), "int", False), 0x19: ((), "int", False),
+    0x1B: ((_HANDLE,), "int", False), 0x1C: ((_BUFFER, _HANDLE), "int", False),
+    0x1D: ((("code", "short", _W), _HANDLE), "int", False), 0x1E: ((("string", "char*", _L), _HANDLE), "int", False),
+    0x1F: ((), "int", False), 0x20: ((("stack", "void*", _L),), "int", False),
+    0x23: ((("mode", "short", _W),), "int", True), 0x24: ((("mode", "short", _W),), "int", True),
+    0x25: ((("vector", "short", _W), ("handler", "void*", _L)), "void*", False), 0x27: ((), "int", False),
+    0x28: ((("time", "int", _L),), "int", False), 0x29: ((_NAME, _BUFFER), "int", False),
+    0x2A: ((), "int", False), 0x2B: ((("date", "short", _W),), "int", False), 0x2C: ((), "int", False),
+    0x2D: ((("time", "short", _W),), "int", False), 0x2E: ((("flag", "short", _W),), "int", False),
+    0x30: ((), "int", False), 0x31: ((("length", "int", _L), ("code", "short", _W)), "int", False),
+    0x33: ((("flag", "short", _W),), "int", False), 0x35: ((("vector", "short", _W),), "void*", False),
+    0x36: ((("drive", "short", _W), _BUFFER), "int", False), 0x37: ((_NAME, _BUFFER), "int", False),
+    0x39: ((_NAME,), "int", False), 0x3A: ((_NAME,), "int", False), 0x3B: ((_NAME,), "int", False),
+    0x3C: ((_NAME, ("attribute", "short", _W)), "int", False), 0x3D: ((_NAME, ("mode", "short", _W)), "int", False),
+    0x3E: ((_HANDLE,), "int", False), 0x3F: ((_HANDLE, _BUFFER, ("length", "int", _L)), "int", False),
+    0x40: ((_HANDLE, _BUFFER, ("length", "int", _L)), "int", False), 0x41: ((_NAME,), "int", False),
+    0x42: ((_HANDLE, ("offset", "int", _L), ("mode", "short", _W)), "int", False),
+    0x43: ((_NAME, ("attribute", "short", _W)), "int", False),
+    0x44: ((("mode", "short", _W), ("unit", "short", _W)), "int", True), 0x45: ((_HANDLE,), "int", False),
+    0x46: ((_HANDLE, ("new_handle", "short", _W)), "int", False),
+    0x47: ((("drive", "short", _W), _BUFFER), "int", False), 0x48: ((("length", "int", _L),), "void*", False),
+    0x49: ((("block", "void*", _L),), "int", False),
+    0x4A: ((("block", "void*", _L), ("length", "int", _L)), "int", False),
+    0x4B: ((("mode", "short", _W), _NAME, ("command", "char*", _L), ("environment", "void*", _L)), "int", False),
+    0x4C: ((("code", "short", _W),), "int", False), 0x4D: ((), "int", False),
+    0x4E: ((_BUFFER, _NAME, ("attribute", "short", _W)), "int", False), 0x4F: ((_BUFFER,), "int", False),
+}
+# Human68k 2.x moved $FF50-$FF5F to $FF80-$FF8F; both numberings take the same arguments.
+for _number, _parameters in {
+    0x50: ((("process", "void*", _L),), "void*", False), 0x51: ((), "void*", False),
+    0x52: ((_NAME, ("environment", "void*", _L), ("value", "char*", _L)), "int", False),
+    0x53: ((_NAME, ("environment", "void*", _L), _BUFFER), "int", False),
+    0x56: ((("old_name", "char*", _L), ("new_name", "char*", _L)), "int", False),
+    0x57: ((_HANDLE, ("date_time", "int", _L)), "int", False),
+    0x58: ((("mode", "short", _W), ("length", "int", _L)), "void*", False),
+    0x5A: ((_NAME, ("attribute", "short", _W)), "int", False), 0x5B: ((_NAME, ("attribute", "short", _W)), "int", False),
+    0x5C: ((("mode", "short", _W), _HANDLE, ("offset", "int", _L), ("length", "int", _L)), "int", False),
+}.items():
+    DOS_PARAMETERS[_number] = DOS_PARAMETERS[_number + 0x30] = _parameters
 
 
 class XError(ValueError):
@@ -242,5 +339,13 @@ def build_x_image(data: bytes, program: str, base: int = DEFAULT_M68K_BASE) -> t
             "dos": {f"{0xFF00 | number:04X}": name for number, name in DOS_CALLS.items()},
             "fpack": {f"{0xFE00 | number:04X}": name for number, name in FPACK_CALLS.items()},
             "no_return": [f"{0xFF00 | number:04X}" for number in DOS_NO_RETURN],
+            "iocs": {f"{number:02X}": name for number, name in IOCS_CALLS.items()},
+            "dos_prototypes": {
+                f"{0xFF00 | number:04X}": {
+                    "parameters": [{"name": name, "type": kind, "size": size} for name, kind, size in parameters],
+                    "result": result, "variadic": variadic,
+                }
+                for number, (parameters, result, variadic) in sorted(DOS_PARAMETERS.items())
+            },
         },
     }

@@ -453,4 +453,4 @@ def test_ghidra_analyzes_phantasie_iv_x68k(phantasie_iv_x68k_export, capsys):
     for size in ("0x13a", "0x76c", "0x532", "0x134"):
         assert f",{size});" in saving
     assert query("func", "text:35d1a")["function"]["name"] == "_rand"  # XC entry bra and trailing link
-    assert "FPACK::__CUMOD(" in query("decomp", "text:35d0c")["decompilation"]
+    assert "uVar2 % param_1 + 1;" in query("decomp", "text:35d0c")["decompilation"]  # stacked __CUMOD result

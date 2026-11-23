@@ -54,6 +54,8 @@ public class RetroreM68kImport extends HeadlessScript {
         0x48e73000, new int[] {2, 3, 0x4cdf000c});
 
     private final Map<Integer, String> callNames = new HashMap<>();
+    private final Map<Integer, JsonObject> dosPrototypes = new HashMap<>();
+    private final Map<Integer, String> iocsNames = new HashMap<>();
     private final Set<Integer> noReturn = new HashSet<>();
     private final Map<String, Integer> callCounts = new TreeMap<>();
     private int callSites;
@@ -163,8 +165,9 @@ public class RetroreM68kImport extends HeadlessScript {
             // analysis misreads that split as a call that never returns and drops the code after its callers.
             // Line-F exit calls get explicit flow overrides instead.
             setAnalysisOption(currentProgram, "Non-Returning Functions - Discovered", "false");
-            var block = memory.createInitializedBlock(CALL_BLOCK, address(CALL_BASE), 0x400, (byte) 0, monitor, false);
-            for (int index = 0; index < 0x200; index++) {
+            // DOS stubs, then FPACK stubs, then IOCS stubs, 256 two-byte slots each.
+            var block = memory.createInitializedBlock(CALL_BLOCK, address(CALL_BASE), 0x600, (byte) 0, monitor, false);
+            for (int index = 0; index < 0x300; index++) {
                 memory.setShort(block.getStart().addNoWrap(index * 2L), RTS);
             }
             block.setExecute(true);
@@ -172,7 +175,8 @@ public class RetroreM68kImport extends HeadlessScript {
             // Every slot is an rts, so unused stubs do not show up as undefined gaps.
             new DisassembleCommand(new AddressSet(block.getStart(), block.getEnd()), null, false)
                 .applyTo(currentProgram, monitor);
-            block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls");
+            block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls and IOCS calls");
+            addFpackFixups();
         }
 
         var entry = address(map.getAsJsonObject("entry").get("linear").getAsLong());
@@ -227,6 +231,16 @@ public class RetroreM68kImport extends HeadlessScript {
         for (var word : calls.getAsJsonArray("no_return")) {
             noReturn.add(Integer.parseInt(word.getAsString(), 16));
         }
+        if (calls.has("iocs")) {
+            for (var entry : calls.getAsJsonObject("iocs").entrySet()) {
+                iocsNames.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsString());
+            }
+        }
+        if (calls.has("dos_prototypes")) {
+            for (var entry : calls.getAsJsonObject("dos_prototypes").entrySet()) {
+                dosPrototypes.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsJsonObject());
+            }
+        }
     }
 
     // After auto-analysis: seed text symbols that look like code, patch line-F words that disassembly reached,
@@ -254,6 +268,7 @@ public class RetroreM68kImport extends HeadlessScript {
         // Reanalysis can split XC entries again, so join them once more after the last round.
         merged += mergeTrailingLinks();
         restoreCallOverrides();
+        int iocs = nameIocsCalls();
         JsonObject report = new JsonObject();
         if (Files.isRegularFile(result)) {
             var previous = JsonParser.parseString(Files.readString(result));
@@ -264,6 +279,7 @@ public class RetroreM68kImport extends HeadlessScript {
         var lineF = gson.toJsonTree(lineFReport()).getAsJsonObject();
         lineF.addProperty("seeded_symbols", seeded);
         lineF.addProperty("merged_entries", merged);
+        lineF.addProperty("iocs_calls", iocs);
         report.add("line_f", lineF);
         return report;
     }
@@ -432,6 +448,80 @@ public class RetroreM68kImport extends HeadlessScript {
                 references.setPrimary(restored, true);
             }
         }
+    }
+
+    // IOCS calls are trap #15 with the call number in D0. Name the sites where the instruction just before the trap
+    // loads D0 with a constant, and turn each trap into a call to a named stub that the decompiler shows.
+    private int nameIocsCalls() throws Exception {
+        var memory = currentProgram.getMemory();
+        var block = memory.getBlock(CALL_BLOCK);
+        if (iocsNames.isEmpty() || block.getSize() < 0x600) {
+            return 0;
+        }
+        var listing = currentProgram.getListing();
+        var references = currentProgram.getReferenceManager();
+        var code = memory.getExecuteSet().subtract(new AddressSet(block.getStart(), block.getEnd()));
+        var sites = new ArrayList<ghidra.program.model.listing.Instruction>();
+        for (var instruction : listing.getInstructions(code, true)) {
+            if (instruction.getLength() == 2 && memoryWord(instruction.getAddress()) == 0x4e4f) {
+                sites.add(instruction);
+            }
+        }
+        int named = 0;
+        for (var trap : sites) {
+            monitor.checkCancelled();
+            var from = trap.getFallFrom();
+            var load = from == null ? null : listing.getInstructionAt(from);
+            if (load == null || jumpedTo(trap)) {
+                continue;  // A jump to the trap could bring another call number.
+            }
+            int opcode = memoryWord(load.getAddress());
+            int number;
+            if ((opcode & 0xff00) == 0x7000 && load.getLength() == 2) {
+                number = opcode & 0xff;                                                 // moveq #n,d0
+            } else if (opcode == 0x203c && load.getLength() == 6) {
+                number = memory.getByte(load.getAddress().addNoWrap(5)) & 0xff;         // move.l #n,d0
+            } else if (opcode == 0x303c && load.getLength() == 4) {
+                number = memory.getByte(load.getAddress().addNoWrap(3)) & 0xff;         // move.w #n,d0
+            } else {
+                continue;
+            }
+            String name = iocsNames.get(number);
+            if (name == null) {
+                continue;
+            }
+            var entry = block.getStart().addNoWrap(0x400 + number * 2L);
+            var function = getFunctionAt(entry);
+            if (function == null) {
+                disassemble(entry);
+                Namespace namespace = currentProgram.getSymbolTable().getOrCreateNameSpace(
+                    currentProgram.getGlobalNamespace(), "IOCS", SourceType.IMPORTED);
+                function = createFunction(entry, name);
+                function.setParentNamespace(namespace);
+                function.setComment(String.format("X68000 IOCS call $%02X (trap #15)", number));
+            }
+            boolean present = false;
+            for (var reference : references.getReferencesFrom(trap.getAddress())) {
+                present |= reference.getToAddress().equals(entry);
+            }
+            if (!present) {
+                var reference = references.addMemoryReference(trap.getAddress(), entry,
+                    RefType.CALLOTHER_OVERRIDE_CALL, SourceType.IMPORTED, Reference.MNEMONIC);
+                references.setPrimary(reference, true);
+            }
+            trap.setComment(CodeUnit.EOL_COMMENT, String.format("retrore: IOCS %s ($%02X)", name, number));
+            named++;
+        }
+        return named;
+    }
+
+    private boolean jumpedTo(ghidra.program.model.listing.Instruction instruction) {
+        for (var reference : currentProgram.getReferenceManager().getReferencesTo(instruction.getAddress())) {
+            if (reference.getReferenceType().isFlow()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private int memoryWord(Address address) throws Exception {
@@ -632,6 +722,15 @@ public class RetroreM68kImport extends HeadlessScript {
         }
         function.setVarArgs(true);
         function.setSignatureSource(SourceType.IMPORTED);
+        if (FPACK_STACKED.containsKey(word)) {
+            // XC's stacked FPACK calls work on the caller's stack, which a prototype cannot express. The call
+            // fixup replaces each call with p-code for the operation, so the decompiler shows the result.
+            function.setVarArgs(false);
+            function.setCallFixup(fixupName(word));
+        }
+        if (dosPrototypes.containsKey(word)) {
+            applyDosPrototype(function, dosPrototypes.get(word));
+        }
         if (word >= 0xfe00 && word <= 0xfe09 && word != 0xfe03 && word != 0xfe07) {
             function.setVarArgs(false);
             // Register helpers: D0 op D1, result in D0.
@@ -645,6 +744,90 @@ public class RetroreM68kImport extends HeadlessScript {
                 new ParameterImpl("right", integer, d1, currentProgram));
         }
         return function;
+    }
+
+    // XC's FPACK calls with operands on the stack (FLOAT2 numbering, XEiJ fefunc.mac). The last value pushed is
+    // the left operand and receives the result; integer operands are longs, F is a 4-byte float, D an 8-byte
+    // double. Each body runs after jsr (sp) pushed its return address, so the operands start at SP + 4.
+    private static final Map<Integer, String> FPACK_STACKED = new LinkedHashMap<>();
+    static {
+        String[][] integer = {{"fee0", "*"}, {"fee1", "s/"}, {"fee2", "s%"}, {"fee3", "*"}, {"fee4", "/"},
+            {"fee5", "%"}};
+        for (var operation : integer) {
+            FPACK_STACKED.put(Integer.parseInt(operation[0], 16),
+                "l:4 = *:4 (SP + 4); r:4 = *:4 (SP + 8); *:4 (SP + 4) = l " + operation[1] + " r;");
+        }
+        FPACK_STACKED.put(0xfee6, "v:4 = *:4 (SP + 4); *:8 (SP + 4) = int2float(v);");
+        FPACK_STACKED.put(0xfee7, "v:8 = *:8 (SP + 4); *:4 (SP + 4) = trunc(v);");
+        FPACK_STACKED.put(0xfee8, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = int2float(v);");
+        FPACK_STACKED.put(0xfee9, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = trunc(v);");
+        FPACK_STACKED.put(0xfeea, "v:4 = *:4 (SP + 4); *:8 (SP + 4) = float2float(v);");
+        FPACK_STACKED.put(0xfeeb, "v:8 = *:8 (SP + 4); *:4 (SP + 4) = float2float(v);");
+        String[] operators = {"f+", "f-", "f*", "f/"};
+        for (int index = 0; index < operators.length; index++) {
+            FPACK_STACKED.put(0xfeed + index,
+                "l:8 = *:8 (SP + 4); r:8 = *:8 (SP + 12); *:8 (SP + 4) = l " + operators[index] + " r;");
+            FPACK_STACKED.put(0xfef3 + index,
+                "l:4 = *:4 (SP + 4); r:4 = *:4 (SP + 8); *:4 (SP + 4) = l " + operators[index] + " r;");
+        }
+        // Comparisons set the condition codes as cmp left - right would, for the signed branches XC emits.
+        String flags = "NF = l f< r; ZF = l f== r; VF = 0; CF = l f< r;";
+        FPACK_STACKED.put(0xfeec, "l:8 = *:8 (SP + 4); r:8 = *:8 (SP + 12); " + flags);
+        FPACK_STACKED.put(0xfef2, "l:4 = *:4 (SP + 4); r:4 = *:4 (SP + 8); " + flags);
+        FPACK_STACKED.put(0xfef8, "l:8 = *:8 (SP + 4); r:8 = int2float(0:4); " + flags);
+        FPACK_STACKED.put(0xfef9, "l:4 = *:4 (SP + 4); r:4 = int2float(0:4); " + flags);
+        FPACK_STACKED.put(0xfefa, "v:8 = *:8 (SP + 4); *:8 (SP + 4) = v f+ int2float(1:4);");
+        FPACK_STACKED.put(0xfefb, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = v f+ int2float(1:4);");
+        FPACK_STACKED.put(0xfefc, "v:8 = *:8 (SP + 4); *:8 (SP + 4) = v f- int2float(1:4);");
+        FPACK_STACKED.put(0xfefd, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = v f- int2float(1:4);");
+    }
+
+    private static String fixupName(int word) {
+        return String.format("retrore_fpack_%04x", word);
+    }
+
+    // Program-specific compiler spec extensions hold the call fixups, so the stock 68000 language stays untouched.
+    private void addFpackFixups() throws Exception {
+        var extension = new ghidra.program.database.SpecExtension(currentProgram);
+        for (var entry : FPACK_STACKED.entrySet()) {
+            String xml = "<callfixup name=\"" + fixupName(entry.getKey()) + "\"><pcode><body><![CDATA[" +
+                entry.getValue() + " SP = SP + 4;]]></body></pcode></callfixup>";
+            extension.addReplaceCompilerSpecExtension(xml, monitor);
+        }
+    }
+
+    // The line-F word sits where the patched jsr (sp) pushes its return address, so the last value pushed
+    // before the call is at +4. Words and longs are packed as pushed, which the 68000 calling convention's
+    // 4-byte stack slots cannot express, so every parameter gets explicit stack storage.
+    private void applyDosPrototype(Function function, JsonObject prototype) throws Exception {
+        var parameters = new ArrayList<ghidra.program.model.listing.Parameter>();
+        int offset = 4;
+        for (var element : prototype.getAsJsonArray("parameters")) {
+            var parameter = element.getAsJsonObject();
+            int size = parameter.get("size").getAsInt();
+            var type = lineFType(parameter.get("type").getAsString());
+            parameters.add(new ParameterImpl(parameter.get("name").getAsString(), type,
+                new VariableStorage(currentProgram, offset, size), currentProgram));
+            offset += size;
+        }
+        var d0 = currentProgram.getRegister("D0");
+        function.updateFunction(null,
+            new ReturnParameterImpl(lineFType(prototype.get("result").getAsString()),
+                new VariableStorage(currentProgram, d0), currentProgram),
+            parameters, FunctionUpdateType.CUSTOM_STORAGE, true, SourceType.IMPORTED);
+        function.setVarArgs(prototype.get("variadic").getAsBoolean());
+        function.setStackPurgeSize(0);
+    }
+
+    private ghidra.program.model.data.DataType lineFType(String name) {
+        var manager = currentProgram.getDataTypeManager();
+        return switch (name) {
+            case "short" -> ghidra.program.model.data.ShortDataType.dataType;
+            case "int" -> IntegerDataType.dataType;
+            case "char*" -> new PointerDataType(ghidra.program.model.data.CharDataType.dataType, 4, manager);
+            case "void*" -> new PointerDataType(ghidra.program.model.data.VoidDataType.dataType, 4, manager);
+            default -> throw new IllegalArgumentException("unknown line-F type " + name);
+        };
     }
 
     private Address address(long value) {

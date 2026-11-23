@@ -189,3 +189,138 @@ def test_x68k_ghidra_import_patches_line_f_calls(tmp_path, capsys):
     assert any(ref["to"]["unit_address"] == "text:0000" for ref in query("xrefs", "data:0006")["outgoing"])
     gap, = query("gaps")["ranges"]
     assert (gap["start"], gap["size"]) == ("text:0030", 2)
+
+
+DOS_TEXT = bytes.fromhex(
+    "3f3c0001"      # 0000 move.w #1,-(sp)             mode
+    "487900000030"  # 0004 pea name
+    "ff3d"          # 000a DOS _OPEN
+    "5c8f"          # 000c addq.l #6,sp
+    "2f3c00000010"  # 000e move.l #16,-(sp)            length
+    "48790000003a"  # 0014 pea buffer
+    "3f00"          # 001a move.w d0,-(sp)             handle
+    "ff40"          # 001c DOS _WRITE
+    "4fef000a"      # 001e lea 10(sp),sp
+    "23c00000004a"  # 0022 move.l d0,result
+    "7210"          # 0028 moveq #16,d1
+    "7010"          # 002a moveq #$10,d0
+    "4e4f"          # 002c IOCS _CRTMOD
+    "ff00"          # 002e DOS _EXIT
+)
+
+
+def _dos_x(symbols=b""):
+    return _x(text=DOS_TEXT, data=b"SAVE.DAT".ljust(10, b"\0") + bytes(16), bss_size=4,
+              relocations=pack(">3H", 0x06, 0x10, 0x0E), symbols=symbols, entry=0)
+
+
+def test_x68k_dos_prototypes_in_map():
+    _, program = build_x_image(_dos_x(), "demo")
+    prototypes = program["line_f_calls"]["dos_prototypes"]
+    assert prototypes["FF3D"] == {"parameters": [
+        {"name": "name", "type": "char*", "size": 4}, {"name": "mode", "type": "short", "size": 2},
+    ], "result": "int", "variadic": False}
+    assert [parameter["size"] for parameter in prototypes["FF40"]["parameters"]] == [2, 4, 4]
+    assert [parameter["size"] for parameter in prototypes["FF42"]["parameters"]] == [2, 4, 2]
+    assert prototypes["FF83"] == prototypes["FF53"]
+    assert prototypes["FF44"]["variadic"]
+
+
+def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    source, out, project = (tmp_path / name for name in ("DOS.X", "out", "project"))
+    source.write_bytes(_dos_x(_symbol(0x0201, 0, b"start") + _symbol(0x0202, 0x3a, b"buffer")))
+    assert main(["load", str(source), "-o", str(out)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["line_f"]["iocs_calls"] == 1
+    assert main(["decomp", "text:0000", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    decompiled = json.loads(capsys.readouterr().out)["decompilation"]
+    assert "DOS::_OPEN(" in decompiled and ",1);" in decompiled
+    assert "DOS::_WRITE(" in decompiled and "&buffer,0x10);" in decompiled
+    assert "IOCS::_CRTMOD(" in decompiled
+    assert main(["callers", "01000420", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    calling, = json.loads(capsys.readouterr().out)["callers"]
+    assert calling["from"]["unit_address"] == "text:002c"
+
+
+FPACK_TEXT = bytes.fromhex(
+    # modulo(a, b)
+    "202f0004"          # 0000 move.l 4(sp),d0
+    "222f0008"          # 0004 move.l 8(sp),d1
+    "48e7c000"          # 0008 movem.l d0/d1,-(sp)
+    "fee2"              # 000c FPACK __CLMOD
+    "4cdf0003"          # 000e movem.l (sp)+,d0/d1
+    "4e75"              # 0012 rts
+    # halve(double sum): XC pushes the right operand first.
+    "4cf900030000005a"  # 0014 movem.l two,d0/d1
+    "48e7c000"          # 001c movem.l d0/d1,-(sp)
+    "4cef0003000c"      # 0020 movem.l 12(sp),d0/d1
+    "48e7c000"          # 0026 movem.l d0/d1,-(sp)
+    "fef0"              # 002a FPACK __CDDIV
+    "4cdf0003"          # 002c movem.l (sp)+,d0/d1
+    "4fef0008"          # 0030 lea 8(sp),sp
+    "4e75"              # 0034 rts
+    # greater(double a, double b)
+    "4cef0003000c"      # 0036 movem.l 12(sp),d0/d1   b
+    "48e7c000"          # 003c movem.l d0/d1,-(sp)
+    "4cef0003000c"      # 0040 movem.l 12(sp),d0/d1   a
+    "48e7c000"          # 0046 movem.l d0/d1,-(sp)
+    "feec"              # 004a FPACK __CDCMP
+    "4fef0010"          # 004c lea 16(sp),sp
+    "6e04"              # 0050 bgt.b 0056
+    "7000"              # 0052 moveq #0,d0
+    "4e75"              # 0054 rts
+    "7001"              # 0056 moveq #1,d0
+    "4e75"              # 0058 rts
+)
+
+
+def test_x68k_ghidra_stacked_fpack_results(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    source, out, project = (tmp_path / name for name in ("FPACK.X", "out", "project"))
+    symbols = b"".join(_symbol(0x0201, offset, name) for offset, name in (
+        (0, b"modulo"), (0x14, b"halve"), (0x36, b"greater")))
+    source.write_bytes(_x(text=FPACK_TEXT, data=bytes.fromhex("4000000000000000"), bss_size=0,
+                          relocations=pack(">H", 0x18), symbols=symbols, entry=0))
+    assert main(["load", str(source), "-o", str(out)]) == 0
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    def decompile(address):
+        assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)["decompilation"]
+
+    modulo, halve, greater = (decompile(address) for address in ("text:0000", "text:0014", "text:0036"))
+    assert "replaced with injection: retrore_fpack_fee2" in modulo and "param_1 % param_2" in modulo
+    assert "return local_10 / (double)CONCAT44(DAT_0001005a,DAT_0001005e);" in halve  # sum / 2.0
+    assert "if ((double)CONCAT44(param_1,param_2) <= (double)CONCAT44(param_3,param_4)) {" in greater
+
+
+def test_ghidra_phantasie_iv_dos_and_fpack_calls(tmp_path, capsys):
+    directory = os.environ.get("RETRORE_PH4_X68K_DIR")
+    if not directory or not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set RETRORE_PH4_X68K_DIR and GHIDRA_HOME to run the real-game test")
+    out, project = tmp_path / "out", tmp_path / "project"
+    assert main(["load", os.path.join(directory, "P4.X"), "-o", str(out)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["line_f"]["iocs_calls"] == 38
+
+    def decompile(address):
+        assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)["decompilation"]
+
+    # _save writes each file through _xwrite, which calls XC's _open, _write, and _close.
+    assert "_xwrite(1,s_goods_0_0004f670,&_item,0x13a);" in decompile("text:1714")
+    assert "_open(acStack_1c,0x4402,1);" in decompile("text:31924")
+    assert "DOS::_OPEN(unaff_A2,0);" in decompile("text:3c086")  # XC's open helper, path in A2
+    writing = decompile("text:3c2dc")
+    assert "DOS::_WRITE(handle,buffer,length);" in writing and "DOS::_WRITE(handle,&DAT_0004c3de,2);" in writing
+    assert "DOS::_SEEK(handle,0,1);" in decompile("text:3bd3c")
+    # Stacked FPACK doubles: _avg_attr is (anc1 + anc2) / 2.0, _frand is rand(100) / 100.0.
+    assert "return (dVar2 + dVar1) / local_24;" in decompile("text:ba90")
+    assert "return (double)iVar1 / 100.0;" in decompile("text:30996")
+    assert "IOCS::_CRTMOD();" in decompile("text:3b676")  # XC's _CRTMOD wrapper: moveq #$10,d0; trap #15
