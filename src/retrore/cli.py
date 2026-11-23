@@ -732,7 +732,8 @@ def _paged_gaps(args: argparse.Namespace) -> None:
     page = report["pagination"]["ranges"]
     print(f"{report['undefined_bytes']} undefined bytes in {page['total']} ranges")
     for gap in report["ranges"][:_PREVIEW_LIMIT]:
-        print(f"{gap['start']}–{gap['end']}  {gap['size']} bytes")
+        kind = f"  {gap['class']}" + (" (conflict)" if gap.get("conflict") else "") if "class" in gap else ""
+        print(f"{gap['start']}–{gap['end']}  {gap['size']} bytes{kind}")
     if len(report["ranges"]) > _PREVIEW_LIMIT:
         print("Use --json for the full page.")
     _print_continue(report)
@@ -1108,6 +1109,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{parameter['description']} ({parameter['minimum']}–{parameter['maximum']}"
             f", default {parameter['default']})"))
     gaps_parser.add_argument("--fields", metavar="FIELD,...", help="select record JSON fields")
+    gaps_parser.add_argument("--classify", action="store_true", default=None,
+                             help=gaps_paging["classify"]["description"])
     batch_parser = commands.add_parser("batch", help="run multiple address queries in one Ghidra session")
     batch_parser.add_argument("input", metavar="FILE", nargs="?", default="-", help="JSON request file (default: stdin)")
     batch_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
@@ -1224,7 +1227,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command in _REGISTRY_COMMANDS:
             return _registry_query(args)
-        paging = ("unit", "limit", "offset", "fields")
+        paging = ("unit", "limit", "offset", "fields", "classify")
         if args.command == "gaps" and any(getattr(args, name) is not None for name in paging):
             _paged_gaps(args)
             return 0

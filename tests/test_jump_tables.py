@@ -243,6 +243,34 @@ def test_ghidra_keeps_candidates_for_far_pointer_tables_and_variables(tmp_path, 
     assert ("root:0208", "DATA") in [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]]
 
 
+def test_ghidra_classifies_gaps_and_seeds_routines_named_by_far_pointers(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    image = bytearray(0x210)
+    image[:0x0B] = bytes.fromhex("b8 20 00 8e d8 9a 30 00 00 00 c3")  # set DS; call far 2000:0030; ret
+    image[0x20:0x28] = bytes.fromhex("55 8b ec 8b 46 06 5d cb")  # reached only through the far pointer below
+    image[0x30] = 0xCB
+    image[0x40:0x200] = (b"Gap text\x01" * 50)[:0x1C0]  # Mostly printable, never a C string
+    pack_into("<2H", image, 0x200, 0x20, 0)  # DGROUP:0000 holds a far pointer to 2000:0020
+    exe = tmp_path / "sample.exe"
+    exe.write_bytes(_mz(image, [1, 8, 0x202]))
+    export, project = tmp_path / "export", tmp_path / "gaps"
+    assert main(["load", str(exe), "-o", str(export), "--base-segment", "2000"]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["seeded_gaps"] == 1
+    assert main(["xrefs", "root:0020", "--project", str(project), "--json"]) == 0
+    refs = json.loads(capsys.readouterr().out)
+    assert [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]] == [("root:0200", "DATA")]
+
+    assert main(["gaps", "--project", str(project), "--classify", "--json"]) == 0, capsys.readouterr().err
+    ranges = {gap["start"]: gap for gap in json.loads(capsys.readouterr().out)["ranges"]}
+    assert ranges["root:000b"]["class"] == "padding"
+    text = ranges["root:0031"]  # Zero fill, then the text
+    assert (text["class"], text["entry"], text["conflict"]) == ("data", None, False)
+    assert "text" in [row["kind"] for row in text["evidence"]]
+
+
 @pytest.fixture
 def phantasie_iii_export(tmp_path, capsys):
     directory = os.environ.get("RETRORE_PH3_DIR")
@@ -269,7 +297,16 @@ def test_phantasie_iii_switches_in_every_code_segment(phantasie_iii_export, caps
         return
     project = tmp_path / "ph3"
     assert main(["ghidra", "import", str(tmp_path / "export"), str(project), "--json"]) == 0
-    capsys.readouterr()
+    assert json.loads(capsys.readouterr().out)["seeded_gaps"] == 2
+    # root:532c was an undefined gap reached only through a relocated far pointer in DGROUP; its frame prologue
+    # and clean decode made it a function.
+    assert main(["xrefs", "root:532c", "--project", str(project), "--json"]) == 0
+    refs = json.loads(capsys.readouterr().out)
+    assert [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]] == [("root:a9c0", "DATA")]
+    assert main(["gaps", "--project", str(project), "--classify", "--unit", "root", "--json", "--limit", "1000"]) == 0
+    gaps = {gap["start"]: gap for gap in json.loads(capsys.readouterr().out)["ranges"]}
+    assert (gaps["root:2bcd"]["class"], gaps["root:2bcd"]["entry"]) == ("code", "root:2bcd")
+    assert {"prologue", "valid_subroutine"} <= set(gaps["root:2bcd"]["counts"])
     assert main(["func", "218f:0ccc", "--project", str(project), "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["function"]["entry"]["unit_address"] == "root:125bc"

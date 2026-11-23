@@ -55,6 +55,7 @@ public class RetroreIndirect extends HeadlessScript {
                 return;
             }
             report.add("indirect", gson.toJsonTree(analyze(map)));
+            report.addProperty("seeded_gaps", seedGaps());
             Files.writeString(result, gson.toJson(report));
         } catch (Exception error) {
             Files.writeString(result, gson.toJson(Map.of("error", error.toString())));
@@ -135,6 +136,59 @@ public class RetroreIndirect extends HeadlessScript {
         counts.put("unresolved_sites", unresolved);
         counts.put("seeded_functions", seeded);
         return counts;
+    }
+
+    /**
+     * Create functions in undefined ranges that RetroreGaps.java scores as code and that a relocated far pointer
+     * in data names exactly, with a frame prologue and a clean decode. Nothing else reaches such a routine, so
+     * analysis leaves it undefined.
+     */
+    private int seedGaps() throws Exception {
+        var file = Files.createTempFile("retrore-gaps", ".json");
+        JsonObject report;
+        try {
+            runScript("RetroreGaps.java", new String[] {file.toString(), "classify"});
+            report = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+        } finally {
+            Files.deleteIfExists(file);
+        }
+        int seeded = 0;
+        for (var item : report.getAsJsonArray("ranges")) {
+            var range = item.getAsJsonObject();
+            if (!range.has("class") || !range.get("class").getAsString().equals("code")) {
+                continue;
+            }
+            String entry = range.get("entry").getAsString();
+            var slots = new ArrayList<Address>();
+            boolean frame = false, decodes = false;
+            for (var row : range.getAsJsonArray("evidence")) {
+                var evidence = row.getAsJsonObject();
+                String kind = evidence.get("kind").getAsString();
+                if (kind.equals("relocated_pointer") && evidence.get("at").getAsString().equals(entry)) {
+                    slots.add(unitAddress(evidence.get("from").getAsString()));
+                }
+                frame |= kind.equals("prologue");
+                decodes |= kind.equals("valid_subroutine");
+            }
+            if (slots.isEmpty() || !frame || !decodes) {
+                continue;
+            }
+            var start = unitAddress(entry);
+            if (disassemble(start) && getFunctionAt(start) == null && createFunction(start, null) != null) {
+                seeded++;
+                for (var slot : slots) {
+                    currentProgram.getReferenceManager().addMemoryReference(slot, start, RefType.DATA,
+                        SourceType.ANALYSIS, 0);
+                }
+            }
+        }
+        return seeded;
+    }
+
+    private Address unitAddress(String text) throws Exception {
+        int colon = text.indexOf(':');
+        var block = currentProgram.getMemory().getBlock(text.substring(0, colon));
+        return block.getStart().addNoWrap(Long.parseLong(text.substring(colon + 1), 16));
     }
 
     static boolean isIndirect(Instruction instruction) {

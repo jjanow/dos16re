@@ -855,6 +855,9 @@ public class RetroreQuery extends GhidraScript {
 
     private Map<String, Object> gaps(JsonObject request, Options options) throws Exception {
         var filter = unit(request);
+        if (request.has("classify") && request.get("classify").getAsBoolean()) {
+            return classifiedGaps(filter, options);
+        }
         var listing = currentProgram.getListing();
         var ranges = new ArrayList<Map<String, Object>>();
         long undefinedBytes = 0;
@@ -928,6 +931,45 @@ public class RetroreQuery extends GhidraScript {
         report.put("units", select(rows, options));
         report.put("pagination", pages);
         return report;
+    }
+
+    /** Gaps with a likely class and evidence, scored by RetroreGaps.java in this session. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> classifiedGaps(MemoryBlock filter, Options options) throws Exception {
+        var file = Files.createTempFile("retrore-gaps", ".json");
+        Map<String, Object> scored;
+        try {
+            runScript("RetroreGaps.java", new String[] {file.toString(), "classify",
+                filter == null ? "" : filter.getName()});
+            scored = GSON.fromJson(Files.readString(file), Map.class);
+        } finally {
+            Files.deleteIfExists(file);
+        }
+        var ranges = new ArrayList<Map<String, Object>>();
+        for (var range : (List<Map<String, Object>>) scored.get("ranges")) {
+            ranges.add((Map<String, Object>) integral(range));
+        }
+        var pages = new LinkedHashMap<String, Page>();
+        var report = new LinkedHashMap<String, Object>();
+        report.put("program", currentProgram.getName());
+        report.put("undefined_bytes", ((Number) scored.get("undefined_bytes")).longValue());
+        report.put("ranges", select(page("ranges", ranges, options, pages), options));
+        report.put("pagination", pages);
+        return report;
+    }
+
+    /** Gson reads every JSON number as a double; the gap report only holds integers. */
+    @SuppressWarnings("unchecked")
+    private static Object integral(Object value) {
+        if (value instanceof Double number) {
+            return number.longValue();
+        }
+        if (value instanceof Map<?, ?> map) {
+            ((Map<String, Object>) map).replaceAll((key, item) -> integral(item));
+        } else if (value instanceof List<?> list) {
+            ((List<Object>) list).replaceAll(RetroreQuery::integral);
+        }
+        return value;
     }
 
     // ---- indirect: computed calls and jumps, with candidates recorded by RetroreIndirect.java ----

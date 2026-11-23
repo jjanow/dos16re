@@ -170,8 +170,14 @@ QUERIES = {
     },
     "gaps": {
         "description": "report undefined ranges in executable units",
-        "parameters": {"unit": _UNIT_FILTER, **_paging(1000, 100, "ranges")},
+        "parameters": {
+            "unit": _UNIT_FILTER, **_paging(1000, 100, "ranges"),
+            "classify": {"type": "boolean", "default": False,
+                         "description": "score each range as likely code, data, or padding and list the evidence"},
+        },
         "fields": ["unit", "size", "linear", "start", "end"],
+        "conditional_fields": {"classify": ["class", "code_score", "data_score", "conflict", "entry", "evidence",
+                                            "counts"]},
         "fields_scope": "record",
         "echo": ["unit"],
     },

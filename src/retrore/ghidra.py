@@ -270,11 +270,14 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
         )
     if program.get("format") == PC98_FORMAT:
         image_units(program, image.stat().st_size)
-    return _run(
+    report = _run(
         project, [*options, "x86:LE:16:Real Mode"],
         ("RetroreSegments.java", "RetroreIndirect.java"), str(manifest), pre_script="RetroreImport.java",
         timeout=timeout,
     )
+    if "indirect" not in report:  # A script that fails to compile leaves no result of its own.
+        raise GhidraError("Ghidra RetroreIndirect.java did not run", code="script_error")
+    return report
 
 
 def decompile(address: str, project: Path, *, timeout: float | None = QUERY_TIMEOUT, **options: object) -> dict:
