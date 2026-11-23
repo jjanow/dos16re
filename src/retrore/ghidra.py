@@ -2,6 +2,8 @@
 
 import json
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 import signal
 import subprocess
 import threading
@@ -26,6 +28,28 @@ class GhidraError(CodedError):
     """A headless Ghidra command could not complete."""
 
     default_code = "invalid_request"
+
+
+# A caller such as the MCP server sets this event to stop the headless run started in its context.
+_cancel: ContextVar[threading.Event | None] = ContextVar("retrore_cancel", default=None)
+_CANCEL_POLL = 0.2
+
+
+@contextmanager
+def cancellable(event: threading.Event):
+    """Stop headless runs started in this context, and fail them with code `cancelled`, once event is set."""
+    token = _cancel.set(event)
+    try:
+        yield
+    finally:
+        _cancel.reset(token)
+
+
+def check_cancelled(label: str = "request") -> None:
+    """Raise GhidraError with code `cancelled` if the current context's request was cancelled."""
+    event = _cancel.get()
+    if event is not None and event.is_set():
+        raise GhidraError(f"Ghidra {label} was cancelled", code="cancelled")
 
 
 def check_timeout(seconds: object) -> float | None:
@@ -82,11 +106,13 @@ def _run(
         lines = output.splitlines()
         errors = [line for line in lines if "ERROR" in line or "Exception" in line]
         detail = "\n".join((errors or lines)[-8:])
-        raise GhidraError(f"Ghidra {label} failed (exit status {returncode})\n{detail}", code="headless_failed")
+        code = "project_locked" if "LockException" in output else "headless_failed"
+        raise GhidraError(f"Ghidra {label} failed (exit status {returncode})\n{detail}", code=code)
 
 
 def _launch(command: list[str], timeout: float | None, label: str | None) -> tuple[int, str]:
     """Run analyzeHeadless in its own process group and kill the whole group when the budget expires."""
+    check_cancelled(label)
     windows = os.name == "nt"
     process = subprocess.Popen(
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -94,17 +120,31 @@ def _launch(command: list[str], timeout: float | None, label: str | None) -> tup
         **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True}),
     )
     started = time.monotonic()
+    deadline = started + timeout if timeout else None
+    cancel = _cancel.get()
     previous = _forward_termination()
     try:
-        output, _ = process.communicate(timeout=timeout or None)
-        return process.returncode, output
-    except subprocess.TimeoutExpired:
-        _kill_group(process, windows)
-        raise GhidraError(
-            f"Ghidra {label} exceeded the {timeout:g} second time budget after "
-            f"{time.monotonic() - started:.1f} seconds; the headless process group was stopped",
-            code="timeout",
-        ) from None
+        while True:
+            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if cancel is not None:
+                wait = _CANCEL_POLL if wait is None else min(wait, _CANCEL_POLL)
+            try:
+                output, _ = process.communicate(timeout=wait)
+                return process.returncode, output
+            except subprocess.TimeoutExpired:
+                if cancel is not None and cancel.is_set():
+                    _kill_group(process, windows)
+                    raise GhidraError(f"Ghidra {label} was cancelled; the headless process group was stopped",
+                                      code="cancelled") from None
+                if deadline is not None and time.monotonic() >= deadline:
+                    _kill_group(process, windows)
+                    raise GhidraError(
+                        f"Ghidra {label} exceeded the {timeout:g} second time budget after "
+                        f"{time.monotonic() - started:.1f} seconds; the headless process group was stopped",
+                        code="timeout",
+                    ) from None
+    except GhidraError:
+        raise
     except BaseException:
         _kill_group(process, windows)
         raise

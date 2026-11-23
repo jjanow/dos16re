@@ -6,6 +6,7 @@ import re
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from retrore.mcp import tools
 from retrore.queries import QUERIES, QueryError, validate_query
 from retrore.schema import DIALECT, query_schema
 from test_c64 import _prg
+from test_errors import _FAKE, _wait_dead
 
 ROOT = Path(__file__).resolve().parents[1]
 # The server subprocess imports the same retrore as the tests: the checkout's src or an installed wheel.
@@ -267,7 +269,7 @@ def test_batch_schema_rejects_invalid_arrays():
 def test_tool_schemas_follow_the_registry():
     document = query_schema()
     listed = {tool["name"]: tool for tool in tools()}
-    assert list(listed) == [*QUERIES, "batch", "where_is"]
+    assert list(listed) == [*QUERIES, "batch", "where_is", "info", "load"]
     for command in QUERIES:
         request, schema = document["$defs"][f"{command}_request"], listed[command]["inputSchema"]
         assert schema["$schema"] == DIALECT and schema["type"] == "object"
@@ -283,6 +285,21 @@ def test_tool_schemas_follow_the_registry():
     assert batch["$defs"] == document["$defs"] and batch["required"] == ["project", "requests"]
     assert not _errors(batch, {"project": "p", "requests": [{"command": "func", "address": "0"}]}, batch)
     assert _errors(batch, {"project": "p", "requests": [{"command": "func"}]}, batch)
+
+
+def test_program_tool_schemas_follow_the_cli_options():
+    listed = {tool["name"]: tool["inputSchema"] for tool in tools()}
+    info, load = listed["info"], listed["load"]
+    assert info["required"] == ["program"] and load["required"] == ["program", "output"]
+    assert load["properties"] == {**info["properties"], "output": load["properties"]["output"]}
+    properties = info["properties"]
+    assert properties["c64"]["type"] == "boolean" and properties["entry"]["type"] == "array"
+    assert properties["x1_lsn"]["items"] == {"type": "string"} and "LSN[+COUNT]@HEX" in properties["x1_lsn"]["description"]
+    assert properties["pc88_disk"]["type"] == "integer"
+    assert properties["pc88_low"]["enum"] == ["ram", "n88-rom", "n-rom"]
+    assert "json" not in properties and info["additionalProperties"] is False
+    assert not _errors(load, {"program": "a.prg", "output": "out", "entry": ["c000"], "c64": True}, load)
+    assert _errors(info, {"program": "a.prg", "entry": "c000"}, info)
 
 
 def _environment(**extra: str) -> dict:
@@ -479,4 +496,114 @@ def test_mcp_answers_each_line_before_stdin_closes():
     finally:
         process.stdin.close()
         assert process.wait(timeout=30) == 0
+        process.stdout.close()
+
+
+def test_mcp_info_and_load_match_the_cli(tmp_path, capsys):
+    program, export = _c64_export(tmp_path)
+    capsys.readouterr()
+    assert main(["info", str(program), "--entry", "c000", "--c64-bank", "6", "--json"]) == 0
+    info = json.loads(capsys.readouterr().out)
+    loaded = tmp_path / "mcp-export"
+    responses = _session([
+        *_initialize(),
+        _call(1, "info", {"program": str(program), "entry": ["c000"], "c64_bank": "6"}),
+        _call(2, "load", {"program": str(program), "entry": ["c000"], "output": str(loaded)}),
+        _call(4, "info", {"program": str(program), "c64": True, "apple2": True}),
+        _call(5, "info", {"program": str(program), "base_address": "zz"}),
+        _call(6, "info", {"program": str(program), "entry": "c000"}),
+        _call(7, "info", {"program": str(program), "json": True}),
+        _call(8, "load", {"program": str(program)}),
+        _call(9, "info", {"program": str(tmp_path / "missing.prg")}),
+    ])
+    assert responses[1]["result"]["structuredContent"] == info and responses[1]["result"]["isError"] is False
+    assert responses[2]["result"]["structuredContent"] == json.loads((export / "map.json").read_text())
+    assert (loaded / "image.bin").read_bytes() == (export / "image.bin").read_bytes()
+    # Calls run concurrently, so a second export to the same directory goes in a later session.
+    responses |= _session([*_initialize(), _call(3, "load", {"program": str(program), "output": str(loaded)})])
+    for identifier, code, message in (
+        (3, "io_error", "[Errno 17] File exists"),
+        (4, "invalid_request", "argument --apple2: not allowed with argument --c64"),
+        (5, "invalid_request", "argument --base-address: expected a hexadecimal address"),
+        (6, "invalid_request", "entry must be a list"),
+        (7, "invalid_request", "unsupported options for info: json"),
+        (8, "invalid_request", "the following arguments are required: -o/--output"),
+        (9, "io_error", "[Errno 2]"),
+    ):
+        result = responses[identifier]["result"]
+        assert result["isError"] is True, identifier
+        error = result["structuredContent"]["error"]
+        assert (error["code"], error["message"][:len(message)]) == (code, message), identifier
+
+
+def _read_response(process: subprocess.Popen, seconds: float = 30) -> dict:
+    ready, _, _ = select.select([process.stdout], [], [], seconds)
+    assert ready, "no response"
+    return json.loads(process.stdout.readline())
+
+
+def _wait_for_pid(pid_file: Path, previous: str = "") -> int:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        text = pid_file.read_text() if pid_file.exists() else ""
+        if text and text != previous:
+            return int(text)
+        time.sleep(0.05)
+    pytest.fail("the fake headless run did not start")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the fake launcher is a POSIX script")
+def test_mcp_calls_run_concurrently_and_cancel(tmp_path):
+    support = tmp_path / "ghidra" / "support"
+    support.mkdir(parents=True)
+    launcher = support / "analyzeHeadless"
+    launcher.write_text(_FAKE.format(python=sys.executable), encoding="utf-8")
+    launcher.chmod(0o755)
+    project = tmp_path / "demo.gpr"
+    project.write_text("", encoding="utf-8")
+    pid_file = tmp_path / "grandchild.pid"
+    _, export = _c64_export(tmp_path)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "retrore", "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env=_environment(GHIDRA_HOME=str(tmp_path / "ghidra"), FAKE_GHIDRA_MODE="hang_soft",
+                         FAKE_GHIDRA_PID=str(pid_file)),
+    )
+
+    def send(message: dict) -> None:
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+
+    def cancel(identifier: int) -> None:
+        send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": identifier}})
+
+    try:
+        for message in _initialize():
+            send(message)
+        assert _read_response(process)["id"] == 0
+        send(_call(1, "func", {"project": str(project), "address": "c000"}))
+        first = _wait_for_pid(pid_file)
+        # A second call on the same project waits for the first; other tools answer meanwhile.
+        send(_call(2, "decomp", {"project": str(tmp_path / "demo"), "address": "c000"}))
+        send(_call(3, "func", {"project": str(project), "address": "c000"}))
+        send(_call(4, "where_is", {"export": str(export), "bytes": "8d 20 d0"}))
+        response = _read_response(process)
+        assert response["id"] == 4 and response["result"]["structuredContent"]["count"] == 1
+        send(_call(3, "func", {"project": str(project), "address": "c000"}))
+        assert _read_response(process)["error"]["message"] == "request id is already in use by a call in progress"
+        time.sleep(0.5)
+        assert pid_file.read_text() == str(first)
+
+        cancel(1)
+        _wait_dead(first)
+        second = _wait_for_pid(pid_file, str(first))
+        cancel(2)
+        cancel(3)
+        _wait_dead(second)
+        send({"jsonrpc": "2.0", "id": 5, "method": "ping"})
+        assert _read_response(process) == {"jsonrpc": "2.0", "id": 5, "result": {}}
+    finally:
+        process.stdin.close()
+        assert process.wait(timeout=60) == 0
+        # Cancelled calls send no response.
+        assert process.stdout.read() == ""
         process.stdout.close()
