@@ -244,9 +244,14 @@ The analysis backlog below applies to existing and future platforms.
   counts, output size, and the steps that reversing questions take ([results](docs/benchmarks.md)).
   On Pool of Radiance (36 units) a launch costs about 4.1 s and a batched query about 18 ms. Real
   questions need two or three dependent steps, so even batched they take 8 to 12 s.
-- **Next.** A persistent query worker that keeps one project open across dependent steps, for the
-  CLI and the MCP server. Keep the request and result contract, time budgets, and cancellation, and
-  measure it against the PoR questions.
+- **Implemented.** A persistent query worker keeps one project open across dependent steps
+  (`retrore.worker`). RetroreQuery.java's serve mode answers newline-delimited JSON requests over a
+  loopback connection with a one-time token. `retrore mcp` hosts a worker per project.
+  `retrore worker start|stop|status` runs a daemon on a unix socket that later CLI queries use.
+  Results, error codes, time budgets, and cancellation match one-shot runs: an expired or cancelled
+  request stops the worker's process group, and a request the worker cannot answer runs one-shot.
+  `ghidra import` stops the project's worker first, and `RETRORE_WORKER=0` opts out. Workers exit
+  after 15 idle minutes. Measured against the PoR questions in [benchmarks](docs/benchmarks.md).
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
 - **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested

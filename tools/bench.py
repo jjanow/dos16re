@@ -216,6 +216,7 @@ def cli_processes(project: Path, requests: list[dict], repeat: int) -> dict:
 
 def measure_project(project: Path, questions: list[dict], repeat: int, batch_sizes: list[int]) -> dict:
     """Measure scenarios and batch sizes on an existing analyzed project."""
+    worker.stop(project)  # A running worker would lock the project against one-shot launches.
     counter = Counter()
     ghidra._launch = counter
     requests = [request for question in questions for step in question["steps"] for request in step]
