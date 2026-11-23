@@ -1318,7 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
     batch_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     batch_parser.add_argument("--evidence", action="store_true", help="include the query requests and program identity")
     batch_parser.add_argument("--export", metavar="OUT", type=Path,
-                              help="compare disassembly rows with a loader export in an evidence bundle")
+                              help="compare disassembly and decompiler instruction bytes with a loader export")
     address_queries = {
         "xrefs": "list references to and from an address",
         "callers": "list calls to a function",

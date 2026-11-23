@@ -57,6 +57,7 @@ public class RetroreQuery extends GhidraScript {
     private record Focus(Location address, String instruction, String bytes) {}
     private record ExcerptLine(int line, String text, boolean focused, List<Location> addresses) {}
     private record MappedLine(int line, String text, List<BodyRange> instructions) {}
+    private record InstructionBytes(Location address, String bytes) {}
     private record OperandReference(int operand, String type, String source, Location target) {}
     private record SliceValue(String storage, int size) {}
     private record SliceInput(String storage, int size, Integer definition) {}
@@ -1355,10 +1356,41 @@ public class RetroreQuery extends GhidraScript {
         return new Location(address.toString(), unitAddress, address.isMemoryAddress() ? address.getOffset() : null);
     }
 
+    private final class InstructionBytesCollector {
+        private static final int MAX_INSTRUCTIONS = 512;
+        private final Map<Address, Instruction> instructions = new LinkedHashMap<>();
+        private boolean truncated;
+
+        void add(Address address) {
+            if (instructions.containsKey(address)) {
+                return;
+            }
+            var instruction = currentProgram.getListing().getInstructionAt(address);
+            if (instruction != null) {
+                if (instructions.size() == MAX_INSTRUCTIONS) {
+                    truncated = true;
+                } else {
+                    instructions.put(address, instruction);
+                }
+            }
+        }
+
+        Map<String, Object> report() throws Exception {
+            var bytes = new ArrayList<InstructionBytes>();
+            for (var instruction : instructions.values()) {
+                monitor.checkCancelled();
+                bytes.add(new InstructionBytes(location(instruction.getAddress()),
+                    HexFormat.of().formatHex(instruction.getBytes())));
+            }
+            return Map.of("instructions", bytes, "truncated", truncated);
+        }
+    }
+
     private Map<String, Object> describeDecompilation(Function function, Address address, JsonObject request,
             Options options)
             throws Exception {
         var report = new LinkedHashMap<String, Object>();
+        var evidence = request.has("_instruction_bytes") ? new InstructionBytesCollector() : null;
         var entry = location(function.getEntryPoint());
         if (options.includes("address")) {
             report.put("address", entry.address());
@@ -1386,6 +1418,9 @@ public class RetroreQuery extends GhidraScript {
             if (options.includes("focus")) {
                 report.put("focus", new Focus(location(instruction.getAddress()), instruction.toString(),
                     HexFormat.of().formatHex(instruction.getBytes())));
+                if (evidence != null) {
+                    evidence.add(instruction.getAddress());
+                }
             }
         }
         if (full || excerpt || slice || map && (options.includes("line_map") || options.includes("line_pagination"))) {
@@ -1394,21 +1429,24 @@ public class RetroreQuery extends GhidraScript {
                 report.put("decompilation", result.getDecompiledFunction().getC());
             }
             if (excerpt) {
-                report.put("excerpt", excerpt(result, instruction.getAddress(), options.context()));
+                report.put("excerpt", excerpt(result, instruction.getAddress(), options.context(), evidence));
             }
             if (slice) {
-                report.put("slice", dataSlice(result, instruction, options.slice()));
+                report.put("slice", dataSlice(result, instruction, options.slice(), evidence));
             }
             if (map) {
                 int offset = request.has("line_offset") ? request.get("line_offset").getAsInt() : 0;
-                mapDecompiledLines(result, offset, request.get("map_lines").getAsInt(), options, report);
+                mapDecompiledLines(result, offset, request.get("map_lines").getAsInt(), options, report, evidence);
             }
+        }
+        if (evidence != null) {
+            report.put("_instruction_bytes", evidence.report());
         }
         return report;
     }
 
     private void mapDecompiledLines(DecompileResults result, int offset, int limit, Options options,
-            Map<String, Object> report) throws Exception {
+            Map<String, Object> report, InstructionBytesCollector evidence) throws Exception {
         var lines = new PrettyPrinter(result.getFunction(), result.getCCodeMarkup(), null).getLines();
         int start = Math.min(offset, lines.size());
         int end = start + Math.min(limit, lines.size() - start);
@@ -1430,6 +1468,9 @@ public class RetroreQuery extends GhidraScript {
                 if (instruction == null || !result.getFunction().getBody().contains(address)) {
                     continue;
                 }
+                if (evidence != null) {
+                    evidence.add(address);
+                }
                 if (last != null && (!address.getAddressSpace().equals(last.getAddressSpace()) ||
                         address.subtract(last) != 1)) {
                     ranges.add(new BodyRange(location(first), location(last)));
@@ -1448,7 +1489,8 @@ public class RetroreQuery extends GhidraScript {
         report.put("line_map", mapped);
     }
 
-    private List<ExcerptLine> excerpt(DecompileResults result, Address focus, int context) throws Exception {
+    private List<ExcerptLine> excerpt(DecompileResults result, Address focus, int context,
+            InstructionBytesCollector evidence) throws Exception {
         var lines = new PrettyPrinter(result.getFunction(), result.getCCodeMarkup(), null).getLines();
         var excerpt = new ArrayList<ExcerptLine>();
         for (int index = 0; index < lines.size(); index++) {
@@ -1460,6 +1502,9 @@ public class RetroreQuery extends GhidraScript {
             int end = Math.min(lines.size(), index + context + 1);
             for (var line : lines.subList(start, end)) {
                 var addresses = lineAddresses(line.getAllTokens());
+                if (evidence != null) {
+                    addresses.forEach(evidence::add);
+                }
                 excerpt.add(new ExcerptLine(line.getLineNumber(), PrettyPrinter.getText(line),
                     addresses.contains(focus), addresses.stream().map(this::location).toList()));
             }
@@ -1482,7 +1527,8 @@ public class RetroreQuery extends GhidraScript {
         return addresses;
     }
 
-    private DataSlice dataSlice(DecompileResults result, Instruction instruction, int limit) throws Exception {
+    private DataSlice dataSlice(DecompileResults result, Instruction instruction, int limit,
+            InstructionBytesCollector evidence) throws Exception {
         var atFocus = new ArrayList<PcodeOp>();
         var candidates = result.getHighFunction().getPcodeOps(instruction.getAddress());
         while (candidates.hasNext()) {
@@ -1520,6 +1566,9 @@ public class RetroreQuery extends GhidraScript {
                     definition == null ? null : definition.getSeqnum().getTime()));
             }
             var output = op.getOutput();
+            if (evidence != null) {
+                evidence.add(op.getSeqnum().getTarget());
+            }
             operations.add(new SliceOperation(op.getSeqnum().getTime(), location(op.getSeqnum().getTarget()),
                 op.getMnemonic(), roots.contains(op), inputs,
                 output == null ? null : new SliceValue(output.toString(language), output.getSize())));

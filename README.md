@@ -944,11 +944,17 @@ stream. A batch launches Ghidra once, so it costs about the same as one single q
 `project-summary` reports the program name, language, compiler model, function count, and memory blocks.
 `batch --evidence --json` includes a compact project summary and the original requests in a
 versioned evidence bundle. Add `--export OUT` to compare each complete `disasm` result with the
-corresponding loader range and include its file spans and fixups. The bundle flags differences
-between the Ghidra bytes and the export, including changes to Ghidra's analysis copy. Conflict
-rows include a `conflicts` array with codes for address, initialized size, and byte mismatches,
-or incomplete coverage when both sources provide the same number of bytes. If the range is
-uninitialized in both, its byte comparison is marked `unavailable` with a reason.
+corresponding loader range and include its file spans and fixups. For `decomp`, request `map_lines`,
+`context`, or `slice` to compare the instructions cited by the returned C lines, focus, or p-code
+operations. The `export_evidence.instructions` array records each distinct instruction's Ghidra
+address and `project_bytes` alongside its loader bytes, source spans, and fixups. Evidence covers
+up to 512 distinct instructions per result and sets `truncated` if it omits any.
+
+Each conflicting byte comparison includes a `conflicts` array with codes for address, initialized size,
+and byte mismatches, or incomplete coverage when both sources provide the same number of bytes.
+A range uninitialized in both sources has an `unavailable` comparison. A `decomp` comparison is
+`consistent` when the bundle checks and matches every cited instruction. Any conflicting instruction
+makes the result `conflict`. Missing or truncated evidence otherwise makes it `unavailable` with a reason.
 
 ### Reuse Ghidra annotations
 

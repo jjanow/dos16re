@@ -78,6 +78,34 @@ def test_bundle_reports_byte_comparison_status_and_conflicts(monkeypatch):
     assert comparisons[0]["bytes"]["loaded"] == ""
 
 
+@pytest.mark.parametrize("address, project_bytes, truncated, status, instruction_status", [
+    ("h0:2", "ffffffff", True, "conflict", "conflict"),
+    ("h0:2", "00010020", True, "unavailable", "consistent"),
+    ("h0:8", "1234", False, "unavailable", "unavailable"),
+])
+def test_bundle_reports_decomp_instruction_coverage(monkeypatch, address, project_bytes, truncated, status,
+                                                     instruction_status):
+    export = FIXTURES / "hunk"
+    location = {"address": "00010002", "unit_address": address, "linear": 0x10002}
+    result = {"name": "demo", "_instruction_bytes": {
+        "instructions": [{"address": location, "bytes": project_bytes}], "truncated": truncated,
+    }}
+    rows = [{"result": {"program": "demo"}}, {"result": result}]
+    monkeypatch.setattr(evidence, "query_batch", lambda *args, **kwargs: {"results": rows})
+
+    bundle = evidence.evidence_bundle(Path("demo.gpr"), [{"command": "decomp", "address": "h0:2"}], export=export)
+
+    row, = bundle["results"]
+    assert row["result"] == {"name": "demo"}
+    comparison = row["export_evidence"]
+    assert comparison["status"] == status
+    assert comparison["truncated"] == truncated
+    instruction, = comparison["instructions"]
+    assert instruction["status"] == instruction_status
+    if instruction_status == "conflict":
+        assert instruction["conflicts"] == ["byte_mismatch"]
+
+
 def test_fragmented_file_mapping_and_mcp(tmp_path):
     program = {"format": "C64_PRG", "program": "disk", "units": [
         {"name": "code", "linear": 0x1000, "image_offset": 0, "size": 4, "file_size": 4,

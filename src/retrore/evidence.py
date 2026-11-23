@@ -204,14 +204,62 @@ def inspect_bytes(export: Path, address: str, *, size: int = 32) -> dict:
     return _inspect_bytes(ExportEvidence(export), address, size)
 
 
+def _compare_bytes(image: ExportEvidence, location: dict, size: int, project_bytes: str,
+                   *, uninitialized: bool = False) -> dict:
+    try:
+        observed = _inspect_bytes(image, location["unit_address"] or location["address"], size)
+    except (EvidenceError, SearchError) as error:
+        return {"status": "unavailable", "reason": str(error)}
+
+    same_address = observed["address"]["linear"] == location["linear"]
+    if same_address and uninitialized and not observed["address"]["initialized"]:
+        return {"status": "unavailable", "reason": "range is uninitialized", "bytes": observed}
+
+    conflicts = []
+    if not same_address:
+        conflicts.append("address_mismatch")
+    if observed["size"] * 2 != len(project_bytes):
+        conflicts.append("initialized_size_mismatch")
+    else:
+        if observed["loaded"] != project_bytes:
+            conflicts.append("byte_mismatch")
+        if observed["size"] != size:
+            conflicts.append("incomplete_range")
+    if conflicts:
+        return {"status": "conflict", "conflicts": conflicts, "bytes": observed}
+    return {"status": "consistent", "bytes": observed}
+
+
+def _decomp_evidence(image: ExportEvidence, result: dict) -> dict:
+    instruction_bytes = result.pop("_instruction_bytes", None)
+    if instruction_bytes is None:
+        return {"status": "unavailable", "reason": "Ghidra did not return instruction bytes"}
+
+    instructions = []
+    for item in instruction_bytes["instructions"]:
+        address, data = item["address"], item["bytes"]
+        comparison = _compare_bytes(image, address, len(data) // 2, data)
+        instructions.append({"address": address, "project_bytes": data, **comparison})
+    truncated = instruction_bytes["truncated"]
+    report = {"instructions": instructions, "truncated": truncated}
+    statuses = {item["status"] for item in instructions}
+    if "conflict" in statuses:
+        return {**report, "status": "conflict"}
+    if not instructions:
+        return {**report, "status": "unavailable", "reason": "no instruction bytes in the returned decomp fields"}
+    if "unavailable" in statuses or truncated:
+        return {**report, "status": "unavailable", "reason": "instruction coverage is incomplete"}
+    return {**report, "status": "consistent"}
+
+
 def evidence_bundle(project: Path, requests: list, *, export: Path | None = None, program: str | None = None,
                     timeout: float | None = None) -> dict:
-    """Bundle selected query results and compare any disassembly with its loader evidence."""
+    """Bundle selected query results and compare Ghidra bytes with loader evidence."""
     if not isinstance(requests, list) or not requests:
         raise GhidraError("expected a nonempty JSON array of evidence queries")
     report = query_batch(project, [
         {"command": "project-summary", "fields": ["program", "language", "compiler", "function_count"]}, *requests,
-    ], program=program, timeout=timeout)
+    ], program=program, timeout=timeout, _instruction_bytes=export is not None)
     summary, *rows = report["results"]
     if "error" in summary:
         raise GhidraError(summary["error"]["message"], code=summary["error"]["code"])
@@ -222,36 +270,19 @@ def evidence_bundle(project: Path, requests: list, *, export: Path | None = None
     bundle["export"] = {"program": image.program.get("program"), "format": image.format,
                         "image_sha256": sha256(image.image).hexdigest()}
     for request, row in zip(requests, rows, strict=True):
-        if request["command"] != "disasm" or "error" in row:
+        if "error" in row:
             continue
         result = row["result"]
-        if not {"start", "size", "rows"} <= result.keys():
-            row["export_evidence"] = {"status": "unavailable", "reason": "disasm fields must include start, size, rows"}
-            continue
-        location = result["start"]
-        try:
-            observed = _inspect_bytes(image, location["unit_address"] or location["address"], result["size"])
-        except (EvidenceError, SearchError) as error:
-            row["export_evidence"] = {"status": "unavailable", "reason": str(error)}
-            continue
-        project_bytes = "".join(part.get("bytes", "") for part in result["rows"])
-        same_address = observed["address"]["linear"] == location["linear"]
-        if (same_address and not observed["address"]["initialized"]
-                and all(part["kind"] == "uninitialized" for part in result["rows"])):
-            row["export_evidence"] = {"status": "unavailable", "reason": "range is uninitialized",
-                                      "bytes": observed}
-            continue
-        conflicts = []
-        if not same_address:
-            conflicts.append("address_mismatch")
-        if observed["size"] * 2 != len(project_bytes):
-            conflicts.append("initialized_size_mismatch")
-        else:
-            if observed["loaded"] != project_bytes:
-                conflicts.append("byte_mismatch")
-            if observed["size"] != result["size"]:
-                conflicts.append("incomplete_range")
-        row["export_evidence"] = {"status": "conflict" if conflicts else "consistent", "bytes": observed}
-        if conflicts:
-            row["export_evidence"]["conflicts"] = conflicts
+        if request["command"] == "decomp":
+            row["export_evidence"] = _decomp_evidence(image, result)
+        elif request["command"] == "disasm":
+            if {"start", "size", "rows"} <= result.keys():
+                parts = result["rows"]
+                row["export_evidence"] = _compare_bytes(
+                    image, result["start"], result["size"], "".join(part.get("bytes", "") for part in parts),
+                    uninitialized=all(part["kind"] == "uninitialized" for part in parts),
+                )
+            else:
+                row["export_evidence"] = {"status": "unavailable",
+                                          "reason": "disasm fields must include start, size, rows"}
     return bundle

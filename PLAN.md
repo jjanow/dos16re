@@ -14,14 +14,12 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `batch --evidence` gained conflict codes for loader comparisons of disassembly
-ranges. The regression test covers address, initialized size, and byte mismatches, incomplete
-coverage, and consistent and unavailable ranges. The standalone suite passed 419 tests with
-90 skipped.
+On 2026-11-23, `batch --evidence --export` added loader comparisons for the instructions behind
+mapped C lines, focused instructions, excerpts, and p-code slices. The standalone suite passed
+422 tests with 90 skipped. Focused Ghidra 12.2 tests verified instruction bytes and source offsets
+from a synthetic DOS program. A persistent worker detected a modified byte in a synthetic C64 export.
 
-Resume by extending Phase 10's evidence categories beyond disassembly, or use runtime observations to investigate
-Phantasie III's unresolved dispatch at `root:13721` in Phase 9.
-X1turbo validation still awaits the Gold Box release.
+Resume Phase 10 by attaching export evidence to recovered indirect control flow and annotation provenance.
 
 ## Why
 
@@ -356,10 +354,13 @@ release. Continue with the analysis backlog below.
   `decomp --map-lines` maps C lines to contributing instruction ranges. Open: source offsets for
   older maps and formats with incomplete provenance, and generalized runtime placement.
 - **Partly implemented.** `batch --evidence` bundles selected results and their requests. It can
-  attach loader evidence to disassembly and report address, initialized size, and byte mismatches,
-  plus incomplete coverage when both sources provide equal byte counts. A range uninitialized in
-  both the export and Ghidra reports an unavailable byte comparison. Gap classification can
-  include observed runtime hits. Open: shared evidence categories across analyses and annotations.
+  attach loader evidence to disassembly and the distinct instructions cited by returned decompiler
+  fields. Both comparisons report address, initialized size, and byte mismatches, plus incomplete
+  coverage when both sources provide equal byte counts. The decompiler comparison records each
+  instruction's bytes and source spans and flags missing or truncated evidence. A disassembly
+  range uninitialized in both sources reports an unavailable byte comparison. Gap classification
+  can include observed runtime hits. Open: shared evidence for recovered indirect flow, runtime
+  observations, and annotations.
 - **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
   entry points. Replay previews conflicts and applies changes in one transaction. Open: user data
   types, custom storage, and layout hints.

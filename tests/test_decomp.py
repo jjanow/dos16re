@@ -97,12 +97,39 @@ def test_focused_decompilation(tmp_path, capsys):
     assert disasm["next_address"]["unit_address"] == "root:000a"
 
     request_file = tmp_path / "evidence-requests.json"
-    requests = [{"command": "disasm", "address": "root:7", "limit": 3}]
+    requests = [
+        {"command": "disasm", "address": "root:7", "limit": 3},
+        {"command": "decomp", "address": "root:0", "map_lines": 1, "line_offset": line["line"] - 1},
+        {"command": "decomp", "address": "root:8", "context": 0, "fields": ["focus"]},
+        {"command": "decomp", "address": "root:7", "context": 0, "fields": ["excerpt"]},
+        {"command": "decomp", "address": "root:7", "slice": 12, "fields": ["slice"]},
+        {"command": "decomp", "address": "root:0", "fields": ["name"]},
+    ]
     request_file.write_text(json.dumps(requests), encoding="utf-8")
     assert main(["batch", str(request_file), "--project", str(project), "--evidence", "--export", str(export),
                  "--json"]) == 0
     bundle = json.loads(capsys.readouterr().out)
     assert bundle["bundle_version"] == 1 and bundle["requests"] == requests
-    row, = bundle["results"]
-    assert row["export_evidence"]["status"] == "consistent"
-    assert row["export_evidence"]["bytes"]["file_spans"][0]["file_offset"] == 32 + 7
+    listing, mapped, focus, excerpt, sliced, plain = bundle["results"]
+    assert listing["export_evidence"]["status"] == "consistent"
+    assert listing["export_evidence"]["bytes"]["file_spans"][0]["file_offset"] == 32 + 7
+
+    assert mapped["result"]["line_map"] == [line_map]
+    assert "_instruction_bytes" not in mapped["result"]
+    for row in (mapped, focus, excerpt, sliced):
+        assert row["export_evidence"]["status"] == "consistent"
+        assert not row["export_evidence"]["truncated"]
+    instructions = mapped["export_evidence"]["instructions"]
+    assert [(item["address"]["unit_address"], item["project_bytes"]) for item in instructions] == [
+        ("root:0002", "a10001"), ("root:0005", "40"), ("root:0007", "e80b00"),
+    ]
+    assert [item["bytes"]["file_spans"][0]["file_offset"] for item in instructions] == [34, 37, 39]
+    assert focus["export_evidence"]["instructions"] == instructions[-1:]
+    assert excerpt["result"] == {"excerpt": call["excerpt"]}
+    assert excerpt["export_evidence"]["instructions"] == instructions
+    assert sliced["result"] == {"slice": call["slice"]}
+    assert {item["address"]["unit_address"] for item in sliced["export_evidence"]["instructions"]} == {
+        op["address"]["unit_address"] for op in call["slice"]["operations"]
+    }
+    assert plain["export_evidence"]["status"] == "unavailable"
+    assert plain["export_evidence"]["instructions"] == []

@@ -320,7 +320,7 @@ def _normalize(request: object) -> dict:
 
 
 def query_batch(project: Path, requests: object, *, timeout: float | None = None,
-                program: str | None = None) -> dict:
+                program: str | None = None, _instruction_bytes: bool = False) -> dict:
     """Run an ordered array of queries in one read-only Ghidra session.
 
     The default budget is QUERY_TIMEOUT or BATCH_SECONDS_PER_QUERY per request, whichever is larger.
@@ -331,9 +331,12 @@ def query_batch(project: Path, requests: object, *, timeout: float | None = None
     normalized = []
     for index, request in enumerate(requests, 1):
         try:
-            normalized.append(_normalize(request))
+            entry = _normalize(request)
         except GhidraError as error:
             raise GhidraError(f"query {index}: {error}") from error
+        if _instruction_bytes and entry["command"] == "decomp":
+            entry["_instruction_bytes"] = True
+        normalized.append(entry)
 
     if timeout is None:
         timeout = max(QUERY_TIMEOUT, BATCH_SECONDS_PER_QUERY * len(requests))
