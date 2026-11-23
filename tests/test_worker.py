@@ -417,11 +417,13 @@ def test_endpoints_of_exited_hosts_are_skipped_without_connecting(tmp_path, monk
 def test_a_daemon_that_fails_to_import_reports_its_output(fake, tmp_path, monkeypatch):
     broken = tmp_path / "broken"
     broken.mkdir()
-    (broken / "capstone.py").write_text('raise ImportError("broken capstone for the test")\n', encoding="utf-8")
+    # PYTHONPATH entries precede the standard library, so this replaces argparse, which only the CLI imports,
+    # wherever retrore is installed.
+    (broken / "argparse.py").write_text('raise ImportError("broken argparse for the test")\n', encoding="utf-8")
     monkeypatch.setenv("PYTHONPATH", str(broken))
     with pytest.raises(GhidraError) as caught:
         worker.start(fake.project, timeout=60)
-    assert caught.value.code == "headless_failed" and "broken capstone for the test" in str(caught.value)
+    assert caught.value.code == "headless_failed" and "broken argparse for the test" in str(caught.value)
 
 
 def test_mcp_hosts_workers_that_cli_queries_reach(fake):
