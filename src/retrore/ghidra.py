@@ -91,10 +91,11 @@ def launch_environment(java_home: str | None) -> dict:
 
 def _run(
     project: Path, options: list[str], script: str | None, *arguments: str, pre_script: str | None = None,
-    timeout: float | None = QUERY_TIMEOUT, setup: dict | None = None,
+    timeout: float | None = QUERY_TIMEOUT, setup: dict | None = None, post_scripts: tuple[str, ...] = (),
 ) -> dict:
     """Run analyzeHeadless once. setup is a worker.launch_setup() record of another process's launcher and
-    JAVA_HOME to use instead of this process's, for a worker host answering that process."""
+    JAVA_HOME to use instead of this process's, for a worker host answering that process. post_scripts run
+    after script with the same arguments and add to its result file."""
     launcher = setup["launcher"] if setup else _headless()
     scripts = files("retrore").joinpath("ghidra_scripts")
     label = script or pre_script
@@ -102,6 +103,8 @@ def _run(
         result_file = Path(temp) / "result.json"
         script_args = [*arguments, str(result_file)]
         script_options = ["-postScript", script, *script_args] if script else []
+        for extra in post_scripts:
+            script_options += ["-postScript", extra, *script_args]
         if pre_script:
             script_options = ["-preScript", pre_script, *script_args, *script_options]
         command = [str(launcher), *_project_parts(project), *options, "-scriptPath", str(script_dir), *script_options]
@@ -271,6 +274,7 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
     return _run(
         project, [*options, "x86:LE:16:Real Mode"],
         "RetroreSegments.java", str(manifest), pre_script="RetroreImport.java", timeout=timeout,
+        post_scripts=("RetroreConventions.java",),
     )
 
 
