@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from .amiga import HUNK_MAGIC, HunkError, build_hunk_image
+from .annotations import export_annotations, import_annotations, transfer_annotations
 from .apple2 import DEFAULT_LC, DISK_SUFFIXES, Apple2Error, Apple2Unit, Binary, SectorImage, build_apple2_image
 from .atari8 import (
     ATR_MAGIC, DEFAULT_PORTB, XEX_MAGIC, Atari8Binary, Atari8Error, Atari8Source, AtrImage, Segment, build_atari8_image,
@@ -14,17 +15,21 @@ from .atari8 import (
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .x68k import X_MAGIC, XError, build_x_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
+from .compare import DEFAULT_LIMIT as DEFAULT_COMPARE_LIMIT, compare_projects
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
+from .evidence import ADDRESS_SPACES, MAX_BYTES, EvidenceError, evidence_bundle, inspect_bytes, map_address
 from .ghidra import (
     BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, check_timeout, decompile,
     import_program, query, query_address, query_batch,
 )
+from .hfs import HfsError
 from .image import (
-    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT,
-    X68K_FORMAT, ImageError,
+    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MAC68K_FORMAT, MSX2_FORMAT, PC88_FORMAT,
+    PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError,
 )
+from .macintosh import MacintoshError, build_macintosh_image, is_macintosh
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, MZExecutable, UnsupportedPacker
 from .overlays import Overlay, address_record, build_image
@@ -37,7 +42,7 @@ from .queries import QUERIES, option_names
 from .schema import DIALECT, query_schema
 from .layout import apply_layout, layout_lines
 from .search import (
-    ENCODINGS, WIDTHS, SearchError, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols,
+    ENCODINGS, POINTER_KINDS, WIDTHS, SearchError, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols,
     search_pattern,
 )
 from .trace import TraceError, import_trace
@@ -54,8 +59,9 @@ _PREVIEW_LIMIT = 10
 
 # Errors that commands report as coded error objects instead of tracebacks.
 HANDLED_ERRORS = (
-    Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
-    Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error, XError, OSError,
+    Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, EvidenceError, GhidraError, HfsError, HunkError,
+    ImageError, MacintoshError, MZError, Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error,
+    XError, OSError,
 )
 
 
@@ -521,13 +527,25 @@ def _query_options(args: argparse.Namespace) -> dict:
 
 
 def _decomp(args: argparse.Namespace) -> None:
-    report = decompile(args.address, args.project, timeout=args.timeout, **_query_options(args))
+    report = decompile(args.address, args.project, timeout=args.timeout, program=args.program, **_query_options(args))
     if args.json:
         print(json.dumps(report))
         return
     if "decompilation" in report:
         print(report["decompilation"].strip())
         return
+    if "line_map" in report:
+        for line in report["line_map"][:_PREVIEW_LIMIT]:
+            addresses = ", ".join(f"{_location(row['start'])}–{_location(row['end'])}"
+                                  for row in line["instructions"])
+            print(f"{line['line']:4} {line['text']}" + (f"  [{addresses}]" if addresses else ""))
+        page = report["line_pagination"]
+        if len(report["line_map"]) > _PREVIEW_LIMIT:
+            print("Use --json for the full page.")
+        if page["next_offset"] is not None:
+            print(f"Continue with --line-offset {page['next_offset']}")
+        if "focus" not in report:
+            return
     focus = report["focus"]
     print(f"{_location(focus['address'])}  {focus['instruction']}")
     if "excerpt" in report:
@@ -550,7 +568,8 @@ def _decomp(args: argparse.Namespace) -> None:
 
 
 def _address_query(args: argparse.Namespace) -> None:
-    report = query_address(args.command, args.address, args.project, timeout=args.timeout, **_query_options(args))
+    report = query_address(args.command, args.address, args.project, timeout=args.timeout, program=args.program,
+                           **_query_options(args))
     if args.json:
         print(json.dumps(report))
         return
@@ -584,7 +603,12 @@ def _batch(args: argparse.Namespace) -> int:
     except (json.JSONDecodeError, UnicodeError) as error:
         raise GhidraError(f"invalid batch JSON: {error}") from error
 
-    report = query_batch(args.project, requests, timeout=args.timeout)
+    if args.export and not args.evidence:
+        raise GhidraError("batch --export requires --evidence")
+    if args.evidence:
+        report = evidence_bundle(args.project, requests, export=args.export, program=args.program, timeout=args.timeout)
+    else:
+        report = query_batch(args.project, requests, timeout=args.timeout, program=args.program)
     results = report["results"]
     errors = [row for row in results if "error" in row]
     if args.json:
@@ -597,7 +621,8 @@ def _batch(args: argparse.Namespace) -> int:
     return int(bool(errors))
 
 
-_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "layout", "indirect")
+_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "layout", "indirect",
+                      "disasm", "project-summary")
 
 
 def _add_query_parser(commands: argparse._SubParsersAction, command: str) -> argparse.ArgumentParser:
@@ -671,10 +696,14 @@ def _indirect_row(row: dict) -> str:
 
 
 def _registry_query(args: argparse.Namespace) -> int:
+    if args.command == "layout" and args.replace and not args.apply:
+        raise GhidraError("--replace requires --apply", code="invalid_request")
     if args.command == "layout" and args.apply:
-        report = apply_layout(args.project, _registry_request(args), timeout=args.timeout)
+        if args.program not in (None, "image.bin"):
+            raise GhidraError("layout --apply requires a retrore import")
+        report = apply_layout(args.project, _registry_request(args), replace=args.replace, timeout=args.timeout)
     else:
-        report = query(args.project, _registry_request(args), timeout=args.timeout)
+        report = query(args.project, _registry_request(args), timeout=args.timeout, program=args.program)
     command = args.command
     if args.json:
         print(json.dumps(report))
@@ -724,6 +753,17 @@ def _registry_query(args: argparse.Namespace) -> int:
     elif command == "indirect":
         print("  ".join(f"{count} {name}" for name, count in report["counts"].items()))
         _print_page(report, "sites", [_indirect_row(row) for row in report["sites"]])
+    elif command == "disasm":
+        print(f"{report['size']} bytes from {_location(report['start'])}")
+        for row in report["rows"][:_PREVIEW_LIMIT]:
+            print(f"  {_location(row['address'])}  {row.get('bytes') or '—'}  {row.get('instruction') or row['kind']}")
+        if len(report["rows"]) > _PREVIEW_LIMIT:
+            print("Use --json for the full range.")
+        if report["next_address"]:
+            print(f"Continue at {_location(report['next_address'])}")
+    elif command == "project-summary":
+        print(f"{report['program']}  {report['language']}  {report['function_count']} functions")
+        _print_page(report, "units", [f"{row['name']}  {row['size']} bytes" for row in report["units"]])
     else:
         _print_page(report, "units", [
             f"{row['unit']}  {row['size']} bytes  {row['instruction_bytes']} code  {row['data_bytes']} data  "
@@ -736,7 +776,7 @@ def _registry_query(args: argparse.Namespace) -> int:
 
 
 def _paged_gaps(args: argparse.Namespace) -> None:
-    report = query(args.project, _registry_request(args), timeout=args.timeout)
+    report = query(args.project, _registry_request(args), timeout=args.timeout, program=args.program)
     if args.json:
         print(json.dumps(report))
         return
@@ -780,6 +820,8 @@ def _where_is(args: argparse.Namespace) -> None:
         if "kind" in match:
             backed = {True: "  relocated", False: "", None: ""}[match["relocated"]]
             detail = f"  {match['kind']} {match['value']}{backed}"
+            if match["kind"] == "split":
+                detail += f"  high byte at {match['high']['unit_address']}"
         elif "encoding" in match:
             detail = f"  {match['encoding']}"
         print(f"{match['unit_address']}  {match['address']}{detail}")
@@ -829,19 +871,13 @@ def _lookup(args: argparse.Namespace) -> None:
 
 
 def _trace(args: argparse.Namespace) -> None:
-    overlay_segments = {}
     try:
-        for value in args.overlay_segment:
-            name, segment = _assignment(value, "UNIT=HEX")
-            name = name.casefold()
-            if name in overlay_segments:
-                raise ValueError(f"runtime segment specified twice for {name}")
-            overlay_segments[name] = _hex_segment(segment)
-    except (ValueError, argparse.ArgumentTypeError) as error:
+        overlay_segments = _overlay_segments(args.overlay_segment)
+    except EvidenceError as error:
         raise TraceError(str(error)) from error
     report = import_trace(
         args.trace, args.export, runtime_base=args.runtime_base, overlay_segments=overlay_segments, project=args.project,
-        timeout=args.timeout,
+        timeout=args.timeout, classify_gaps=args.classify_gaps,
     )
     if args.json:
         print(json.dumps(report))
@@ -855,6 +891,8 @@ def _trace(args: argparse.Namespace) -> None:
     else:
         functions, missed = analysis["functions"], analysis["missed"]
         print(f"{len(functions)} executed functions, {len(missed)} addresses missed by disassembly")
+        if "observed_gaps" in analysis:
+            print(f"{len(analysis['observed_gaps'])} undefined ranges contain executed addresses")
         rows = [f"{_location(hit)}  {hit['reason']}" for hit in missed[:_PREVIEW_LIMIT]]
         for entry in functions[:_PREVIEW_LIMIT - len(rows)]:
             function = entry["function"]
@@ -864,6 +902,20 @@ def _trace(args: argparse.Namespace) -> None:
         print(f"  {row}")
     if total > _PREVIEW_LIMIT or unmapped or report["ignored_lines"]:
         print("Use --json for the full trace report.")
+
+
+def _overlay_segments(values: list[str]) -> dict[str, int]:
+    segments = {}
+    try:
+        for value in values:
+            name, segment = _assignment(value, "UNIT=HEX")
+            name = name.casefold()
+            if name in segments:
+                raise ValueError(f"runtime segment specified twice for {name}")
+            segments[name] = _hex_segment(segment)
+    except (ValueError, argparse.ArgumentTypeError) as error:
+        raise EvidenceError(str(error)) from error
+    return segments
 
 
 def _schema(args: argparse.Namespace) -> None:
@@ -924,6 +976,11 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     human68k = data.startswith(X_MAGIC)
     m68k = hunk or human68k or data.startswith(PRG_MAGIC)
     extension = args.program.suffix.lower()
+    macintosh = args.macintosh or (
+        not (m68k or data.startswith(b"MZ") or args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order
+             or args.atari8 or args.atari8_raw)
+        and (extension in (".rsrc", ".dc42", ".macbin", ".as", ".ad") or is_macintosh(data))
+    )
     atari8 = args.atari8 or args.atari8_raw or (
         not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or extension in DISK_SUFFIXES)
         and (extension in (".atr", ".xex") or
@@ -947,6 +1004,15 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         image, program_map = _msx2_image(args, data)
     elif args.msx2_unit or args.msx2_copy:
         raise Msx2Error("--msx2-unit and --msx2-copy require --msx2")
+    elif macintosh:
+        if args.base_segment is not None or args.overlay:
+            raise MacintoshError("--base-segment and --overlay apply to DOS executables")
+        if len(args.disk_file) > 1:
+            raise MacintoshError("select one Macintosh application with --disk-file NAME")
+        base_address = DEFAULT_M68K_BASE if args.base_address is None else args.base_address
+        image, program_map = build_macintosh_image(
+            data, args.program.name, base_address, disk_file=next(iter(args.disk_file), None),
+        )
     elif atari8:
         image, program_map = _atari8_image(args, data)
     elif args.atari8_unit or args.atari8_portb is not None:
@@ -969,7 +1035,7 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         image, program_map = loader(data, args.program.name, base_address)
     else:
         if args.base_address is not None:
-            raise MZError("--base-address applies to Amiga, Atari ST, X68000, and 8-bit programs")
+            raise MZError("--base-address applies to 68k and 8-bit programs")
         executable = MZExecutable.parse(data)
         base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
         loaded = executable.load(base_segment)
@@ -989,6 +1055,10 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         symbols = sum(len(unit["symbols"]) for unit in program_map["units"])
         lines.append(f"X68000 Human68k  entry {entry['unit_address']} ({entry['linear']:06x})  {symbols} symbols")
         lines.append("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
+    elif program_map["format"] == MAC68K_FORMAT:
+        entry = program_map["entry"]
+        lines.append(f"Classic Macintosh 68k  entry {entry['unit_address']} ({entry['linear']:06x})"
+                     f"  {len(program_map['a5_jumps'])} jump-table entries")
     elif program_map["format"] == PC98_FORMAT:
         entry = program_map["entry"]
         lines.append(f"PC-98  entry {entry['segment']:04x}:{entry['offset']:04x}  {len(program_map['units'])} units")
@@ -1041,7 +1111,7 @@ def program_options() -> argparse.ArgumentParser:
     )
     base.add_argument(
         "--base-address", type=_hex_address, metavar="HEX",
-        help=f"Amiga/Atari ST/X68000 base (default {DEFAULT_M68K_BASE:06x}) or 8-bit program load address",
+        help=f"68k image base (default {DEFAULT_M68K_BASE:06x}) or 8-bit program load address",
     )
     command.add_argument(
         "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
@@ -1057,6 +1127,9 @@ def program_options() -> argparse.ArgumentParser:
     platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
     platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
     platform.add_argument("--x1", action="store_true", help="interpret the input as a Sharp X1 D88 disk or raw file")
+    platform.add_argument(
+        "--macintosh", action="store_true", help="interpret the input as a Classic Macintosh 68k application or HFS disk",
+    )
     command.add_argument(
         "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
         help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
@@ -1175,6 +1248,8 @@ def main(argv: list[str] | None = None) -> int:
     decomp_parser.add_argument("--fields", metavar="FIELD,...", help="select top-level JSON fields")
     decomp_parser.add_argument("--context", type=int, metavar="N", help="show N C lines around the selected instruction (0–20)")
     decomp_parser.add_argument("--slice", type=int, metavar="N", help="trace up to N backward p-code operations (1–128)")
+    decomp_parser.add_argument("--map-lines", type=int, metavar="N", help="map up to N C lines to instruction ranges (1–200)")
+    decomp_parser.add_argument("--line-offset", type=int, metavar="N", help="skip N C lines when mapping")
     gaps_parser = commands.add_parser("gaps", help="report undefined ranges in an analyzed Ghidra project")
     gaps_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     gaps_paging = QUERIES["gaps"]["parameters"]
@@ -1190,6 +1265,9 @@ def main(argv: list[str] | None = None) -> int:
     batch_parser = commands.add_parser("batch", help="run multiple address queries in one Ghidra session")
     batch_parser.add_argument("input", metavar="FILE", nargs="?", default="-", help="JSON request file (default: stdin)")
     batch_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    batch_parser.add_argument("--evidence", action="store_true", help="include the query requests and program identity")
+    batch_parser.add_argument("--export", metavar="OUT", type=Path,
+                              help="compare disassembly rows with a loader export in an evidence bundle")
     address_queries = {
         "xrefs": "list references to and from an address",
         "callers": "list calls to a function",
@@ -1215,6 +1293,36 @@ def main(argv: list[str] | None = None) -> int:
     commands.choices["layout"].add_argument(
         "--apply", action="store_true",
         help="apply the proposed structure or array in Ghidra (saves the project; default: preview only)")
+
+    annotations_parser = commands.add_parser("annotations", help="export or replay Ghidra annotations")
+    annotations_modes = annotations_parser.add_subparsers(dest="annotations_mode", required=True)
+    annotations_export = annotations_modes.add_parser("export", help="export a versioned annotation document")
+    annotations_import = annotations_modes.add_parser("import", help="preview or apply an annotation document")
+    annotations_import.add_argument("document", type=Path, metavar="FILE")
+    annotations_import.add_argument("--apply", action="store_true", help="save all changes if there are no conflicts")
+    annotations_transfer = annotations_modes.add_parser("transfer", help="prepare annotations for matched function entries")
+    annotations_transfer.add_argument("document", type=Path, metavar="FILE")
+    annotations_transfer.add_argument("comparison", type=Path, metavar="COMPARE_JSON")
+    annotations_transfer.add_argument("--json", action="store_true", help="print the new annotation document")
+    for command in (annotations_export, annotations_import):
+        command.add_argument("--project", type=Path, metavar="PROJECT", required=True)
+        command.add_argument("--program", default="image.bin", metavar="NAME", help="Ghidra program name")
+        command.add_argument("--json", action="store_true", help="print JSON")
+        command.add_argument("--timeout", type=_seconds, default=QUERY_TIMEOUT, metavar="SECONDS")
+    commands.choices["layout"].add_argument(
+        "--replace", action="store_true", help="allow --apply to replace overlapping defined data")
+
+    compare_parser = commands.add_parser("compare", help="compare functions across two analyzed Ghidra programs")
+    for side in ("before", "after"):
+        compare_parser.add_argument(side, type=Path, metavar=side.upper(), help=f"{side} Ghidra project")
+        compare_parser.add_argument(f"--{side}-program", default="image.bin", metavar="NAME",
+                                    help=f"{side} Ghidra program name")
+    compare_parser.add_argument("--limit", type=int, default=DEFAULT_COMPARE_LIMIT, metavar="N",
+                                help="return at most N rows per list")
+    compare_parser.add_argument("--offset", type=int, default=0, metavar="N", help="skip N rows per list")
+    compare_parser.add_argument("--json", action="store_true", help="print JSON")
+    compare_parser.add_argument("--timeout", type=_seconds, default=QUERY_TIMEOUT, metavar="SECONDS",
+                                help="maximum seconds per Ghidra project")
 
     schema_parser = commands.add_parser("schema", help="print the JSON Schema of query requests and errors")
     schema_parser.add_argument("--json", action="store_true", help="print the JSON Schema document")
@@ -1249,8 +1357,8 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument("--width", type=int, choices=WIDTHS, help="constant width in bytes (default 2)")
     pattern.add_argument("--pointer", metavar="ADDR",
                          help="stored pointers to ADDR: DOS near and far, 68k longs, 6502 and Z80 words")
-    search_parser.add_argument("--pointer-kind", action="append", choices=("far", "near", "absolute"),
-                               help="only these pointer kinds (repeatable)")
+    search_parser.add_argument("--pointer-kind", action="append", choices=POINTER_KINDS,
+                               help="only these pointer kinds (repeatable; absolute-short for 68k, split for 6502)")
     search_parser.add_argument("--encoding", choices=list(ENCODINGS),
                                help="string encoding (default: every encoding of the export's platform)")
     search_parser.add_argument("--ignore-case", action="store_true", help="match strings in either letter case")
@@ -1269,6 +1377,20 @@ def main(argv: list[str] | None = None) -> int:
     lookup_target.add_argument("--name", metavar="PATTERN", help="exact name or * and ? pattern")
     lookup_target.add_argument("--address", metavar="ADDR", help="report the nearest symbol at or below ADDR")
     lookup_parser.add_argument("--ignore-case", action="store_true", help="match names ignoring case")
+    map_parser = commands.add_parser("address-map", help="map a location across export address spaces")
+    map_parser.add_argument("address", metavar="ADDR", help="hexadecimal address or offset")
+    map_parser.add_argument("--from", dest="space", choices=ADDRESS_SPACES, default="logical")
+    map_parser.add_argument("--source", help="match a source filename when mapping a file offset")
+    map_parser.add_argument("--member", help="match a disk member when mapping a file offset")
+    map_parser.add_argument("--runtime-base", type=_hex_segment, metavar="HEX", help="DOS runtime root segment")
+    map_parser.add_argument("--overlay-segment", metavar="UNIT=HEX", action="append", default=[],
+                            help="supply a DOS overlay's runtime segment")
+    bytes_parser = commands.add_parser("bytes", help="read initialized bytes and the loader edits that changed them")
+    bytes_parser.add_argument("address", metavar="ADDR")
+    bytes_parser.add_argument("--size", type=int, default=32, metavar="N", help=f"read 1–{MAX_BYTES} bytes (default 32)")
+    for command in (map_parser, bytes_parser):
+        command.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
+        command.add_argument("--json", action="store_true", help="print JSON")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
     call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
@@ -1288,6 +1410,8 @@ def main(argv: list[str] | None = None) -> int:
     trace_parser.add_argument("trace", metavar="LOGCPU.TXT", type=Path)
     trace_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     trace_parser.add_argument("--project", metavar="PROJECT", type=Path, help="compare with the analyzed Ghidra project")
+    trace_parser.add_argument("--classify-gaps", action="store_true",
+                              help="include static evidence for gaps observed in the trace (requires --project)")
     trace_parser.add_argument(
         "--runtime-base", metavar="HEX", type=_hex_segment, help="runtime root load segment (defaults to the export base)",
     )
@@ -1306,6 +1430,8 @@ def main(argv: list[str] | None = None) -> int:
             "--timeout", type=_seconds, default=default, metavar="SECONDS",
             help=f"stop headless Ghidra after SECONDS (default: {described}; 0 disables the limit)",
         )
+        if command not in (import_parser, trace_parser):
+            command.add_argument("--program", metavar="NAME", help="query an existing program at the Ghidra project root")
 
     args = parser.parse_args(argv)
     if args.command == "schema":
@@ -1330,7 +1456,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in _REGISTRY_COMMANDS:
             return _registry_query(args)
         paging = ("unit", "limit", "offset", "fields", "classify")
-        if args.command == "gaps" and any(getattr(args, name) is not None for name in paging):
+        if args.command == "gaps" and (args.program or any(getattr(args, name) is not None for name in paging)):
             _paged_gaps(args)
             return 0
         if args.command == "gaps":
@@ -1360,9 +1486,82 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "lookup":
             _lookup(args)
             return 0
+        if args.command == "address-map":
+            report = map_address(args.export, args.address, space=args.space, source=args.source, member=args.member,
+                                 runtime_base=args.runtime_base, overlay_segments=_overlay_segments(args.overlay_segment))
+            if args.json:
+                print(json.dumps(report))
+            else:
+                print(f"{report['count']} matches")
+                for row in report["matches"][:_PREVIEW_LIMIT]:
+                    location = f"{row['unit_address']}  linear {row['linear']:x}  image +{row['image_offset']:x}"
+                    file = row["file"]
+                    if file:
+                        location += f"  {file['source']}:{file['member'] or ''}+{file['offset']:x}"
+                    if row["runtime"]:
+                        location += f"  runtime {row['runtime']['address']}"
+                    print(f"  {location}")
+            return 0
+        if args.command == "bytes":
+            report = inspect_bytes(args.export, args.address, size=args.size)
+            if args.json:
+                print(json.dumps(report))
+            else:
+                print(f"{report['address']['unit_address']}  {report['size']}/{report['requested']} bytes")
+                print(report["loaded"][:128])
+                if report["original"] != report["loaded"]:
+                    print(f"Original: {report['original'][:128]}")
+            return 0
         if args.command == "trace":
             _trace(args)
             return 0
+        if args.command == "compare":
+            report = compare_projects(args.before, args.after, before_program=args.before_program,
+                                      after_program=args.after_program, limit=args.limit, offset=args.offset,
+                                      timeout=args.timeout)
+            if args.json:
+                print(json.dumps(report))
+            else:
+                counts = report["counts"]
+                print(f"{counts['same_body']} matching bodies, {counts['changed_candidate']} changed candidates, "
+                      f"{counts['cross_port_candidate']} cross-port candidates")
+                if counts["unverified_candidate"]:
+                    print(f"{counts['unverified_candidate']} candidates lack comparable bodies")
+                print(f"{counts['unpaired_before']} unpaired before, {counts['unpaired_after']} after")
+                _print_page(report, "matches", [
+                    f"{row['before']['name']} → {row['after']['name']}  "
+                    f"{row['status'].replace('_', ' ')} ({row['matched_by'].replace('_', ' ')})"
+                    for row in report["matches"]
+                ])
+                _print_continue({"pagination": {"matches": report["pagination"]["matches"]}})
+                if counts["unpaired_before"] or counts["unpaired_after"]:
+                    print("Use --json to review unpaired functions and their candidates.")
+            return 0
+        if args.command == "annotations":
+            if args.annotations_mode == "transfer":
+                report = transfer_annotations(args.document, args.comparison)
+                if args.json:
+                    print(json.dumps(report, indent=2, ensure_ascii=False))
+                else:
+                    print(f"{len(report['annotations'])} annotations matched  "
+                          f"{len(report['transfer']['skipped'])} skipped. Use --json to export the document.")
+                return 0
+            if args.annotations_mode == "export":
+                report = export_annotations(args.project, program=args.program, timeout=args.timeout)
+                if args.json:
+                    print(json.dumps(report, indent=2, ensure_ascii=False))
+                else:
+                    print(f"{len(report['annotations'])} annotations. Use --json to export the document.")
+                return 0
+            report = import_annotations(args.project, args.document, apply=args.apply, program=args.program,
+                                        timeout=args.timeout)
+            if args.json:
+                print(json.dumps(report))
+            else:
+                status = "Applied" if report["applied"] else "Preview"
+                print(f"{status}  {report['additions']} additions  {report['conflicts']} conflicts  "
+                      f"{report['unchanged']} unchanged")
+            return int(bool(args.apply and report["conflicts"]))
         image, program_map, summary = build_program(args)
         if args.command == "load":
             _export_image(args.output, image, program_map)

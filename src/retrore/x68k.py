@@ -108,6 +108,46 @@ IOCS_CALLS = {
     0xF2: "_A_JOY", 0xF3: "_MUSICDRV", 0xF5: "_SCSIDRV", 0xF8: "_TS16DRV", 0xFB: "_ROMDB_CMD", 0xFC: "_ROMDB_ASM",
     0xFD: "_ABORTRST", 0xFE: "_IPLERR", 0xFF: "_ABORTJOB",
 }
+# Register arguments of common ROM IOCS calls, checked against elf2x68k's iocscall.csv and
+# XEiJ's CRT mode examples. Packed words use the high (u) and low (w) register halves.
+# https://github.com/yunkya2/elf2x68k/blob/master/src/libx68k/libiocs/iocscall.csv
+_IOCS_PROTOTYPES = {
+    0x00: ("int", ()),
+    0x01: ("int", ()),
+    0x02: ("int", ()),
+    0x04: ("int", (("D1", "int", "group"),)),
+    0x10: ("int", (("D1w", "short", "mode"),)),
+    0x14: ("int", (("D1", "int", "index"), ("D2", "int", "color"))),
+    0x1E: ("void", ()),
+    0x1F: ("void", ()),
+    0x20: ("int", (("D1", "int", "character"),)),
+    0x21: ("int", (("A1", "char*", "text"),)),
+    0x22: ("int", (("D1", "int", "attributes"),)),
+    0x23: ("int", (("D1", "int", "column"), ("D2", "int", "row"))),
+    0x46: ("int", (("D1", "int", "device_mode"), ("D2", "int", "position"),
+                   ("D3", "int", "size"), ("A1", "void*", "buffer"))),
+    0x4E: ("int", (("D1", "int", "device"), ("D2", "int", "mode"))),
+    0x56: ("int", ()),
+    0x57: ("int", (("D1", "int", "time_bcd"),)),
+    0x60: ("void", (("A1", "void*", "samples"), ("D1", "int", "mode"), ("D2", "int", "size"))),
+    0x70: ("void", ()),
+    0x71: ("void", ()),
+    0x72: ("void", ()),
+    0x74: ("int", ()),
+    0x75: ("int", ()),
+    0x76: ("int", (("D1u", "short", "x"), ("D1w", "short", "y"))),
+    0x77: ("int", (("D1u", "short", "left"), ("D1w", "short", "top"),
+                   ("D2u", "short", "right"), ("D2w", "short", "bottom"))),
+    0x7A: ("void", (("D1", "int", "cursor"), ("A1", "void*", "pattern"))),
+    0x7B: ("void", (("D1", "int", "cursor"),)),
+    0x7D: ("int", (("D1", "int", "control"), ("D2u", "short", "x"), ("D2w", "short", "y"))),
+    0x81: ("int", (("A1", "void*", "supervisor_stack"),)),
+    0x90: ("void", ()),
+    0x94: ("int", (("D1", "int", "index"), ("D2", "int", "color"))),
+    0xB1: ("int", (("D1", "int", "page"),)),
+    0xB2: ("int", (("D1", "int", "page_bits"),)),
+}
+
 # Stock X68000 address map (24-bit bus). Programs load in main RAM; the rest is video, I/O, SRAM, and ROM.
 MEMORY_MAP = (
     (0x000000, 0xC00000, "main_ram", "ram"), (0xC00000, 0xE00000, "gvram", "ram"), (0xE00000, 0xE80000, "tvram", "ram"),
@@ -341,6 +381,14 @@ def build_x_image(data: bytes, program: str, base: int = DEFAULT_M68K_BASE) -> t
             "fpack": {f"{0xFE00 | number:04X}": name for number, name in FPACK_CALLS.items()},
             "no_return": [f"{0xFF00 | number:04X}" for number in DOS_NO_RETURN],
             "iocs": {f"{number:02X}": name for number, name in IOCS_CALLS.items()},
+            "iocs_prototypes": {
+                f"{number:02X}": {
+                    "parameters": [{"name": name, "type": kind, "register": register}
+                                   for register, kind, name in parameters],
+                    "result": result,
+                }
+                for number, (result, parameters) in _IOCS_PROTOTYPES.items()
+            },
             "dos_prototypes": {
                 f"{0xFF00 | number:04X}": {
                     "parameters": [{"name": name, "type": kind, "size": size} for name, kind, size in parameters],

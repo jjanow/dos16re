@@ -79,6 +79,24 @@ def test_unpadded_short_relocations(record):
     assert image == _words(0x10000)
 
 
+@pytest.mark.parametrize(("code", "encoding", "table", "targets"), [
+    ("0c80 00000002 640a e380 4efb0802 6004 6006 4e75 7001 4e75 7002 4e75",
+     "branch", "h0:000e", ["h0:000e", "h0:0010"]),
+    ("0c80 00000001 6214 e380 303b000c 4efb0000 7001 4e75 4e75 0002 0006 4e75 0000",
+     "relative", "h0:0018", ["h0:0012", "h0:0016"]),
+])
+def test_amiga_recovers_pc_indexed_switch_tables(code, encoding, table, targets):
+    text = bytes.fromhex(code)
+    source = _words(0x3F3, 0, 1, 0, 0, len(text) // 4, 0x3E9, len(text) // 4) + text + _words(0x3F2)
+    _, export = build_hunk_image(source, "switch")
+    switch, = export["jump_tables"]
+    assert switch["encoding"] == encoding and switch["entry_size"] == 2
+    assert switch["table"]["unit_address"] == table
+    assert [target["unit_address"] for target in switch["targets"]] == targets
+    if encoding == "branch":
+        assert [target["unit_address"] for target in switch["cases"]] == ["h0:0014", "h0:0018"]
+
+
 @pytest.mark.parametrize(
     ("edit", "message"),
     [

@@ -21,13 +21,15 @@ from pathlib import Path
 from typing import IO
 
 from . import worker
-from .cli import HANDLED_ERRORS, _export_image, build_program, error_report, program_options
+from .cli import HANDLED_ERRORS, _export_image, _hex_segment, _overlay_segments, build_program, error_report, program_options
 from .errors import CONTRACT_VERSION
+from .evidence import ADDRESS_SPACES, MAX_BYTES, inspect_bytes, map_address
 from .ghidra import QUERY_TIMEOUT, GhidraError, cancellable, check_cancelled, check_timeout, query, query_batch
 from .queries import query_definitions
 from .schema import DIALECT, query_schema
 from .search import (
-    ENCODINGS, WIDTHS, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols, search_pattern,
+    ENCODINGS, POINTER_KINDS, WIDTHS, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols,
+    search_pattern,
 )
 
 MODERN_VERSIONS = ("2026-07-28",)
@@ -64,6 +66,8 @@ INSTRUCTIONS = (
 
 _PROJECT = {"type": "string", "minLength": 1,
             "description": "path to the Ghidra project (.gpr file, or its path without the suffix)"}
+_PROJECT_PROGRAM = {"type": "string", "minLength": 1,
+                    "description": "exact program name at the project root (default image.bin)"}
 
 
 def _timeout_schema(default: str) -> dict:
@@ -101,7 +105,7 @@ def _query_tool(command: str, definition: dict, document: dict) -> dict:
     schema.pop("title", None)
     del schema["properties"]["command"]
     schema["required"].remove("command")
-    schema["properties"] = {"project": _PROJECT, **schema["properties"],
+    schema["properties"] = {"project": _PROJECT, "program": _PROJECT_PROGRAM, **schema["properties"],
                             "timeout": _timeout_schema(f"{QUERY_TIMEOUT} seconds")}
     schema["required"].insert(0, "project")
     schema = {"$schema": DIALECT, **_flatten(schema)}
@@ -110,6 +114,8 @@ def _query_tool(command: str, definition: dict, document: dict) -> dict:
         description += f". Requires exactly one of {', '.join(group)}"
     for group in definition.get("any_of", []):
         description += f". Requires at least one nonempty {' or '.join(group)}"
+    for name, required in definition.get("dependent_required", {}).items():
+        description += f". {name} requires {' and '.join(required)}"
     return {"name": command, "title": f"retrore {command}", "description": description + ".",
             "inputSchema": schema}
 
@@ -126,6 +132,7 @@ def _batch_tool(document: dict) -> dict:
             "type": "object",
             "properties": {
                 "project": _PROJECT,
+                "program": _PROJECT_PROGRAM,
                 "requests": {"$ref": "#/$defs/batch"},
                 "timeout": _timeout_schema("the larger of 600 seconds and 60 seconds per query"),
             },
@@ -145,7 +152,8 @@ def _where_is_tool() -> dict:
                        "in every text encoding of the export's platform (PETSCII and screen codes on the C64, "
                        "high-bit ASCII on the Apple II, ATASCII and screen codes on Atari 8-bit, Shift-JIS on "
                        "Japanese machines). A pointer search finds stored DOS near and far pointers, 68k longs, "
-                       "or 6502 and Z80 words holding an address, and marks relocation-backed hits.",
+                       "or 6502 and Z80 words holding an address, and marks relocation-backed hits. Request "
+                       "absolute-short for 68k short addresses or split for 6502 split table candidates.",
         "inputSchema": {
             "$schema": DIALECT,
             "type": "object",
@@ -158,8 +166,9 @@ def _where_is_tool() -> dict:
                 "width": {"enum": list(WIDTHS), "description": "constant width in bytes (default 2)"},
                 "pointer": {"type": "string", "minLength": 1,
                             "description": "find stored pointers to this unit:offset, seg:off, or hex address"},
-                "pointer_kinds": {"type": "array", "minItems": 1, "items": {"enum": ["far", "near", "absolute"]},
-                                  "description": "only these pointer kinds (DOS: far, near; others: absolute)"},
+                "pointer_kinds": {"type": "array", "minItems": 1, "items": {"enum": list(POINTER_KINDS)},
+                                  "description": "only these pointer kinds. DOS: far, near. Flat: absolute. "
+                                                 "68k: absolute-short. 6502: split."},
                 "encoding": {"enum": list(ENCODINGS),
                              "description": "string encoding (default: every encoding of the export's platform)"},
                 "ignore_case": {"type": "boolean", "description": "match strings in either letter case"},
@@ -219,6 +228,29 @@ def _lookup_tool() -> dict:
             "additionalProperties": False,
         },
     }
+
+
+_EXPORT_EVIDENCE = {
+    "bytes": ("Read initialized bytes before and after loader edits", {
+        "size": {"type": "integer", "minimum": 1, "maximum": MAX_BYTES, "default": 32},
+    }),
+    "address_map": ("Map a location across the address spaces of an export", {
+        "space": {"type": "string", "enum": list(ADDRESS_SPACES), "default": "logical"},
+        "source": {"type": "string", "minLength": 1},
+        "member": {"type": "string", "minLength": 1},
+        "runtime_base": {"type": "string", "pattern": "^[a-fA-F0-9]{1,4}$"},
+        "overlay_segments": {"type": "array", "items": {"type": "string"},
+                             "description": "DOS overlay placements as UNIT=HEX"},
+    }),
+}
+
+
+def _evidence_tool(name: str) -> dict:
+    description, properties = _EXPORT_EVIDENCE[name]
+    return {"name": name, "title": f"retrore {name.replace('_', '-')}", "description": description + ".",
+            "inputSchema": {"$schema": DIALECT, "type": "object",
+                            "properties": {"export": _EXPORT, "address": _ADDRESS_TEXT, **properties},
+                            "required": ["export", "address"], "additionalProperties": False}}
 
 
 class _ToolParser(argparse.ArgumentParser):
@@ -328,13 +360,13 @@ def _call_program(command: str, arguments: dict) -> dict:
 def tools() -> list[dict]:
     """Return every tool definition in a stable order."""
     definitions = query_definitions()
-    reserved = {"batch", "where_is", "relocations", "lookup", *_PROGRAM_TOOLS} & definitions.keys()
+    reserved = {"batch", "where_is", "relocations", "lookup", *_EXPORT_EVIDENCE, *_PROGRAM_TOOLS} & definitions.keys()
     if reserved:
         raise RuntimeError(f"query names collide with adapter tools: {', '.join(sorted(reserved))}")
     document = query_schema()
     return [*(_query_tool(command, definition, document) for command, definition in definitions.items()),
             _batch_tool(document), _where_is_tool(), _relocations_tool(), _lookup_tool(),
-            *map(_program_tool, _PROGRAM_TOOLS)]
+            *map(_evidence_tool, _EXPORT_EVIDENCE), *map(_program_tool, _PROGRAM_TOOLS)]
 
 
 def _project(arguments: dict) -> Path:
@@ -377,20 +409,22 @@ def _project_session(project: Path):
 
 def _call_query(command: str, arguments: dict) -> dict:
     project, timeout = _project(arguments), _timeout(arguments, QUERY_TIMEOUT)
-    request = {name: value for name, value in arguments.items() if name not in ("project", "timeout")}
+    program = _optional(arguments, "program", str)
+    request = {name: value for name, value in arguments.items() if name not in ("project", "program", "timeout")}
     if "command" in request:
         raise InvalidArguments(f"the tool name selects the command; remove command from the {command} arguments")
     with _project_session(project):
-        return query(project, {"command": command, **request}, timeout=timeout)
+        return query(project, {"command": command, **request}, timeout=timeout, program=program)
 
 
 def _call_batch(arguments: dict) -> dict:
-    unknown = arguments.keys() - {"project", "requests", "timeout"}
+    unknown = arguments.keys() - {"project", "program", "requests", "timeout"}
     if unknown:
         raise InvalidArguments(f"unsupported options for batch: {', '.join(sorted(unknown))}")
     project, timeout = _project(arguments), _timeout(arguments, None)
     with _project_session(project):
-        return query_batch(project, arguments.get("requests"), timeout=timeout)
+        return query_batch(project, arguments.get("requests"), timeout=timeout,
+                           program=_optional(arguments, "program", str))
 
 
 def _export_arguments(tool: str, arguments: dict, allowed: set[str]) -> Path:
@@ -423,7 +457,7 @@ def _call_where_is(arguments: dict) -> dict:
         kinds = arguments.get("pointer_kinds")
         if kinds is not None and (not isinstance(kinds, list) or not kinds
                                   or any(not isinstance(kind, str) for kind in kinds)):
-            raise InvalidArguments("pointer_kinds must be a nonempty list of far, near, or absolute")
+            raise InvalidArguments("pointer_kinds must be a nonempty list of " + ", ".join(POINTER_KINDS))
         return find_pointers(export, _optional(arguments, "pointer", str), kinds=tuple(kinds) if kinds else None)
     if "string" in arguments and not any(name in arguments for name in ("bytes", "constant", "width")):
         return find_text(export, arguments["string"], encoding=_optional(arguments, "encoding", str),
@@ -450,6 +484,27 @@ def _call_lookup(arguments: dict) -> dict:
     )
 
 
+def _call_evidence(name: str, arguments: dict) -> dict:
+    export = _export_arguments(name, arguments, {"address", *_EXPORT_EVIDENCE[name][1]})
+    address = _optional(arguments, "address", str)
+    if address is None:
+        raise InvalidArguments("address is required")
+    if name == "bytes":
+        size = _optional(arguments, "size", int)
+        return inspect_bytes(export, address, size=32 if size is None else size)
+    runtime_base = _optional(arguments, "runtime_base", str)
+    segments = arguments.get("overlay_segments", [])
+    if not isinstance(segments, list) or any(not isinstance(value, str) for value in segments):
+        raise InvalidArguments("overlay_segments must be an array of UNIT=HEX assignments")
+    try:
+        base = _hex_segment(runtime_base) if runtime_base is not None else None
+    except argparse.ArgumentTypeError as error:
+        raise InvalidArguments(str(error)) from error
+    return map_address(export, address, space=_optional(arguments, "space", str) or "logical",
+                       source=_optional(arguments, "source", str), member=_optional(arguments, "member", str),
+                       runtime_base=base, overlay_segments=_overlay_segments(segments))
+
+
 def call_tool(name: str, arguments: dict) -> dict:
     """Run a tool and return an MCP CallToolResult. Unknown tool names raise UnknownTool."""
     if name == "batch":
@@ -460,6 +515,9 @@ def call_tool(name: str, arguments: dict) -> dict:
         run = _call_relocations
     elif name == "lookup":
         run = _call_lookup
+    elif name in _EXPORT_EVIDENCE:
+        def run(arguments: dict) -> dict:
+            return _call_evidence(name, arguments)
     elif name in _PROGRAM_TOOLS:
         def run(arguments: dict) -> dict:
             return _call_program(name, arguments)

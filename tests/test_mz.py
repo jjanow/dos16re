@@ -4,6 +4,7 @@ from struct import pack_into, unpack_from
 import pytest
 
 from retrore.cli import main
+from retrore.evidence import inspect_bytes, map_address
 from retrore.mz import Address, MZError, MZExecutable
 
 
@@ -96,7 +97,7 @@ def test_cli_load_and_info_share_the_map(tmp_path, capsys):
     assert program_map["entry"] == {"segment": 0x1001, "offset": 3, "linear": 0x10013}
     assert program_map["relocations"] == [1, 20]
     assert program_map["units"] == [
-        {"name": "root", "segment": 0x1000, "linear": 0x10000, "image_offset": 0, "size": 22}
+        {"name": "root", "segment": 0x1000, "linear": 0x10000, "image_offset": 0, "size": 22, "file_offset": 48}
     ]
     assert unpack_from("<H", (output / "image.bin").read_bytes(), 20) == (0x1007,)
 
@@ -119,6 +120,19 @@ def test_cli_preserves_existing_export_and_rolls_back(tmp_path, capsys):
     assert "map.json" in json.loads(captured.err)["error"]["message"]
     assert map_path.read_text() == "{}"
     assert not (tmp_path / "image.bin").exists()
+
+
+def test_original_bytes_reverse_overlapping_relocations_in_loader_order(tmp_path, capsys):
+    original = bytearray(make_mz())
+    pack_into("<4H", original, 0x24, 2, 0, 1, 0)
+    source, export = tmp_path / "overlap.exe", tmp_path / "export"
+    source.write_bytes(original)
+    assert main(["load", str(source), "-o", str(export), "--base-segment", "1234"]) == 0
+    capsys.readouterr()
+    proof = inspect_bytes(export, "root:1", size=3)
+    assert proof["original"] == original[49:52].hex()
+    assert [edit["image_offset"] for edit in proof["evidence"]] == [2, 1]
+    assert map_address(export, "31", space="file")["matches"][0]["unit_address"] == "root:0001"
 
 
 def test_cli_rejects_invalid_program_before_creating_output(tmp_path, capsys):

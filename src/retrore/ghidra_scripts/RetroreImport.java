@@ -9,6 +9,7 @@ import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.SegmentedAddressSpace;
+import ghidra.program.model.data.DWordDataType;
 import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.mem.Memory;
@@ -18,6 +19,7 @@ import ghidra.program.model.symbol.SourceType;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashSet;
 import java.util.Map;
 
 public class RetroreImport extends HeadlessScript {
@@ -223,11 +225,15 @@ public class RetroreImport extends HeadlessScript {
             JsonObject record = item.getAsJsonObject();
             Address table = address(record.getAsJsonObject("table"));
             int count = record.getAsJsonArray("targets").size();
+            int width = tableEntrySize(record);
             for (int index = 0; index < count; index++) {
-                Address word = table.addNoWrap(2L * index);
-                if (listing.getUndefinedDataAt(word) != null &&
-                        listing.getUndefinedDataAt(word.addNoWrap(1)) != null) {
-                    listing.createData(word, WordDataType.dataType);
+                Address word = table.addNoWrap((long) width * index);
+                boolean undefined = true;
+                for (int offset = 0; offset < width; offset++) {
+                    undefined &= listing.getUndefinedDataAt(word.addNoWrap(offset)) != null;
+                }
+                if (undefined) {
+                    listing.createData(word, width == 4 ? DWordDataType.dataType : WordDataType.dataType);
                 }
             }
         }
@@ -245,21 +251,35 @@ public class RetroreImport extends HeadlessScript {
                 continue;
             }
             instruction.addOperandReference(0, table, RefType.READ, SourceType.ANALYSIS);
+            int width = tableEntrySize(record);
             int index = 0;
+            var destinations = new LinkedHashSet<Address>();
             for (JsonElement target : record.getAsJsonArray("targets")) {
                 Address destination = address(target.getAsJsonObject());
-                Address word = table.addNoWrap(2L * index++);
+                destinations.add(destination);
+                Address word = table.addNoWrap((long) width * index++);
                 references.addMemoryReference(word, destination, RefType.DATA, SourceType.ANALYSIS, 0);
                 instruction.addMnemonicReference(destination,
                     call ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
             }
             for (Address destination : instruction.getFlows()) {
+                destinations.add(destination);
+            }
+            for (Address destination : destinations) {
                 disassemble(destination);
                 if (call && getFunctionAt(destination) == null) {
                     createFunction(destination, null);
                 }
             }
         }
+    }
+
+    private static int tableEntrySize(JsonObject table) {
+        int width = table.has("entry_size") ? table.get("entry_size").getAsInt() : 2;
+        if (width != 2 && width != 4) {
+            throw new IllegalArgumentException("unsupported DOS jump table entry size " + width);
+        }
+        return width;
     }
 
     private Address address(JsonObject record) {

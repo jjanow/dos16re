@@ -55,9 +55,13 @@ QUERIES = {
             "address": {**_address(), "required": True},
             "context": _integer(0, 20, "C lines around the selected instruction"),
             "slice": _integer(1, 128, "backward p-code operations from the selected instruction"),
+            "map_lines": _integer(1, 200, "C lines with their contributing instruction ranges"),
+            "line_offset": _integer(0, MAX_INT, "skip this many C lines before mapping"),
         },
         "fields": ["address", "unit_address", "linear", "name", "decompilation"],
-        "conditional_fields": {"context": ["excerpt", "focus"], "slice": ["slice", "focus"]},
+        "conditional_fields": {"context": ["excerpt", "focus"], "slice": ["slice", "focus"],
+                               "map_lines": ["line_map", "line_pagination"]},
+        "dependent_required": {"line_offset": ["map_lines"]},
         "fields_scope": "result",
         "echo": ["address"],
     },
@@ -223,6 +227,23 @@ QUERIES = {
         "fields_scope": "record",
         "echo": ["unit", "at"],
     },
+    "disasm": {
+        "description": "read analyzed instructions, data, and gaps within one Ghidra memory block",
+        "parameters": {
+            "address": {**_address(), "required": True},
+            "limit": _integer(1, 512, "maximum bytes to inspect", 64),
+        },
+        "fields": ["start", "size", "rows", "next_address"],
+        "fields_scope": "result",
+        "echo": ["address"],
+    },
+    "project-summary": {
+        "description": "summarize a Ghidra program and page through its memory blocks",
+        "parameters": _paging(1000, 100, "memory blocks"),
+        "fields": ["program", "language", "compiler", "function_count", "units"],
+        "fields_scope": "result",
+        "echo": [],
+    },
 }
 
 # Messages kept from the original validator.
@@ -354,6 +375,9 @@ def validate_query(request: object) -> None:
     for group in definition.get("any_of", []):
         if not any(request.get(name) for name in group):
             raise QueryError(f"{command} requires {_either(group)}")
+    for name, required in definition.get("dependent_required", {}).items():
+        if name in request and not set(required) <= request.keys():
+            raise QueryError(f"{name} requires {_either(required, 'and')}")
     total = definition.get("max_total_items")
     if total and sum(len(request.get(name, [])) for name in total["keys"]) > total["maximum"]:
         raise QueryError(f"{command} accepts at most {total['maximum']} {_either(total['keys'], 'and')} in total")

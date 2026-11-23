@@ -84,6 +84,20 @@ def test_atari_st_without_fixups(absolute):
     assert image == text
 
 
+def test_atari_st_recovers_a_relocated_switch_table_in_data():
+    text = bytes.fromhex("b47c0001 620e e542 3642 d7fc00000020 2653 4ed3 4e75 7001 4e75 7002 4e75 0000")
+    data = pack(">2I", 22, 26)
+    fixups = pack(">I3B", 12, 20, 4, 0)
+    _, export = build_prg_image(_prg(text, data, fixups=fixups), "switch")
+    switch, = export["jump_tables"]
+    assert switch["table"]["unit_address"] == "data:0000"
+    assert switch["address"]["unit_address"] == "text:0012"
+    assert [target["unit_address"] for target in switch["targets"]] == ["text:0016", "text:001a"]
+
+    _, incomplete = build_prg_image(_prg(text, data, fixups=pack(">I2B", 12, 20, 0)), "switch")
+    assert "jump_tables" not in incomplete
+
+
 @pytest.mark.parametrize(("source", "base", "message"), [
     (b"\x60\x1a", 0, "truncated GEMDOS program header"),
     (_prg(bytes(8))[:30], 0, "truncated GEMDOS TEXT"),

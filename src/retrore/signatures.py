@@ -39,6 +39,30 @@ _MICROSOFT_C_STARTUPS = (
     ("5.x", 11, _pattern("b4 30 cd 21 3c 02 73 02 cd 20 bf ?? ?? 8b 36 02 00 2b f7 81 fe 00 10")),
     ("6.x", 14, _pattern("b4 30 cd 21 3c 02 73 05 33 c0 06 50 cb bf ?? ?? 8b 36 02 00 2b f7 81 fe 00 10")),
 )
+_MICROSOFT_C_FAR_START = _pattern("72 03 be 00 10 fa 8e d7 81 c4 ?? ?? fb 73 14 16 1f 9a ?? ??")
+
+
+def _microsoft_startup(image: bytes, entry: int, origin: int, relocations: set[int]) -> Compiler | None:
+    # A small preloader may do setup and then jump to the actual C runtime.
+    starts = [(entry, "startup")]
+    for position in sorted(relocations):
+        if not entry + 3 <= position < min(entry + 0x80, len(image) - 1) or image[position - 3] != 0xEA:
+            continue
+        offset, segment = unpack_from("<HH", image, position - 2)
+        start = segment * 16 + offset - origin
+        if 0 <= start < len(image):
+            starts.append((start, "relocated entry jump to startup"))
+
+    for start, evidence in starts:
+        for version, relocation, pattern in _MICROSOFT_C_STARTUPS:
+            match = pattern.match(image, start)
+            if match is None or start + relocation not in relocations:
+                continue
+            far = _MICROSOFT_C_FAR_START.match(image, match.end())
+            if far is not None and far.end() in relocations:
+                return Compiler("microsoft_c_medium", "Microsoft C", version, evidence)
+            return Compiler("microsoft_c", "Microsoft C", version, evidence)
+    return None
 
 
 def detect_compiler(root: LoadedMZ, *, pascal_overlays: bool) -> Compiler | None:
@@ -64,9 +88,9 @@ def detect_compiler(root: LoadedMZ, *, pascal_overlays: bool) -> Compiler | None
             return Compiler("borland_c", family, version, "startup and runtime identification string")
         return Compiler("borland_c", "Borland C runtime", None, "startup")
 
-    for version, relocation, pattern in _MICROSOFT_C_STARTUPS:
-        if entry + relocation in relocations and pattern.match(image, entry):
-            return Compiler("microsoft_c", "Microsoft C", version, "startup")
+    microsoft = _microsoft_startup(image, entry, origin, relocations)
+    if microsoft is not None:
+        return microsoft
 
     if pascal_overlays:
         return Compiler("pascal", "Turbo Pascal", None, "Turbo Pascal overlay directory")
@@ -85,9 +109,10 @@ class Prototype:
     name: str
     result: str
     parameters: tuple[Parameter, ...]
-    stack_purge: int | None = None  # Pascal RETF operand. None denotes near cdecl.
+    stack_purge: int | None = None  # Pascal RETF operand. None denotes cdecl.
     result_registers: tuple[str, ...] = ()
     variadic: bool = False
+    far: bool = False  # Caller-cleanup functions with a far return address.
 
 
 def _pascal(name: str, stack_purge: int, *parameters: Parameter, result: str = "void") -> Prototype:
@@ -161,9 +186,37 @@ _MICROSOFT_C = (
      "55 8b ec 56 8b 5e 04 be ?? ?? 39 5c 06 73 0d 4b 4b 80 0f 01 39 5c 08 76 03 89 5c 08"),
 )
 
+
+def _medium(prototype: Prototype) -> Prototype:
+    return Prototype(prototype.name, prototype.result, prototype.parameters, variadic=prototype.variadic, far=True)
+
+
+# Microsoft C 5.1 /AM probes linked against MLIBCR. Medium model keeps data pointers near and uses
+# far calls for public functions. Offsets and selectors resolved by the linker are wildcarded.
+_MICROSOFT_C_MEDIUM = (
+    (_medium(_STRCPY),
+     "55 8b ec 8b d7 8b de 8b 76 08 8b fe 8c d8 8e c0 33 c0 b9 ff ff f2 ae f7 d1 8b 7e 06 8b c7"),
+    (_medium(_STRLEN), "55 8b ec 8b d7 8c d8 8e c0 8b 7e 06 33 c0 b9 ff ff f2 ae f7 d1 49 91 8b fa 5d cb"),
+    (_medium(_PUTS),
+     "55 8b ec 83 ec 08 57 56 be ?? ?? ff 76 06 9a ?? ?? ?? ?? 83 c4 02 8b f8 56 9a ?? ?? ?? ?? 83 c4 02 89 46 fe"),
+    (_medium(_PRINTF),
+     "55 8b ec 83 ec 08 57 56 be ?? ?? 8d 46 08 89 46 fc 56 9a ?? ?? ?? ?? 83 c4 02 8b f8 8d 46 08"),
+    (_medium(_MALLOC), "55 8b ec 56 57 bb ?? ?? 83 3f 00 75 29 1e 07 b8 05 00 e8 ?? ?? 75 05 33 c0 99"),
+    (_medium(_FREE), "55 8b ec 8b 5e 06 0b db 74 04 80 4f fe 01 8b e5 5d cb"),
+    (Prototype("write", "int", (Parameter("handle", "int"), Parameter("buffer", "void*"), Parameter("count", "uint")),
+               far=True),
+     "55 8b ec 83 ec 08 8b 5e 06 3b 1e ?? ?? 72 07 b8 00 09 f9 e9 ?? ?? f6 87 ?? ?? 20"),
+    (Prototype("lseek", "long", (Parameter("handle", "int"), Parameter("offset", "long"), Parameter("origin", "int")),
+               result_registers=("DX", "AX"), far=True),
+     "55 8b ec 83 ec 04 8b 5e 06 3b 1e ?? ?? 72 05 b8 00 09 eb 2a f7 46 0a 00 80 74 48"),
+)
+
 _CATALOG = {
     group: tuple((prototype, _pattern(pattern)) for prototype, pattern in entries)
-    for group, entries in (("pascal", _PASCAL), ("borland_c", _BORLAND_C), ("microsoft_c", _MICROSOFT_C))
+    for group, entries in (
+        ("pascal", _PASCAL), ("borland_c", _BORLAND_C), ("microsoft_c", _MICROSOFT_C),
+        ("microsoft_c_medium", _MICROSOFT_C_MEDIUM),
+    )
 }
 
 

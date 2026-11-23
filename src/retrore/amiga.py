@@ -4,6 +4,7 @@ from struct import pack_into, unpack_from
 
 from .image import DEFAULT_M68K_BASE as DEFAULT_BASE_ADDRESS
 from .image import M68K_ADDRESS_LIMIT as ADDRESS_LIMIT
+from .jump_tables import m68k_jump_table_records
 
 HUNK_HEADER = 0x3F3
 HUNK_MAGIC = HUNK_HEADER.to_bytes(4, "big")
@@ -151,7 +152,12 @@ def build_hunk_image(data: bytes, program: str, base: int = DEFAULT_BASE_ADDRESS
     if reader.position != len(data):
         record = reader.record_type()
         raise HunkError(f"unexpected AmigaDOS record 0x{record:x} after the last hunk")
-    return bytes(image), {
+    program_map = {
         "version": 1, "format": "HUNK", "program": program, "base_address": base,
         "entry": {"unit_address": "h0:0000", "linear": base}, "units": units,
     }
+    tables = [table for unit in units if unit["kind"] == "code"
+              for table in m68k_jump_table_records(image, unit, units=units)]
+    if tables:
+        program_map["jump_tables"] = tables
+    return bytes(image), program_map

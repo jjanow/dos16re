@@ -200,6 +200,38 @@ def test_pointer_and_relocation_search_on_flat_images(tmp_path, capsys):
     assert _run(capsys, "relocs", "--export", str(export))["has_relocations"] is False
 
 
+def test_68k_short_pointers_are_aligned_sign_extended_and_width_checked(tmp_path, capsys):
+    code = b"\x12\x34\x80\x12\x80\x12\x12\x34\x00\x00\x12\x34\xff\xee\xff\xff"
+    fixups = [{"offset": 0, "original": 0x1234, "value": 0x1234, "width": 2},
+              {"offset": 6, "original": 0x12340000, "value": 0x12340000}]
+    export = _export(tmp_path, "X68K", [("text", 0x10000, 0, len(code), {"relocations": fixups})], code)
+    common = ("where-is", "--export", str(export), "--pointer-kind", "absolute-short", "--pointer")
+    report = _run(capsys, *common, "1234")
+    assert [(row["unit_address"], row["relocated"], row["value"]) for row in report["matches"]] == [
+        ("text:0000", True, "1234"), ("text:0006", False, "1234"), ("text:000a", False, "1234")]
+    assert _run(capsys, *common, "8012")["count"] == 0
+    assert [row["unit_address"] for row in _run(capsys, *common, "ff8012")["matches"]] == [
+        "text:0002", "text:0004"]
+    assert _run(capsys, *common, "ffffff")["count"] == 1
+
+
+def test_6502_split_pointer_search_reports_both_bytes_and_load_evidence(tmp_path, capsys):
+    code = bytes.fromhex("bd 20 20 85 02 bd 23 20 85 03 b9 23 20 8d 03 00 b9 20 20 85 02")
+    image = code.ljust(0x20, b"\x00") + bytes.fromhex("44 34 50 11 12 13")
+    export = _export(tmp_path, "APPLE2", [("root", 0x2000, 0, len(image))], image)
+    arguments = ("where-is", "--export", str(export), "--pointer", "1234")
+    assert _run(capsys, *arguments)["count"] == 0
+    report = _run(capsys, *arguments, "--pointer-kind", "split")
+    match, = report["matches"]
+    assert report["counts"] == {"split": 1}
+    assert (match["address"], match["high"]["address"], match["value"], match["relocated"]) == (
+        "2021", "2024", "1234", None)
+    assert [(item["instruction"]["address"], item["index_register"], item["index"]) for item in match["evidence"]] == [
+        ("2000", "x", 1), ("200a", "y", 1)]
+    assert match["evidence"][0]["low_table"]["address"] == "2020"
+    assert match["evidence"][0]["high_table"]["address"] == "2023"
+
+
 def test_symbol_lookup_from_the_map(tmp_path, capsys):
     units = [("text", 0x10000, 0, 16, {"symbols": [{"name": "_main", "offset": 0}, {"name": "_Save", "offset": 8}]})]
     export = _export(tmp_path, "X68K", units, bytes(16), entry={"unit_address": "text:0004", "linear": 0x10004},
@@ -276,6 +308,16 @@ def test_phantasie_c64_text_and_pointers(tmp_path, capsys):
     match, = _run(capsys, "where-is", "--export", str(c64), "--string", "Minotaur")["matches"]
     assert (match["unit_address"], match["encoding"]) == ("TOWNR:0187", "petscii")
     assert _run(capsys, "lookup", "--export", str(c64), "--address", "a095")["nearest"]["name"] == "entry"
+
+
+def test_phantasie_iii_apple2_high_bit_text(tmp_path, capsys):
+    disk = _game_file("RETRORE_PH3_APPLE2_DIR", "PHANTASIE_III_1987_SSI_CR_DISK_1_OF_3_SIDE_A.DSK")
+    export = tmp_path / "apple2"
+    assert main(["load", str(disk), "--disk-file", "SSI.INIT3", "-o", str(export)]) == 0
+    capsys.readouterr()
+    report = _run(capsys, "where-is", "--export", str(export), "--string", "INSERT ANOTHER DISK")
+    match, = report["matches"]
+    assert (match["address"], match["encoding"]) == ("0a8c", "apple2")
 
 
 def test_phantasie_iv_x68k_pointers_relocations_and_symbols(tmp_path, capsys):

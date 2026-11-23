@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from struct import Struct, pack, unpack_from
 
-from .jump_tables import recover_jump_tables
+from .jump_tables import FarTableImage, recover_jump_tables
 from .mz import Address, LoadedMZ, MZError
 from .signatures import detect_compiler, match_runtime
 
@@ -214,13 +214,26 @@ def _jump_table_record(unit: str, segment: int, table) -> dict:
     }
     # Always present so version-1 readers find it; null for mask- and byte-bounded tables.
     record["default"] = None if table.default is None else address_record(Address(segment, table.default))
-    record["targets"] = [address_record(Address(segment, offset)) for offset in table.targets]
+    if table.target_segments is None:
+        record["targets"] = [address_record(Address(segment, offset)) for offset in table.targets]
+    else:
+        record["entry_size"] = 4
+        record["targets"] = [
+            address_record(Address(selector, offset))
+            for selector, offset in zip(table.target_segments, table.targets, strict=True)
+        ]
     return record
 
 
 def _add_jump_tables(image: bytes, program_map: dict) -> None:
     tables = []
-    for unit in program_map["units"]:
+    units = program_map["units"]
+    far_image = FarTableImage(
+        image, units[0]["linear"],
+        tuple((unit["image_offset"], unit["image_offset"] + unit["size"]) for unit in units),
+        set(program_map.get("relocations", ())),
+    )
+    for unit in units:
         is_root = unit["name"] == "root"
         end = unit["image_offset"] + unit["size"]
         segments = _root_code_segments(image, program_map) if is_root else [unit["segment"]]
@@ -232,6 +245,7 @@ def _add_jump_tables(image: bytes, program_map: dict) -> None:
                 continue
             for table in recover_jump_tables(
                 image[start:end], flat_overlay=not is_root and "file_offset" not in unit,
+                segment=segment, far_image=far_image,
             ):
                 found[segment * 16 + table.jump] = _jump_table_record(unit["name"], segment, table)
         tables.extend(found[linear] for linear in sorted(found))
@@ -242,7 +256,7 @@ def _add_jump_tables(image: bytes, program_map: dict) -> None:
 def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
     _add_jump_tables(image, program_map)
     units = program_map["units"]
-    compiler = detect_compiler(root, pascal_overlays=any("file_offset" in unit for unit in units))
+    compiler = detect_compiler(root, pascal_overlays=any("file_offset" in unit for unit in units[1:]))
     program_map["compiler"] = None
     program_map["runtime_signatures"] = signatures = []
     if compiler is None:
@@ -258,8 +272,11 @@ def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
             segment = root.entry.segment if unit["name"] == "root" else unit["segment"]
             if not 0 <= linear - segment * 16 <= 0xFFFF:
                 segment = unit["segment"] if offset <= 0xFFFF else linear >> 4
+            record = asdict(prototype)
+            if not prototype.far:
+                del record["far"]
             signatures.append({
-                **asdict(prototype), "unit": unit["name"], "unit_offset": offset,
+                **record, "unit": unit["name"], "unit_offset": offset,
                 "address": address_record(Address(segment, linear - segment * 16)),
             })
 
@@ -276,6 +293,11 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     fixup_positions = {fixup.linear for fixup in root.relocations}
     if root.packer:
         program_map["packer"] = root.packer
+    if root.file_offset is not None:
+        root_record["file_offset"] = root.file_offset
+    root_fixups = [fixup.linear for fixup in root.relocations]
+    if root_fixups != sorted(fixup_positions):
+        program_map["root_relocation_order"] = root_fixups
     if not overlays:
         if fixup_positions:
             program_map["relocations"] = sorted(fixup_positions)

@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from struct import Struct, pack_into, unpack_from
 
 from .image import DEFAULT_M68K_BASE, M68K_ADDRESS_LIMIT
+from .jump_tables import m68k_jump_table_records
 
 PRG_MAGIC = b"\x60\x1a"
 _HEADER = Struct(">2s6IH")
@@ -100,9 +101,13 @@ def build_prg_image(data: bytes, program: str, base: int = DEFAULT_M68K_BASE) ->
             unit = units[0] if offset < text_size else units[1]
             unit["relocations"].append({"offset": offset - unit["image_offset"], "original": original, "value": value})
     image.extend(bytes(bss_size))
-    return bytes(image), {
+    program_map = {
         "version": 1, "format": "PRG", "program": program, "base_address": base,
         "header": {"reserved": reserved, "flags": flags, "absolute": bool(absolute),
                    "symbol_table_size": symbol_size},
         "entry": {"unit_address": "text:0000", "linear": base}, "units": units,
     }
+    tables = m68k_jump_table_records(image, units[0], units=units)
+    if tables:
+        program_map["jump_tables"] = tables
+    return bytes(image), program_map

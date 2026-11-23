@@ -1,5 +1,8 @@
 import json
+import os
 from struct import pack_into
+
+import pytest
 
 from retrore.cli import main
 
@@ -52,3 +55,25 @@ def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):
     trace.write_text("2000:00010000\n", encoding="ascii")
     assert main([*command, "--json"]) == 1
     assert "no 16-bit DOSBox-X instruction addresses" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+
+@pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
+def test_trace_attaches_execution_evidence_to_static_gaps(tmp_path, capsys):
+    header = bytearray(32)
+    pack_into("<2s13H", header, 0, b"MZ", 64, 1, 0, 2, 0, 0, 0, 32, 0, 0, 0, 28, 0)
+    source = tmp_path / "test.exe"
+    source.write_bytes(header + b"\xc3" + b"\0" * 31)
+    export, project = tmp_path / "export", tmp_path / "project"
+    assert main(["load", str(source), "-o", str(export)]) == 0
+    assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    trace = tmp_path / "logcpu.txt"
+    trace.write_text("1000:0000\n1000:000e\n1000:000e\n1000:000f\n", encoding="utf-8")
+    assert main(["trace", str(trace), "--project", str(project), "--export", str(export), "--classify-gaps",
+                 "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    gap, = report["analysis"]["observed_gaps"]
+    assert gap["class"] == "padding"
+    evidence = gap["trace_evidence"]
+    assert (evidence["kind"], evidence["addresses"], evidence["hits"]) == ("executed", 2, 3)
+    assert [row["unit_address"] for row in evidence["examples"]] == ["root:000e", "root:000f"]

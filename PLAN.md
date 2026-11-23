@@ -2,8 +2,8 @@
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
-binaries, Atari 8-bit executables, MSX2 programs, NEC PC-88 and PC-98 programs, Sharp X1 disks, and Sharp X68000
-Human68k executables. It handles formats and compiler
+binaries, Atari 8-bit executables, MSX2 programs, NEC PC-88 and PC-98 programs, Sharp X1 disks, Sharp X68000
+Human68k executables, and Classic Macintosh 68k applications. It handles formats and compiler
 patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
 Ghidra's decompiler and agents driving it one whole-program image to work on.
 
@@ -13,21 +13,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22–23 (fifth session), Phase 9 landed in four parallel parts, merged on `main`:
-- **Segments:** cross-call segment summaries and `LES`/`LDS` far pointers, with `segment_losses` in `func`.
-- **Indirect flow:** more switch patterns, including XC 68k, plus the `indirect` query with candidate
-  targets and evidence, and `gaps --classify` with gap seeding.
-- **Conventions:** DOS calling conventions and `int 21h` service stubs. On X68000, DOS prototypes,
-  FPACK call fixups, and IOCS names.
-- **Data:** platform string, pointer, relocation, and symbol searches without Ghidra, and the `layout`
-  query.
+On 2026-11-23, Classic Macintosh 68k loading and Ghidra analysis were validated against Pool of
+Radiance and Secret of the Silver Blades. Phase 9 gained DOS segment and stack fixes, MSC medium-model
+signatures, far-table and 68k switch recovery, trace-backed gap evidence, pointer searches, and safer
+layout application. Phase 10 gained export address and byte evidence, bounded Ghidra disassembly and C
+line maps, named-program queries, evidence bundles, function comparison, and transactional annotation replay.
 
-The merge exposed one interaction: unreached caller chains lost pushed far pointers. Segment analysis
-now seeds unreached functions callers first. The Phase 8 Windows items are closed (see Phase 8). Full
-local suite with Ghidra 12.2 and 15 game directories: 442 passed, 1 skipped.
+Verification used Python 3.14, Ghidra 12.2, JDK 25, and 18 opt-in game directories. All 484 tests
+passed across the parallel suites and the final Ghidra layout rerun.
 
-Resume with the Phase 9 open items below, or start Classic Macintosh. CI runs for tagged releases, and
-by hand (`gh workflow run release-ci.yml`) only when a change needs a check that can't run locally.
+Resume with the remaining Phase 9 and Phase 10 items, or start the Nintendo NES / Famicom loader.
+CI runs for tagged releases. Start it by hand only for a check that needs CI.
 
 ## Why
 
@@ -220,8 +216,8 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
-Sharp X1, and Sharp X68000 milestones are complete for the validated releases. X1turbo validation
-waits for a copy of the Gold Box release. Classic Macintosh is the next platform milestone.
+Sharp X1, Sharp X68000, and Classic Macintosh milestones are complete for the validated releases.
+X1turbo validation waits for a copy of the Gold Box release. Nintendo NES / Famicom is the next platform milestone.
 The analysis backlog below applies to existing and future platforms.
 
 ## Analysis backlog
@@ -296,9 +292,11 @@ The analysis backlog below applies to existing and future platforms.
   Functions entering with DS known went from 247 of 380 to 423 of 448, and with ES known from 0 to 94. `1000:1274` references `FAR2820_aa30`, and `int86` at
   `1000:5276` resolves `LDS DI,[BP+8]` to `FAR2820_b7f6` from all 5 callers. Pool of Radiance
   `root:852f` resolves `LES DI,ES:[DI]` to `root_bss:114e`.
-  Open: SS stays unknown at functions no analyzed caller reaches; stack slots go stale after writes
-  through `[BP+SI+n]`, string instructions, or unresolved pointers; Ghidra keeps its own references where
-  retrore records ES as unknown; most PoR heap far pointers can't be resolved statically.
+  Known BP indexes update frame slots. Unknown writes with evidence that they address SS invalidate
+  the affected stack state. Detached MZ functions can inherit the loader SS when the analyzed code never
+  changes it. The pass removes Ghidra analysis-only data references on operands that use unknown ES.
+  Open: unknown-segment aliases, detached functions when analyzed code can change SS, and dynamic
+  heap pointers such as Pool of Radiance's.
 - **Implemented.** More switch patterns: `jbe`/`jb` bounds, `sub` bias, mask bounds, byte indexes, and
   near call tables. A root switch is read against the nearest relocated code segment. The XC 68k switch is
   recognized on X68000. A pass after segment analysis keeps candidate targets for unresolved indirect calls
@@ -310,8 +308,11 @@ The analysis backlog below applies to existing and future platforms.
   pointer, is now a function. Phantasie I has 17 tables (was 15), and Mystic SCORE still decompiles.
   P4.X resolves all 41 computed jumps (was 32). In Pool of Radiance, `tpov_0096:0d70 CALLF [0x6b84]` gets
   candidates `root:0994` and `root:06e6`, written at `tpov_0035:006f` and `:008b`.
-  Open: sites with unknown DS; PH3's 256-entry byte-index table at `root:13721`; far CS jump tables;
-  trace coverage as gap evidence; 68k switches for the Amiga and Atari ST loaders.
+  Far CS jump and call tables use relocated selector words for destination evidence. Amiga
+  Phantasie I and III each recover 22 switches, and Atari ST Phantasie II recovers 15 in `PHANT.PRG`
+  and 3 in `UTILIT2.PRG`. `trace --classify-gaps` attaches runtime hit evidence to static gaps.
+  Open: sites with unknown DS and PH3's dispatch at `root:13721`, where the zero-extended
+  index allows 256 values but the available bytes do not corroborate 256 targets.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry
   as a result. X68000 DOS stubs have prototypes for about 80 calls. Call fixups model stacked FPACK
@@ -320,10 +321,12 @@ The analysis backlog below applies to existing and future platforms.
   `uVar2 % param_1 + 1` in `_rand`, and `(dVar2 + dVar1) / local_24` in `_avg_attr`. Pool of Radiance
   names 35 `int 21h` sites. It recovers 491 callee-cleanup functions and 356 far pointer arguments, and
   Seek at `root:c4e3` tests `extraout_CF` instead of a multiply's carry.
-  Open: new runtime signatures need original toolchains for probes (none on the dev machine); PH3's
-  medium-model MSC runtime; `_frand` lost the `_rand` argument after the fixups; a leftover `swi(0x21)`
-  before each named service; IOCS register arguments; DX:AX and Real48 returns; functions taking register
-  arguments.
+  MSC 5.1 medium-model signatures recognized eight routines in a compiler probe, including the
+  DX:AX `lseek` return. The Phantasie III export matches four, and Ghidra applies three to analyzed
+  functions. X68000 IOCS stubs have register prototypes for 32 services, covering 25 sites in
+  `P4.X`. Caller-validated XC stack parameters restore the `_rand(100)` argument in `_frand`.
+  Open: additional runtimes and generic DX:AX, Real48, and register-argument recovery; the
+  separate `swi(0x21)` in Ghidra's p-code; and more IOCS prototypes.
 - **Implemented.** Searches without Ghidra: `where-is --string` tries each platform's encodings
   (PETSCII and screen codes, high-bit Apple II, ATASCII, Shift-JIS, and others), `--pointer` finds
   stored near, far, or absolute pointers and marks relocated ones, `relocs` filters relocations, and
@@ -333,26 +336,31 @@ The analysis backlog below applies to existing and future platforms.
   **Validated:** P4.X `_gmb` at `88f9c` is 10 × 190-byte records (stride from `text:1754`). Phantasie III's
   roster at `2820:e820` is 20 × 262 bytes (stride from `root:1f8c`). Atari 8-bit Phantasie I's
   copy-protection quiz is found in screen codes at `9f5c`, and C64 "Minotaur" in PETSCII at `TOWNR:0187`.
-  Open: Apple II strings on real data; split low/high 6502 address tables; 68k short absolute pointers;
-  `layout` drops functions beyond `max_functions` without a truncation flag; `--apply` replaces existing
-  data without a separate warning.
+  Apple II high-bit strings were also validated on original input. Pointer search supports opt-in
+  aligned 68k short addresses and 6502 split tables with file-backed low and high bytes. `layout`
+  reports omitted functions and previews defined data in the proposal range. Replacing defined data
+  requires `--apply --replace`. Runtime-generated split tables such as Apple II PICPLOT still need traces.
 
 ### Phase 10: inspectable evidence and reusable analysis
 
-- Add bounded disassembly and bytes queries with unit offsets, file offsets, resolved operands,
-  and original versus relocated bytes. Map logical, linear, runtime, and file addresses in both
-  directions. Make decompiler statements traceable to instruction ranges.
-- Report why a claim exists, such as a loader fixup, instruction, Ghidra reference, heuristic,
-  user annotation, or trace observation. Expose unresolved targets and conflicting evidence
-  explicitly in JSON.
-- Import and export names, types, signatures, comments, entry points, and layout hints in a
-  versioned, diffable file. Preview changes, apply them transactionally, and preserve manual
-  Ghidra work across re-imports.
-- Identify matching functions and changed behavior across revisions or ports with normalized
-  signatures, call graphs, and referenced data. Transfer annotations with provenance and a
-  reviewable match report.
-- Support read-only queries on compatible existing Ghidra programs where possible. Provide a
-  compact project summary and an export of selected evidence for handing work to another agent.
+- **Implemented.** `bytes` reports export bytes, original values, source spans, and recorded fixups.
+  `address-map` maps logical, linear, runtime, image, and available source file coordinates.
+  `disasm` reads a bounded Ghidra range with resolved references and flags unresolved computed flow.
+  `decomp --map-lines` maps C lines to contributing instruction ranges. Open: source offsets for
+  older maps and formats with incomplete provenance, and generalized runtime placement.
+- **Partly implemented.** `batch --evidence` bundles selected results and their requests. It can
+  attach loader evidence to disassembly and flag byte conflicts. Gap classification can include
+  observed runtime hits. Open: shared evidence categories across all analyses and annotations.
+- **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
+  entry points. Replay previews conflicts and applies changes in one transaction. Open: user data
+  types, custom storage, and layout hints.
+- **Implemented for review.** `compare` matches normalized bodies in the same language and uses
+  names, call graphs, and referenced data to suggest changed and cross-port matches. The result
+  shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay
+  at a matched same-body entry. Open: matching unnamed cross-port routines without shared call
+  or data anchors, and transferring annotations inside function bodies.
+- **Implemented.** Read-only queries accept an exact name for a compatible existing Ghidra program
+  at the project root. `project-summary` and `batch --evidence` support review and handoff.
 
 ### Phase 11: repeatable dynamic analysis
 
@@ -386,7 +394,7 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga, Atari ST, and X68000 | C64, Apple II, Atari 8-bit, MSX2, PC-88, and X1 | PC-98 |
+| Capability | DOS | Amiga, Atari ST, X68000, and Macintosh | C64, Apple II, Atari 8-bit, MSX2, PC-88, and X1 | PC-98 |
 |---|---|---|---|---|
 | Load, export, byte, string, pointer, relocation, and symbol search | Implemented | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
@@ -394,8 +402,8 @@ underlying analysis uses each machine's conventions and available emulator or tr
 | Bulk lookups, inventories, call graphs, and routine context | Implemented | Implemented | Implemented | Implemented |
 | Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
 | Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
-| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
-| Calling conventions, runtime signatures, and indirect control flow | Stack conventions, `int 21h` services, switch patterns, and indirect-call candidates | X68000: DOS prototypes, IOCS names, FPACK fixups, XC arithmetic and switches; extend for Amiga and Atari ST | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
+| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations, including a fixed Macintosh A5 world | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
+| Calling conventions, runtime signatures, and indirect control flow | Stack conventions, `int 21h` services, switch patterns, and indirect-call candidates | X68000 DOS and FPACK, Amiga and Atari ST switch recovery, and Macintosh A5 jump targets and named Toolbox traps | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
 | Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned | Planned |
 
 For each new capability, use shared synthetic contract checks where possible and add fixtures for
@@ -564,7 +572,19 @@ Phantasie IV's `P4.X` (Star Craft, 1991) has 11,122 relocations and 1,015 symbol
 2,222 line-F sites, including all 1,521 `__CLMUL` and 133 `__CFTOD` calls that a linear sweep finds in
 code, without touching the `$FFFF` words in data embedded in TEXT. `_save` at `text:1714` decompiles
 with the 190-byte character stride and the 314-, 1,900-, 1,330-, and 308-byte save file writes, and the
-callers of `DOS::_OPEN` resolve to `text:3c094`. The decompiler doesn't show DOS arguments, which mix
-word and long pushes, or the results of stacked remainder and floating-point FPACK calls. Future work
-includes those prototypes, `.dim`/`.xdf` Human68k disk members, `.Z`/`.R` programs, and IOCS
-(`trap #15`) call names.
+callers of `DOS::_OPEN` resolve to `text:3c094`. The decompiler uses DOS stack prototypes and FPACK
+remainder and floating-point call fixups. Future loader work includes `.dim`/`.xdf` Human68k disk
+members and `.Z`/`.R` programs.
+
+### Classic Macintosh
+
+**Implemented for near-model 68k.** The loader reads resource forks, MacBinary, AppleSingle and
+AppleDouble, unpartitioned HFS, and Disk Copy 4.2. It maps `CODE` segments and `CODE 0` jump entries,
+builds the A5 world from THINK C `DATA`, `ZERO`, and `STRS`, and applies `CREL` and `DREL` fixups.
+Ghidra recovers direct and recognized indexed A5 calls and names common A-line Toolbox traps.
+
+**Validated on Ghidra 12.2.** Pool of Radiance v1.1 has 14 CODE segments and 582 jump entries.
+Its startup at `code1:003c` resolves an indexed A5 transfer. Secret of the Silver Blades has 15
+segments and 859 jump entries. The imports applied 1,345 and 1,601 THINK C fixups respectively.
+Open: compressed CODE, split STRS heaps, MPW far-model code, CFM and PowerPC, partitioned media,
+MFS and HFS+, full Toolbox prototypes, and dynamic analysis.

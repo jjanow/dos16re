@@ -7,11 +7,12 @@ from bisect import bisect_right
 from pathlib import Path
 
 from .image import (
-    APPLE2_FORMAT, ATARI8_FORMAT, C64_FORMAT, FLAT16_FORMATS, M68K_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT,
-    X1_FORMAT, X68K_FORMAT, ImageError, ImageUnit, image_units, read_map,
+    APPLE2_FORMAT, ATARI8_FORMAT, C64_FORMAT, FLAT16_FORMATS, M68K_FORMATS, MAC68K_FORMAT, MOS6502_FORMATS, MSX2_FORMAT,
+    PC88_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError, ImageUnit, image_units, read_map,
 )
 
 WIDTHS = (1, 2, 4, 8)
+POINTER_KINDS = ("far", "near", "absolute", "absolute-short", "split")
 
 
 class SearchError(ValueError):
@@ -90,6 +91,7 @@ ENCODINGS = {
     "latin-1": _codec("latin-1"),
     "cp437": _codec("cp437"),
     "shift-jis": _codec("cp932"),
+    "mac-roman": _codec("mac_roman"),
     "petscii": _petscii,
     "petscii-shifted": _petscii_shifted,
     "c64-screen": _c64_screen,
@@ -103,6 +105,7 @@ PLATFORM_ENCODINGS = {
     "MZ": ("cp437",),
     PC98_FORMAT: ("shift-jis",),
     X68K_FORMAT: ("shift-jis",),
+    MAC68K_FORMAT: ("mac-roman",),
     "HUNK": ("latin-1",),
     "PRG": ("ascii",),
     C64_FORMAT: ("petscii", "petscii-shifted", "c64-screen", "c64-screen-shifted"),
@@ -115,7 +118,10 @@ PLATFORM_ENCODINGS = {
 
 
 # Single codecs for find_bytes with a plain string; find_text tries every platform encoding.
-_STRING_CODECS = {"MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii", X68K_FORMAT: "cp932", PC98_FORMAT: "cp932"}
+_STRING_CODECS = {
+    "MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii", X68K_FORMAT: "cp932", PC98_FORMAT: "cp932",
+    MAC68K_FORMAT: "mac_roman",
+}
 
 
 def search_pattern(
@@ -308,23 +314,68 @@ def locate(program: dict, units: list[ImageUnit], linear: int) -> dict:
 
 # Pointers ------------------------------------------------------------------------------------------------------
 
-def _relocation_sites(program: dict, units: list[ImageUnit]) -> set[int] | None:
-    """Return image offsets of relocated words or longs, or None when the format has no relocations."""
+def _relocation_sites(program: dict, units: list[ImageUnit]) -> set[tuple[int, int]] | None:
+    """Return image offsets and widths of fixups, or None when the format has no relocations."""
     image_format = program.get("format", "MZ")
     if image_format == "MZ":
-        return set(program.get("relocations", ()))
+        return {(offset, 2) for offset in program.get("relocations", ())}
     if image_format in M68K_FORMATS:
         by_name = {unit.name: unit for unit in units}
-        return {by_name[unit["name"]].image_offset + reloc["offset"]
+        return {(by_name[unit["name"]].image_offset + reloc["offset"], reloc.get("width", 4))
                 for unit in program["units"] for reloc in unit.get("relocations", ())}
     return None
 
 
+# LDA abs,X/Y; STA zp/abs; LDA abs,X/Y using the same index; STA zp/abs. A backreference
+# requires the same LDA opcode. The stores must write adjacent bytes of one pointer.
+_SPLIT_LOADS = re.compile(rb"(?=([\xbd\xb9])(..)(?:\x85(.)|\x8d(..))\1(..)(?:\x85(.)|\x8d(..)))", re.DOTALL)
+
+
+def _split_pointers(image: bytes, units: list[ImageUnit], linear: int) -> dict[tuple[int, int], dict]:
+    """Match 6502 low/high table entries backed by indexed loads that assemble a pointer."""
+    hits: dict[tuple[int, int], dict] = {}
+    if not 0 <= linear < 0x10000:
+        return hits
+    for code in units:
+        start, end = code.image_offset, code.image_offset + code.file_size
+        for match in _SPLIT_LOADS.finditer(image, start, end):
+            opcode, first, first_zp, first_abs, second, second_zp, second_abs = match.groups()
+            first_store = int.from_bytes(first_zp or first_abs, "little")
+            second_store = int.from_bytes(second_zp or second_abs, "little")
+            if abs(first_store - second_store) != 1:
+                continue
+            if first_store > second_store:
+                first, second = second, first
+            low, high = int.from_bytes(first, "little"), int.from_bytes(second, "little")
+            low_unit, high_unit = _unit_at(units, low), _unit_at(units, high)
+            if low_unit is None or high_unit is None:
+                continue
+            low_offset, high_offset = low - low_unit.linear, high - high_unit.linear
+            low_position = low_unit.image_offset + low_offset
+            high_position = high_unit.image_offset + high_offset
+            # X and Y are bytes. The table lengths are unknown, so stop before the planes overlap,
+            # or the first entry leaves a file-backed unit.
+            count = min(0x100, abs(low - high), low_unit.file_size - low_offset, high_unit.file_size - high_offset)
+            for index in range(count):
+                if image[low_position + index] | image[high_position + index] << 8 != linear:
+                    continue
+                low_entry, high_entry = low_position + index, high_position + index
+                row = hits.setdefault((low_entry, high_entry), {
+                    "high": high_unit.location(high_offset + index), "evidence": [],
+                })
+                row["evidence"].append({
+                    "instruction": code.location(match.start() - start),
+                    "index_register": "x" if opcode == b"\xbd" else "y", "index": index,
+                    "low_table": low_unit.location(low_offset), "high_table": high_unit.location(high_offset),
+                })
+    return hits
+
+
 def find_pointers(export: Path, target: str, *, kinds: tuple[str, ...] | None = None,
                   limit: int | None = None) -> dict:
-    """Find stored addresses of a target: DOS near and far pointers, 68k longs, and 16-bit 6502 or Z80 words.
+    """Find stored addresses of a target, with optional 68k short or 6502 split pointer candidates.
 
-    `relocated` says whether a loader relocation covers the stored segment word or long. It is null for
+    `relocated` says whether a loader relocation covers the stored segment word, short, or long. It is null for
     formats without relocations and for DOS near pointers, which relocations never cover.
     """
     image, program, units = _load(export)
@@ -332,11 +383,25 @@ def find_pointers(export: Path, target: str, *, kinds: tuple[str, ...] | None = 
     linear = resolved["linear"]
     image_format = program.get("format", "MZ")
     relocations = _relocation_sites(program, units)
-    available = ("far", "near") if segmented(program) else ("absolute",)
-    kinds = tuple(kinds or available)
+    defaults = ("far", "near") if segmented(program) else ("absolute",)
+    big = image_format in M68K_FORMATS
+    available = defaults
+    if big:
+        available += ("absolute-short",)
+    elif image_format in MOS6502_FORMATS:
+        available += ("split",)
+    kinds = tuple(dict.fromkeys(kinds or defaults))
     if any(kind not in available for kind in kinds):
         raise SearchError(f"pointer kinds for {image_format} are {', '.join(available)}")
-    hits = []  # (position, size, kind, value, relocated)
+    formats = []
+    width = 4 if big else 2
+    if "absolute" in kinds and 0 <= linear < 1 << (8 * width):
+        formats.append(("absolute", width, linear))
+    # A 68k absolute short sign-extends to 32 bits. These exports map the 24-bit bus.
+    if "absolute-short" in kinds and (0 <= linear < 0x8000 or 0xFF8000 <= linear <= 0xFFFFFF
+                                      or 0xFFFF8000 <= linear <= 0xFFFFFFFF):
+        formats.append(("absolute-short", 2, linear & 0xFFFF))
+    hits = []  # (position, size, kind, value, relocated, details)
     for unit in units:
         start, end = unit.image_offset, unit.image_offset + unit.file_size
         if segmented(program):
@@ -352,35 +417,35 @@ def find_pointers(export: Path, target: str, *, kinds: tuple[str, ...] | None = 
                         segment = words[index + 1]
                         if low <= segment <= high and words[index] + segment * 16 == linear:
                             position = first + index * 2
-                            backed = None if relocations is None else position + 2 in relocations
-                            hits.append((position, 4, "far", f"{segment:04x}:{words[index]:04x}", backed))
+                            backed = None if relocations is None else (position + 2, 2) in relocations
+                            hits.append((position, 4, "far", f"{segment:04x}:{words[index]:04x}", backed, None))
             if "near" in kinds:
                 pattern = resolved["offset"].to_bytes(2, "little")
                 position = image.find(pattern, start, end - 1)
                 while position != -1:
-                    hits.append((position, 2, "near", f"{resolved['offset']:04x}", None))
+                    hits.append((position, 2, "near", f"{resolved['offset']:04x}", None, None))
                     position = image.find(pattern, position + 1, end - 1)
             continue
-        big = image_format in M68K_FORMATS
-        width = 4 if big else 2
-        if not 0 <= linear < 1 << (8 * width):
-            continue
-        pattern = linear.to_bytes(width, "big" if big else "little")
-        position = image.find(pattern, start, end)
-        while position != -1:
-            if not big or (position - start) % 2 == 0:
-                backed = None if relocations is None else position in relocations
-                hits.append((position, width, "absolute", f"{linear:0{width * 2}x}", backed))
-            position = image.find(pattern, position + 1, end)
+        for kind, width, value in formats:
+            pattern = value.to_bytes(width, "big" if big else "little")
+            position = image.find(pattern, start, end)
+            while position != -1:
+                if not big or (unit.linear + position - start) % 2 == 0:
+                    backed = None if relocations is None else (position, width) in relocations
+                    hits.append((position, width, kind, f"{value:0{width * 2}x}", backed, None))
+                position = image.find(pattern, position + 1, end)
+    if "split" in kinds:
+        split = _split_pointers(image, units, linear)
+        hits.extend((low, 2, "split", f"{linear:04x}", None, details) for (low, _), details in sorted(split.items()))
     hits.sort(key=lambda hit: (hit[0], -hit[1]))
     unit_starts = [unit.image_offset for unit in units]
     matches = []
-    for position, size, kind, value, backed in hits:
+    for position, size, kind, value, backed, details in hits:
         if limit is not None and len(matches) >= limit:
             break
         unit = units[bisect_right(unit_starts, position) - 1]
         matches.append({**unit.location(position - unit.image_offset), "kind": kind, "size": size,
-                        "value": value, "relocated": backed})
+                        "value": value, "relocated": backed, **(details or {})})
     counts = {kind: sum(1 for hit in hits if hit[2] == kind) for kind in kinds}
     return {
         "target": locate(program, units, linear), "kinds": list(kinds), "count": len(hits), "counts": counts,

@@ -2,7 +2,8 @@
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
-NEC PC-88 and PC-98 programs, Sharp X1 programs, and Sharp X68000 Human68k executables.
+NEC PC-88 and PC-98 programs, Sharp X1 programs, Sharp X68000 Human68k executables, and Classic
+Macintosh 68k applications.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -128,10 +129,11 @@ array of requests), `error`, and `error_report` (the `--json` error object). The
 ```
 
 `retrore mcp` serves the same queries to [MCP](https://modelcontextprotocol.io) clients over stdio.
-It offers one tool per query command, `batch`, `where_is`, `info`, and `load`. Query tools take the request
-parameters as arguments, plus `project` and an optional `timeout` in seconds. `batch` takes `project`
-and `requests`, the same array `retrore batch` reads. `where_is` takes `export` and one of `bytes`,
-`string`, or `constant`, with an optional `width`. A call runs through the same validation and
+It offers one tool per query command, `batch`, `where_is`, `relocations`, `lookup`, `bytes`,
+`address_map`, `info`, and `load`. Query tools take the request parameters as arguments, plus `project`,
+an optional exact Ghidra `program` name, and an optional `timeout` in seconds. `batch` takes `requests`,
+the same array `retrore batch` reads. `where_is` takes `export` and one of `bytes`, `string`, `constant`,
+or `pointer`. `bytes` and `address_map` take `export` and `address`. A call runs through the same validation and
 functions as the CLI. Its `structuredContent` and text content hold the JSON that `--json` prints.
 An error result has `isError: true` and carries the `--json` error object with `code`, `message`,
 and `hint`. A batch with failed rows, or a `functions` call with failed lookups, still succeeds
@@ -565,11 +567,36 @@ program. The original bytes stay in `image.bin`.
   write their result over the first stacked argument. Call fixups model each one, so the decompiler shows
   `uVar2 % param_1` or `(dVar2 + dVar1) / 2.0`. Compares set the condition codes.
 - `trap #15` calls whose number is loaded into D0 just before the trap become calls to
-  `IOCS::_CRTMOD`-style stubs, with the name in the comment.
+  `IOCS::_CRTMOD`-style stubs, with the name in the comment. Supported IOCS calls declare their
+  register arguments and results.
+- For rejoined XC functions, a direct caller whose stack cleanup corroborates the decompiler's
+  inferred stack slots lets the importer persist those parameters. Phantasie IV's `_frand` shows
+  the call to `_rand(100)`.
 - The importer recognizes XC switch tables (`cmpi.l`, `bhi`, `asl.l #2`, a PC-relative `lea`, and an
   indexed `movea.l` / `jmp (a0)`) and adds their targets.
 
 [Human68k DOS, IOCS, and FPACK call numbers, from XEiJ's include files](https://stdkmd.net/xeij/)
+[IOCS register arguments, from elf2x68k](https://github.com/yunkya2/elf2x68k/blob/master/src/libx68k/libiocs/iocscall.csv)
+
+## Classic Macintosh loader
+
+`info` and `load` recognize 68k applications stored as raw resource forks, MacBinary, AppleSingle,
+AppleDouble, or on unpartitioned HFS disks, including Disk Copy 4.2. Use `--disk-file NAME` to select
+an application on disk and `--macintosh` to force format detection.
+
+```sh
+.venv/bin/retrore info 'Pool of Radiance v1.1.rsrc' --json
+.venv/bin/retrore load 'Secret of the Silver Blade.img' --disk-file Secret -o out/mac
+.venv/bin/retrore ghidra import out/mac out/mac-project
+.venv/bin/retrore project-summary --project out/mac-project --json
+```
+
+The loader places the near-model `CODE` segments and A5 world at a fixed analysis base. It
+reconstructs `CODE 0` jump entries and loads supported THINK C `DATA`, `ZERO`, and `STRS` resources
+with `CREL` and `DREL` fixups. The export records original fixup values and source offsets, including
+noncontiguous HFS spans. Ghidra resolves direct and recognized indexed calls through A5 and names
+common A-line Toolbox traps. `where-is --string` searches MacRoman. The current scope is uncompressed
+near-model 68k code. Far-model MPW, CFM and PowerPC, partitioned disks, MFS, and HFS+ remain open.
 
 ## Ghidra
 
@@ -583,6 +610,8 @@ export JAVA_HOME=/path/to/jdk-25
 ```
 
 Pass the project path with or without its `.gpr` extension.
+Read-only queries can also open an existing Ghidra program with `--program NAME`, using its exact
+name at the project root. A name other than `image.bin` uses a one-shot headless session.
 
 For DOS, the importer creates one memory block per unit, names overlay entries and stubs, and runs
 Ghidra's auto-analysis.
@@ -691,7 +720,7 @@ within a unit's file-backed span. `--string` tries every text encoding the platf
 - Atari 8-bit: ATASCII and screen codes.
 - PC-98 and X68000: Shift-JIS.
 - MSX, PC-88, and X1: ASCII, then Shift-JIS.
-- Amiga: Latin-1. Atari ST: ASCII.
+- Amiga: Latin-1. Atari ST: ASCII. Classic Macintosh: MacRoman.
 
 `--ignore-case` matches either letter case. When several encodings were tried, or with
 `--ignore-case`, each match reports its `encoding` and `bytes`. Use `--bytes` to search for Atari ST
@@ -704,7 +733,9 @@ text containing bytes above `0x7f`.
 - 6502 and Z80: little-endian words.
 
 Each match reports whether a loader relocation backs it (`relocated`, `null` where the format has none).
-`--pointer-kind` keeps only `far`, `near`, or `absolute` matches.
+`--pointer-kind` also enables `absolute-short` for aligned 68k words or `split` for 6502 low/high
+tables whose indexed loads and stores assemble a pointer. The split result includes both bytes
+and the instructions that pair them.
 
 `relocs` lists loader relocations from the export, filtered by `--unit`, by site (`--at` and `--size`),
 or by `--target`. DOS targets match on segment, and 68k targets on the value range. Results are paged
@@ -718,6 +749,27 @@ at the specified width (1, 2, 4, or 8 bytes, default 2).
 Text output previews up to ten references or matches. Use `--json` for the full results with
 `unit:offset` and linear addresses where available. Ghidra queries also report the address as
 displayed by the analyzed project.
+
+### Inspect bytes and source locations
+
+```sh
+.venv/bin/retrore bytes root:12a --export out/pool --size 16 --json
+.venv/bin/retrore address-map 02b0 --from file --source START.EXE --export out/pool --json
+.venv/bin/retrore disasm root:12a --project out/pool-project --limit 32 --json
+```
+
+`bytes` returns up to 4,096 initialized bytes in one unit. `loaded` is the export's byte sequence.
+`original` restores the values before recorded relocations and overlay rewrites. For a packed
+executable it refers to the unpacked load module. `file_spans` gives available source offsets over
+the requested range. `address-map` accepts logical, linear, runtime, image, or file coordinates.
+File lookups may return several matches. `--source` and `--member` narrow them where applicable.
+For DOS, use `--runtime-base` and `--overlay-segment UNIT=HEX` for the observed placement.
+For flat formats, runtime coordinates use the view selected at export.
+
+`disasm` reads up to 512 bytes in one Ghidra block. It returns instructions, defined data, and
+undefined or uninitialized bytes, with explicit offcuts if the range splits a code unit. Operand
+references carry the target, type, and Ghidra source. Computed transfers with no resolved targets
+are flagged. The query includes original file bytes when Ghidra retains a file mapping.
 
 ### Indirect control flow and data layouts
 
@@ -749,8 +801,10 @@ constant. The result lists the following:
 Loops that copy or clear whole records are counted apart from field accesses. The size defaults to
 the defined data, or up to the next named symbol. `--stride` overrides the inferred element size.
 `--apply` (CLI only) stops the project's worker, creates the proposed structure or array, and saves the
-project. It refuses a type that would cover instructions, and it replaces data already defined in the
-range. Without `--apply` the query is read-only, as in `batch` and the MCP server.
+project. The preview lists defined data in the proposed range. Replacing it requires
+`--apply --replace`. The import refuses instruction overlaps and partial overlaps with defined data.
+The `functions` record reports omitted functions when `--max-functions` limits the analysis.
+An explicitly sized or defined table can establish a larger count than a loop that accesses a subset.
 
 ### Limit Ghidra address query results
 
@@ -797,6 +851,8 @@ Ghidra recovered. Instructions eliminated by the decompiler can yield an empty e
 
 Use plain `decomp` or select `decompilation` explicitly with `--fields` to get the entire C body.
 To retrieve the instruction bytes at any returned address, query it with `--context 0 --fields focus --json`.
+Use `--map-lines N` for a page of C lines and the inclusive instruction ranges that contribute to
+each line. `--line-offset N` continues the page. Lines with no mapped instruction have an empty list.
 
 ### Batch Ghidra queries
 
@@ -831,6 +887,44 @@ the request contains. It then includes either `result`, with the individual comm
 any query fails. An invalid request array or a headless launch failure uses the command's error
 stream. A batch launches Ghidra once, so it costs about the same as one single query. See
 [benchmarks](docs/benchmarks.md).
+
+`project-summary` reports the program name, language, compiler model, function count, and memory blocks.
+`batch --evidence --json` includes a compact project summary and the original requests in a
+versioned evidence bundle. Add `--export OUT` to compare each complete `disasm` result with the
+corresponding loader range and include its file spans and fixups. The bundle flags differences
+between the Ghidra bytes and the export, including changes to Ghidra's analysis copy.
+
+### Reuse Ghidra annotations
+
+```sh
+.venv/bin/retrore annotations export --project out/old-project --json > annotations.json
+.venv/bin/retrore annotations import annotations.json --project out/fresh-project --json
+.venv/bin/retrore annotations import annotations.json --project out/fresh-project --apply --json
+```
+
+The versioned file uses memory unit names and offsets. It carries manually named functions,
+global labels, comments, entry points, and signatures whose types the destination can resolve.
+Export includes the Ghidra language and the executable hash when available. Import previews
+additions and conflicts, and applies the entire document in one transaction if it has no conflicts.
+Replaying it again leaves identical annotations unchanged. Custom data type definitions and custom
+register storage require separate Ghidra handling.
+
+### Compare revisions and ports
+
+```sh
+.venv/bin/retrore compare out/old-project out/new-project --json > comparison.json
+.venv/bin/retrore annotations transfer annotations.json comparison.json --json > transferred.json
+```
+
+`compare` identifies unique normalized instruction bodies on the same Ghidra language. It also
+uses stable symbols, matched callers and callees, and referenced data to report changed and cross-port
+candidates. JSON includes the match method, shared evidence, and unresolved alternatives. Use
+`--limit` and `--offset` to review another page. The result can identify where a routine changed
+without establishing that the two routines have identical behavior.
+
+`annotations transfer` prepares a new annotation document from one comparison page. It carries
+names, signatures, and comments at same-body function entries, records the source and match method
+for each, and lists skipped entries. Use `annotations import` to review it against the destination.
 
 ### Persistent query workers
 
@@ -1075,6 +1169,8 @@ first observed pair. JSON includes unmapped addresses and the count of ignored n
 With `--project`, a read-only Ghidra query lists executed functions and hit counts. It also lists
 traced addresses where disassembly has no instruction start because the address is undefined,
 defined as data, or inside an instruction.
+Add `--classify-gaps` to attach static gap classification and runtime hit evidence to the undefined
+ranges that contain executed addresses.
 
 ## Tests
 
@@ -1095,7 +1191,9 @@ containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. Set
 `RETRORE_PH3_PC98_DIR` to the directory containing the Phantasie III PC-98 Program and Utility Disk
 `.d88` images. Set `RETRORE_PH1_X1_DIR` to the directory containing the Phantasie I X1 Program and
 Player Disk `.d88` images. Set `RETRORE_PH4_X68K_DIR` to the directory containing Phantasie IV's
-X68000 `P4.X`, extracted from Disk 1. The Ghidra tests use
+X68000 `P4.X`, extracted from Disk 1. Set `RETRORE_POR_MAC_DIR` to the directory containing
+`Pool of Radiance v1.1.rsrc` and `RETRORE_SOTSB_MAC_DIR` to the directory containing
+`Secret of the Silver Blade.img`. The Ghidra tests use
 `GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
 input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and

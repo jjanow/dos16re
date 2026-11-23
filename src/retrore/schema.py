@@ -77,6 +77,8 @@ def request_schema(command: str, definition: dict) -> dict:
         conditions.append({"anyOf": [
             {"required": [name], "properties": {name: {"minItems": 1}}} for name in group
         ]})
+    for name, dependencies in definition.get("dependent_required", {}).items():
+        conditions.append({"if": {"required": [name]}, "then": {"required": dependencies}})
     if conditions:
         schema["allOf"] = conditions
     total = definition.get("max_total_items")

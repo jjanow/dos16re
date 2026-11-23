@@ -164,6 +164,9 @@ def test_phantasie_amiga_hunk_layout(amiga_export):
         fixup = next(item for item in caller["relocations"] if item["offset"] == 0x18E)
         assert fixup["target"] == "h77"
         assert unpack_from(">I", image, caller["image_offset"] + 0x18E) == (target["linear"] + 0x466,)
+        first = program["jump_tables"][0]
+        assert first["encoding"] == "branch" and first["address"]["unit_address"] == "h2:00d6"
+        assert (first["targets"][0]["unit_address"], first["cases"][0]["unit_address"]) == ("h2:00da", "h2:010e")
     else:
         assert [unit["kind"] for unit in units] == ["code", "data", "bss"]
         code, data, bss = units
@@ -171,6 +174,10 @@ def test_phantasie_amiga_hunk_layout(amiga_export):
         assert image[data["linear"] + data["file_size"]:data["linear"] + data["size"]] == bytes(0x4390)
         assert image[bss["linear"]:bss["linear"] + bss["size"]] == bytes(4)
         assert unpack_from(">I", image, code["image_offset"] + 0x7372) == (0x240FC,)
+        first = program["jump_tables"][0]
+        assert first["encoding"] == "relative" and first["address"]["unit_address"] == "h0:a3f6"
+        assert (first["table"]["unit_address"], len(first["targets"])) == ("h0:a3de", 5)
+    assert len(program["jump_tables"]) == 22
 
 
 def test_ghidra_analyzes_phantasie_amiga(amiga_export, capsys):
@@ -182,6 +189,7 @@ def test_ghidra_analyzes_phantasie_amiga(amiga_export, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["units"] == len(program["units"])
     assert report["relocations"] == sum(len(unit["relocations"]) for unit in program["units"])
+    assert report["switches"] == 22
 
     def query(command, address):
         assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
@@ -198,6 +206,11 @@ def test_ghidra_analyzes_phantasie_amiga(amiga_export, capsys):
     result = query("decomp", routine)
     assert result["unit_address"] == routine
     assert result["decompilation"].strip()
+    table = program["jump_tables"][0]
+    site, = query("indirect", "--at=" + table["address"]["unit_address"])["sites"]
+    assert site["table"]["unit_address"] == table["table"]["unit_address"]
+    assert {target["unit_address"] for target in table["targets"]} <= {
+        target["unit_address"] for target in site["targets"]}
 
 
 @pytest.fixture
@@ -218,6 +231,10 @@ def test_phantasie_ii_atari_st_layout(phantasie_ii_atari_export):
     assert unpack_from(">I", image, 8) == (bss["linear"],)
     assert unpack_from(">I", image, data["image_offset"] + 0x2EC) == (data["linear"] + 0x718,)
     assert image[bss["image_offset"]:] == bytes(bss["size"])
+    assert len(program["jump_tables"]) == 15
+    first = program["jump_tables"][0]
+    assert (first["address"]["unit_address"], first["table"]["unit_address"], len(first["targets"])) == (
+        "text:4ec0", "data:1954", 5)
 
 
 def test_phantasie_ii_atari_st_utility_symbols(capsys):
@@ -235,7 +252,8 @@ def test_ghidra_analyzes_phantasie_ii_atari_st(phantasie_ii_atari_export, capsys
     output, _ = phantasie_ii_atari_export
     project = output / "phantasie-ii"
     assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0, capsys.readouterr().err
-    assert json.loads(capsys.readouterr().out)["relocations"] == 6485
+    report = json.loads(capsys.readouterr().out)
+    assert (report["relocations"], report["switches"]) == (6485, 15)
 
     def query(command, address):
         assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
@@ -249,6 +267,9 @@ def test_ghidra_analyzes_phantasie_ii_atari_st(phantasie_ii_atari_export, capsys
     result = query("decomp", "text:ec36")
     assert result["unit_address"] == "text:ec36"
     assert "FUN_0001b8f2()" in result["decompilation"]
+    site, = query("indirect", "--at=text:4ec0")["sites"]
+    assert site["table"]["unit_address"] == "data:1954"
+    assert len(site["targets"]) == 5
 
 
 @pytest.fixture

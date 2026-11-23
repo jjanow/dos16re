@@ -12,11 +12,13 @@ _FIELD_PREVIEW = 12
 _PROPOSAL_PREVIEW = 16
 
 
-def apply_layout(project: Path, request: dict, *, timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
+def apply_layout(project: Path, request: dict, *, replace: bool = False,
+                 timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
     """Run the layout query in a writable headless session and apply the proposed type.
 
     Queries and workers open projects read-only, so applying stops the project's worker first and then
-    saves the program when the script finishes. The result is the layout report plus an "applied" record.
+    saves the program when the script finishes. `replace` permits overwriting existing defined data
+    entirely covered by the proposal. The result is the layout report plus an "applied" record.
     """
     try:
         normalized = normalize_query(request)
@@ -28,7 +30,7 @@ def apply_layout(project: Path, request: dict, *, timeout: float | None = ghidra
     worker.stop(project)
     with TemporaryDirectory() as temp:
         input_file = Path(temp) / "input.json"
-        input_file.write_text(json.dumps({**normalized, "apply": True}), encoding="utf-8")
+        input_file.write_text(json.dumps({**normalized, "apply": True, "replace": replace}), encoding="utf-8")
         report = ghidra._run(project, ["-process", "image.bin", "-noanalysis"], "RetroreQuery.java", "single",
                              str(input_file), timeout=timeout)
     return {"contract": CONTRACT_VERSION, **report}
@@ -57,6 +59,9 @@ def layout_lines(report: dict) -> list[str]:
                          f"{field['writes']} writes{inner}")
         if len(layout["fields"]) > _FIELD_PREVIEW:
             lines.append("  Use --json for every field.")
+    functions = report.get("functions", {})
+    if functions.get("truncated"):
+        lines.append(f"Function analysis truncated. {functions['omitted']} omitted. Increase --max-functions.")
     for stride in report.get("strides", [])[:3]:
         notes = "; ".join(stride["evidence"][:2])
         lines.append(f"stride 0x{stride['stride']:x} in {stride['accesses']} accesses: {notes}")
@@ -69,6 +74,11 @@ def layout_lines(report: dict) -> list[str]:
         applied = report["applied"]
         lines.append(f"applied {applied['data_type']} ({applied['length']} bytes)")
     elif "proposal" in report:
+        existing = report["proposal"].get("existing_data")
+        if existing and existing["partial_overlap"]:
+            lines.append("Proposal would split an existing defined data item.")
+        elif existing and existing["count"]:
+            lines.append(f"Proposal overlaps {existing['count']} defined data items. Use --apply --replace to replace them.")
         proposal = report["proposal"]["c"].splitlines()
         lines.append("proposal (apply with --apply):")
         lines.extend("  " + line for line in proposal[:_PROPOSAL_PREVIEW])

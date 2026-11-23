@@ -19,6 +19,12 @@ public class CheckSegmentReferences extends GhidraScript {
             var value = context.getValue(currentProgram.getRegister(register), instruction, false);
             if (parts[2].equals("?")) {
                 require(value == null, check, "unknown " + register);
+                if (parts.length > 3) {
+                    for (var ref : refs.getReferencesFrom(instruction, Integer.parseInt(parts[3]))) {
+                        require(!ref.isMemoryReference() || !ref.getReferenceType().isData() ||
+                            ref.getSource() != SourceType.ANALYSIS, check, "no stale analysis data reference");
+                    }
+                }
                 continue;
             }
             require(new BigInteger(parts[2], 16).equals(value), check, register);

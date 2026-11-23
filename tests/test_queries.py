@@ -44,7 +44,8 @@ def test_every_query_has_a_cli_command(command, capsys):
 
 @pytest.mark.parametrize("request_, message", [
     ([], "expected a query object with a command"),
-    ({"command": "nope", "address": "0"}, "command must use decomp, xrefs, .*, gaps, coverage, layout, or indirect"),
+    ({"command": "nope", "address": "0"}, "command must use decomp, xrefs, .*, disasm, or project-summary"),
+    ({"command": "decomp", "address": "0", "line_offset": 1}, "line_offset requires map_lines"),
     ({"command": "func"}, "expected a query object with command and address"),
     ({"command": "func", "address": 7}, "address must be a string"),
     ({"command": "func", "address": "g:"}, "expected a hexadecimal unit:offset"),

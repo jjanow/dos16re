@@ -274,6 +274,66 @@ def _mz(code, data):
     return bytes(header + image)
 
 
+def test_frame_loads_do_not_reuse_words_after_indexed_or_indirect_writes(tmp_path, capsys):
+    code = _Code()
+    code.segment("b8", 0x20)
+    code.emit("8e d8")                                  # DS = DGROUP
+    for routine in ("indexed", "unknown_index", "unknown_pointer", "string"):
+        code.segment("b8", 0x30)
+        code.emit("50 b8 30 00 50")                       # push far pointer 2030:0030
+        code.call(routine)
+    code.emit("b8 00 4c cd 21 eb fe")
+    for routine in ("indexed", "unknown_index", "unknown_pointer", "string"):
+        code.label(routine)
+        code.emit("55 8b ec")                            # push bp; mov bp,sp
+        if routine == "indexed":
+            code.emit("be 02 00 c7 42 02 20 00")         # mov si,2; mov word ptr [bp+si+2],0x20
+            code.segment("c7 42 04", 0x40)               # mov word ptr [bp+si+4],0x2040
+            code.emit("c4 5a 02")                        # les bx,[bp+si+2]
+        else:
+            code.emit({
+                "unknown_index": "89 42 04",            # mov [bp+si+4],ax
+                "unknown_pointer": "16 07 26 89 05",    # push ss; pop es; mov es:[di],ax
+                "string": "16 07 ab",                   # push ss; pop es; stosw
+            }[routine])
+            code.emit("c4 5e 04")                        # les bx,[bp+4]
+        code.label(routine + "_use")
+        code.emit("26 8b 07 5d c2 04 00")                # mov ax,es:[bx]; pop bp; ret 4
+
+    exe = tmp_path / "aliases.exe"
+    exe.write_bytes(_mz(code, []))
+    project, _ = _import_program(tmp_path, capsys, exe, "--base-segment", "2000")
+    at = lambda name: f"2000:{code.labels[name + '_use']:04x}"
+    _check_references(
+        project,
+        f"{at('indexed')},ES,2040,1,2040:0020,word,FAR2040_0020",
+        f"{at('unknown_index')},ES,?",
+        f"{at('unknown_pointer')},ES,?",
+        f"{at('string')},ES,?",
+    )
+
+
+@pytest.mark.parametrize("writes_ss", (False, True))
+def test_detached_code_inherits_only_unchanged_loader_stack_segment(tmp_path, capsys, writes_ss):
+    code = _Code()
+    code.emit("8e d0 c3" if writes_ss else "c3")         # mov ss,ax; ret / ret
+    code.label("detached")
+    code.emit("36 a1 10 00 c3")                         # mov ax,ss:[0x10]; ret
+    exe, export, project = (tmp_path / name for name in ("stack.exe", "export", "stack"))
+    exe.write_bytes(_mz(code, []))
+    assert main(["load", str(exe), "-o", str(export), "--base-segment", "2000"]) == 0
+    capsys.readouterr()
+    path = export / "map.json"
+    program = json.loads(path.read_text())
+    program["units"][0]["entries"] = [code.labels["detached"]]
+    path.write_text(json.dumps(program))
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    at = f"2000:{code.labels['detached']:04x}"
+    expected = f"{at},SS,?" if writes_ss else f"{at},SS,2046,1,2046:0010,word,FAR2046_0010"
+    _check_references(project, expected)
+
+
 def test_jumps_into_another_function_keep_its_context(tmp_path, capsys):
     code = _Code()
     code.segment("b8", 0x20)
@@ -331,6 +391,7 @@ def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
         "1000:1274,ES,2820,0,2820:aa30,word,FAR2820_aa30",
         "1000:52af,DS,2820,1,2820:b7f6,word,FAR2820_b7f6",
         "1000:2851,ES,2820,0,2820:09fa,byte,FAR2820_09fa",
+        "1000:3069,ES,?,1",  # Ghidra's prior analysis dereferenced ES:00ef despite unknown ES.
     )
     # Before summaries and loss tracking, 247 of 380 functions entered with a known DS and the
     # import added 1,903 data references.

@@ -29,6 +29,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -55,6 +56,8 @@ public class RetroreQuery extends GhidraScript {
     private record Page(int offset, int total, int returned, Integer nextOffset) {}
     private record Focus(Location address, String instruction, String bytes) {}
     private record ExcerptLine(int line, String text, boolean focused, List<Location> addresses) {}
+    private record MappedLine(int line, String text, List<BodyRange> instructions) {}
+    private record OperandReference(int operand, String type, String source, Location target) {}
     private record SliceValue(String storage, int size) {}
     private record SliceInput(String storage, int size, Integer definition) {}
     private record SliceOperation(int id, Location address, String opcode, boolean focused,
@@ -137,8 +140,45 @@ public class RetroreQuery extends GhidraScript {
             case "trace" -> trace(input.getAsJsonObject());
             case "batch" -> batch(input.getAsJsonArray());
             case "single" -> query(input.getAsJsonObject());
+            case "annotations" -> annotationQuery(input.getAsJsonObject());
+            case "fingerprints" -> fingerprints();
             default -> throw new IllegalArgumentException("unknown query mode " + mode);
         };
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> fingerprints() throws Exception {
+        Path output = Files.createTempFile("retrore-fingerprints", ".json");
+        try {
+            runScript("RetroreFingerprints.java", new String[] {output.toString()});
+            return (Map<String, Object>) integral(GSON.fromJson(Files.readString(output), Map.class));
+        } finally {
+            Files.deleteIfExists(output);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> annotationQuery(JsonObject request) throws Exception {
+        String mode = request.get("mode").getAsString();
+        Path input = null;
+        Path output = Files.createTempFile("retrore-annotations", ".json");
+        try {
+            String[] arguments = {mode, output.toString()};
+            if (mode.equals("preview")) {
+                input = Files.createTempFile("retrore-annotations-input", ".json");
+                Files.writeString(input, GSON.toJson(request.get("document")));
+                arguments = new String[] {mode, input.toString(), output.toString()};
+            } else if (!mode.equals("export")) {
+                throw new IllegalArgumentException("unknown read-only annotation mode " + mode);
+            }
+            runScript("RetroreAnnotations.java", arguments);
+            return (Map<String, Object>) integral(GSON.fromJson(Files.readString(output), Map.class));
+        } finally {
+            Files.deleteIfExists(output);
+            if (input != null) {
+                Files.deleteIfExists(input);
+            }
+        }
     }
 
     /**
@@ -296,7 +336,46 @@ public class RetroreQuery extends GhidraScript {
         }
         var functions = executed.entrySet().stream().map(entry ->
             Map.of("function", routine(entry.getKey(), false), "count", entry.getValue())).toList();
+        if (trace.has("classify_gaps") && trace.get("classify_gaps").getAsBoolean()) {
+            return Map.of("functions", functions, "missed", misses, "observed_gaps", traceGaps(misses));
+        }
         return Map.of("functions", functions, "missed", misses);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> traceGaps(List<JsonObject> misses) throws Exception {
+        var observed = new TreeMap<Long, JsonObject>();
+        for (var hit : misses) {
+            if (hit.get("reason").getAsString().equals("undefined")) {
+                observed.put(hit.get("linear").getAsLong(), hit);
+            }
+        }
+        var result = new ArrayList<Map<String, Object>>();
+        if (observed.isEmpty()) {
+            return result;
+        }
+        var report = classifiedGaps(null, new Options(new JsonObject()));
+        for (var gap : (List<Map<String, Object>>) report.get("ranges")) {
+            monitor.checkCancelled();
+            long start = ((Number) gap.get("linear")).longValue();
+            long size = ((Number) gap.get("size")).longValue();
+            var hits = observed.subMap(start, true, start + size, false).values();
+            if (hits.isEmpty()) {
+                continue;
+            }
+            long count = 0;
+            var examples = new ArrayList<JsonObject>();
+            for (var hit : hits) {
+                count += hit.get("count").getAsLong();
+                if (examples.size() < 4) {
+                    examples.add(hit);
+                }
+            }
+            gap.put("trace_evidence", Map.of("kind", "executed", "hits", count,
+                "addresses", hits.size(), "examples", examples));
+            result.add(gap);
+        }
+        return result;
     }
 
     private Map<String, Object> query(JsonObject request) throws Exception {
@@ -312,8 +391,135 @@ public class RetroreQuery extends GhidraScript {
             case "coverage" -> coverage(request, options);
             case "layout" -> layout(request, options);
             case "indirect" -> indirect(request, options);
+            case "disasm" -> disassembly(request, options);
+            case "project-summary" -> projectSummary(options);
             default -> addressQuery(command, request, options);
         };
+    }
+
+    private Map<String, Object> disassembly(JsonObject request, Options options) throws Exception {
+        Address start = resolve(request.get("address").getAsString());
+        var memory = currentProgram.getMemory();
+        var block = memory.getBlock(start);
+        if (block == null) {
+            throw new IllegalArgumentException("address outside the loaded image: " + start);
+        }
+        int length = options.limit();
+        long remaining = block.getEnd().subtract(start) + 1;
+        int size = (int) Math.min(remaining, length);
+        var report = new LinkedHashMap<String, Object>();
+        if (options.includes("start")) {
+            report.put("start", location(start));
+        }
+        if (options.includes("size")) {
+            report.put("size", size);
+        }
+        if (options.includes("next_address")) {
+            report.put("next_address", size < remaining ? location(start.addNoWrap(size)) : null);
+        }
+        if (options.includes("rows")) {
+            var listing = currentProgram.getListing();
+            var rows = new ArrayList<Map<String, Object>>();
+            for (int position = 0; position < size;) {
+                monitor.checkCancelled();
+                Address address = start.addNoWrap(position);
+                var instruction = listing.getInstructionContaining(address);
+                var data = instruction == null ? listing.getDefinedDataContaining(address) : null;
+                var unit = instruction != null ? instruction : data;
+                int count = unit == null ? (block.isInitialized() ? 1 : size - position) :
+                    (int) Math.min(unit.getMaxAddress().subtract(address) + 1, size - position);
+                var row = new LinkedHashMap<String, Object>();
+                row.put("address", location(address));
+                row.put("unit_offset", address.subtract(block.getStart()));
+                row.put("size", count);
+                row.put("kind", instruction != null ? "instruction" : data != null ? "data" :
+                    block.isInitialized() ? "undefined" : "uninitialized");
+                if (block.isInitialized()) {
+                    byte[] bytes = new byte[count];
+                    int read = memory.getBytes(address, bytes);
+                    row.put("bytes", HexFormat.of().formatHex(bytes, 0, read));
+                    addFileEvidence(block, address, read, row);
+                }
+                if (unit != null) {
+                    boolean partial = !unit.getMinAddress().equals(address) || unit.getLength() != count;
+                    row.put("partial", partial);
+                    if (partial) {
+                        row.put("start", location(unit.getMinAddress()));
+                    }
+                }
+                if (instruction != null) {
+                    row.put("instruction", instruction.toString());
+                    var references = Arrays.stream(instruction.getReferencesFrom()).sorted(REFERENCE_ORDER)
+                        .map(reference -> new OperandReference(reference.getOperandIndex(),
+                            reference.getReferenceType().toString(), reference.getSource().toString(),
+                            location(reference.getToAddress()))).toList();
+                    row.put("references", references);
+                row.put("unresolved_flow", indirectSite(instruction) && instruction.getFlows().length == 0);
+                } else if (data != null) {
+                    row.put("type", data.getDataType().getDisplayName());
+                }
+                rows.add(row);
+                position += count;
+            }
+            report.put("rows", rows);
+        }
+        return report;
+    }
+
+    private void addFileEvidence(MemoryBlock block, Address address, int size, Map<String, Object> row)
+            throws Exception {
+        if (size == 0) {
+            return;
+        }
+        Address last = address.addNoWrap(size - 1);
+        for (var source : block.getSourceInfos()) {
+            if (address.compareTo(source.getMinAddress()) < 0 || last.compareTo(source.getMaxAddress()) > 0) {
+                continue;
+            }
+            long offset = source.getFileBytesOffset(address);
+            if (offset < 0 || source.getFileBytesOffset(last) != offset + size - 1) {
+                continue;
+            }
+            var file = source.getFileBytes().orElse(null);
+            if (file == null) {
+                continue;
+            }
+            byte[] original = new byte[size];
+            int read = file.getOriginalBytes(offset, original);
+            row.put("ghidra_file", Map.of("name", file.getFilename(), "offset", file.getFileOffset() + offset,
+                "original", HexFormat.of().formatHex(original, 0, read)));
+            return;
+        }
+    }
+
+    private Map<String, Object> projectSummary(Options options) throws Exception {
+        var report = new LinkedHashMap<String, Object>();
+        if (options.includes("program")) {
+            report.put("program", currentProgram.getName());
+        }
+        if (options.includes("language")) {
+            report.put("language", currentProgram.getLanguageID().toString());
+        }
+        if (options.includes("compiler")) {
+            report.put("compiler", currentProgram.getCompilerSpec().getCompilerSpecID().toString());
+        }
+        if (options.includes("function_count")) {
+            report.put("function_count", currentProgram.getFunctionManager().getFunctionCount());
+        }
+        if (options.includes("units")) {
+            var pages = new LinkedHashMap<String, Page>();
+            var blocks = Arrays.asList(currentProgram.getMemory().getBlocks());
+            var units = new ArrayList<Map<String, Object>>();
+            for (var block : page("units", blocks, options, pages)) {
+                monitor.checkCancelled();
+                units.add(Map.of("name", block.getName(), "start", location(block.getStart()),
+                    "size", block.getSize(), "initialized", block.isInitialized(), "execute", block.isExecute(),
+                    "overlay", block.isOverlay()));
+            }
+            report.put("units", units);
+            report.put("pagination", pages);
+        }
+        return report;
     }
 
     private Map<String, Object> addressQuery(String command, JsonObject request, Options options) throws Exception {
@@ -329,7 +535,7 @@ public class RetroreQuery extends GhidraScript {
                 throw new IllegalArgumentException("no analyzed function contains " + input);
             }
             if (command.equals("decomp")) {
-                return describeDecompilation(function, address, options);
+                return describeDecompilation(function, address, request, options);
             }
             if (options.includes("function")) {
                 report.put("function", routine(function, options.compact()));
@@ -1143,7 +1349,8 @@ public class RetroreQuery extends GhidraScript {
         return new Location(address.toString(), unitAddress, address.isMemoryAddress() ? address.getOffset() : null);
     }
 
-    private Map<String, Object> describeDecompilation(Function function, Address address, Options options)
+    private Map<String, Object> describeDecompilation(Function function, Address address, JsonObject request,
+            Options options)
             throws Exception {
         var report = new LinkedHashMap<String, Object>();
         var entry = location(function.getEntryPoint());
@@ -1160,7 +1367,8 @@ public class RetroreQuery extends GhidraScript {
             report.put("name", function.getName());
         }
         boolean targeted = options.context() != null || options.slice() != null;
-        boolean full = targeted ? options.fields().contains("decompilation") : options.includes("decompilation");
+        boolean map = request.has("map_lines");
+        boolean full = targeted || map ? options.fields().contains("decompilation") : options.includes("decompilation");
         boolean excerpt = options.context() != null && options.includes("excerpt");
         boolean slice = options.slice() != null && options.includes("slice");
         Instruction instruction = null;
@@ -1174,7 +1382,7 @@ public class RetroreQuery extends GhidraScript {
                     HexFormat.of().formatHex(instruction.getBytes())));
             }
         }
-        if (full || excerpt || slice) {
+        if (full || excerpt || slice || map && (options.includes("line_map") || options.includes("line_pagination"))) {
             var result = decompile(function);
             if (full) {
                 report.put("decompilation", result.getDecompiledFunction().getC());
@@ -1185,8 +1393,53 @@ public class RetroreQuery extends GhidraScript {
             if (slice) {
                 report.put("slice", dataSlice(result, instruction, options.slice()));
             }
+            if (map) {
+                int offset = request.has("line_offset") ? request.get("line_offset").getAsInt() : 0;
+                mapDecompiledLines(result, offset, request.get("map_lines").getAsInt(), options, report);
+            }
         }
         return report;
+    }
+
+    private void mapDecompiledLines(DecompileResults result, int offset, int limit, Options options,
+            Map<String, Object> report) throws Exception {
+        var lines = new PrettyPrinter(result.getFunction(), result.getCCodeMarkup(), null).getLines();
+        int start = Math.min(offset, lines.size());
+        int end = start + Math.min(limit, lines.size() - start);
+        if (options.includes("line_pagination")) {
+            report.put("line_pagination", new Page(offset, lines.size(), end - start, end < lines.size() ? end : null));
+        }
+        if (!options.includes("line_map")) {
+            return;
+        }
+        var mapped = new ArrayList<MappedLine>();
+        var listing = currentProgram.getListing();
+        for (var line : lines.subList(start, end)) {
+            monitor.checkCancelled();
+            var ranges = new ArrayList<BodyRange>();
+            Address first = null;
+            Address last = null;
+            for (Address address : lineAddresses(line.getAllTokens())) {
+                var instruction = listing.getInstructionAt(address);
+                if (instruction == null || !result.getFunction().getBody().contains(address)) {
+                    continue;
+                }
+                if (last != null && (!address.getAddressSpace().equals(last.getAddressSpace()) ||
+                        address.subtract(last) != 1)) {
+                    ranges.add(new BodyRange(location(first), location(last)));
+                    first = null;
+                }
+                if (first == null) {
+                    first = address;
+                }
+                last = instruction.getMaxAddress();
+            }
+            if (last != null) {
+                ranges.add(new BodyRange(location(first), location(last)));
+            }
+            mapped.add(new MappedLine(line.getLineNumber(), PrettyPrinter.getText(line), ranges));
+        }
+        report.put("line_map", mapped);
     }
 
     private List<ExcerptLine> excerpt(DecompileResults result, Address focus, int context) throws Exception {
@@ -1525,7 +1778,9 @@ public class RetroreQuery extends GhidraScript {
                 return leaf(varnode);
             }
             var start = eval(initial, depth + 1);
-            String name = "loop " + variableName(varnode);
+            // Decompilers reuse register names across functions and loops. The phi distinguishes them.
+            String name = "loop " + variableName(varnode) + " [" + layoutWhere(phi) + ", "
+                + phi.getSeqnum().getTime() + "]";
             var counter = Affine.variable(name);
             counter.evidence.computeIfAbsent(name, key -> new ArrayList<>()).add(String.format(
                 "%s MULTIEQUAL steps by %s%s", layoutWhere(phi), step < 0 ? "-0x" : "0x", Long.toHexString(Math.abs(step))));
@@ -1624,9 +1879,11 @@ public class RetroreQuery extends GhidraScript {
         var symbols = currentProgram.getSymbolTable();
         String sizeSource;
         long size;
+        boolean knownExtent = false;
         if (request.has("size")) {
             size = request.get("size").getAsLong();
             sizeSource = "given";
+            knownExtent = true;
         } else {
             size = 0x100;
             sizeSource = "default";
@@ -1634,6 +1891,7 @@ public class RetroreQuery extends GhidraScript {
             if (data != null && data.isDefined() && data.getLength() > 1) {
                 size = data.getLength();
                 sizeSource = "defined data " + data.getDataType().getDisplayName();
+                knownExtent = true;
             } else {
                 for (var symbol : symbols.getSymbolIterator(start.addNoWrap(1), true)) {
                     monitor.checkCancelled();
@@ -1881,14 +2139,16 @@ public class RetroreQuery extends GhidraScript {
         String countSource = null;
         if (stride != null) {
             for (var bound : bounds) {
-                if (bound.count() != null && stride.equals(elementStep(bound, accesses))
+                if (bound.count() != null && usesStride(bound, stride, accesses)
                         && (count == null || bound.count() > count)) {
                     count = bound.count();
                     countSource = String.format("%s %s %d%s at %s", bound.variable().substring(5), bound.compare(),
                         bound.constant(), bound.incremented() ? " after the increment" : "", bound.address());
                 }
             }
-            if (count == null && size % stride == 0) {
+            // A loop can touch only a prefix of a global. A known aligned extent gives a lower bound on
+            // the count. A scan window or gap to a following symbol is weaker evidence.
+            if (size % stride == 0 && (count == null || (knownExtent && count < size / stride))) {
                 count = size / stride;
                 countSource = "range size / stride";
             }
@@ -1936,6 +2196,8 @@ public class RetroreQuery extends GhidraScript {
             summary.put("matching_operands", functions.size() - referencingFunctions);
             summary.put("scanned", scannedRecords);
             summary.put("failed", failed);
+            summary.put("truncated", scanned.size() < prioritized.size());
+            summary.put("omitted", prioritized.size() - scanned.size());
             report.put("functions", summary);
         }
         if (options.includes("accesses")) {
@@ -1953,12 +2215,17 @@ public class RetroreQuery extends GhidraScript {
         if (options.includes("conflicts")) {
             report.put("conflicts", conflicts);
         }
-        var proposal = layoutProposal(start, size, stride, count, fields, fieldWidths, request);
+        var extent = layoutExtent(start, block, size, stride, count);
+        var existing = extent == null ? null : existingLayoutData(start, extent);
         if (options.includes("proposal")) {
+            var proposal = layoutProposal(start, size, stride, count, fields, fieldWidths, request);
+            proposal.put("existing_data", existing == null ? null : Map.of("count", existing.count(),
+                "partial_overlap", existing.partialOverlap()));
             report.put("proposal", proposal);
         }
         if (request.has("apply") && request.get("apply").getAsBoolean()) {
-            report.put("applied", applyLayout(start, size, stride, count, fields, fieldWidths, request));
+            report.put("applied", applyLayout(start, extent, existing, size, stride, count, fields, fieldWidths,
+                request));
         }
         if (!pages.isEmpty()) {
             report.put("pagination", pages);
@@ -1978,15 +2245,9 @@ public class RetroreQuery extends GhidraScript {
     }
 
     // The element step a bound's loop variable takes in the accesses it indexes.
-    private static Long elementStep(LayoutBound bound, List<LayoutAccess> accesses) {
-        for (var access : accesses) {
-            for (var index : access.index()) {
-                if (index.variable().equals(bound.variable())) {
-                    return Math.abs(index.scale());
-                }
-            }
-        }
-        return null;
+    private static boolean usesStride(LayoutBound bound, long stride, List<LayoutAccess> accesses) {
+        return accesses.stream().flatMap(access -> access.index().stream()).anyMatch(index ->
+            index.variable().equals(bound.variable()) && Math.abs(index.scale()) == stride);
     }
 
     private List<LayoutBound> loopBounds(String name, LoopInfo loop, boolean compact) {
@@ -2137,7 +2398,35 @@ public class RetroreQuery extends GhidraScript {
         return proposal;
     }
 
-    private Map<String, Object> applyLayout(Address start, long size, Long stride, Long count,
+    private static Address layoutExtent(Address start, MemoryBlock block, long size, Long stride, Long count)
+            throws AddressOverflowException {
+        long available = block.getEnd().subtract(start) + 1;
+        if (stride == null) {
+            return start.addNoWrap(size - 1);
+        }
+        if (count == null || count < 1 || count > Math.min(available, Integer.MAX_VALUE) / stride) {
+            return null;
+        }
+        return start.addNoWrap(stride * count - 1);
+    }
+
+    private record ExistingLayoutData(int count, boolean partialOverlap) {}
+
+    private ExistingLayoutData existingLayoutData(Address start, Address end) throws Exception {
+        var listing = currentProgram.getListing();
+        var atStart = listing.getDefinedDataContaining(start);
+        boolean partial = atStart != null && atStart.getMinAddress().compareTo(start) < 0;
+        int count = partial ? 1 : 0;
+        for (var data : listing.getDefinedData(new AddressSet(start, end), true)) {
+            monitor.checkCancelled();
+            count++;
+            partial |= data.getMaxAddress().compareTo(end) > 0;
+        }
+        return new ExistingLayoutData(count, partial);
+    }
+
+    private Map<String, Object> applyLayout(Address start, Address end, ExistingLayoutData existing,
+            long size, Long stride, Long count,
             Map<Long, Map<String, Object>> fields, Map<Long, TreeSet<Integer>> widths, JsonObject request)
             throws Exception {
         if (fields.isEmpty()) {
@@ -2145,6 +2434,20 @@ public class RetroreQuery extends GhidraScript {
         }
         if (stride != null && count == null) {
             throw new IllegalArgumentException("element count unknown; give size or stride so the count follows");
+        }
+        if (end == null) {
+            throw new IllegalArgumentException("the proposed type does not fit in the memory block");
+        }
+        var listing = currentProgram.getListing();
+        if (listing.getInstructionContaining(start) != null
+                || listing.getInstructions(new AddressSet(start, end), true).hasNext()) {
+            throw new IllegalArgumentException("the proposed type would cover instructions");
+        }
+        if (existing.partialOverlap()) {
+            throw new IllegalArgumentException("the proposed type would partially cover existing defined data");
+        }
+        if (existing.count() > 0 && !(request.has("replace") && request.get("replace").getAsBoolean())) {
+            throw new IllegalArgumentException("the proposed type would replace existing defined data; use --replace");
         }
         String name = layoutName(start, request);
         long length = stride == null ? size : stride;
@@ -2162,22 +2465,26 @@ public class RetroreQuery extends GhidraScript {
             structure.replaceAtOffset((int) member[0], type, (int) member[1], String.format("field_%04x", member[0]),
                 null);
         }
-        var resolved = types.addDataType(structure, ghidra.program.model.data.DataTypeConflictHandler.REPLACE_HANDLER);
-        ghidra.program.model.data.DataType applied = resolved;
-        if (stride != null) {
-            applied = new ghidra.program.model.data.ArrayDataType(resolved, count.intValue(), (int) length, types);
+        int transaction = currentProgram.startTransaction("Apply retrore layout");
+        boolean saved = false;
+        try {
+            var resolved = types.addDataType(structure, ghidra.program.model.data.DataTypeConflictHandler.DEFAULT_HANDLER);
+            ghidra.program.model.data.DataType applied = resolved;
+            if (stride != null) {
+                applied = new ghidra.program.model.data.ArrayDataType(resolved, count.intValue(), (int) length, types);
+            }
+            if (existing.count() > 0) {
+                listing.clearCodeUnits(start, end, false, monitor);
+            }
+            listing.createData(start, applied);
+            saved = true;
+            var result = new LinkedHashMap<String, Object>();
+            result.put("data_type", applied.getDisplayName());
+            result.put("path", resolved.getPathName());
+            result.put("length", applied.getLength());
+            return result;
+        } finally {
+            currentProgram.endTransaction(transaction, saved);
         }
-        var end = start.addNoWrap(applied.getLength() - 1);
-        var listing = currentProgram.getListing();
-        if (listing.getInstructions(new AddressSet(start, end), true).hasNext()) {
-            throw new IllegalArgumentException("the proposed type would cover instructions");
-        }
-        listing.clearCodeUnits(start, end, false);
-        listing.createData(start, applied);
-        var result = new LinkedHashMap<String, Object>();
-        result.put("data_type", applied.getDisplayName());
-        result.put("path", resolved.getPathName());
-        result.put("length", applied.getLength());
-        return result;
     }
 }

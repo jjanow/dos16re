@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from struct import pack, unpack_from
 
 import pytest
@@ -224,6 +225,13 @@ def test_x68k_dos_prototypes_in_map():
     assert [parameter["size"] for parameter in prototypes["FF42"]["parameters"]] == [2, 4, 2]
     assert prototypes["FF83"] == prototypes["FF53"]
     assert prototypes["FF44"]["variadic"]
+    iocs = program["line_f_calls"]["iocs_prototypes"]
+    assert iocs["10"] == {
+        "parameters": [{"name": "mode", "type": "short", "register": "D1w"}],
+        "result": "int",
+    }
+    assert iocs["21"]["parameters"] == [{"name": "text", "type": "char*", "register": "A1"}]
+    assert [parameter["register"] for parameter in iocs["77"]["parameters"]] == ["D1u", "D1w", "D2u", "D2w"]
 
 
 def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
@@ -239,10 +247,33 @@ def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
     decompiled = json.loads(capsys.readouterr().out)["decompilation"]
     assert "DOS::_OPEN(" in decompiled and ",1);" in decompiled
     assert "DOS::_WRITE(" in decompiled and "&buffer,0x10);" in decompiled
-    assert "IOCS::_CRTMOD(" in decompiled
+    assert re.search(r"IOCS::_CRTMOD\((?:0x10|16)\);", decompiled)
     assert main(["callers", "01000420", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     calling, = json.loads(capsys.readouterr().out)["callers"]
     assert calling["from"]["unit_address"] == "text:002c"
+
+
+def test_x68k_recovers_arguments_of_rejoined_xc_routine(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    code = bytes.fromhex(
+        "2f3c0000002a"  # 0000 move.l #42,-(sp)
+        "4eb900000010"  # 0006 jsr worker
+        "588f4e75"      # 000c addq.l #4,sp; rts
+        "6008"          # 0010 worker: bra.b 001a
+        "202e0008"      # 0012 move.l 8(a6),d0
+        "4e5e4e75"      # 0016 unlk a6; rts
+        "4e56000060f2"  # 001a link.w a6,#0; bra.b 0012
+    )
+    source, out, project = (tmp_path / name for name in ("ARGS.X", "out", "project"))
+    source.write_bytes(_x(text=code, data=b"", bss_size=0, entry=0, relocations=pack(">H", 8),
+                          symbols=_symbol(0x0201, 0x10, b"worker")))
+    assert main(["load", str(source), "-o", str(out)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["line_f"]["recovered_stack_parameters"] == 1
+    assert main(["decomp", "text:0000", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    assert re.search(r"worker\((?:0x2a|42)\)", json.loads(capsys.readouterr().out)["decompilation"])
 
 
 FPACK_TEXT = bytes.fromhex(
@@ -322,5 +353,8 @@ def test_ghidra_phantasie_iv_dos_and_fpack_calls(tmp_path, capsys):
     assert "DOS::_SEEK(handle,0,1);" in decompile("text:3bd3c")
     # Stacked FPACK doubles: _avg_attr is (anc1 + anc2) / 2.0, _frand is rand(100) / 100.0.
     assert "return (dVar2 + dVar1) / local_24;" in decompile("text:ba90")
-    assert "return (double)iVar1 / 100.0;" in decompile("text:30996")
-    assert "IOCS::_CRTMOD();" in decompile("text:3b676")  # XC's _CRTMOD wrapper: moveq #$10,d0; trap #15
+    random = decompile("text:30996")
+    assert re.search(r"_rand\((?:0x64|100)\)", random)
+    assert "return (double)iVar1 / 100.0;" in random
+    crt_mode = decompile("text:3b676")
+    assert "void _CRTMOD(short param_1)" in crt_mode and "IOCS::_CRTMOD(param_1);" in crt_mode

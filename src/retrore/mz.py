@@ -66,6 +66,7 @@ class LoadedMZ:
     relocations: tuple[Address, ...] = ()
     packer: str | None = None
     min_alloc_paragraphs: int = 0
+    file_offset: int | None = None
 
     @property
     def memory_end(self) -> int:
@@ -139,7 +140,8 @@ class MZExecutable:
 
         entry = Address((base_segment + entry.segment) & _SEGMENT_MASK, entry.offset)
         stack = Address((base_segment + stack.segment) & _SEGMENT_MASK, stack.offset)
-        return LoadedMZ(base_segment, bytes(image), entry, stack, relocations, self.packer, min_alloc)
+        return LoadedMZ(base_segment, bytes(image), entry, stack, relocations, self.packer, min_alloc,
+                        None if self.packer else header.header_size)
 
 
 class UnsupportedPacker(MZError):

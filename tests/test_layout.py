@@ -149,6 +149,15 @@ def test_layout_recovers_a_record_array(record_project, tmp_path, capsys):
     assert (table["kind"], table["element_size"], table["count"], table["read_only"]) == ("array", 2, 8, True)
     assert table["count_source"].endswith(" INT_SLESS 8 after the increment at root:005a")
 
+    larger = _json(capsys, "layout", "root:0270", "--size", "32", "--project", str(record_project))
+    assert (larger["layout"]["count"], larger["layout"]["count_source"]) == (16, "range size / stride")
+    assert any(bound["count"] == 8 for bound in larger["bounds"])
+
+    limited = _json(capsys, "layout", "root:0200", "--size", "128", "--max-functions", "1",
+                    "--project", str(record_project))["functions"]
+    assert limited["truncated"] and limited["omitted"] >= 2
+    assert len(limited["scanned"]) == 1
+
     # Applying writes the structure array into a copy of the project.
     copy = tmp_path / "copy"
     shutil.copytree(Path(record_project).parent, copy)
@@ -159,6 +168,13 @@ def test_layout_recovers_a_record_array(record_project, tmp_path, capsys):
     inventory = _json(capsys, "inventory", "root", "--compact", "--project", str(project))
     assert {"address": "root:0200", "type": "record[6]"}.items() <= next(
         row for row in inventory["data"] if row["address"] == "root:0200").items()
+
+    apply = ["layout", "root:0200", "--size", "72", "--name", "replacement", "--project", str(project)]
+    preview = _json(capsys, *apply)
+    assert preview["proposal"]["existing_data"] == {"count": 1, "partial_overlap": False}
+    assert main([*apply, "--apply", "--json"]) == 1
+    assert "use --replace" in json.loads(capsys.readouterr().err)["error"]["message"]
+    assert _json(capsys, *apply, "--apply", "--replace")["applied"]["path"] == "/retrore/replacement"
 
 
 @pytest.fixture(scope="module")
@@ -182,7 +198,8 @@ def test_phantasie_iv_character_records(phantasie_iv_project, capsys):
     assert (layout["kind"], layout["element_size"], layout["count"]) == ("record_array", 190, 10)
     assert layout["size_source"] == "next symbol _pmb" and report["size"] == 1900
     # Several loops over the roster bound it; which one is reported depends on what analysis recovers.
-    assert re.search(r" INT_SLESS 10 at text:[0-9a-f]+$", layout["count_source"])
+    assert layout["count_source"] == "range size / stride" or re.search(
+        r" INT_SLESS 10 at text:[0-9a-f]+$", layout["count_source"])
     assert {0x22, 0x23, 0xB4, 0xB5, 0xBA} <= {field["offset"] for field in layout["fields"]}
     stride = report["strides"][0]
     assert stride["stride"] == 190 and "text:1754 INT_MULT by 0xbe" in stride["evidence"] + [
@@ -195,7 +212,8 @@ def test_phantasie_iv_character_records(phantasie_iv_project, capsys):
     report = _json(capsys, "layout", "4f66e", "--compact", "--project", project)
     layout = report["layout"]
     assert (layout["element_size"], layout["count"]) == (8, 6)
-    assert layout["count_source"].endswith(" INT_SLESS 6 at text:1740")
+    assert re.search(r" INT_SLESS 6 at text:(1326|1740)$", layout["count_source"])
+    assert any(bound["address"] == "text:1740" and bound["count"] == 6 for bound in report["bounds"])
 
 
 def test_phantasie_iii_roster_records(tmp_path, capsys):

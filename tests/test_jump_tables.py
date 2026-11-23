@@ -7,7 +7,7 @@ import pytest
 
 from retrore.cli import main
 from retrore.jump_tables import JumpTable, M68kJumpTable, recover_jump_tables, recover_m68k_jump_tables
-from retrore.mz import Address, LoadedMZ
+from retrore.mz import Address, LoadedMZ, MZExecutable
 from retrore.overlays import Overlay, build_image
 
 
@@ -188,6 +188,53 @@ def _mz(image, relocations):
     for index, offset in enumerate(relocations):
         pack_into("<2H", header, 0x1C + 4 * index, offset, 0)
     return bytes(header) + bytes(image)
+
+
+def _far_table(opcode):
+    code = bytearray(b"\xcc" * 0x98)
+    # cmp bx,1; ja 0x18; shl bx,1; shl bx,1; jmp/call far ptr cs:[bx+0x30]; ret
+    code[:15] = bytes.fromhex(f"83 fb 01 77 13 d1 e3 d1 e3 2e ff {opcode} 30 00 c3")
+    code[0x18] = 0xC3
+    code[0x60] = 0xCB
+    code[0x92:0x96] = bytes.fromhex("0e 07 90 cb")  # push cs; pop es; nop; retf
+    pack_into("<4H", code, 0x30, 0x10, 5, 0x12, 8)
+    return code
+
+
+@pytest.mark.parametrize(("kind", "opcode"), [("jump", "af"), ("call", "9f")])
+def test_recovers_far_dispatch_only_with_relocated_segments(kind, opcode):
+    code = _far_table(opcode)
+    unproved = MZExecutable.parse(_mz(code, (0x32,))).load(0x1000)
+    assert "jump_tables" not in build_image(unproved, "test.exe", [])[1]
+
+    proved = MZExecutable.parse(_mz(code, (0x32, 0x36))).load(0x1000)
+    _, program = build_image(proved, "test.exe", [])
+    table, = program["jump_tables"]
+    assert table["kind"] == kind
+    assert table["entry_size"] == 4
+    assert table["table"]["offset"] == 0x30
+    assert table["targets"] == [
+        {"segment": 0x1005, "offset": 0x10, "linear": 0x10060},
+        {"segment": 0x1008, "offset": 0x12, "linear": 0x10092},
+    ]
+
+
+def test_ghidra_adds_far_call_table_cross_references(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    exe, export, project = (tmp_path / name for name in ("calls.exe", "export", "project"))
+    exe.write_bytes(_mz(_far_table("9f"), (0x32, 0x36)))
+    assert main(["load", str(exe), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    assert main(["xrefs", "root:0092", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    incoming = json.loads(capsys.readouterr().out)["incoming"]
+    assert {(ref["from"]["unit_address"], ref["type"]) for ref in incoming} == {
+        ("root:0009", "COMPUTED_CALL"), ("root:0034", "DATA"),
+    }
+    assert main(["func", "root:0094", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["segments"]["ES"] == 0x1008
 
 
 def test_ghidra_keeps_candidates_for_far_pointer_tables_and_variables(tmp_path, capsys):

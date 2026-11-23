@@ -14,6 +14,7 @@ import ghidra.program.model.data.ByteDataType;
 import ghidra.program.model.data.CharDataType;
 import ghidra.program.model.data.DWordDataType;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.LongDataType;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.QWordDataType;
 import ghidra.program.model.data.ShortDataType;
@@ -39,6 +40,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -71,6 +73,7 @@ public class RetroreSegments extends HeadlessScript {
     private final Map<Address, State> states = new HashMap<>();
     private final ArrayDeque<Address> pending = new ArrayDeque<>();
     private final Map<String, Integer> overlaySegments = new HashMap<>();
+    private final Map<Long, Map<Long, Integer>> farSwitchSegments = new HashMap<>();
     private final Map<Address, Summary> symbolicSummaries = new HashMap<>();
     private Map<Address, Summary> contextSummaries = new HashMap<>();
     private Startup startup;
@@ -141,6 +144,13 @@ public class RetroreSegments extends HeadlessScript {
         void forgetStack() {
             stack.clear();
             height = UNKNOWN_HEIGHT;
+        }
+
+        void forgetStackValues() {
+            Collections.fill(stack, null);
+            if (frame != null) {
+                Collections.fill(frame, null);
+            }
         }
 
         // Keep only values that agree on every incoming path. Loss records never requeue a state.
@@ -316,20 +326,28 @@ public class RetroreSegments extends HeadlessScript {
             }
             var registers = signature.getAsJsonArray("result_registers");
             boolean custom = !registers.isEmpty();
+            var purge = signature.get("stack_purge");
+            boolean far = !purge.isJsonNull() || signature.has("far") && signature.get("far").getAsBoolean();
             DataType result = runtimeType(signature.get("result").getAsString());
             var returnValue = custom ? new ReturnParameterImpl(result, registerStorage(registers), currentProgram)
                 : new ReturnParameterImpl(result, currentProgram);
             var parameters = new ArrayList<Parameter>();
+            int stackOffset = far ? 4 : 2;
             for (var argument : signature.getAsJsonArray("parameters")) {
                 var parameter = argument.getAsJsonObject();
                 String name = parameter.get("name").getAsString();
                 DataType type = runtimeType(parameter.get("type").getAsString());
-                parameters.add(custom
-                    ? new ParameterImpl(name, type, registerStorage(parameter.getAsJsonArray("registers")), currentProgram)
-                    : new ParameterImpl(name, type, currentProgram));
+                var argumentRegisters = parameter.getAsJsonArray("registers");
+                if (!custom) {
+                    parameters.add(new ParameterImpl(name, type, currentProgram));
+                } else if (!argumentRegisters.isEmpty()) {
+                    parameters.add(new ParameterImpl(name, type, registerStorage(argumentRegisters), currentProgram));
+                } else {
+                    parameters.add(new ParameterImpl(name, type, stackOffset, currentProgram));
+                    stackOffset += (type.getLength() + 1) & ~1;
+                }
             }
-            var purge = signature.get("stack_purge");
-            String convention = purge.isJsonNull() ? "__cdecl16near" : "__stdcall16far";
+            String convention = !purge.isJsonNull() ? "__stdcall16far" : far ? "__cdecl16far" : "__cdecl16near";
             function.updateFunction(convention, returnValue, parameters,
                 custom ? FunctionUpdateType.CUSTOM_STORAGE : FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
                 true, SourceType.ANALYSIS);
@@ -355,6 +373,7 @@ public class RetroreSegments extends HeadlessScript {
             case "void" -> VoidDataType.dataType;
             case "int" -> ShortDataType.dataType;
             case "uint" -> UnsignedShortDataType.dataType;
+            case "long" -> LongDataType.dataType;
             case "char*" -> new PointerDataType(CharDataType.dataType, 2, manager);
             case "void*" -> new PointerDataType(VoidDataType.dataType, 2, manager);
             case "farptr" -> new PointerDataType(VoidDataType.dataType, 4, manager);
@@ -400,6 +419,21 @@ public class RetroreSegments extends HeadlessScript {
                 }
             }
         }
+        if (map.has("jump_tables")) {
+            for (JsonElement item : map.getAsJsonArray("jump_tables")) {
+                var table = item.getAsJsonObject();
+                if (!table.has("entry_size") || table.get("entry_size").getAsInt() != 4) {
+                    continue;
+                }
+                var selectors = new HashMap<Long, Integer>();
+                for (JsonElement destination : table.getAsJsonArray("targets")) {
+                    var target = destination.getAsJsonObject();
+                    selectors.merge(target.get("linear").getAsLong(), target.get("segment").getAsInt(),
+                        (previous, next) -> previous.equals(next) ? previous : -1);
+                }
+                farSwitchSegments.put(table.getAsJsonObject("address").get("linear").getAsLong(), selectors);
+            }
+        }
 
         var entryRecord = map.getAsJsonObject("entry");
         int codeSegment = entryRecord.get("segment").getAsInt();
@@ -412,6 +446,7 @@ public class RetroreSegments extends HeadlessScript {
         if (map.has("stack")) {
             initial.set(ss, map.getAsJsonObject("stack").get("segment").getAsInt());
         }
+        Integer detachedSS = pc98 ? null : unchangedStackSegment(initial.registers.get(ss));
         startup = findStartup(entry, initial, 2);
         var entryStates = new LinkedHashMap<Address, State>();
         entryStates.put(entry, initial);
@@ -434,7 +469,7 @@ public class RetroreSegments extends HeadlessScript {
         summarize(symbolicSummaries, false);
         int rounds = 1;
         for (;; rounds++) {
-            analyzeProgram(entryStates);
+            analyzeProgram(entryStates, detachedSS);
             if (rounds == CONTEXT_ROUNDS) {
                 break;
             }
@@ -452,7 +487,23 @@ public class RetroreSegments extends HeadlessScript {
         writeContextAndReferences();
     }
 
-    private void analyzeProgram(Map<Address, State> entryStates) throws Exception {
+    private Integer unchangedStackSegment(Integer initial) throws Exception {
+        if (initial == null) {
+            return null;
+        }
+        // The MZ stack segment is valid at detached entries when analyzed code never assigns SS.
+        for (var instruction : currentProgram.getListing().getInstructions(true)) {
+            monitor.checkCancelled();
+            for (Object result : instruction.getResultObjects()) {
+                if (result instanceof Register register && register.getBaseRegister().equals(ss.getBaseRegister())) {
+                    return null;
+                }
+            }
+        }
+        return initial;
+    }
+
+    private void analyzeProgram(Map<Address, State> entryStates, Integer detachedSS) throws Exception {
         var memory = currentProgram.getMemory();
         // A direct write may invalidate a segment word even when another path first reads it.
         // Re-run after removing such words so no context depends on their initial contents.
@@ -481,7 +532,11 @@ public class RetroreSegments extends HeadlessScript {
                         detached.set(ds, startup.dgroup());
                     }
                     detached.lose(es, none);
-                    detached.lose(ss, none);
+                    if (detachedSS == null) {
+                        detached.lose(ss, none);
+                    } else {
+                        detached.set(ss, detachedSS);
+                    }
                     detached.set(cs, overlaySegments.get(memory.getBlock(start).getName()));
                     offer(start, detached);
                     follow();
@@ -525,7 +580,7 @@ public class RetroreSegments extends HeadlessScript {
             if (flow.isCall() && !flow.isComputed() && callDepth > 0) {
                 Address[] targets = instruction.getFlows();
                 if (targets.length == 1) {
-                    Startup callee = findStartup(targets[0], callState(instruction, state), callDepth - 1);
+                    Startup callee = findStartup(targets[0], callState(instruction, state, targets[0]), callDepth - 1);
                     if (callee != null) {
                         return new Startup(callee.dgroup(), address);
                     }
@@ -562,16 +617,14 @@ public class RetroreSegments extends HeadlessScript {
             var flow = instruction.getFlowType();
             State output = transfer(instruction, input);
             if (flow.isCall()) {
-                State callee = callState(instruction, input);
                 for (Address target : instruction.getFlows()) {
-                    offer(target, callee);
+                    offer(target, callState(instruction, input, target));
                 }
                 if (startup != null && address.equals(startup.call())) {
                     output.set(ds, startup.dgroup());
                 }
             } else if (flow.isJump()) {
                 State jumped = output.copy();
-                jumped.set(cs, targetCS(instruction, input));
                 // A jump into the middle of another function is either a misread table or a shared
                 // error or exit tail. Joining its state would erase the context that function's own
                 // paths establish, so only jumps within a function or to a function entry carry state.
@@ -583,6 +636,7 @@ public class RetroreSegments extends HeadlessScript {
                         skippedJumps++;
                         continue;
                     }
+                    jumped.set(cs, targetCS(instruction, input, target));
                     offer(target, jumped);
                 }
             }
@@ -590,9 +644,9 @@ public class RetroreSegments extends HeadlessScript {
         }
     }
 
-    private State callState(Instruction instruction, State input) throws Exception {
+    private State callState(Instruction instruction, State input, Address target) throws Exception {
         State callee = new State();
-        callee.set(cs, targetCS(instruction, input));
+        callee.set(cs, targetCS(instruction, input, target));
         for (Register segment : segmentRegisters) {
             Integer value = input.registers.get(segment);
             if (value == null) {
@@ -614,14 +668,16 @@ public class RetroreSegments extends HeadlessScript {
         return (instruction.getByte(0) & 0xff) == 0x9a || instruction.getMnemonicString().endsWith("F");
     }
 
-    private Integer targetCS(Instruction instruction, State input) throws Exception {
+    private Integer targetCS(Instruction instruction, State input, Address target) throws Exception {
         byte[] bytes = instruction.getBytes();
         int opcode = bytes[0] & 0xff;
         if (bytes.length == 5 && (opcode == 0x9a || opcode == 0xea)) {
             return (bytes[3] & 0xff) | ((bytes[4] & 0xff) << 8);
         }
         if (instruction.getMnemonicString().endsWith("F")) {
-            return null;
+            var switches = farSwitchSegments.get(instruction.getAddress().getOffset());
+            Integer selector = switches == null ? null : switches.get(target.getOffset());
+            return selector == null || selector < 0 ? null : selector;
         }
         return input.registers.get(cs);
     }
@@ -717,11 +773,13 @@ public class RetroreSegments extends HeadlessScript {
                 if (flow.isComputed() && targets.length == 0) {
                     return null;
                 }
+                State jumped = output.copy();
                 for (Address target : targets) {
                     if (!body.contains(target)) {
                         return null;
                     }
-                    offerLocal(local, queue, target, output);
+                    jumped.set(cs, targetCS(instruction, input, target));
+                    offerLocal(local, queue, target, jumped);
                 }
             }
             Address next = instruction.getFallThrough();
@@ -817,9 +875,11 @@ public class RetroreSegments extends HeadlessScript {
         String op = instruction.getMnemonicString();
         Register dest = instruction.getNumOperands() == 0 ? null : instruction.getRegister(0);
         boolean stackWritten = false;
+        boolean stackSegmentWritten = false;
         for (Object result : instruction.getResultObjects()) {
             if (result instanceof Register written) {
                 Register base = written.getBaseRegister();
+                stackSegmentWritten |= base.equals(ss.getBaseRegister());
                 if (base.equals(sp.getBaseRegister())) {
                     stackWritten = true;
                     continue;
@@ -938,14 +998,38 @@ public class RetroreSegments extends HeadlessScript {
                 setOrLose(output, dest, result, lossFor(instruction, input));
             }
         }
-        if (output.frame != null) {
-            for (Access access : accesses(instruction)) {
-                if (access.type().isWrite()) {
-                    storeFrameWord(output, access, op.equals("MOV") ? value(instruction, 1, input) : null);
-                }
+        Integer oldSS = input.registers.get(ss);
+        Integer newSS = output.registers.get(ss);
+        if (!Objects.equals(oldSS, newSS) || stackSegmentWritten && newSS == null) {
+            output.forgetStackValues();
+        }
+        for (Access access : accesses(instruction)) {
+            if (!access.type().isWrite()) {
+                continue;
+            }
+            Integer displacement = frameOffset(access, input);
+            if (displacement != null && output.frame != null) {
+                storeFrameWord(output, displacement, access.size(), op.equals("MOV") ? value(instruction, 1, input) : null);
+            } else if (mayWriteStack(access.segment(), input)) {
+                output.forgetStackValues();
             }
         }
+        // The output of string stores is ES:DI. REP/DF can make the affected range larger than
+        // one operand, so do not keep a tracked stack word when that range may reach SS.
+        if ((op.startsWith("STOS") || op.startsWith("MOVS") && !op.startsWith("MOVSX") || op.startsWith("INS"))
+                && mayWriteStack(es, input)) {
+            output.forgetStackValues();
+        }
         return output;
+    }
+
+    private boolean mayWriteStack(Register segment, State state) {
+        if (segment.equals(ss)) {
+            return true;
+        }
+        Integer destination = state.registers.get(segment);
+        Integer stackSegment = state.registers.get(ss);
+        return destination != null && destination.equals(stackSegment);
     }
 
     private static void setOrLose(State output, Register register, Integer value, Loss loss) {
@@ -1016,10 +1100,25 @@ public class RetroreSegments extends HeadlessScript {
     }
 
     private Slot frameSlot(Access access, State state, int delta) {
-        if (!access.bases().equals(List.of(bp)) || !access.segment().equals(ss)) {
+        Integer offset = frameOffset(access, state);
+        return offset == null ? null : frameSlot(state, (short) (offset + delta));
+    }
+
+    private Integer frameOffset(Access access, State state) {
+        if (state.frame == null || !access.bases().contains(bp) || !access.segment().equals(ss)) {
             return null;
         }
-        return frameSlot(state, (short) access.offset() + delta);
+        int displacement = access.offset();
+        for (Register base : access.bases()) {
+            if (!base.equals(bp)) {
+                Integer value = state.registers.get(base);
+                if (value == null || value >= SYMBOL) {
+                    return null;
+                }
+                displacement += value;
+            }
+        }
+        return (int) (short) displacement;
     }
 
     private static Slot frameSlot(State state, int displacement) {
@@ -1030,6 +1129,10 @@ public class RetroreSegments extends HeadlessScript {
             int index = state.frame.size() - 1 - displacement / 2;
             return index < 0 ? null : new Slot(state.frame, index);
         }
+        return stackSlot(state, displacement);
+    }
+
+    private static Slot stackSlot(State state, int displacement) {
         if (state.height == UNKNOWN_HEIGHT || state.frameHeight == UNKNOWN_HEIGHT) {
             return null;
         }
@@ -1060,16 +1163,20 @@ public class RetroreSegments extends HeadlessScript {
         return currentProgram.getMemory().getShort(address) & WORD_MASK;
     }
 
-    private void storeFrameWord(State output, Access access, Integer value) {
-        if (!access.bases().equals(List.of(bp)) || !access.segment().equals(ss)) {
-            return;
-        }
-        int start = (short) access.offset();
-        for (int word = Math.floorDiv(start, 2) * 2; word < start + access.size(); word += 2) {
-            Slot slot = frameSlot(output, word);
-            if (slot != null) {
-                slot.words().set(slot.index(), word == start && access.size() == 2 ? value : null);
+    private void storeFrameWord(State output, int start, int size, Integer value) {
+        for (int word = start & ~1; word < start + size; word += 2) {
+            int displacement = (short) word;
+            Integer known = word == start && size == 2 ? value : null;
+            storeWord(frameSlot(output, displacement), known);
+            if (displacement >= 0) {
+                storeWord(stackSlot(output, displacement), known);
             }
+        }
+    }
+
+    private static void storeWord(Slot slot, Integer value) {
+        if (slot != null) {
+            slot.words().set(slot.index(), value);
         }
     }
 
@@ -1247,6 +1354,17 @@ public class RetroreSegments extends HeadlessScript {
                 farPointers++;
             }
             for (Access access : accesses(instruction)) {
+                // Ghidra may have followed one incoming ES value before our analysis joined the paths.
+                // Leave explicitly supplied references alone.
+                if (access.segment().equals(es) && state.losses.containsKey(es)) {
+                    for (var old : refs.getReferencesFrom(entry.getKey(), access.operand())) {
+                        if (old.isMemoryReference() && old.getReferenceType().isData() &&
+                                old.getSource() == SourceType.ANALYSIS) {
+                            refs.delete(old);
+                        }
+                    }
+                    continue;
+                }
                 if (access.segment().equals(cs) || access.bases().contains(bp)) {
                     continue;
                 }

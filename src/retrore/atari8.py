@@ -215,6 +215,7 @@ def build_atari8_image(
     regions = memory_map(portb)
     image = bytearray(MOS6502_ADDRESS_LIMIT)
     owners = [None] * MOS6502_ADDRESS_LIMIT
+    file_offsets = [0] * MOS6502_ADDRESS_LIMIT
     source_records = []
     names = set()
     for index, source in enumerate(sources):
@@ -238,6 +239,7 @@ def build_atari8_image(
                 if region["read"] == "ram":
                     image[start:end] = segment.data[offset:offset + end - start]
                     owners[start:end] = [index] * (end - start)
+                    file_offsets[start:end] = range(segment.file_offset + offset, segment.file_offset + offset + end - start)
                 elif binary.kind == "xex":
                     unmapped_writes.append({"linear": start, "size": end - start, "region": region["name"],
                                             "file_offset": segment.file_offset + offset})
@@ -265,10 +267,19 @@ def build_atari8_image(
     for index, start, size in ranges:
         source = sources[index]
         name = source.name if unit_counts[index] == 1 else f"{source.name}_{start:04x}"
-        units.append({
+        unit = {
             "name": name, "kind": "ram", "linear": start, "size": size, "image_offset": start - origin,
             "file_size": size, "source": source.source, "disk_file": source.disk_file,
-        })
+        }
+        spans = []
+        for _, addresses in groupby(range(start, start + size), key=lambda address: file_offsets[address] - address):
+            first = next(addresses)
+            spans.append({"offset": first - start, "size": 1 + sum(1 for _ in addresses),
+                          "file_offset": file_offsets[first]})
+        unit["file_offset"] = spans[0]["file_offset"]
+        if len(spans) > 1:
+            unit["file_spans"] = spans
+        units.append(unit)
     if len({unit["name"].casefold() for unit in units}) != len(units):
         raise Atari8Error("duplicate Atari 8-bit memory block name")
 

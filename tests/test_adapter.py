@@ -269,13 +269,14 @@ def test_batch_schema_rejects_invalid_arrays():
 def test_tool_schemas_follow_the_registry():
     document = query_schema()
     listed = {tool["name"]: tool for tool in tools()}
-    assert list(listed) == [*QUERIES, "batch", "where_is", "relocations", "lookup", "info", "load"]
+    assert list(listed) == [*QUERIES, "batch", "where_is", "relocations", "lookup", "bytes", "address_map", "info", "load"]
     for command in QUERIES:
         request, schema = document["$defs"][f"{command}_request"], listed[command]["inputSchema"]
         assert schema["$schema"] == DIALECT and schema["type"] == "object"
         assert not schema.keys() & {"oneOf", "anyOf", "allOf"}
         assert schema["properties"] == {
             "project": schema["properties"]["project"],
+            "program": schema["properties"]["program"],
             **{name: value for name, value in request["properties"].items() if name != "command"},
             "timeout": schema["properties"]["timeout"],
         }

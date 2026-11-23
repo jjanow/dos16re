@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 
 from .errors import CONTRACT_VERSION, CodedError, coded
 from .image import (
-    FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, Z80_FORMATS, image_units, read_map,
+    FLAT16_FORMATS, M68K_FORMATS, MAC68K_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, Z80_FORMATS, image_units, read_map,
 )
 from .queries import QueryError, echo, normalize_query
 
@@ -252,12 +252,16 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
     options = ["-import", str(image), "-loader", "BinaryLoader", "-processor"]
     if program.get("format") in M68K_FORMATS:
         image_units(program, image.stat().st_size)
-        # X68000 imports run the script again after analysis to patch line-F calls that analysis reached.
-        post_script = "RetroreM68kImport.java" if program["format"] == X68K_FORMAT else None
-        return _run(
+        post_script = {
+            X68K_FORMAT: "RetroreM68kImport.java", MAC68K_FORMAT: "RetroreMacintosh.java",
+        }.get(program["format"])
+        report = _run(
             project, [*options, "68000:BE:32:MC68020"], post_script, str(manifest),
             pre_script="RetroreM68kImport.java", timeout=timeout,
         )
+        if program["format"] == MAC68K_FORMAT and "macintosh" not in report:
+            raise GhidraError("Ghidra RetroreMacintosh.java did not run", code="script_error")
+        return report
     if program.get("format") in FLAT16_FORMATS:
         image_units(program, image.stat().st_size)
         language = "z80:LE:16:default" if program["format"] in Z80_FORMATS else "6502:LE:16:default"
@@ -282,19 +286,22 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
     return report
 
 
-def decompile(address: str, project: Path, *, timeout: float | None = QUERY_TIMEOUT, **options: object) -> dict:
-    return query_address("decomp", address, project, timeout=timeout, **options)
+def decompile(address: str, project: Path, *, timeout: float | None = QUERY_TIMEOUT,
+              program: str | None = None, **options: object) -> dict:
+    return query_address("decomp", address, project, timeout=timeout, program=program, **options)
 
 
 def query_address(
-    command: str, address: str, project: Path, *, timeout: float | None = QUERY_TIMEOUT, **options: object,
+    command: str, address: str, project: Path, *, timeout: float | None = QUERY_TIMEOUT,
+    program: str | None = None, **options: object,
 ) -> dict:
-    return query(project, dict(command=command, address=address, **options), timeout=timeout)
+    return query(project, dict(command=command, address=address, **options), timeout=timeout, program=program)
 
 
-def query(project: Path, request: object, *, timeout: float | None = QUERY_TIMEOUT) -> dict:
+def query(project: Path, request: object, *, timeout: float | None = QUERY_TIMEOUT,
+          program: str | None = None) -> dict:
     """Run one query from the registry in a read-only Ghidra session."""
-    return _code_row_errors(_query_json(project, "single", _normalize(request), timeout=timeout))
+    return _code_row_errors(_query_json(project, "single", _normalize(request), timeout=timeout, program=program))
 
 
 def _code_row_errors(result: dict) -> dict:
@@ -312,7 +319,8 @@ def _normalize(request: object) -> dict:
         raise GhidraError(str(error)) from error
 
 
-def query_batch(project: Path, requests: object, *, timeout: float | None = None) -> dict:
+def query_batch(project: Path, requests: object, *, timeout: float | None = None,
+                program: str | None = None) -> dict:
     """Run an ordered array of queries in one read-only Ghidra session.
 
     The default budget is QUERY_TIMEOUT or BATCH_SECONDS_PER_QUERY per request, whichever is larger.
@@ -329,7 +337,7 @@ def query_batch(project: Path, requests: object, *, timeout: float | None = None
 
     if timeout is None:
         timeout = max(QUERY_TIMEOUT, BATCH_SECONDS_PER_QUERY * len(requests))
-    report = _query_json(project, "batch", normalized, timeout=timeout)
+    report = _query_json(project, "batch", normalized, timeout=timeout, program=program)
     report["results"] = [
         {"command": request["command"], **echo(request), **row}
         for request, row in zip(requests, report["results"], strict=True)
@@ -348,8 +356,13 @@ def trace_coverage(project: Path, coverage: dict, *, timeout: float | None = QUE
     return _query_json(project, "trace", coverage, timeout=timeout)
 
 
-def _query_json(project: Path, mode: str, request: object, *, timeout: float | None = QUERY_TIMEOUT) -> dict:
-    report = _report(project, mode, request, timeout)
+def _query_json(project: Path, mode: str, request: object, *, timeout: float | None = QUERY_TIMEOUT,
+                program: str | None = None) -> dict:
+    if program is not None and program != "image.bin":
+        _check_program_name(program)
+        report = _oneshot(project, mode, request, timeout, program=program)
+    else:
+        report = _report(project, mode, request, timeout)
     if mode == "trace":
         return report
     if mode == "batch":
@@ -357,6 +370,12 @@ def _query_json(project: Path, mode: str, request: object, *, timeout: float | N
             if "error" in row:
                 row["error"] = coded(row["error"], "query_failed")
     return {"contract": CONTRACT_VERSION, **report}
+
+
+def _check_program_name(program: str) -> None:
+    if (not isinstance(program, str) or not program.strip() or program.startswith("-")
+            or any(char in program for char in "/\\*?\0\r\n") or program in (".", "..")):
+        raise GhidraError("program must be the exact name of a program at the project root")
 
 
 def _report(project: Path, mode: str, request: object, timeout: float | None) -> dict:
@@ -371,14 +390,15 @@ def _report(project: Path, mode: str, request: object, timeout: float | None) ->
     return _oneshot(project, mode, request, timeout) if report is None else report
 
 
-def _oneshot(project: Path, mode: str, request: object, timeout: float | None, setup: dict | None = None) -> dict:
+def _oneshot(project: Path, mode: str, request: object, timeout: float | None, setup: dict | None = None,
+             *, program: str = "image.bin") -> dict:
     """Run one query mode in its own analyzeHeadless launch, with another process's setup if given."""
     if mode == "gaps":
         return _query(project, "RetroreGaps.java", timeout=timeout, setup=setup)
     with TemporaryDirectory() as temp:
         input_file = Path(temp) / "input.json"
         input_file.write_text(json.dumps(request), encoding="utf-8")
-        return _query(project, "RetroreQuery.java", mode, str(input_file), timeout=timeout, setup=setup)
+        return _query(project, "RetroreQuery.java", mode, str(input_file), timeout=timeout, setup=setup, program=program)
 
 
 def _require_project(project: Path) -> None:
@@ -390,9 +410,9 @@ def _require_project(project: Path) -> None:
 
 
 def _query(project: Path, script: str, *arguments: str, timeout: float | None = QUERY_TIMEOUT,
-           setup: dict | None = None) -> dict:
+           setup: dict | None = None, program: str = "image.bin") -> dict:
     _require_project(project)
     return _run(
-        project, ["-process", "image.bin", "-noanalysis", "-readOnly"],
+        project, ["-process", program, "-noanalysis", "-readOnly"],
         script, *arguments, timeout=timeout, setup=setup,
     )

@@ -5,7 +5,7 @@ from struct import pack_into
 import pytest
 
 from retrore.cli import main
-from retrore.mz import MZExecutable
+from retrore.mz import Address, LoadedMZ, MZExecutable
 from retrore.overlays import Overlay, build_image
 
 
@@ -36,6 +36,34 @@ def test_runtime_detection_uses_relocation_and_matches_inside_units(base):
     _, unknown = build_image(loaded, "test.exe", [overlay])
     assert unknown["compiler"] is None
     assert unknown["runtime_signatures"] == []
+
+
+def test_detects_medium_model_at_relocated_startup_target():
+    base = 0x2000
+    image = bytearray(b"\xcc" * 0x90)
+    image[:5] = bytes.fromhex("ea 20 00 00 20")  # far jump to compiler startup
+    startup = bytes.fromhex(
+        "b4 30 cd 21 3c 02 73 02 cd 20 bf 00 21 8b 36 02 00 2b f7 81 fe 00 10"
+        " 72 03 be 00 10 fa 8e d7 81 c4 20 01 fb 73 14 16 1f 9a 10 00 00 20"
+    )
+    image[0x20:0x20 + len(startup)] = startup
+    lseek = bytes.fromhex("55 8b ec 83 ec 04 8b 5e 06 3b 1e 20 00 72 05 b8 00 09 eb 2a f7 46 0a 00 80 74 48")
+    image[0x60:0x60 + len(lseek)] = lseek
+    root = LoadedMZ(base, bytes(image), Address(base, 0), Address(0x2100, 0),
+                    (Address(0, 3), Address(0, 0x2B), Address(0, 0x4B)))
+    _, report = build_image(root, "test.exe", [])
+    assert report["compiler"] == {
+        "family": "Microsoft C", "version": "5.x", "evidence": "relocated entry jump to startup",
+    }
+    signature, = report["runtime_signatures"]
+    assert (signature["name"], signature["far"], signature["stack_purge"]) == ("lseek", True, None)
+    assert (signature["result"], signature["result_registers"]) == ("long", ("DX", "AX"))
+    assert [(param["name"], param["type"]) for param in signature["parameters"]] == [
+        ("handle", "int"), ("offset", "long"), ("origin", "int"),
+    ]
+
+    unknown = LoadedMZ(base, bytes(image), root.entry, root.stack, root.relocations[1:])
+    assert build_image(unknown, "test.exe", [])[1]["compiler"] is None
 
 
 CONVENTIONS = bytes.fromhex(

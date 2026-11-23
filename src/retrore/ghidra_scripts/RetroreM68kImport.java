@@ -7,20 +7,25 @@ import com.google.gson.JsonParser;
 
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.data.IntegerDataType;
 import ghidra.program.model.data.PointerDataType;
+import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.listing.BookmarkType;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.FlowOverride;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.ParameterImpl;
 import ghidra.program.model.listing.ReturnParameterImpl;
 import ghidra.program.model.listing.VariableStorage;
+import ghidra.program.model.pcode.HighFunctionDBUtil;
+import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
 import ghidra.program.model.reloc.Relocation;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.RefType;
@@ -28,6 +33,7 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolUtilities;
 
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,6 +41,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -56,6 +63,8 @@ public class RetroreM68kImport extends HeadlessScript {
     private final Map<Integer, String> callNames = new HashMap<>();
     private final Map<Integer, JsonObject> dosPrototypes = new HashMap<>();
     private final Map<Integer, String> iocsNames = new HashMap<>();
+    private final Map<Integer, JsonObject> iocsPrototypes = new HashMap<>();
+    private final Set<Address> linkedEntries = new LinkedHashSet<>();
     private final Set<Integer> noReturn = new HashSet<>();
     private final Map<String, Integer> callCounts = new TreeMap<>();
     private int callSites;
@@ -177,6 +186,9 @@ public class RetroreM68kImport extends HeadlessScript {
                 .applyTo(currentProgram, monitor);
             block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls and IOCS calls");
             addFpackFixups();
+            if (!iocsPrototypes.isEmpty()) {
+                addIocsConvention();
+            }
         }
 
         var entry = address(map.getAsJsonObject("entry").get("linear").getAsLong());
@@ -184,6 +196,9 @@ public class RetroreM68kImport extends HeadlessScript {
             throw new IllegalArgumentException("Entry point is outside executable memory");
         }
         int switches = map.has("jump_tables") ? recoverSwitches(map.getAsJsonArray("jump_tables")) : 0;
+        if (format.equals("MAC68K")) {
+            seedMacintosh(map);
+        }
         currentProgram.getSymbolTable().addExternalEntryPoint(entry);
         disassemble(entry);
         createFunction(entry, null);
@@ -203,25 +218,58 @@ public class RetroreM68kImport extends HeadlessScript {
         return report;
     }
 
-    /** Reserve each switch table's pointers, then add the computed jumps and disassemble the cases. */
+    private void seedMacintosh(JsonObject map) throws Exception {
+        long a5 = map.getAsJsonObject("a5").get("linear").getAsLong();
+        var context = currentProgram.getProgramContext();
+        var a5Register = currentProgram.getRegister("A5");
+        for (var range : currentProgram.getMemory().getExecuteSet().getAddressRanges()) {
+            context.setValue(a5Register, range.getMinAddress(), range.getMaxAddress(), BigInteger.valueOf(a5));
+        }
+        var listing = currentProgram.getListing();
+        var targets = new HashSet<Address>();
+        for (var element : map.getAsJsonArray("a5_jumps")) {
+            monitor.checkCancelled();
+            var jump = element.getAsJsonObject();
+            var stub = address(jump.getAsJsonObject("stub").get("linear").getAsLong());
+            var target = address(jump.getAsJsonObject("target").get("linear").getAsLong());
+            listing.createData(stub.subtractNoWrap(2), WordDataType.dataType);
+            disassemble(stub);
+            if (targets.add(target)) {
+                disassemble(target);
+                if (getFunctionAt(target) == null) {
+                    createFunction(target, null);
+                }
+            }
+        }
+    }
+
+    /** Reserve each switch table's data, then add the computed jumps and disassemble the cases. */
     private int recoverSwitches(JsonArray switches) throws Exception {
         var listing = currentProgram.getListing();
         var references = currentProgram.getReferenceManager();
         for (var item : switches) {
             var record = item.getAsJsonObject();
+            String encoding = record.has("encoding") ? record.get("encoding").getAsString() : "absolute";
+            if (encoding.equals("branch")) {
+                continue;
+            }
+            int width = encoding.equals("relative") ? 2 : 4;
             var table = address(record.getAsJsonObject("table").get("linear").getAsLong());
             int count = record.getAsJsonArray("targets").size();
             for (int index = 0; index < count; index++) {
-                var entry = table.addNoWrap(4L * index);
-                if (listing.getUndefinedDataAt(entry) != null && listing.getUndefinedDataAt(entry.addNoWrap(3)) != null) {
-                    listing.createData(entry, PointerDataType.dataType);
+                var entry = table.addNoWrap((long) width * index);
+                if (listing.isUndefined(entry, entry.addNoWrap(width - 1))) {
+                    listing.createData(entry, width == 4 ? PointerDataType.dataType
+                        : WordDataType.dataType);
                 }
             }
         }
         int recovered = 0;
+        var metadata = currentProgram.getUsrPropertyManager().createStringPropertyMap("retrore.indirect");
         for (var item : switches) {
             monitor.checkCancelled();
             var record = item.getAsJsonObject();
+            String encoding = record.has("encoding") ? record.get("encoding").getAsString() : "absolute";
             var jump = address(record.getAsJsonObject("address").get("linear").getAsLong());
             var table = address(record.getAsJsonObject("table").get("linear").getAsLong());
             disassemble(address(record.getAsJsonObject("guard").get("linear").getAsLong()));
@@ -230,15 +278,21 @@ public class RetroreM68kImport extends HeadlessScript {
                 continue;
             }
             int index = 0;
+            int width = encoding.equals("relative") ? 2 : 4;
             for (var target : record.getAsJsonArray("targets")) {
                 var destination = address(target.getAsJsonObject().get("linear").getAsLong());
-                references.addMemoryReference(table.addNoWrap(4L * index++), destination, RefType.DATA,
-                    SourceType.ANALYSIS, 0);
+                if (!encoding.equals("branch")) {
+                    references.addMemoryReference(table.addNoWrap((long) width * index++), destination, RefType.DATA,
+                        SourceType.ANALYSIS, 0);
+                }
                 instruction.addMnemonicReference(destination, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
             }
             for (Address destination : instruction.getFlows()) {
                 disassemble(destination);
             }
+            var evidence = new JsonObject();
+            evidence.addProperty("table", table.getOffset());
+            metadata.add(jump, evidence.toString());
             recovered++;
         }
         return recovered;
@@ -281,6 +335,11 @@ public class RetroreM68kImport extends HeadlessScript {
                 iocsNames.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsString());
             }
         }
+        if (calls.has("iocs_prototypes")) {
+            for (var entry : calls.getAsJsonObject("iocs_prototypes").entrySet()) {
+                iocsPrototypes.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsJsonObject());
+            }
+        }
         if (calls.has("dos_prototypes")) {
             for (var entry : calls.getAsJsonObject("dos_prototypes").entrySet()) {
                 dosPrototypes.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsJsonObject());
@@ -314,6 +373,7 @@ public class RetroreM68kImport extends HeadlessScript {
         merged += mergeTrailingLinks();
         restoreCallOverrides();
         int iocs = nameIocsCalls();
+        int recovered = recoverLinkedStackParameters();
         JsonObject report = new JsonObject();
         if (Files.isRegularFile(result)) {
             var previous = JsonParser.parseString(Files.readString(result));
@@ -325,6 +385,7 @@ public class RetroreM68kImport extends HeadlessScript {
         lineF.addProperty("seeded_symbols", seeded);
         lineF.addProperty("merged_entries", merged);
         lineF.addProperty("iocs_calls", iocs);
+        lineF.addProperty("recovered_stack_parameters", recovered);
         report.add("line_f", lineF);
         return report;
     }
@@ -388,9 +449,87 @@ public class RetroreM68kImport extends HeadlessScript {
             } else {
                 functions.createFunction(name, namespace, entry, flow, SourceType.IMPORTED);
             }
+            linkedEntries.add(entry);
             merged++;
         }
         return merged;
+    }
+
+    // A rebuilt XC frame can decompile with stack parameters while its stored prototype is empty.
+    // Record the inferred slots when a direct caller's cleanup independently supports their size.
+    private int recoverLinkedStackParameters() throws Exception {
+        var decompiler = new DecompInterface();
+        int recovered = 0;
+        try {
+            decompiler.toggleCCode(false);
+            if (!decompiler.openProgram(currentProgram)) {
+                return 0;
+            }
+            for (Address entry : linkedEntries) {
+                monitor.checkCancelled();
+                Function function = getFunctionAt(entry);
+                if (function == null || function.isThunk() || function.getSignatureSource() != SourceType.DEFAULT) {
+                    continue;
+                }
+                Set<Integer> cleanups = callerCleanups(entry);
+                if (cleanups.size() != 1) {
+                    continue;
+                }
+                var result = decompiler.decompileFunction(function, 5, monitor);
+                if (!result.decompileCompleted() || result.getHighFunction() == null) {
+                    continue;
+                }
+                var high = result.getHighFunction();
+                var symbols = high.getLocalSymbolMap();
+                int count = symbols.getNumParams();
+                if (count == 0 || !cleanups.contains(4 * count)) {
+                    continue;
+                }
+                boolean contiguous = true;
+                for (int index = 0; index < count; index++) {
+                    var storage = symbols.getParamSymbol(index).getStorage();
+                    if (!storage.isStackStorage() || storage.size() != 4 ||
+                            storage.getStackOffset() != 4 + index * 4) {
+                        contiguous = false;
+                        break;
+                    }
+                }
+                if (contiguous) {
+                    HighFunctionDBUtil.commitParamsToDatabase(high, false, ReturnCommitOption.NO_COMMIT,
+                        SourceType.ANALYSIS);
+                    recovered += count;
+                }
+            }
+        } finally {
+            decompiler.dispose();
+        }
+        return recovered;
+    }
+
+    private Set<Integer> callerCleanups(Address entry) throws Exception {
+        var cleanups = new HashSet<Integer>();
+        for (Reference reference : getReferencesTo(entry)) {
+            Instruction call = getInstructionAt(reference.getFromAddress());
+            if (call == null || !reference.getReferenceType().isCall() || !call.getFlowType().isCall() ||
+                    call.getFlowType().isComputed() || call.getFallThrough() == null) {
+                continue;
+            }
+            Instruction next = getInstructionAt(call.getFallThrough());
+            if (next == null) {
+                continue;
+            }
+            int opcode = memoryWord(next.getAddress());
+            if ((opcode & 0xf1ff) == 0x508f) {  // addq.l #n,sp
+                int immediate = (opcode >> 9) & 7;
+                cleanups.add(immediate == 0 ? 8 : immediate);
+            } else if (opcode == 0x4fef && next.getLength() == 4) {  // lea n(sp),sp
+                int immediate = (short) memoryWord(next.getAddress().addNoWrap(2));
+                if (immediate > 0) {
+                    cleanups.add(immediate);
+                }
+            }
+        }
+        return cleanups;
     }
 
     private static <T> Iterable<T> iterable(java.util.Iterator<T> iterator) {
@@ -544,6 +683,9 @@ public class RetroreM68kImport extends HeadlessScript {
                 function = createFunction(entry, name);
                 function.setParentNamespace(namespace);
                 function.setComment(String.format("X68000 IOCS call $%02X (trap #15)", number));
+                if (iocsPrototypes.containsKey(number)) {
+                    applyIocsPrototype(function, iocsPrototypes.get(number));
+                }
             }
             boolean present = false;
             for (var reference : references.getReferencesFrom(trap.getAddress())) {
@@ -841,6 +983,36 @@ public class RetroreM68kImport extends HeadlessScript {
         }
     }
 
+    // Trap p-code contributes no stack adjustment. Unlike a JSR, the overridden call must
+    // leave the caller's SP unchanged.
+    private void addIocsConvention() throws Exception {
+        var extension = new ghidra.program.database.SpecExtension(currentProgram);
+        extension.addReplaceCompilerSpecExtension(
+            "<prototype name=\"__iocs\" extrapop=\"0\" stackshift=\"0\"><input/>" +
+            "<output><pentry minsize=\"1\" maxsize=\"4\"><register name=\"D0\"/></pentry></output>" +
+            "<unaffected><register name=\"SP\"/><register name=\"D2\"/><register name=\"D3\"/>" +
+            "<register name=\"D4\"/><register name=\"D5\"/><register name=\"D6\"/><register name=\"D7\"/>" +
+            "<register name=\"A2\"/><register name=\"A3\"/><register name=\"A4\"/><register name=\"A5\"/>" +
+            "<register name=\"A6\"/></unaffected><killedbycall><register name=\"D0\"/><register name=\"D1\"/>" +
+            "<register name=\"A0\"/><register name=\"A1\"/></killedbycall></prototype>", monitor);
+    }
+
+    private void applyIocsPrototype(Function function, JsonObject prototype) throws Exception {
+        var parameters = new ArrayList<ghidra.program.model.listing.Parameter>();
+        for (var element : prototype.getAsJsonArray("parameters")) {
+            var parameter = element.getAsJsonObject();
+            var register = currentProgram.getRegister(parameter.get("register").getAsString());
+            parameters.add(new ParameterImpl(parameter.get("name").getAsString(),
+                lineFType(parameter.get("type").getAsString()), register, currentProgram));
+        }
+        String result = prototype.get("result").getAsString();
+        var storage = result.equals("void") ? VariableStorage.VOID_STORAGE
+            : new VariableStorage(currentProgram, currentProgram.getRegister("D0"));
+        function.updateFunction("__iocs", new ReturnParameterImpl(lineFType(result), storage, currentProgram),
+            parameters, FunctionUpdateType.CUSTOM_STORAGE, true, SourceType.IMPORTED);
+        function.setStackPurgeSize(0);
+    }
+
     // The line-F word sits where the patched jsr (sp) pushes its return address, so the last value pushed
     // before the call is at +4. Words and longs are packed as pushed, which the 68000 calling convention's
     // 4-byte stack slots cannot express, so every parameter gets explicit stack storage.
@@ -867,6 +1039,7 @@ public class RetroreM68kImport extends HeadlessScript {
     private ghidra.program.model.data.DataType lineFType(String name) {
         var manager = currentProgram.getDataTypeManager();
         return switch (name) {
+            case "void" -> ghidra.program.model.data.VoidDataType.dataType;
             case "short" -> ghidra.program.model.data.ShortDataType.dataType;
             case "int" -> IntegerDataType.dataType;
             case "char*" -> new PointerDataType(ghidra.program.model.data.CharDataType.dataType, 4, manager);

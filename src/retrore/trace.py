@@ -53,8 +53,10 @@ def _runtime_units(
 def import_trace(
     trace: Path, export: Path, *, runtime_base: int | None = None,
     overlay_segments: dict[str, int] | None = None, project: Path | None = None,
-    timeout: float | None = QUERY_TIMEOUT,
+    timeout: float | None = QUERY_TIMEOUT, classify_gaps: bool = False,
 ) -> dict:
+    if classify_gaps and project is None:
+        raise TraceError("classifying gaps requires a Ghidra project")
     image = export / "image.bin"
     program = read_map(export)
     if program.get("format", "MZ") != "MZ":
@@ -96,6 +98,7 @@ def import_trace(
             "sha256": sha256(image.read_bytes()).hexdigest(),
             "units": [asdict(unit) for unit in units],
             "hits": mapped,
+            "classify_gaps": classify_gaps,
         }, timeout=timeout)
     return {
         "instructions": counts.total(), "ignored_lines": ignored,

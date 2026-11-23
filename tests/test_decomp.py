@@ -43,9 +43,13 @@ def test_focused_decompilation(tmp_path, capsys):
         {"address": "0fff:001f", "context": 0, "slice": 12},
         {"address": "root:11", "context": 0, "slice": 1},
         {"address": "root:0", "context": 0, "slice": 12},
+        {"address": "root:0", "map_lines": 200},
     ]
-    rows = query_batch(project, [{"command": "decomp", **request} for request in requests])["results"]
-    limited, call, branch, store, optimized = (row["result"] for row in rows)
+    rows = query_batch(project, [
+        *({"command": "decomp", **request} for request in requests),
+        {"command": "disasm", "address": "root:8", "limit": 2},
+    ])["results"]
+    limited, call, branch, store, optimized, mapped, disasm = (row["result"] for row in rows)
     assert main(["decomp", "root:8", "--project", str(project), "--context", "1", "--slice", "1", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {"contract": 1, **limited}
     assert limited["unit_address"] == "root:0000"
@@ -81,3 +85,24 @@ def test_focused_decompilation(tmp_path, capsys):
     assert operation["inputs"][2]["definition"] == seed["id"]
     assert optimized["excerpt"] == []
     assert optimized["slice"] == {"operations": [], "truncated": False}
+    line_map = next(row for row in mapped["line_map"] if row["line"] == line["line"])
+    assert [(item["start"]["unit_address"], item["end"]["unit_address"]) for item in line_map["instructions"]] == [
+        ("root:0002", "root:0005"), ("root:0007", "root:0009"),
+    ]
+    assert mapped["line_pagination"]["next_offset"] is None
+    instruction, = disasm["rows"]
+    assert instruction["partial"] and instruction["bytes"] == "0b00"
+    assert instruction["start"]["unit_address"] == "root:0007"
+    assert instruction["references"][0]["target"]["unit_address"] == "root:0015"
+    assert disasm["next_address"]["unit_address"] == "root:000a"
+
+    request_file = tmp_path / "evidence-requests.json"
+    requests = [{"command": "disasm", "address": "root:7", "limit": 3}]
+    request_file.write_text(json.dumps(requests), encoding="utf-8")
+    assert main(["batch", str(request_file), "--project", str(project), "--evidence", "--export", str(export),
+                 "--json"]) == 0
+    bundle = json.loads(capsys.readouterr().out)
+    assert bundle["bundle_version"] == 1 and bundle["requests"] == requests
+    row, = bundle["results"]
+    assert row["export_evidence"]["status"] == "consistent"
+    assert row["export_evidence"]["bytes"]["file_spans"][0]["file_offset"] == 32 + 7
