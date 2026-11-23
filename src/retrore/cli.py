@@ -1353,7 +1353,7 @@ def main(argv: list[str] | None = None) -> int:
     annotations_import = annotations_modes.add_parser("import", help="preview or apply an annotation document")
     annotations_import.add_argument("document", type=Path, metavar="FILE")
     annotations_import.add_argument("--apply", action="store_true", help="save all changes if there are no conflicts")
-    annotations_transfer = annotations_modes.add_parser("transfer", help="prepare annotations for matched function entries")
+    annotations_transfer = annotations_modes.add_parser("transfer", help="prepare annotations for matched functions")
     annotations_transfer.add_argument("document", type=Path, metavar="FILE")
     annotations_transfer.add_argument("comparison", type=Path, metavar="COMPARE_JSON")
     annotations_transfer.add_argument("--json", action="store_true", help="print the new annotation document")
@@ -1374,6 +1374,8 @@ def main(argv: list[str] | None = None) -> int:
                                 help="return at most N rows per list")
     compare_parser.add_argument("--offset", type=int, default=0, metavar="N", help="skip N rows per list")
     compare_parser.add_argument("--storage", action="store_true", help="include layout evidence for custom storage transfer")
+    compare_parser.add_argument("--instructions", action="store_true",
+                                help="include instruction locations for transferring comments and labels")
     compare_parser.add_argument("--json", action="store_true", help="print JSON")
     compare_parser.add_argument("--timeout", type=_seconds, default=QUERY_TIMEOUT, metavar="SECONDS",
                                 help="maximum seconds per Ghidra project")
@@ -1574,7 +1576,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "compare":
             report = compare_projects(args.before, args.after, before_program=args.before_program,
                                       after_program=args.after_program, limit=args.limit, offset=args.offset,
-                                      storage=args.storage, timeout=args.timeout)
+                                      storage=args.storage, instructions=args.instructions, timeout=args.timeout)
             if args.json:
                 print(json.dumps(report))
             else:

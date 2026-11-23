@@ -72,7 +72,7 @@ def test_compare_projects_normalizes_moved_operands_and_flags_changed_body(tmp_p
         projects.append(project)
     worker.start(projects[0])
     try:
-        assert main(["compare", *map(str, projects), "--json"]) == 0, capsys.readouterr().err
+        assert main(["compare", *map(str, projects), "--instructions", "--json"]) == 0, capsys.readouterr().err
         report = json.loads(capsys.readouterr().out)
         assert worker.status(projects[0])["requests"] == 1
     finally:
@@ -82,7 +82,10 @@ def test_compare_projects_normalizes_moved_operands_and_flags_changed_body(tmp_p
     assert all(not row["evidence"]["same_raw_instruction_bytes"] for row in calls)
     main_match = next(row for row in calls if row["before"]["offset"] == 0)
     assert "name:CPU_PORT_DATA" in main_match["evidence"]["shared"]["data"]["examples"]
+    assert main_match["instruction_map"][1] == {"before": {"unit": "root", "offset": 3},
+                                               "after": {"unit": "root", "offset": 3}}
     changed, = [row for row in report["matches"] if row["status"] == "changed_candidate"]
+    assert "instruction_map" not in changed
     assert changed["matched_by"] == "call_graph_and_data"
     assert (changed["before"]["offset"], changed["after"]["offset"]) == (0x10, 0x10)
     assert changed["evidence"]["shared"]["callers"]["count"] == 2

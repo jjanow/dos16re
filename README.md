@@ -978,7 +978,8 @@ makes the result `conflict`. Missing or truncated evidence otherwise makes it `u
 ```
 
 The versioned file uses memory unit names and offsets. It carries manually named functions,
-global labels, comments, entry points, manually defined function signatures, and data layouts.
+global labels, function-local labels at instruction starts, comments, entry points, manually defined
+function signatures, and data layouts.
 Export includes the Ghidra language and the executable hash when available. Import previews
 additions and conflicts, and applies the entire document in one transaction if it has no conflicts.
 Replaying it again reports identical annotations as unchanged.
@@ -1031,8 +1032,17 @@ source in `provenance`. If a typed signature transfers, its data type archive tr
 document. Data layouts appear among the skipped entries. Use `annotations import` to review
 the transfer against the destination.
 
+`compare --instructions` includes an `instruction_map` for same-body matches with aligned entries.
+Transfer uses that map for comments and global or function-local labels at instruction starts,
+including when instruction lengths change or a function moves. Local labels keep their function
+scope. The transferred annotation records the destination function entry and preserves the source
+entry in `provenance`. Preview reports a conflict if the destination instruction or its expected
+function is missing. Offcut comments and annotations with no matching instruction are skipped.
+Use `--instructions` and `--storage` together when transferring both instruction annotations and
+custom storage.
+
 ```sh
-.venv/bin/retrore compare out/old-project out/new-project --storage --json > comparison.json
+.venv/bin/retrore compare out/old-project out/new-project --instructions --storage --json > comparison.json
 .venv/bin/retrore annotations transfer annotations.json comparison.json --json > transferred.json
 .venv/bin/retrore annotations import transferred.json --project out/new-project --json
 .venv/bin/retrore annotations import transferred.json --project out/new-project --apply --json

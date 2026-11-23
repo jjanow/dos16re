@@ -14,7 +14,8 @@ _MIN_BODY_INSTRUCTIONS = 3
 
 def compare_projects(before: Path, after: Path, *, before_program: str = "image.bin",
                      after_program: str = "image.bin", limit: int = DEFAULT_LIMIT, offset: int = 0,
-                     storage: bool = False, timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
+                     storage: bool = False, instructions: bool = False,
+                     timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
     """Read the projects and report exact normalized bodies and reviewable match candidates."""
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise ghidra.GhidraError(f"limit must be between 1 and {MAX_LIMIT}")
@@ -25,6 +26,8 @@ def compare_projects(before: Path, after: Path, *, before_program: str = "image.
     ghidra._require_project(before)
     ghidra._require_project(after)
     request = {"storage": True} if storage else {}
+    if instructions:
+        request["instructions"] = True
     first = ghidra._query_json(before, "fingerprints", request, timeout=timeout, program=before_program)
     second = (first if ghidra._project_parts(before) == ghidra._project_parts(after)
               and before_program == after_program else
@@ -106,6 +109,15 @@ def _storage_offsets(before: list[int], after: list[int]) -> dict | None:
     if before == after:
         return {"same": True}
     return {"before": before, "after": after}
+
+
+def _instruction_map(before: dict, after: dict) -> list[dict]:
+    first, second = before["instruction_sites"], after["instruction_sites"]
+    old_entry, new_entry = ({"unit": row["unit"], "offset": row["offset"]} for row in (before, after))
+    if (old_entry not in first or new_entry not in second or len(first) != len(second)
+            or first.index(old_entry) != second.index(new_entry)):
+        return []
+    return [{"before": old, "after": new} for old, new in zip(first, second) if old is not None and new is not None]
 
 
 def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
@@ -192,6 +204,11 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
             offsets = _storage_offsets(original["instruction_offsets"], revised["instruction_offsets"])
             if offsets is not None:
                 matches[-1]["storage_offsets"] = offsets
+        if (status == "same_body" and offset < len(matches) <= offset + limit
+                and original.get("instruction_sites") is not None and revised.get("instruction_sites") is not None):
+            instructions = _instruction_map(original, revised)
+            if instructions:
+                matches[-1]["instruction_map"] = instructions
 
     def unpaired(source: dict, target: dict, source_context: dict, target_context: dict) -> list[dict]:
         keys = [("symbol", _stable_name, _stable_name), ("call_graph_and_data",

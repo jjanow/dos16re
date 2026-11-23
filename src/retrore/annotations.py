@@ -86,8 +86,36 @@ def _transfer_storage(storage: dict, offsets: dict) -> dict | None:
     return {**storage, "locals": locals_}
 
 
+def _site(record: dict) -> tuple[str, int]:
+    unit, offset = record["unit"], record["offset"]
+    if not isinstance(unit, str) or not unit or type(offset) is not int or offset < 0:
+        raise ghidra.GhidraError("invalid comparison instruction location")
+    return unit, offset
+
+
+def _instruction_matches(matches: dict) -> dict:
+    locations = {}
+    destinations = set()
+    for entry, match in matches.items():
+        if match["status"] != "same_body" or "instruction_map" not in match:
+            continue
+        destination_entry = _site(match["after"])
+        entry_aligned = False
+        for pair in match["instruction_map"]:
+            old, new = _site(pair["before"]), _site(pair["after"])
+            if old in locations or new in destinations:
+                raise ghidra.GhidraError("comparison contains duplicate instruction matches")
+            if old == entry and new == destination_entry:
+                entry_aligned = True
+            locations[old] = (entry, match, pair["after"])
+            destinations.add(new)
+        if not entry_aligned:
+            raise ghidra.GhidraError("comparison instruction map must align the entries")
+    return locations
+
+
 def transfer_annotations(document: Path, comparison: Path) -> dict:
-    """Make a replay document for same-body function entries on a page of comparison results."""
+    """Make a replay document for same-body function entries and mapped instructions."""
     source = _read_annotations(document)
     comparison = _read_json(comparison)
     if type(comparison.get("comparison_version")) is not int or comparison["comparison_version"] != 1:
@@ -107,23 +135,40 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
                 raise ghidra.GhidraError("comparison contains duplicate function entry matches")
             matches[key] = match
             destinations.add(destination)
+        same_language = before["language"] == after["language"]
+        instructions = _instruction_matches(matches) if same_language else {}
         annotations, skipped = [], []
         for item in source["annotations"]:
             key = item["unit"], item["offset"]
+            kind = item["kind"]
             match = matches.get(key)
+            scoped = "function" in item
+            needs_instruction = kind in ("label", "local_label") or (
+                kind == "comment" and (scoped or (match is None and bool(instructions))))
+            site = instructions.get(key) if needs_instruction else None
+            entry = None
+            if site is not None:
+                entry, match, destination = site
+            else:
+                destination = match["after"] if match is not None else None
             custom_storage = "custom_storage" in item
             mapped_storage = None
             if custom_storage and "storage_blocks" not in comparison:
                 reason = "custom_variable_storage_requires_original_layout"
-            elif item["kind"] == "data_layout":
+            elif kind == "data_layout":
                 reason = "data_layout_requires_original_layout"
-            elif item["kind"] not in ("function_name", "signature", "comment"):
+            elif kind not in ("function_name", "signature", "comment", "label", "local_label"):
                 reason = "unsupported_annotation_kind"
+            elif needs_instruction and site is None:
+                reason = ("no_instruction_match_on_page" if instructions or kind == "local_label"
+                          or scoped else "unsupported_annotation_kind")
+            elif entry is not None and scoped and _site(item["function"]) != entry:
+                reason = "instruction_function_mismatch"
             elif match is None:
                 reason = "no_function_entry_match_on_page"
-            elif match["status"] != "same_body" or before["language"] != after["language"]:
+            elif match["status"] != "same_body" or not same_language:
                 reason = "function_match_requires_review"
-            elif match["after"]["unit"] is None or type(match["after"]["offset"]) is not int:
+            elif destination["unit"] is None or type(destination["offset"]) is not int:
                 reason = "destination_has_no_unit"
             elif custom_storage and source["version"] == 5:
                 reason = "custom_storage_requires_fresh_export"
@@ -131,11 +176,14 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
                     (mapped_storage := _transfer_storage(item["custom_storage"], match["storage_offsets"])) is None):
                 reason = "custom_storage_first_use_unmapped"
             else:
-                transferred = {**item, "unit": match["after"]["unit"], "offset": match["after"]["offset"]}
+                transferred = {**item, "unit": destination["unit"], "offset": destination["offset"]}
                 if mapped_storage is not None:
                     transferred["custom_storage"] = mapped_storage
                 provenance = {"sha256": before["sha256"], "unit": key[0], "offset": key[1],
                               "matched_by": match["matched_by"]}
+                if entry is not None:
+                    transferred["function"] = {name: match["after"][name] for name in ("unit", "offset")}
+                    provenance["function"] = {"unit": entry[0], "offset": entry[1]}
                 if "export_evidence" in transferred:
                     provenance["export_evidence"] = transferred.pop("export_evidence")
                     if "export" in source:
@@ -145,7 +193,7 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
                 transferred["provenance"] = provenance
                 annotations.append(transferred)
                 continue
-            skipped.append({"unit": key[0], "offset": key[1], "kind": item["kind"], "reason": reason})
+            skipped.append({"unit": key[0], "offset": key[1], "kind": kind, "reason": reason})
         report = {"version": 1, "language": after["language"], "sha256": after["sha256"],
                   "annotations": annotations, "transfer": {"skipped": skipped}}
         if any("custom_storage" in item for item in annotations):

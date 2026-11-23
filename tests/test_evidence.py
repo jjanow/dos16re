@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from struct import pack_into
 
 import pytest
 
@@ -222,6 +223,75 @@ def test_annotation_transfer_maps_local_first_use_by_instruction(tmp_path, capsy
     skipped = json.loads(capsys.readouterr().out)
     assert skipped["annotations"] == []
     assert skipped["transfer"]["skipped"][0]["reason"] == "custom_storage_first_use_unmapped"
+
+
+@pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
+def test_annotations_follow_instructions_with_changed_offsets(tmp_path, capsys):
+    before, after = (tmp_path / name for name in ("before", "after"))
+    for project, entry, branch in ((before, 0, "75 01"), (after, 0x10, "0f 85 01 00")):
+        program = tmp_path / (project.name + ".exe")
+        export = tmp_path / (project.name + "-export")
+        # INC AX; JNZ clear; INC BX; clear: XOR DX,DX; RET
+        code = bytes(entry) + bytes.fromhex(f"40 {branch} 43 31 d2 c3")
+        header = bytearray(32)
+        pack_into("<2s13H", header, 0, b"MZ", len(header) + len(code), 1, 0, 2, 32, 32, 2, 0x200, 0,
+                  entry, 0, 28, 0)
+        program.write_bytes(header + code)
+        assert main(["load", str(program), "-o", str(export)]) == 0, capsys.readouterr().err
+        assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    source = export_annotations(before)
+    source["annotations"] += [
+        {"kind": "comment", "unit": "root", "offset": 4, "comment_type": "PRE", "value": "Clear the result"},
+        {"kind": "label", "unit": "root", "offset": 4, "value": "clear_result"},
+        {"kind": "local_label", "unit": "root", "offset": 4, "value": "clear",
+         "function": {"unit": "root", "offset": 0}},
+        {"kind": "comment", "unit": "root", "offset": 5, "comment_type": "EOL", "value": "Offcut"},
+    ]
+    original = tmp_path / "annotations.json"
+    original.write_text(json.dumps(source), encoding="utf-8")
+    assert import_annotations(before, original, apply=True)["applied"]
+    source = export_annotations(before, export=tmp_path / "before-export")
+    assert any(row["kind"] == "local_label" for row in source["annotations"])
+    original.write_text(json.dumps(source), encoding="utf-8")
+
+    comparison = tmp_path / "comparison.json"
+    assert main(["compare", str(before), str(after), "--instructions", "--storage", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    match, = report["matches"]
+    assert match["status"] == "same_body"
+    assert match["storage_offsets"] == {"before": [0, 1, 3, 4, 6], "after": [0, 1, 5, 6, 8]}
+    assert match["instruction_map"][3] == {"before": {"unit": "root", "offset": 4},
+                                          "after": {"unit": "root", "offset": 0x16}}
+    comparison.write_text(json.dumps(report), encoding="utf-8")
+    assert main(["annotations", "transfer", str(original), str(comparison), "--json"]) == 0
+    transferred = json.loads(capsys.readouterr().out)
+    entry_name, = [row for row in transferred["annotations"] if row["kind"] == "function_name"]
+    assert entry_name["offset"] == 0x10
+    notes = [row for row in transferred["annotations"] if row["kind"] != "function_name"]
+    assert {row["kind"] for row in notes} == {"comment", "label", "local_label"}
+    for row in notes:
+        assert row["offset"] == 0x16
+        assert row["function"] == {"unit": "root", "offset": 0x10}
+        assert row["provenance"]["offset"] == 4 and row["provenance"]["function"]["offset"] == 0
+        assert row["provenance"]["export_evidence"]["status"] == "consistent"
+    assert any(row["offset"] == 5 and row["reason"] == "no_instruction_match_on_page"
+               for row in transferred["transfer"]["skipped"])
+
+    path = tmp_path / "transferred.json"
+    bad_notes = [notes[0] | {"offset": 0x17}, notes[1] | {"function": {"unit": "root", "offset": 0}}, *notes[2:]]
+    path.write_text(json.dumps(transferred | {"annotations": bad_notes}), encoding="utf-8")
+    conflict = import_annotations(after, path, apply=True)
+    assert not conflict["applied"] and conflict["conflicts"] == 2
+    assert all(row.get("value") != "clear" for row in export_annotations(after)["annotations"])
+    path.write_text(json.dumps(transferred), encoding="utf-8")
+    preview = import_annotations(after, path)
+    assert preview["additions"] == 3 and preview["conflicts"] == 0
+    assert import_annotations(after, path, apply=True)["applied"]
+    assert import_annotations(after, path)["unchanged"] == 4
+    local, = [row for row in export_annotations(after)["annotations"] if row["kind"] == "local_label"]
+    assert local["offset"] == 0x16 and local["function"]["offset"] == 0x10
 
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")

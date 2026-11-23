@@ -59,7 +59,9 @@ import java.util.Set;
 
 public class RetroreAnnotations extends GhidraScript {
     private record Item(String unit, long offset, String kind, String value, String commentType,
-            String callingConvention, Prototype prototype, CustomStorage customStorage, DataLayout dataLayout) {}
+            String callingConvention, Prototype prototype, CustomStorage customStorage, DataLayout dataLayout,
+            Location function) {}
+    private record Location(String unit, long offset) {}
     private record TypePath(String category, String name) {
         static TypePath of(DataType type) {
             return new TypePath(type.getCategoryPath().getPath(), type.getName());
@@ -117,7 +119,7 @@ public class RetroreAnnotations extends GhidraScript {
     }
 
     private static final Set<String> KINDS =
-        Set.of("label", "function_name", "comment", "entry_point", "signature", "data_layout");
+        Set.of("label", "local_label", "function_name", "comment", "entry_point", "signature", "data_layout");
     private static final String ARCHIVE_FORMAT = "ghidra-gdt";
     private static final DataTypeConflictHandler TYPE_HANDLER = DataTypeConflictHandler.DEFAULT_HANDLER;
     private static final Comparator<DataType> TYPE_ORDER = Comparator
@@ -145,9 +147,18 @@ public class RetroreAnnotations extends GhidraScript {
     }
 
     private Item item(Address address, String kind, String value, String detail) {
+        return item(address, kind, value, detail, null);
+    }
+
+    private Location location(Address address) {
         var block = currentProgram.getMemory().getBlock(address);
-        return block == null ? null : new Item(block.getName(), address.subtract(block.getStart()), kind, value,
-            kind.equals("comment") ? detail : null, kind.equals("signature") ? detail : null, null, null, null);
+        return block == null ? null : new Location(block.getName(), address.subtract(block.getStart()));
+    }
+
+    private Item item(Address address, String kind, String value, String detail, Location function) {
+        var site = location(address);
+        return site == null ? null : new Item(site.unit(), site.offset(), kind, value, kind.equals("comment") ? detail :
+            null, kind.equals("signature") ? detail : null, null, null, null, function);
     }
 
     private Map<String, Object> exportAnnotations() throws Exception {
@@ -168,14 +179,24 @@ public class RetroreAnnotations extends GhidraScript {
                 continue;
             }
             String kind;
+            Location owner = null;
             if (symbol.getSymbolType() == SymbolType.FUNCTION) {
                 kind = "function_name";
-            } else if (symbol.getSymbolType() == SymbolType.LABEL && symbol.getParentNamespace().isGlobal()) {
-                kind = "label";
+            } else if (symbol.getSymbolType() == SymbolType.LABEL) {
+                var namespace = symbol.getParentNamespace();
+                if (namespace.isGlobal()) {
+                    kind = "label";
+                } else if (namespace instanceof Function function && function.getBody().contains(symbol.getAddress())
+                        && listing.getInstructionAt(symbol.getAddress()) != null
+                        && (owner = location(function.getEntryPoint())) != null) {
+                    kind = "local_label";
+                } else {
+                    continue;
+                }
             } else {
                 continue;
             }
-            var item = item(symbol.getAddress(), kind, symbol.getName(), null);
+            var item = item(symbol.getAddress(), kind, symbol.getName(), null, owner);
             if (item != null) {
                 items.add(item);
             }
@@ -198,7 +219,7 @@ public class RetroreAnnotations extends GhidraScript {
                     types.add(variable.getDataType());
                 }
                 item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
-                    item.callingConvention(), null, CustomStorage.of(function), null);
+                    item.callingConvention(), null, CustomStorage.of(function), null, null);
                 customStorage = true;
             } else {
                 var signatureTypes = new ArrayList<DataType>();
@@ -209,7 +230,7 @@ public class RetroreAnnotations extends GhidraScript {
                 if (signatureTypes.stream().anyMatch(RetroreAnnotations::usesNamedDefinition)) {
                     types.addAll(signatureTypes);
                     item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
-                        item.callingConvention(), Prototype.of(signature), null, null);
+                        item.callingConvention(), Prototype.of(signature), null, null, null);
                 }
             }
             items.add(item);
@@ -224,7 +245,7 @@ public class RetroreAnnotations extends GhidraScript {
             if (block != null && block.contains(data.getMaxAddress()) && DataLayout.supports(type, data.getLength())) {
                 types.add(type);
                 items.add(new Item(block.getName(), address.subtract(block.getStart()), "data_layout",
-                    null, null, null, null, null, new DataLayout(TypePath.of(type), data.getLength())));
+                    null, null, null, null, null, new DataLayout(TypePath.of(type), data.getLength()), null));
                 dataLayouts = true;
             }
         }
@@ -235,7 +256,10 @@ public class RetroreAnnotations extends GhidraScript {
             for (var type : CommentType.values()) {
                 String value = listing.getComment(type, address);
                 if (value != null) {
-                    items.add(item(address, "comment", value, type.name()));
+                    var item = item(address, "comment", value, type.name());
+                    if (item != null) {
+                        items.add(item);
+                    }
                 }
             }
         }
@@ -433,6 +457,13 @@ public class RetroreAnnotations extends GhidraScript {
         var manager = currentProgram.getDataTypeManager();
         var keys = new HashSet<Item>();
         var layoutRanges = new AddressSet();
+        var unitNames = new HashSet<String>();
+        var ambiguousUnits = new HashSet<String>();
+        for (var block : currentProgram.getMemory().getBlocks()) {
+            if (!unitNames.add(block.getName())) {
+                ambiguousUnits.add(block.getName());
+            }
+        }
         int conflicts = 0;
         int additions = 0;
         if (staged != null) {
@@ -484,17 +515,18 @@ public class RetroreAnnotations extends GhidraScript {
                 }
             }
             var dataLayout = readLayout(row, kind, version);
+            var function = readInstructionFunction(row, kind);
             var item = new Item(string(row, "unit"), offset, kind,
                 kind.equals("entry_point") || dataLayout != null ? null : string(row, "value"),
                 kind.equals("comment") ? string(row, "comment_type") : null,
                 kind.equals("signature") ? string(row, "calling_convention") : null,
-                prototype, customStorage, dataLayout);
+                prototype, customStorage, dataLayout, function);
             var key = new Item(item.unit(), item.offset(), item.kind(),
-                kind.equals("label") ? item.value() : null, item.commentType(), null, null, null, null);
+                isLabel(kind) ? item.value() : null, item.commentType(), null, null, null, null, null);
             if (!keys.add(key)) {
                 throw new IllegalArgumentException("duplicate annotation at " + item.unit() + "+" + item.offset());
             }
-            var change = check(item, staged, layoutRanges, storageBlocks);
+            var change = check(item, staged, layoutRanges, storageBlocks, ambiguousUnits);
             if (change.status().equals("conflict")) {
                 conflicts++;
             } else if (change.status().equals("add")) {
@@ -551,8 +583,28 @@ public class RetroreAnnotations extends GhidraScript {
         return layout;
     }
 
-    private Change check(Item item, DataTypeManager staged, AddressSet layoutRanges, List<StorageBlock> storageBlocks)
-            throws Exception {
+    private static boolean isLabel(String kind) {
+        return kind.equals("label") || kind.equals("local_label");
+    }
+
+    private static Location readInstructionFunction(JsonObject row, String kind) {
+        if (!row.has("function") && !kind.equals("local_label")) {
+            return null;
+        }
+        if (!(isLabel(kind) || kind.equals("comment")) || !row.has("function")
+                || !row.get("function").isJsonObject()) {
+            throw new IllegalArgumentException("expected an instruction's function for the label or comment");
+        }
+        var location = GSON.fromJson(row.get("function"), Location.class);
+        if (location.unit() == null || location.unit().isEmpty() || location.offset() < 0
+                || !GSON.toJsonTree(location).equals(row.get("function"))) {
+            throw new IllegalArgumentException("invalid instruction function location");
+        }
+        return location;
+    }
+
+    private Change check(Item item, DataTypeManager staged, AddressSet layoutRanges,
+            List<StorageBlock> storageBlocks, Set<String> ambiguousUnits) throws Exception {
         var block = currentProgram.getMemory().getBlock(item.unit());
         if (block == null || item.offset() < 0 || item.offset() >= block.getSize()) {
             return new Change(item, null, "conflict", "unit or offset is missing");
@@ -563,7 +615,18 @@ public class RetroreAnnotations extends GhidraScript {
         }
         var listing = currentProgram.getListing();
         var symbols = currentProgram.getSymbolTable();
-        if (item.kind().equals("label") || item.kind().equals("function_name")) {
+        Function owner = null;
+        if (item.function() != null) {
+            if (ambiguousUnits.contains(item.unit()) || ambiguousUnits.contains(item.function().unit())) {
+                return new Change(item, address, "conflict", "the instruction or its expected function has an ambiguous unit");
+            }
+            owner = listing.getFunctionContaining(address);
+            if (owner == null || !item.function().equals(location(owner.getEntryPoint()))
+                    || listing.getInstructionAt(address) == null) {
+                return new Change(item, address, "conflict", "no instruction at this address in the expected function");
+            }
+        }
+        if (isLabel(item.kind()) || item.kind().equals("function_name")) {
             SymbolUtilities.validateName(item.value());
         }
         if (item.kind().equals("function_name")) {
@@ -577,12 +640,17 @@ public class RetroreAnnotations extends GhidraScript {
             if (function.getSymbol().getSource() == SourceType.USER_DEFINED) {
                 return new Change(item, address, "conflict", "a manual function name already exists");
             }
-        } else if (item.kind().equals("label")) {
+        } else if (isLabel(item.kind())) {
+            var namespace = item.kind().equals("local_label") ? owner : currentProgram.getGlobalNamespace();
             for (var symbol : symbols.getSymbols(address)) {
-                if (symbol.getSymbolType() == SymbolType.LABEL && symbol.getParentNamespace().isGlobal() &&
+                if (symbol.getSymbolType() == SymbolType.LABEL && symbol.getParentNamespace().equals(namespace) &&
                         symbol.getName().equals(item.value())) {
                     return new Change(item, address, "unchanged", "");
                 }
+            }
+            if (owner != null && owner.getEntryPoint().equals(address)
+                    && owner.getSymbol().getSource() == SourceType.DEFAULT) {
+                return new Change(item, address, "conflict", "the label would rename the destination function");
             }
         } else if (item.kind().equals("comment")) {
             String previous = listing.getComment(CommentType.valueOf(item.commentType()), address);
@@ -606,7 +674,7 @@ public class RetroreAnnotations extends GhidraScript {
                     if (storageBlocks != null) {
                         var storage = remapCustomStorage(item.customStorage(), function, storageBlocks);
                         item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
-                            item.callingConvention(), null, storage, null);
+                            item.callingConvention(), null, storage, null, null);
                     }
                     var update = customUpdate(item, function, staged);
                     return new Change(item, address, update.unchanged() ? "unchanged" : "add", "");
@@ -907,6 +975,8 @@ public class RetroreAnnotations extends GhidraScript {
         switch (item.kind()) {
             case "function_name" -> listing.getFunctionAt(address).setName(item.value(), SourceType.USER_DEFINED);
             case "label" -> symbols.createLabel(address, item.value(), SourceType.USER_DEFINED);
+            case "local_label" -> symbols.createLabel(address, item.value(), listing.getFunctionContaining(address),
+                SourceType.USER_DEFINED);
             case "comment" -> listing.setComment(address, CommentType.valueOf(item.commentType()), item.value());
             case "entry_point" -> symbols.addExternalEntryPoint(address);
             case "data_layout" -> {

@@ -15,7 +15,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -25,20 +27,32 @@ import java.util.TreeSet;
 public class RetroreFingerprints extends GhidraScript {
     private record Shape(String id, String name, String stableName, String address, String unit, Long offset,
             int instructions, String fingerprint, String rawSha256, TreeSet<String> calls,
-            TreeSet<String> externalCalls, TreeSet<String> data, List<Long> instructionOffsets) {}
+            TreeSet<String> externalCalls, TreeSet<String> data, List<Long> instructionOffsets,
+            List<Location> instructionSites) {}
+    private record Location(String unit, long offset) {}
     private record StorageBlock(String unit, String space, String start, long size, String type,
             boolean initialized, boolean read, boolean write, boolean execute) {}
 
     private final Map<Address, List<String>> dataCache = new HashMap<>();
+    private final HashSet<String> ambiguousUnits = new HashSet<>();
 
     @Override
     public void run() throws Exception {
-        var args = getScriptArgs();
-        boolean storage = args.length > 1 && args[1].equals("storage");
+        var args = Arrays.asList(getScriptArgs());
+        boolean storage = args.subList(1, args.size()).contains("storage");
+        boolean instructions = args.subList(1, args.size()).contains("instructions");
+        if (instructions) {
+            var names = new HashSet<String>();
+            for (var block : currentProgram.getMemory().getBlocks()) {
+                if (!names.add(block.getName())) {
+                    ambiguousUnits.add(block.getName());
+                }
+            }
+        }
         var functions = new ArrayList<Shape>();
         for (var function : currentProgram.getFunctionManager().getFunctions(true)) {
             monitor.checkCancelled();
-            functions.add(fingerprint(function, storage));
+            functions.add(fingerprint(function, storage, instructions));
         }
         var report = new HashMap<String, Object>(Map.of("program", currentProgram.getName(),
             "language", currentProgram.getLanguageID().toString(),
@@ -56,10 +70,10 @@ public class RetroreFingerprints extends GhidraScript {
         }
         var gson = new GsonBuilder().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .serializeNulls().create();
-        Files.writeString(Path.of(args[0]), gson.toJson(report));
+        Files.writeString(Path.of(args.getFirst()), gson.toJson(report));
     }
 
-    private Shape fingerprint(Function function, boolean storage) throws Exception {
+    private Shape fingerprint(Function function, boolean storage, boolean includeSites) throws Exception {
         var entry = function.getEntryPoint();
         var block = currentProgram.getMemory().getBlock(entry);
         var instructions = new ArrayList<Instruction>();
@@ -113,10 +127,18 @@ public class RetroreFingerprints extends GhidraScript {
         String stableName = function.getSymbol().getSource() == SourceType.DEFAULT ? null : function.getName();
         var offsets = storage ? instructions.stream().map(instruction -> instruction.getAddress().subtract(entry))
             .toList() : null;
+        var sites = includeSites ? instructions.stream().map(instruction -> location(instruction.getAddress()))
+            .toList() : null;
         return new Shape(entry.toString(true), function.getName(), stableName, entry.toString(),
             block == null ? null : block.getName(), block == null ? null : entry.subtract(block.getStart()),
             instructions.size(), HexFormat.of().formatHex(normalized.digest()), HexFormat.of().formatHex(raw.digest()),
-            calls, externals, data, offsets);
+            calls, externals, data, offsets, sites);
+    }
+
+    private Location location(Address address) {
+        var block = currentProgram.getMemory().getBlock(address);
+        return block == null || ambiguousUnits.contains(block.getName()) ? null :
+            new Location(block.getName(), address.subtract(block.getStart()));
     }
 
     private void operand(MessageDigest hash, Instruction instruction, int index, Map<Address, Integer> ordinals) {

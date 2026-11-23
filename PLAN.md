@@ -14,13 +14,14 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `compare --storage` and version 5 annotation transfer gained custom variable
-storage remapping for same-body functions. Local first-use positions follow matched instructions
-and absolute storage follows compatible memory blocks. The standalone suite passed 423 tests with
-93 skipped. The evidence, layout, and comparison suites on Ghidra 12.2 passed 26 tests with 2
-skipped, including replay into a relocated C64 project and conflict handling for unmapped storage.
+On 2026-11-23, `compare --instructions` gained instruction maps for transferring comments and
+global and function-local labels inside matching functions. Replay checks the destination instruction
+and its owning function. A synthetic DOS fixture exercises a moved routine with a wider branch,
+source evidence, atomic conflict handling, and repeat replay. The standalone suite passed 423 tests
+with 94 skipped. The comparison, evidence, and layout suites passed 27 tests with 2 skipped on
+Ghidra 12.2.
 
-Resume Phase 10 with transferring annotations inside function bodies.
+Resume Phase 10 with transferring fixed-size data layouts between projects.
 
 ## Why
 
@@ -364,9 +365,10 @@ release. Continue with the analysis backlog below.
   pointer writers. `trace --evidence` attaches the export identity and a byte at each mapped DOSBox-X
   address to the report, including disassembly misses and observed gap examples. The evidence
   includes the original byte before loader fixups and source coordinates where available.
-- **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
-  entry points. An optional loader export adds byte and source evidence at each anchor. Transfer
-  preserves the source evidence. Replay previews conflicts and applies changes in one transaction.
+- **Partly implemented.** `annotations` exports names, global labels, function-local instruction
+  labels, signatures, comments, and entry points. An optional loader export adds byte and source
+  evidence at each anchor. Transfer preserves the source evidence. Replay previews conflicts and
+  applies changes in one transaction.
   Version 2 bundles program-local structures, unions, enums, typedefs, function definitions, and
   required dependencies as a Ghidra data type archive. It previews definitions by category and
   name and installs them before replaying signatures that use them. Version 3 also replays custom
@@ -379,8 +381,10 @@ release. Continue with the analysis backlog below.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay
-  at a matched same-body entry. Open: matching unnamed cross-port routines without shared call
-  or data anchors, and transferring annotations inside function bodies.
+  at a matched same-body entry. `compare --instructions` also maps instruction starts so interior
+  comments and global and function-local labels follow the matched instructions. Preview checks
+  that each destination instruction belongs to the expected function. Open: matching unnamed
+  cross-port routines without shared call or data anchors.
 - **Implemented.** Read-only queries accept an exact name for a compatible existing Ghidra program
   at the project root. `project-summary` and `batch --evidence` support review and handoff.
 
