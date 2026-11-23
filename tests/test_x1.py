@@ -38,8 +38,8 @@ def _ipl_entry(size, load, start, lsn, attribute=1, extension=b"Sys"):
 
 # LD BC,1800 / LD A,0D / OUT (C),A / LD BC,1E00 / OUT (C),A / JP 0100
 _BOOT = bytes.fromhex("01 00 18 3e 0d ed 79 01 00 1e ed 79 c3 00 01")
-# LD BC,0FFC / LD A,80 / OUT (C),A / RET
-_STAGE2 = bytes.fromhex("01 fc 0f 3e 80 ed 79 c9")
+# LD BC,0FFC / LD A,80 / OUT (C),A / LD BC,0000 / OUT (C),A / RET
+_STAGE2 = bytes.fromhex("01 fc 0f 3e 80 ed 79 01 00 00 ed 79 c9")
 
 
 def _boot_disk(entry=None):
@@ -164,8 +164,9 @@ def test_ghidra_x1_full_port_references(tmp_path, capsys):
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
     imported = json.loads(capsys.readouterr().out)
     assert (imported["format"], imported["memory_view"]) == ("X1", "ram")
-    function, transfer, crtc, rom, fdc = query_batch(project, [
+    function, stage2, transfer, crtc, rom, fdc = query_batch(project, [
         {"command": "decomp", "address": "c000"},
+        {"command": "decomp", "address": "0100"},
         {"command": "xrefs", "address": "c00c", "compact": True, "direction": "outgoing"},
         {"command": "xrefs", "address": "x1_crtc:0000", "compact": True, "direction": "incoming"},
         {"command": "xrefs", "address": "x1_ipl_rom_off:0000", "compact": True, "direction": "incoming"},
@@ -174,6 +175,9 @@ def test_ghidra_x1_full_port_references(tmp_path, capsys):
     # Ports use the full BC value, so 1800 and 1E00 are distinct from each other and from port 00.
     assert "CRTC_ADDRESS" in function["result"]["decompilation"]
     assert "IPL_ROM_OFF" in function["result"]["decompilation"]
+    # The Z180 variant's internal register names at io:0000-003F are removed.
+    assert "FDC_DRIVE_CONTROL" in stage2["result"]["decompilation"]
+    assert "CNTLA0" not in stage2["result"]["decompilation"]
     assert transfer["result"]["outgoing"][0]["to"] == "lsn_0010_0100:0000"
     assert crtc["result"]["incoming"][0]["from"] == "root:0005"
     assert rom["result"]["incoming"][0]["from"] == "root:000a"
@@ -211,8 +215,9 @@ def test_phantasie_i_x1_boot_and_second_stage(tmp_path, capsys):
     assert main(["load", str(disk), "--x1", "--x1-ipl", "--x1-lsn", "80+112@100", "--entry", "100",
                  "-o", str(export)]) == 0, capsys.readouterr().err
     assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
-    main_loop, loader, load_call, transfer, crtc, ppi, fdc = query_batch(project, [
+    main_loop, callees, loader, load_call, transfer, crtc, ppi, fdc = query_batch(project, [
         {"command": "decomp", "address": "3d7f"},
+        {"command": "callees", "address": "3d7f", "compact": True},
         {"command": "decomp", "address": "c3d8"},
         {"command": "xrefs", "address": "c45e", "compact": True, "direction": "outgoing", "ref_types": ["UNCONDITIONAL_CALL"]},
         {"command": "xrefs", "address": "c465", "compact": True, "direction": "outgoing"},
@@ -221,7 +226,8 @@ def test_phantasie_i_x1_boot_and_second_stage(tmp_path, capsys):
         {"command": "xrefs", "address": "011d", "compact": True, "direction": "outgoing", "ref_types": ["WRITE"]},
     ])["results"]
     assert main_loop["result"]["unit_address"] == "lsn_0080_0100:3c7f"
-    assert "FUN_ram_0108" in main_loop["result"]["decompilation"]
+    assert main_loop["result"]["decompilation"]
+    assert callees["result"]["callees"][0]["to"] == "lsn_0080_0100:0008"
     assert loader["result"]["unit_address"] == "root:0458"
     assert loader["result"]["decompilation"]
     assert load_call["result"]["outgoing"][0]["to"] == "root:0458"

@@ -435,7 +435,9 @@ off with a write to port `$1E00` before it jumps to the payload. A write to `$1D
 on. The default view is RAM. Use `--x1-view ipl-rom` to represent the ROM window as uninitialized
 memory. Devices and VRAM are in the 16-bit I/O space, addressed through `OUT (C),r` with the full
 `BC` value. Ghidra imports X1 exports with its Z180 language variant. Unlike the plain Z80
-variant, which keeps only `C`, it decodes these ports as `BC`. The importer maps the whole I/O space and
+variant, which keeps only `C`, it decodes these ports as `BC`. That variant omits the undocumented
+Z80 instructions (`IXH`/`IXL`/`IYH`/`IYL` forms, `SLL`, and the `ED 4E`/`ED 6E` mode mirrors), so
+code that uses them stops at a bad instruction. Phantasie I's analysis coverage is the same under both variants. The importer maps the whole I/O space and
 labels the cartridge ROM, FDC, palette, priority, PCG, CRTC, sub-CPU, PPI, PSG, IPL ROM switch,
 CTC, attribute VRAM, text VRAM, and graphics VRAM blocks. For example, the command
 `xrefs x1_crtc:0001 --project out/x1-project --json` lists writes to the CRTC data register.
