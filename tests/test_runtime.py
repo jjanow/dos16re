@@ -94,7 +94,36 @@ def test_ghidra_dos_conventions_and_services(tmp_path, capsys):
     assert "FUN_1000_0034((void *)CONCAT22(unaff_CS,(void *)0x60),7);" in entry
     assert "FUN_1000_0046(3,5);" in entry
     assert "int FUN_1000_0034(void *param_1,int param_2)" in decompile("root:0034")
-    assert main(["callers", "dos_services:003d", "--project", str(project),
-                 "--json"]) == 0, capsys.readouterr().err
+    assert main(["callers", "dos_services:003d", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     site, = json.loads(capsys.readouterr().out)["callers"]
     assert site["from"]["unit_address"] == "root:0008"
+
+
+def test_ghidra_pool_of_radiance_conventions_and_services(tmp_path, capsys):
+    directory = os.environ.get("RETRORE_POR_DIR")
+    if not directory or not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set RETRORE_POR_DIR and GHIDRA_HOME to run the real-game test")
+    files = {name.upper(): os.path.join(directory, name) for name in os.listdir(directory)}
+    export, project = tmp_path / "export", tmp_path / "project"
+    root = files.get("START.EXE") or files["GAME.EXE"]
+    assert main(["load", root, "--overlay", files["GAME.OVR"], "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["dos_services"] == 35
+    assert report["calling_conventions"] == {
+        "callee_cleanup": 491, "caller_cleanup": 1, "far_pointer_arguments": 356, "no_stack_arguments": 222}
+
+    def decompile(address):
+        assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)["decompilation"]
+
+    # Turbo Pascal's Seek: the file record is one far pointer, and the carry flag comes from INT 21h AH=42h.
+    seek = decompile("root:c4e3")
+    assert "void __stdcall16far FUN_1000_c4e3(uint param_1,int param_2,void *param_3)" in seek
+    assert "DOS::SeekFile(0,*(undefined2 *)param_3," in seek and "if (extraout_CF) {" in seek
+    # GetTime(var Hour, Minute, Second, Sec100) stores the CX and DX results of AH=2Ch.
+    timing = decompile("root:a3c2")
+    assert "DOS::GetTime();" in timing and "*(uint *)param_4 = (uint)extraout_CH;" in timing
+    # The string store helper (retf 0Ah) takes a length and two far pointers; the source is one constant.
+    assert "(void *)0x4c1f0e2e);" in decompile("tpov_0025:1036")
