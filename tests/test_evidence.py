@@ -196,6 +196,34 @@ def test_annotation_transfer_preserves_anchors_and_skips_changed_bodies(tmp_path
     assert report["transfer"]["skipped"][-1]["reason"] == "data_layout_requires_original_layout"
 
 
+def test_annotation_transfer_maps_local_first_use_by_instruction(tmp_path, capsys):
+    annotations, comparison = (tmp_path / name for name in ("annotations.json", "compare.json"))
+    source = {"version": 3, "language": "x86", "sha256": "before", "data_types": {}, "annotations": [
+        {"kind": "signature", "unit": "root", "offset": 16, "custom_storage": {
+            "locals": [{"name": "scoped", "first_use": 2}, {"name": "stack", "first_use": 0}]}},
+    ]}
+    annotations.write_text(json.dumps(source), encoding="utf-8")
+    match = {"before": {"unit": "root", "offset": 16}, "after": {"unit": "root", "offset": 48},
+             "status": "same_body", "matched_by": "normalized_instructions",
+             "storage_offsets": {"before": [0, 2, 5], "after": [0, 3, 6]}}
+    report = {"comparison_version": 1, "before": {"language": "x86", "sha256": "before"},
+              "after": {"language": "x86", "sha256": "after"}, "matches": [match], "storage_blocks": []}
+    comparison.write_text(json.dumps(report), encoding="utf-8")
+    assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
+    transferred = json.loads(capsys.readouterr().out)
+    assert transferred["version"] == 5 and transferred["storage_blocks"] == []
+    signature, = transferred["annotations"]
+    assert signature["offset"] == 48
+    assert [variable["first_use"] for variable in signature["custom_storage"]["locals"]] == [3, 0]
+
+    source["annotations"][0]["custom_storage"]["locals"][0]["first_use"] = 1
+    annotations.write_text(json.dumps(source), encoding="utf-8")
+    assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
+    skipped = json.loads(capsys.readouterr().out)
+    assert skipped["annotations"] == []
+    assert skipped["transfer"]["skipped"][0]["reason"] == "custom_storage_first_use_unmapped"
+
+
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
 def test_non_retrore_project_can_be_queried_read_only(tmp_path):
     member = tmp_path / "native test.bin"
@@ -332,6 +360,15 @@ def test_annotation_data_types_round_trip(tmp_path, capsys):
     assert all(row.get("value") != "unapplied" for row in remaining["annotations"])
 
 
+def _edit_storage(project, mode, *args):
+    returncode, log = ghidra._launch([
+        str(ghidra._headless()), *ghidra._project_parts(project),
+        "-process", "image.bin", "-noanalysis", "-scriptPath", str(Path(__file__).parent / "ghidra"),
+        "-postScript", "AnnotationStorage.java", mode, *args,
+    ], 60, "synthetic annotation storage")
+    assert not returncode and "Annotation storage checked" in log, log
+
+
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
 def test_annotation_custom_storage_round_trip(tmp_path, capsys):
     source, export, original, fresh, conflict = (
@@ -343,15 +380,7 @@ def test_annotation_custom_storage_round_trip(tmp_path, capsys):
         assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
     capsys.readouterr()
 
-    def edit_storage(project, mode):
-        returncode, log = ghidra._launch([
-            str(ghidra._headless()), *ghidra._project_parts(project),
-            "-process", "image.bin", "-noanalysis", "-scriptPath", str(Path(__file__).parent / "ghidra"),
-            "-postScript", "AnnotationStorage.java", mode,
-        ], 60, "synthetic annotation storage")
-        assert not returncode and "Annotation storage checked" in log, log
-
-    edit_storage(original, "seed")
+    _edit_storage(original, "seed")
     document = export_annotations(original, export=export)
     assert document["version"] == 3 and document["data_types"]["types"] == []
     signature, = [row for row in document["annotations"] if row["kind"] == "signature"]
@@ -363,7 +392,7 @@ def test_annotation_custom_storage_round_trip(tmp_path, capsys):
     assert export_annotations(fresh)["version"] == 1
     assert main(["annotations", "import", str(path), "--project", str(fresh), "--apply", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["applied"]
-    edit_storage(fresh, "check")
+    _edit_storage(fresh, "check")
     again = import_annotations(fresh, path)
     assert again["additions"] == again["conflicts"] == 0
 
@@ -371,7 +400,7 @@ def test_annotation_custom_storage_round_trip(tmp_path, capsys):
         "unit": signature["unit"], "offset": 1, "kind": "comment", "comment_type": "EOL", "value": "unapplied",
     })
     path.write_text(json.dumps(document), encoding="utf-8")
-    edit_storage(conflict, "conflict")
+    _edit_storage(conflict, "conflict")
     before = export_annotations(conflict)
     preview = import_annotations(conflict, path)
     assert preview["additions"] == preview["conflicts"] == 1
@@ -380,3 +409,43 @@ def test_annotation_custom_storage_round_trip(tmp_path, capsys):
     assert main(["annotations", "import", str(path), "--project", str(conflict), "--apply", "--json"]) == 1
     assert not json.loads(capsys.readouterr().out)["applied"]
     assert export_annotations(conflict) == before
+
+
+@pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
+def test_annotation_custom_storage_transfer_rebases_memory(tmp_path, capsys):
+    source = tmp_path / "storage.prg"
+    source.write_bytes(bytes.fromhex("00 c0 a9 07 ea 60") + bytes(0x20))
+    before, after = (tmp_path / name for name in ("before", "after"))
+    for project, entry in ((before, "c000"), (after, "c400")):
+        export = project.with_name(project.name + "-export")
+        assert main(["load", str(source), "--base-address", entry, "--entry", entry, "-o", str(export)]) == 0
+        assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    _edit_storage(before, "seed", "c000", "relative")
+    original = tmp_path / "annotations.json"
+    original.write_text(json.dumps(export_annotations(before)), encoding="utf-8")
+    assert main(["compare", str(before), str(after), "--storage", "--json"]) == 0, capsys.readouterr().err
+    comparison = tmp_path / "comparison.json"
+    comparison.write_text(capsys.readouterr().out, encoding="utf-8")
+    assert main(["annotations", "transfer", str(original), str(comparison), "--json"]) == 0
+    transferred = json.loads(capsys.readouterr().out)
+    assert transferred["version"] == 5
+    signature, = transferred["annotations"]
+    assert signature["kind"] == "signature"
+    block, = [pair for pair in transferred["storage_blocks"] if pair["unit"] == "root"]
+    assert (block["before_start"], block["after_start"]) == ("c000", "c400")
+    path = tmp_path / "transferred.json"
+
+    path.write_text(json.dumps(transferred | {"storage_blocks": []}), encoding="utf-8")
+    conflict = import_annotations(after, path, apply=True)
+    assert not conflict["applied"] and conflict["conflicts"] == 1
+    assert "no matching memory block" in conflict["changes"][0]["reason"]
+
+    path.write_text(json.dumps(transferred), encoding="utf-8")
+    preview = import_annotations(after, path)
+    assert not preview["applied"] and preview["additions"] == 1 and preview["conflicts"] == 0
+    assert import_annotations(after, path, apply=True)["applied"]
+    _edit_storage(after, "check", "c400", "relative")
+    again = import_annotations(after, path)
+    assert again["additions"] == again["conflicts"] == 0

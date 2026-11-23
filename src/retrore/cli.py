@@ -1373,6 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
     compare_parser.add_argument("--limit", type=int, default=DEFAULT_COMPARE_LIMIT, metavar="N",
                                 help="return at most N rows per list")
     compare_parser.add_argument("--offset", type=int, default=0, metavar="N", help="skip N rows per list")
+    compare_parser.add_argument("--storage", action="store_true", help="include layout evidence for custom storage transfer")
     compare_parser.add_argument("--json", action="store_true", help="print JSON")
     compare_parser.add_argument("--timeout", type=_seconds, default=QUERY_TIMEOUT, metavar="SECONDS",
                                 help="maximum seconds per Ghidra project")
@@ -1573,7 +1574,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "compare":
             report = compare_projects(args.before, args.after, before_program=args.before_program,
                                       after_program=args.after_program, limit=args.limit, offset=args.offset,
-                                      timeout=args.timeout)
+                                      storage=args.storage, timeout=args.timeout)
             if args.json:
                 print(json.dumps(report))
             else:

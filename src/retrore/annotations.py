@@ -20,11 +20,13 @@ def _read_json(path: Path) -> dict:
 
 def _read_annotations(path: Path) -> dict:
     content = _read_json(path)
-    if (type(content.get("version")) is not int or content["version"] not in (1, 2, 3, 4)
+    if (type(content.get("version")) is not int or not 1 <= content["version"] <= 5
             or not isinstance(content.get("annotations"), list)
             or ("data_types" in content) != (content["version"] >= 2)
-            or (content["version"] >= 2 and not isinstance(content["data_types"], dict))):
-        raise ghidra.GhidraError("expected a version 1 through 4 annotation document")
+            or (content["version"] >= 2 and not isinstance(content["data_types"], dict))
+            or ("storage_blocks" in content) != (content["version"] == 5)
+            or (content["version"] == 5 and not isinstance(content["storage_blocks"], list))):
+        raise ghidra.GhidraError("expected a version 1 through 5 annotation document")
     return content
 
 
@@ -65,6 +67,25 @@ def import_annotations(project: Path, document: Path, *, apply: bool = False, pr
         return ghidra._run(project, ["-process", program, "-noanalysis"], *arguments, timeout=timeout)
 
 
+def _transfer_storage(storage: dict, offsets: dict) -> dict | None:
+    if offsets.get("same") is True:
+        return storage
+    before, after = offsets["before"], offsets["after"]
+    if (len(before) != len(after) or any(type(offset) is not int for offset in before + after)
+            or len(set(before)) != len(before) or len(set(after)) != len(after)):
+        raise ghidra.GhidraError("invalid comparison instruction offsets")
+    locations = dict(zip(before, after, strict=True))
+    if locations.get(0) != 0:
+        raise ghidra.GhidraError("comparison instruction offsets must align the entries")
+    locals_ = []
+    for variable in storage["locals"]:
+        offset = locations.get(variable["first_use"])
+        if offset is None:
+            return None
+        locals_.append({**variable, "first_use": offset})
+    return {**storage, "locals": locals_}
+
+
 def transfer_annotations(document: Path, comparison: Path) -> dict:
     """Make a replay document for same-body function entries on a page of comparison results."""
     source = _read_annotations(document)
@@ -90,7 +111,9 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
         for item in source["annotations"]:
             key = item["unit"], item["offset"]
             match = matches.get(key)
-            if "custom_storage" in item:
+            custom_storage = "custom_storage" in item
+            mapped_storage = None
+            if custom_storage and "storage_blocks" not in comparison:
                 reason = "custom_variable_storage_requires_original_layout"
             elif item["kind"] == "data_layout":
                 reason = "data_layout_requires_original_layout"
@@ -102,8 +125,15 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
                 reason = "function_match_requires_review"
             elif match["after"]["unit"] is None or type(match["after"]["offset"]) is not int:
                 reason = "destination_has_no_unit"
+            elif custom_storage and source["version"] == 5:
+                reason = "custom_storage_requires_fresh_export"
+            elif custom_storage and ("storage_offsets" not in match or
+                    (mapped_storage := _transfer_storage(item["custom_storage"], match["storage_offsets"])) is None):
+                reason = "custom_storage_first_use_unmapped"
             else:
                 transferred = {**item, "unit": match["after"]["unit"], "offset": match["after"]["offset"]}
+                if mapped_storage is not None:
+                    transferred["custom_storage"] = mapped_storage
                 provenance = {"sha256": before["sha256"], "unit": key[0], "offset": key[1],
                               "matched_by": match["matched_by"]}
                 if "export_evidence" in transferred:
@@ -118,7 +148,9 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
             skipped.append({"unit": key[0], "offset": key[1], "kind": item["kind"], "reason": reason})
         report = {"version": 1, "language": after["language"], "sha256": after["sha256"],
                   "annotations": annotations, "transfer": {"skipped": skipped}}
-        if any(item["kind"] == "signature" and "prototype" in item for item in annotations):
+        if any("custom_storage" in item for item in annotations):
+            report.update(version=5, data_types=source["data_types"], storage_blocks=comparison["storage_blocks"])
+        elif any(item["kind"] == "signature" and "prototype" in item for item in annotations):
             report.update(version=2, data_types=source["data_types"])
         return report
     except (KeyError, TypeError) as error:

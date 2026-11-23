@@ -14,14 +14,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, version 4 annotation documents gained export and replay of fixed-size record and
-array placements. Preview reports instruction, data, and placement overlaps before the transaction.
-The standalone suite passed 422 tests with 92 skipped. The layout and evidence suites with
-Ghidra 12.2 passed 21 tests with 2 skipped, including legacy annotation replay, conflict handling,
-and replay of an inferred DOS record array. A separate check replayed a primitive array in
-uninitialized memory.
+On 2026-11-23, `compare --storage` and version 5 annotation transfer gained custom variable
+storage remapping for same-body functions. Local first-use positions follow matched instructions
+and absolute storage follows compatible memory blocks. The standalone suite passed 423 tests with
+93 skipped. The evidence, layout, and comparison suites on Ghidra 12.2 passed 26 tests with 2
+skipped, including replay into a relocated C64 project and conflict handling for unmapped storage.
 
-Resume Phase 10 with remapping custom variable storage across layouts.
+Resume Phase 10 with transferring annotations inside function bodies.
 
 ## Why
 
@@ -373,7 +372,10 @@ release. Continue with the analysis backlog below.
   name and installs them before replaying signatures that use them. Version 3 also replays custom
   return, parameter, and local storage, with stack purge size and local first-use offsets. Version 4
   replays fixed-size record and array placements, including `layout --apply` results, with overlap
-  checks before applying. Version 1 remains supported. Remapping custom storage across layouts is open.
+  checks before applying. Version 5 transfer documents use `compare --storage` to remap custom
+  storage within matching memory blocks and align local first-use positions by instruction.
+  Preview reports unmapped storage as a conflict. Version 1 remains supported. Open work includes
+  transferring data layouts and mapping custom storage in renamed or resized blocks.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay

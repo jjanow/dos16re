@@ -998,8 +998,7 @@ The `custom_storage` field records the return and parameter locations, local var
 their first-use offsets, signature flags, and stack purge size. Storage uses Ghidra's native
 address spaces, including ordered register pieces and signed stack offsets. The bundled archive
 supplies the variable types. Preview reports incompatible signatures and conflicting locals.
-Reuse custom storage against the original program layout so absolute storage addresses
-and local first-use offsets still refer to the same locations.
+For a different program layout, prepare a transfer with `compare --storage`.
 
 Version 4 carries fixed-size structures, unions, and arrays placed in the Ghidra listing,
 including placements from `layout --apply`. Each `data_layout` annotation records the
@@ -1029,8 +1028,24 @@ without establishing that the two routines have identical behavior.
 names, signatures, and comments at same-body function entries, records the source and match method
 for each, and lists skipped entries. Source anchor evidence and the export identity travel with the
 source in `provenance`. If a typed signature transfers, its data type archive travels with the
-document. Custom-storage signatures and data layouts appear among the skipped entries because
-they depend on the original layout. Use `annotations import` to review it against the destination.
+document. Data layouts appear among the skipped entries. Use `annotations import` to review
+the transfer against the destination.
+
+```sh
+.venv/bin/retrore compare out/old-project out/new-project --storage --json > comparison.json
+.venv/bin/retrore annotations transfer annotations.json comparison.json --json > transferred.json
+.venv/bin/retrore annotations import transferred.json --project out/new-project --json
+.venv/bin/retrore annotations import transferred.json --project out/new-project --apply --json
+```
+
+With `--storage`, same-body matches on the same language and compiler specification can carry custom
+return, parameter, and local storage in a version 5 transfer document. Register pieces and stack
+offsets retain their original order and values. Absolute storage follows offsets within uniquely
+named memory blocks with matching size, space, type, and permissions. Local first-use offsets follow
+the corresponding instructions when their positions change. Preview shows the resolved storage
+and reports conflicts when a storage range cannot be mapped or when the destination block's address
+or size differs from the comparison. Export the applied destination project to transfer its
+annotations again.
 
 ### Persistent query workers
 

@@ -146,16 +146,17 @@ public class RetroreQuery extends GhidraScript {
             case "batch" -> batch(input.getAsJsonArray());
             case "single" -> query(input.getAsJsonObject());
             case "annotations" -> annotationQuery(input.getAsJsonObject());
-            case "fingerprints" -> fingerprints();
+            case "fingerprints" -> fingerprints(input.getAsJsonObject().has("storage"));
             default -> throw new IllegalArgumentException("unknown query mode " + mode);
         };
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> fingerprints() throws Exception {
+    private Map<String, Object> fingerprints(boolean storage) throws Exception {
         Path output = Files.createTempFile("retrore-fingerprints", ".json");
         try {
-            runScript("RetroreFingerprints.java", new String[] {output.toString()});
+            runScript("RetroreFingerprints.java", storage ? new String[] {output.toString(), "storage"} :
+                new String[] {output.toString()});
             return (Map<String, Object>) integral(GSON.fromJson(Files.readString(output), Map.class));
         } finally {
             Files.deleteIfExists(output);

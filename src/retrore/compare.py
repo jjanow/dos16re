@@ -14,7 +14,7 @@ _MIN_BODY_INSTRUCTIONS = 3
 
 def compare_projects(before: Path, after: Path, *, before_program: str = "image.bin",
                      after_program: str = "image.bin", limit: int = DEFAULT_LIMIT, offset: int = 0,
-                     timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
+                     storage: bool = False, timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
     """Read the projects and report exact normalized bodies and reviewable match candidates."""
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise ghidra.GhidraError(f"limit must be between 1 and {MAX_LIMIT}")
@@ -24,10 +24,11 @@ def compare_projects(before: Path, after: Path, *, before_program: str = "image.
     ghidra._check_program_name(after_program)
     ghidra._require_project(before)
     ghidra._require_project(after)
-    first = ghidra._query_json(before, "fingerprints", {}, timeout=timeout, program=before_program)
+    request = {"storage": True} if storage else {}
+    first = ghidra._query_json(before, "fingerprints", request, timeout=timeout, program=before_program)
     second = (first if ghidra._project_parts(before) == ghidra._project_parts(after)
               and before_program == after_program else
-              ghidra._query_json(after, "fingerprints", {}, timeout=timeout, program=after_program))
+              ghidra._query_json(after, "fingerprints", request, timeout=timeout, program=after_program))
     return _compare(first, second, limit, offset)
 
 
@@ -84,8 +85,33 @@ def _routine(function: dict) -> dict:
     return {name: function[name] for name in ("name", "address", "unit", "offset", "instructions")}
 
 
+def _storage_blocks(before: list[dict], after: list[dict]) -> list[dict]:
+    first, second = (_index(dict(enumerate(blocks)), lambda block: block["unit"]) for blocks in (before, after))
+    pairs = []
+    for unit, indices in first.items():
+        destinations = second.get(unit, ())
+        if len(indices) != 1 or len(destinations) != 1:
+            continue
+        old, new = before[indices[0]], after[destinations[0]]
+        if all(old[key] == new[key] for key in ("space", "size", "type", "initialized", "read", "write", "execute")):
+            pairs.append({"unit": unit, "space": old["space"], "size": old["size"],
+                          "before_start": old["start"], "after_start": new["start"]})
+    return pairs
+
+
+def _storage_offsets(before: list[int], after: list[int]) -> dict | None:
+    # Normalized instructions compare in listing order. The two entries must also line up in that order.
+    if len(before) != len(after) or 0 not in before or 0 not in after or before.index(0) != after.index(0):
+        return None
+    if before == after:
+        return {"same": True}
+    return {"before": before, "after": after}
+
+
 def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
     same_language = before["language"] == after["language"]
+    storage = ("storage_blocks" in before and "storage_blocks" in after and same_language
+               and before["compiler"] == after["compiler"])
     first = {function["id"]: function for function in before["functions"]}
     second = {function["id"]: function for function in after["functions"]}
     left, right = dict(first), dict(second)
@@ -162,6 +188,10 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
                                                            original["raw_sha256"] == revised["raw_sha256"]),
                             "shared": shared, "different_known_context": differences,
                         }})
+        if storage and status == "same_body":
+            offsets = _storage_offsets(original["instruction_offsets"], revised["instruction_offsets"])
+            if offsets is not None:
+                matches[-1]["storage_offsets"] = offsets
 
     def unpaired(source: dict, target: dict, source_context: dict, target_context: dict) -> list[dict]:
         keys = [("symbol", _stable_name, _stable_name), ("call_graph_and_data",
@@ -193,6 +223,8 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
     counts["ambiguous_before"] = sum(row["candidate_count"] > 0 for row in unpaired_before)
     counts["ambiguous_after"] = sum(row["candidate_count"] > 0 for row in unpaired_after)
     report = {"comparison_version": 1}
+    if storage:
+        report["storage_blocks"] = _storage_blocks(before["storage_blocks"], after["storage_blocks"])
     for side, listing in (("before", before), ("after", after)):
         report[side] = {key: listing[key] for key in ("program", "language", "sha256")} | {
             "function_count": len(listing["functions"])}

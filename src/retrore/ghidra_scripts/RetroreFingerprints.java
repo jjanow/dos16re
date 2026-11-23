@@ -25,25 +25,41 @@ import java.util.TreeSet;
 public class RetroreFingerprints extends GhidraScript {
     private record Shape(String id, String name, String stableName, String address, String unit, Long offset,
             int instructions, String fingerprint, String rawSha256, TreeSet<String> calls,
-            TreeSet<String> externalCalls, TreeSet<String> data) {}
+            TreeSet<String> externalCalls, TreeSet<String> data, List<Long> instructionOffsets) {}
+    private record StorageBlock(String unit, String space, String start, long size, String type,
+            boolean initialized, boolean read, boolean write, boolean execute) {}
 
     private final Map<Address, List<String>> dataCache = new HashMap<>();
 
     @Override
     public void run() throws Exception {
+        var args = getScriptArgs();
+        boolean storage = args.length > 1 && args[1].equals("storage");
         var functions = new ArrayList<Shape>();
         for (var function : currentProgram.getFunctionManager().getFunctions(true)) {
             monitor.checkCancelled();
-            functions.add(fingerprint(function));
+            functions.add(fingerprint(function, storage));
         }
-        var report = Map.of("program", currentProgram.getName(), "language", currentProgram.getLanguageID().toString(),
-            "sha256", Objects.toString(currentProgram.getExecutableSHA256(), ""), "functions", functions);
+        var report = new HashMap<String, Object>(Map.of("program", currentProgram.getName(),
+            "language", currentProgram.getLanguageID().toString(),
+            "sha256", Objects.toString(currentProgram.getExecutableSHA256(), ""), "functions", functions));
+        if (storage) {
+            var blocks = new ArrayList<StorageBlock>();
+            for (var block : currentProgram.getMemory().getBlocks()) {
+                var start = block.getStart();
+                blocks.add(new StorageBlock(block.getName(), start.getAddressSpace().getName(),
+                    Long.toUnsignedString(start.getOffset(), 16), block.getSize(), block.getType().name(),
+                    block.isInitialized(), block.isRead(), block.isWrite(), block.isExecute()));
+            }
+            report.put("compiler", currentProgram.getCompilerSpec().getCompilerSpecID().toString());
+            report.put("storage_blocks", blocks);
+        }
         var gson = new GsonBuilder().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
             .serializeNulls().create();
-        Files.writeString(Path.of(getScriptArgs()[0]), gson.toJson(report));
+        Files.writeString(Path.of(args[0]), gson.toJson(report));
     }
 
-    private Shape fingerprint(Function function) throws Exception {
+    private Shape fingerprint(Function function, boolean storage) throws Exception {
         var entry = function.getEntryPoint();
         var block = currentProgram.getMemory().getBlock(entry);
         var instructions = new ArrayList<Instruction>();
@@ -95,10 +111,12 @@ public class RetroreFingerprints extends GhidraScript {
             }
         }
         String stableName = function.getSymbol().getSource() == SourceType.DEFAULT ? null : function.getName();
+        var offsets = storage ? instructions.stream().map(instruction -> instruction.getAddress().subtract(entry))
+            .toList() : null;
         return new Shape(entry.toString(true), function.getName(), stableName, entry.toString(),
             block == null ? null : block.getName(), block == null ? null : entry.subtract(block.getStart()),
             instructions.size(), HexFormat.of().formatHex(normalized.digest()), HexFormat.of().formatHex(raw.digest()),
-            calls, externals, data);
+            calls, externals, data, offsets);
     }
 
     private void operand(MessageDigest hash, Instruction instruction, int index, Map<Address, Integer> ordinals) {

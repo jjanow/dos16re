@@ -14,7 +14,10 @@ import java.util.List;
 public class AnnotationStorage extends GhidraScript {
     @Override
     public void run() throws Exception {
-        var function = getFunctionAt(toAddr(0xc000));
+        var args = getScriptArgs();
+        var entry = args.length > 1 ? toAddr(Long.parseLong(args[1], 16)) : toAddr(0xc000);
+        var scratch = args.length > 2 ? entry.add(0x20) : toAddr(0x200);
+        var function = getFunctionAt(entry);
         var accumulator = currentProgram.getRegister("A");
         var x = currentProgram.getRegister("X");
         var y = currentProgram.getRegister("Y");
@@ -22,7 +25,7 @@ public class AnnotationStorage extends GhidraScript {
         var word = UnsignedShortDataType.dataType;
         var byteType = ByteDataType.dataType;
         var manual = SourceType.USER_DEFINED;
-        switch (getScriptArgs()[0]) {
+        switch (args[0]) {
             case "seed" -> {
                 var registerArg = new ParameterImpl("index", word, pair, currentProgram, manual);
                 registerArg.setComment("XY index");
@@ -35,7 +38,7 @@ public class AnnotationStorage extends GhidraScript {
                 function.addLocalVariable(local, manual);
                 function.addLocalVariable(new LocalVariableImpl("reused_x", 2, byteType, x, currentProgram), manual);
                 function.addLocalVariable(
-                    new LocalVariableImpl("scratch", 0, byteType, toAddr(0x200), currentProgram), manual);
+                    new LocalVariableImpl("scratch", 0, byteType, scratch, currentProgram), manual);
                 function.setVarArgs(true);
                 function.setNoReturn(true);
                 function.setStackPurgeSize(2);
@@ -55,7 +58,7 @@ public class AnnotationStorage extends GhidraScript {
                 check(locals.stream().anyMatch(local -> local.getName().equals("reused_x") &&
                       local.getFirstUseOffset() == 2 && x.equals(local.getRegister())), "scoped register local");
                 check(locals.stream().anyMatch(local -> local.getName().equals("scratch") &&
-                      local.getFirstStorageVarnode().getAddress().equals(toAddr(0x200))), "absolute local");
+                      local.getFirstStorageVarnode().getAddress().equals(scratch)), "absolute local");
                 check(function.hasVarArgs() && function.hasNoReturn() && function.getStackPurgeSize() == 2,
                     "signature flags and stack purge");
             }

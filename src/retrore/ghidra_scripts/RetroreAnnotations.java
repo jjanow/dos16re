@@ -9,6 +9,7 @@ import ghidra.app.cmd.function.FunctionRenameOption;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressOverflowException;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.data.Array;
 import ghidra.program.model.data.CategoryPath;
@@ -26,6 +27,7 @@ import ghidra.program.model.data.ParameterDefinitionImpl;
 import ghidra.program.model.data.Pointer;
 import ghidra.program.model.data.StandAloneDataTypeManager;
 import ghidra.program.model.data.TypeDef;
+import ghidra.program.model.lang.UnknownRegister;
 import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
@@ -36,6 +38,7 @@ import ghidra.program.model.listing.ReturnParameterImpl;
 import ghidra.program.model.listing.Variable;
 import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.listing.VariableUtilities;
+import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.program.model.symbol.SymbolUtilities;
@@ -97,6 +100,11 @@ public class RetroreAnnotations extends GhidraScript {
             return returnType.equals(actual.returnType) && returnStorage.equals(actual.returnStorage)
                 && parameters.equals(actual.parameters) && varargs == actual.varargs
                 && noreturn == actual.noreturn && stackPurge == actual.stackPurge;
+        }
+    }
+    private record StorageBlock(String unit, String space, String beforeStart, String afterStart, long size) {
+        long sourceOffset(Address address) {
+            return address.getOffset() - Long.parseUnsignedLong(beforeStart, 16);
         }
     }
     private record TypeArchive(String format, List<TypePath> types, String archive) {}
@@ -389,16 +397,36 @@ public class RetroreAnnotations extends GhidraScript {
             throw new IllegalArgumentException("annotation executable SHA-256 differs from the Ghidra program");
         }
         int version = document.get("version").getAsBigDecimal().intValueExact();
-        if (version < 1 || version > 4 || document.has("data_types") != (version >= 2)) {
-            throw new IllegalArgumentException("expected a version 1 through 4 annotation document");
+        if (version < 1 || version > 5 || document.has("data_types") != (version >= 2) ||
+                document.has("storage_blocks") != (version == 5)) {
+            throw new IllegalArgumentException("expected a version 1 through 5 annotation document");
         }
         try (var staged = version >= 2 ? readTypes(document, version) : null) {
-            return replay(document, apply, version, staged);
+            var blocks = version == 5 ? readStorageBlocks(document) : null;
+            return replay(document, apply, version, staged, blocks);
         }
     }
 
+    private static List<StorageBlock> readStorageBlocks(JsonObject document) {
+        var records = document.getAsJsonArray("storage_blocks");
+        var blocks = new ArrayList<StorageBlock>();
+        var units = new HashSet<String>();
+        for (var record : records) {
+            var block = GSON.fromJson(record, StorageBlock.class);
+            if (block == null || !GSON.toJsonTree(block).equals(record) || block.unit() == null ||
+                    block.space() == null || block.beforeStart() == null || block.afterStart() == null ||
+                    block.size() <= 0 || !units.add(block.unit())) {
+                throw new IllegalArgumentException("invalid annotation storage block");
+            }
+            Long.parseUnsignedLong(block.beforeStart(), 16);
+            Long.parseUnsignedLong(block.afterStart(), 16);
+            blocks.add(block);
+        }
+        return blocks;
+    }
+
     private Map<String, Object> replay(JsonObject document, boolean apply, int version,
-            DataTypeManager staged) throws Exception {
+            DataTypeManager staged, List<StorageBlock> storageBlocks) throws Exception {
         var changes = new ArrayList<Change>();
         var typeChanges = new ArrayList<TypeChange>();
         var typesToAdd = new ArrayList<DataType>();
@@ -447,7 +475,7 @@ public class RetroreAnnotations extends GhidraScript {
             if (row.has("custom_storage")) {
                 if (version < 3 || !kind.equals("signature") || prototype != null ||
                         !row.get("custom_storage").isJsonObject()) {
-                    throw new IllegalArgumentException("custom storage requires a version 3 or 4 signature annotation");
+                    throw new IllegalArgumentException("custom storage requires a version 3 through 5 signature annotation");
                 }
                 customStorage = GSON.fromJson(row.get("custom_storage"), CustomStorage.class);
                 if (!GSON.toJsonTree(customStorage).equals(row.get("custom_storage")) ||
@@ -466,7 +494,7 @@ public class RetroreAnnotations extends GhidraScript {
             if (!keys.add(key)) {
                 throw new IllegalArgumentException("duplicate annotation at " + item.unit() + "+" + item.offset());
             }
-            var change = check(item, staged, layoutRanges);
+            var change = check(item, staged, layoutRanges, storageBlocks);
             if (change.status().equals("conflict")) {
                 conflicts++;
             } else if (change.status().equals("add")) {
@@ -523,7 +551,8 @@ public class RetroreAnnotations extends GhidraScript {
         return layout;
     }
 
-    private Change check(Item item, DataTypeManager staged, AddressSet layoutRanges) throws Exception {
+    private Change check(Item item, DataTypeManager staged, AddressSet layoutRanges, List<StorageBlock> storageBlocks)
+            throws Exception {
         var block = currentProgram.getMemory().getBlock(item.unit());
         if (block == null || item.offset() < 0 || item.offset() >= block.getSize()) {
             return new Change(item, null, "conflict", "unit or offset is missing");
@@ -574,6 +603,11 @@ public class RetroreAnnotations extends GhidraScript {
             }
             if (item.customStorage() != null) {
                 try {
+                    if (storageBlocks != null) {
+                        var storage = remapCustomStorage(item.customStorage(), function, storageBlocks);
+                        item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
+                            item.callingConvention(), null, storage, null);
+                    }
                     var update = customUpdate(item, function, staged);
                     return new Change(item, address, update.unchanged() ? "unchanged" : "add", "");
                 } catch (InvalidInputException error) {
@@ -736,6 +770,84 @@ public class RetroreAnnotations extends GhidraScript {
             throw new InvalidInputException("invalid custom variable storage: " + encoded);
         }
         return storage;
+    }
+
+    private CustomStorage remapCustomStorage(CustomStorage storage, Function function, List<StorageBlock> blocks)
+            throws InvalidInputException {
+        var returnStorage = remapStorage(storage.returnStorage(), blocks);
+        var parameters = new ArrayList<StoredVariable>();
+        var locals = new ArrayList<StoredVariable>();
+        for (var parameter : storage.parameters()) {
+            parameters.add(remapVariable(parameter, blocks));
+        }
+        for (var local : storage.locals()) {
+            if (local == null) {
+                throw new InvalidInputException("invalid custom local variable");
+            }
+            if (local.firstUse() != 0) {
+                try {
+                    var use = function.getEntryPoint().addNoWrap(local.firstUse());
+                    if (!function.getBody().contains(use) || currentProgram.getListing().getInstructionAt(use) == null) {
+                        throw new InvalidInputException("custom local first use is not a destination instruction: " + local.name());
+                    }
+                } catch (AddressOverflowException error) {
+                    throw new InvalidInputException("custom local first use is out of range: " + local.name());
+                }
+            }
+            locals.add(remapVariable(local, blocks));
+        }
+        return new CustomStorage(storage.returnType(), returnStorage, parameters, locals, storage.varargs(),
+            storage.noreturn(), storage.stackPurge());
+    }
+
+    private StoredVariable remapVariable(StoredVariable variable, List<StorageBlock> blocks)
+            throws InvalidInputException {
+        if (variable == null) {
+            throw new InvalidInputException("invalid custom variable record");
+        }
+        return new StoredVariable(variable.name(), variable.type(), remapStorage(variable.storage(), blocks),
+            variable.firstUse(), variable.comment(), variable.source());
+    }
+
+    private String remapStorage(String encoded, List<StorageBlock> blocks) throws InvalidInputException {
+        var pieces = variableStorage(encoded).getVarnodes();
+        for (int i = 0; i < pieces.length; i++) {
+            var piece = pieces[i];
+            var address = piece.getAddress();
+            if (address.isStackAddress() || address.isRegisterAddress() || address.isConstantAddress()) {
+                continue;
+            }
+            if (!address.isMemoryAddress()) {
+                throw new InvalidInputException("unsupported custom storage address across layouts: " + address);
+            }
+            var register = currentProgram.getLanguage().getRegister(address, piece.getSize());
+            if (register == null || register instanceof UnknownRegister) {
+                pieces[i] = remapMemoryPiece(piece, blocks);
+            }
+        }
+        return pieces.length == 0 ? encoded : new VariableStorage(currentProgram, pieces).getSerializationString();
+    }
+
+    private Varnode remapMemoryPiece(Varnode piece, List<StorageBlock> blocks) throws InvalidInputException {
+        var address = piece.getAddress();
+        var space = address.getAddressSpace().getName();
+        for (var pair : blocks) {
+            long offset = pair.sourceOffset(address);
+            if (!space.equals(pair.space()) || offset < 0 || offset >= pair.size()) {
+                continue;
+            }
+            var block = currentProgram.getMemory().getBlock(pair.unit());
+            if (block == null || !space.equals(block.getStart().getAddressSpace().getName()) ||
+                    block.getStart().getOffset() != Long.parseUnsignedLong(pair.afterStart(), 16) ||
+                    block.getSize() != pair.size()) {
+                throw new InvalidInputException("destination storage block differs from the comparison: " + pair.unit());
+            }
+            if (piece.getSize() > pair.size() - offset) {
+                throw new InvalidInputException("custom storage crosses the block boundary: " + address.toString(true));
+            }
+            return new Varnode(block.getStart().add(offset), piece.getSize());
+        }
+        throw new InvalidInputException("custom storage has no matching memory block: " + address.toString(true));
     }
 
     private Variable readVariable(StoredVariable saved, DataTypeManager staged, int ordinal)
