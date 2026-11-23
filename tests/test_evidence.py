@@ -184,6 +184,17 @@ def test_annotation_transfer_preserves_anchors_and_skips_changed_bodies(tmp_path
     assert report["version"] == 1
     assert report["transfer"]["skipped"][-1]["reason"] == "custom_variable_storage_requires_original_layout"
 
+    source["version"] = 4
+    source["annotations"].append({
+        "kind": "data_layout", "unit": "root", "offset": 16,
+        "data_layout": {"type": {"category": "/", "name": "Mode[4]"}, "length": 4},
+    })
+    annotations.write_text(json.dumps(source), encoding="utf-8")
+    assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["version"] == 1 and [row["kind"] for row in report["annotations"]] == ["function_name"]
+    assert report["transfer"]["skipped"][-1]["reason"] == "data_layout_requires_original_layout"
+
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
 def test_non_retrore_project_can_be_queried_read_only(tmp_path):

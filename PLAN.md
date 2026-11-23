@@ -14,13 +14,14 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, version 3 annotation documents gained export and replay of custom return,
-parameter, and local variable storage. Replay preserves variable types, locations, comments,
-and stack purge size. The standalone suite passed 422 tests with 92 skipped. Ghidra 12.2
-verified legacy and typed replay, custom-storage round trips, and a local conflict that blocked
-the whole apply.
+On 2026-11-23, version 4 annotation documents gained export and replay of fixed-size record and
+array placements. Preview reports instruction, data, and placement overlaps before the transaction.
+The standalone suite passed 422 tests with 92 skipped. The layout and evidence suites with
+Ghidra 12.2 passed 21 tests with 2 skipped, including legacy annotation replay, conflict handling,
+and replay of an inferred DOS record array. A separate check replayed a primitive array in
+uninitialized memory.
 
-Resume Phase 10 with replay of data layout hints.
+Resume Phase 10 with remapping custom variable storage across layouts.
 
 ## Why
 
@@ -370,8 +371,9 @@ release. Continue with the analysis backlog below.
   Version 2 bundles program-local structures, unions, enums, typedefs, function definitions, and
   required dependencies as a Ghidra data type archive. It previews definitions by category and
   name and installs them before replaying signatures that use them. Version 3 also replays custom
-  return, parameter, and local storage, with stack purge size and local first-use offsets.
-  Version 1 remains supported. Data layout hints and remapping custom storage across layouts are open.
+  return, parameter, and local storage, with stack purge size and local first-use offsets. Version 4
+  replays fixed-size record and array placements, including `layout --apply` results, with overlap
+  checks before applying. Version 1 remains supported. Remapping custom storage across layouts is open.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay

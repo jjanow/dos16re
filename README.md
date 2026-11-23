@@ -978,7 +978,7 @@ makes the result `conflict`. Missing or truncated evidence otherwise makes it `u
 ```
 
 The versioned file uses memory unit names and offsets. It carries manually named functions,
-global labels, comments, entry points, and manually defined function signatures.
+global labels, comments, entry points, manually defined function signatures, and data layouts.
 Export includes the Ghidra language and the executable hash when available. Import previews
 additions and conflicts, and applies the entire document in one transaction if it has no conflicts.
 Replaying it again reports identical annotations as unchanged.
@@ -993,13 +993,19 @@ Typed signatures use category-qualified type names. Preview reports type changes
 requires the same Ghidra language and compiler specification, and adds definitions before applying
 signatures. Version 1 documents still replay with textual signatures.
 
-Version 3 also carries manually defined signatures that use Ghidra's custom variable storage.
+Version 3 and later also carry manually defined signatures that use Ghidra's custom variable storage.
 The `custom_storage` field records the return and parameter locations, local variables and
 their first-use offsets, signature flags, and stack purge size. Storage uses Ghidra's native
 address spaces, including ordered register pieces and signed stack offsets. The bundled archive
 supplies the variable types. Preview reports incompatible signatures and conflicting locals.
-Reuse version 3 documents against the original program layout so absolute storage addresses
+Reuse custom storage against the original program layout so absolute storage addresses
 and local first-use offsets still refer to the same locations.
+
+Version 4 carries fixed-size structures, unions, and arrays placed in the Ghidra listing,
+including placements from `layout --apply`. Each `data_layout` annotation records the
+category-qualified type and byte length at a unit and offset. The data type archive supplies
+the definition. Preview reports conflicts for overlaps with instructions, other defined data,
+or other placements in the document. Replay installs the types and placements together.
 
 With `--export OUT`, each annotation includes an `export_evidence` comparison of the byte at its
 anchor. The comparison includes loader source spans and fixups where available, and the document
@@ -1023,8 +1029,8 @@ without establishing that the two routines have identical behavior.
 names, signatures, and comments at same-body function entries, records the source and match method
 for each, and lists skipped entries. Source anchor evidence and the export identity travel with the
 source in `provenance`. If a typed signature transfers, its data type archive travels with the
-document. Custom-storage signatures appear among the skipped entries because they depend on the
-original layout. Use `annotations import` to review it against the destination.
+document. Custom-storage signatures and data layouts appear among the skipped entries because
+they depend on the original layout. Use `annotations import` to review it against the destination.
 
 ### Persistent query workers
 

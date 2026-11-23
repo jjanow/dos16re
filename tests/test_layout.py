@@ -169,6 +169,50 @@ def test_layout_recovers_a_record_array(record_project, tmp_path, capsys):
     assert {"address": "root:0200", "type": "record[6]"}.items() <= next(
         row for row in inventory["data"] if row["address"] == "root:0200").items()
 
+    document = _json(capsys, "annotations", "export", "--project", str(project),
+                     "--export", str(Path(record_project).parent / "export"))
+    assert document["version"] == 4
+    layout, = (row for row in document["annotations"] if row["kind"] == "data_layout")
+    assert (layout["unit"], layout["offset"]) == ("root", 0x200)
+    assert layout["data_layout"] == {"type": {"category": "/retrore", "name": "record[6]"}, "length": 72}
+    assert layout["export_evidence"]["status"] == "consistent"
+
+    fresh = tmp_path / "fresh"
+    shutil.copytree(Path(record_project).parent, fresh)
+    replay = fresh / Path(record_project).name
+    path = tmp_path / "layouts.json"
+    command = ["annotations", "import", str(path), "--project", str(replay)]
+    path.write_text(json.dumps(document | {"annotations": [layout]}), encoding="utf-8")
+    preview = _json(capsys, *command)
+    assert not preview["applied"] and preview["additions"] == 2 and preview["conflicts"] == 0
+    assert _json(capsys, "annotations", "export", "--project", str(replay))["version"] == 1
+
+    comment = {"kind": "comment", "unit": "root", "offset": 0, "comment_type": "PRE", "value": "layout note"}
+    bad_layouts = [layout | {"offset": offset} for offset in (0x201, 0x210, 0x1, 0x280)]
+    path.write_text(json.dumps(document | {"annotations": [layout, comment, *bad_layouts]}), encoding="utf-8")
+    preview = _json(capsys, *command)
+    assert [row["reason"] for row in preview["changes"] if row["status"] == "conflict"] == [
+        "the data layout overlaps another annotation in the document",
+        "the data layout would overlap existing defined data",
+        "the data layout would cover instructions",
+        "the data layout extends beyond its memory block",
+    ]
+    assert main([*command, "--apply", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out) == preview
+    after_conflict = _json(capsys, "annotations", "export", "--project", str(replay))
+    assert after_conflict["version"] == 1 and comment not in after_conflict["annotations"]
+
+    path.write_text(json.dumps(document | {"annotations": [layout, comment]}), encoding="utf-8")
+    assert _json(capsys, *command, "--apply")["applied"]
+    again = _json(capsys, *command)
+    assert again["additions"] == again["conflicts"] == 0
+    after = _json(capsys, "annotations", "export", "--project", str(replay))
+    assert comment in after["annotations"]
+    assert {key: value for key, value in layout.items() if key != "export_evidence"} in after["annotations"]
+    path.write_text(json.dumps(document | {"annotations": [layout | {"offset": 0x201}]}), encoding="utf-8")
+    preview = _json(capsys, *command)
+    assert preview["changes"][0]["reason"] == "the data layout would overlap existing defined data"
+
     apply = ["layout", "root:0200", "--size", "72", "--name", "replacement", "--project", str(project)]
     preview = _json(capsys, *apply)
     assert preview["proposal"]["existing_data"] == {"count": 1, "partial_overlap": False}

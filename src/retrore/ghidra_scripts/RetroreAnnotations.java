@@ -9,6 +9,7 @@ import ghidra.app.cmd.function.FunctionRenameOption;
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.data.Array;
 import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.data.Composite;
@@ -55,7 +56,7 @@ import java.util.Set;
 
 public class RetroreAnnotations extends GhidraScript {
     private record Item(String unit, long offset, String kind, String value, String commentType,
-            String callingConvention, Prototype prototype, CustomStorage customStorage) {}
+            String callingConvention, Prototype prototype, CustomStorage customStorage, DataLayout dataLayout) {}
     private record TypePath(String category, String name) {
         static TypePath of(DataType type) {
             return new TypePath(type.getCategoryPath().getPath(), type.getName());
@@ -100,8 +101,15 @@ public class RetroreAnnotations extends GhidraScript {
     }
     private record TypeArchive(String format, List<TypePath> types, String archive) {}
     private record TypeChange(TypePath type, String status, String reason) {}
+    private record DataLayout(TypePath type, int length) {
+        static boolean supports(DataType type, int length) {
+            var base = type instanceof TypeDef alias ? alias.getBaseDataType() : type;
+            return length > 0 && length == type.getLength() && (base instanceof Composite || base instanceof Array);
+        }
+    }
 
-    private static final Set<String> KINDS = Set.of("label", "function_name", "comment", "entry_point", "signature");
+    private static final Set<String> KINDS =
+        Set.of("label", "function_name", "comment", "entry_point", "signature", "data_layout");
     private static final String ARCHIVE_FORMAT = "ghidra-gdt";
     private static final DataTypeConflictHandler TYPE_HANDLER = DataTypeConflictHandler.DEFAULT_HANDLER;
     private static final Comparator<DataType> TYPE_ORDER = Comparator
@@ -131,7 +139,7 @@ public class RetroreAnnotations extends GhidraScript {
     private Item item(Address address, String kind, String value, String detail) {
         var block = currentProgram.getMemory().getBlock(address);
         return block == null ? null : new Item(block.getName(), address.subtract(block.getStart()), kind, value,
-            kind.equals("comment") ? detail : null, kind.equals("signature") ? detail : null, null, null);
+            kind.equals("comment") ? detail : null, kind.equals("signature") ? detail : null, null, null, null);
     }
 
     private Map<String, Object> exportAnnotations() throws Exception {
@@ -182,7 +190,7 @@ public class RetroreAnnotations extends GhidraScript {
                     types.add(variable.getDataType());
                 }
                 item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
-                    item.callingConvention(), null, CustomStorage.of(function));
+                    item.callingConvention(), null, CustomStorage.of(function), null);
                 customStorage = true;
             } else {
                 var signatureTypes = new ArrayList<DataType>();
@@ -193,12 +201,25 @@ public class RetroreAnnotations extends GhidraScript {
                 if (signatureTypes.stream().anyMatch(RetroreAnnotations::usesNamedDefinition)) {
                     types.addAll(signatureTypes);
                     item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
-                        item.callingConvention(), Prototype.of(signature), null);
+                        item.callingConvention(), Prototype.of(signature), null, null);
                 }
             }
             items.add(item);
         }
         var memory = currentProgram.getMemory();
+        boolean dataLayouts = false;
+        for (var data : listing.getDefinedData(true)) {
+            monitor.checkCancelled();
+            var type = data.getDataType();
+            var address = data.getMinAddress();
+            var block = memory.getBlock(address);
+            if (block != null && block.contains(data.getMaxAddress()) && DataLayout.supports(type, data.getLength())) {
+                types.add(type);
+                items.add(new Item(block.getName(), address.subtract(block.getStart()), "data_layout",
+                    null, null, null, null, null, new DataLayout(TypePath.of(type), data.getLength())));
+                dataLayouts = true;
+            }
+        }
         var addresses = listing.getCommentAddressIterator(memory, true);
         while (addresses.hasNext()) {
             monitor.checkCancelled();
@@ -221,7 +242,7 @@ public class RetroreAnnotations extends GhidraScript {
             .thenComparing(Item::commentType, Comparator.nullsFirst(Comparator.naturalOrder()))
             .thenComparing(Item::value, Comparator.nullsFirst(Comparator.naturalOrder())));
         var report = new LinkedHashMap<String, Object>();
-        report.put("version", customStorage ? 3 : types.isEmpty() ? 1 : 2);
+        report.put("version", dataLayouts ? 4 : customStorage ? 3 : types.isEmpty() ? 1 : 2);
         report.put("language", language());
         report.put("sha256", currentProgram.getExecutableSHA256());
         report.put("annotations", items);
@@ -368,8 +389,8 @@ public class RetroreAnnotations extends GhidraScript {
             throw new IllegalArgumentException("annotation executable SHA-256 differs from the Ghidra program");
         }
         int version = document.get("version").getAsBigDecimal().intValueExact();
-        if (version < 1 || version > 3 || document.has("data_types") != (version >= 2)) {
-            throw new IllegalArgumentException("expected a version 1, 2, or 3 annotation document");
+        if (version < 1 || version > 4 || document.has("data_types") != (version >= 2)) {
+            throw new IllegalArgumentException("expected a version 1 through 4 annotation document");
         }
         try (var staged = version >= 2 ? readTypes(document, version) : null) {
             return replay(document, apply, version, staged);
@@ -383,6 +404,7 @@ public class RetroreAnnotations extends GhidraScript {
         var typesToAdd = new ArrayList<DataType>();
         var manager = currentProgram.getDataTypeManager();
         var keys = new HashSet<Item>();
+        var layoutRanges = new AddressSet();
         int conflicts = 0;
         int additions = 0;
         if (staged != null) {
@@ -423,9 +445,9 @@ public class RetroreAnnotations extends GhidraScript {
             }
             CustomStorage customStorage = null;
             if (row.has("custom_storage")) {
-                if (version != 3 || !kind.equals("signature") || prototype != null ||
+                if (version < 3 || !kind.equals("signature") || prototype != null ||
                         !row.get("custom_storage").isJsonObject()) {
-                    throw new IllegalArgumentException("custom storage requires a version 3 signature annotation");
+                    throw new IllegalArgumentException("custom storage requires a version 3 or 4 signature annotation");
                 }
                 customStorage = GSON.fromJson(row.get("custom_storage"), CustomStorage.class);
                 if (!GSON.toJsonTree(customStorage).equals(row.get("custom_storage")) ||
@@ -433,16 +455,18 @@ public class RetroreAnnotations extends GhidraScript {
                     throw new IllegalArgumentException("invalid custom storage record");
                 }
             }
+            var dataLayout = readLayout(row, kind, version);
             var item = new Item(string(row, "unit"), offset, kind,
-                kind.equals("entry_point") ? null : string(row, "value"),
+                kind.equals("entry_point") || dataLayout != null ? null : string(row, "value"),
                 kind.equals("comment") ? string(row, "comment_type") : null,
-                kind.equals("signature") ? string(row, "calling_convention") : null, prototype, customStorage);
+                kind.equals("signature") ? string(row, "calling_convention") : null,
+                prototype, customStorage, dataLayout);
             var key = new Item(item.unit(), item.offset(), item.kind(),
-                kind.equals("label") ? item.value() : null, item.commentType(), null, null, null);
+                kind.equals("label") ? item.value() : null, item.commentType(), null, null, null, null);
             if (!keys.add(key)) {
                 throw new IllegalArgumentException("duplicate annotation at " + item.unit() + "+" + item.offset());
             }
-            var change = check(item, staged);
+            var change = check(item, staged, layoutRanges);
             if (change.status().equals("conflict")) {
                 conflicts++;
             } else if (change.status().equals("add")) {
@@ -484,12 +508,30 @@ public class RetroreAnnotations extends GhidraScript {
         return report;
     }
 
-    private Change check(Item item, DataTypeManager staged) throws Exception {
+    private static DataLayout readLayout(JsonObject row, String kind, int version) {
+        if (!kind.equals("data_layout") && !row.has("data_layout")) {
+            return null;
+        }
+        if (version != 4 || !kind.equals("data_layout") || !row.has("data_layout") ||
+                !row.get("data_layout").isJsonObject()) {
+            throw new IllegalArgumentException("data layouts require a version 4 data_layout annotation");
+        }
+        var layout = GSON.fromJson(row.get("data_layout"), DataLayout.class);
+        if (!GSON.toJsonTree(layout).equals(row.get("data_layout")) || layout.type() == null || layout.length() < 1) {
+            throw new IllegalArgumentException("invalid data layout record");
+        }
+        return layout;
+    }
+
+    private Change check(Item item, DataTypeManager staged, AddressSet layoutRanges) throws Exception {
         var block = currentProgram.getMemory().getBlock(item.unit());
         if (block == null || item.offset() < 0 || item.offset() >= block.getSize()) {
             return new Change(item, null, "conflict", "unit or offset is missing");
         }
         Address address = block.getStart().addNoWrap(item.offset());
+        if (item.dataLayout() != null) {
+            return checkLayout(item, address, block.getSize() - item.offset(), staged, layoutRanges);
+        }
         var listing = currentProgram.getListing();
         var symbols = currentProgram.getSymbolTable();
         if (item.kind().equals("label") || item.kind().equals("function_name")) {
@@ -555,6 +597,37 @@ public class RetroreAnnotations extends GhidraScript {
         return new Change(item, address, "add", "");
     }
 
+    private Change checkLayout(Item item, Address start, long available, DataTypeManager staged,
+            AddressSet layoutRanges) throws Exception {
+        var layout = item.dataLayout();
+        var type = annotationType(layout.type(), staged, currentProgram.getDataTypeManager());
+        if (!DataLayout.supports(type, layout.length())) {
+            return new Change(item, start, "conflict", "the archived type does not match the data layout length or kind");
+        }
+        if (layout.length() > available) {
+            return new Change(item, start, "conflict", "the data layout extends beyond its memory block");
+        }
+        var end = start.addNoWrap(layout.length() - 1);
+        var range = new AddressSet(start, end);
+        var listing = currentProgram.getListing();
+        if (listing.getInstructionContaining(start) != null || listing.getInstructions(range, true).hasNext()) {
+            return new Change(item, start, "conflict", "the data layout would cover instructions");
+        }
+        var existing = listing.getDefinedDataContaining(start);
+        if (existing != null && existing.getMinAddress().equals(start) && existing.getLength() == layout.length()
+                && layout.type().equals(TypePath.of(existing.getDataType())) && equivalentType(existing.getDataType(), type)) {
+            return new Change(item, start, "unchanged", "");
+        }
+        if (existing != null || listing.getDefinedData(range, true).hasNext()) {
+            return new Change(item, start, "conflict", "the data layout would overlap existing defined data");
+        }
+        if (layoutRanges.intersects(range)) {
+            return new Change(item, start, "conflict", "the data layout overlaps another annotation in the document");
+        }
+        layoutRanges.add(range);
+        return new Change(item, start, "add", "");
+    }
+
     private FunctionDefinitionDataType parseSignature(Item item, Address address, DataTypeManager staged)
             throws Exception {
         var function = currentProgram.getListing().getFunctionAt(address);
@@ -568,10 +641,10 @@ public class RetroreAnnotations extends GhidraScript {
                 throw new IllegalArgumentException("expected annotation signature parameters");
             }
             signature = new FunctionDefinitionDataType(function.getName(), manager);
-            signature.setReturnType(signatureType(prototype.returnType(), staged, manager));
+            signature.setReturnType(annotationType(prototype.returnType(), staged, manager));
             var parameters = new ArrayList<ParameterDefinition>();
             for (var param : prototype.parameters()) {
-                parameters.add(new ParameterDefinitionImpl(param.name(), signatureType(param.type(), staged, manager), null));
+                parameters.add(new ParameterDefinitionImpl(param.name(), annotationType(param.type(), staged, manager), null));
             }
             signature.setArguments(parameters.toArray(ParameterDefinition[]::new));
             signature.setVarArgs(prototype.varargs());
@@ -583,7 +656,7 @@ public class RetroreAnnotations extends GhidraScript {
         return signature;
     }
 
-    private static DataType signatureType(TypePath path, DataTypeManager staged, DataTypeManager destination) {
+    private static DataType annotationType(TypePath path, DataTypeManager staged, DataTypeManager destination) {
         if (TypePath.of(DataType.DEFAULT).equals(path)) {
             return DataType.DEFAULT;
         }
@@ -614,7 +687,7 @@ public class RetroreAnnotations extends GhidraScript {
         }
 
         var manager = currentProgram.getDataTypeManager();
-        var returnValue = new ReturnParameterImpl(signatureType(storage.returnType(), staged, manager),
+        var returnValue = new ReturnParameterImpl(annotationType(storage.returnType(), staged, manager),
             variableStorage(storage.returnStorage()), true, currentProgram);
         var originalLocals = new HashSet<StoredVariable>();
         var names = new HashSet<String>();
@@ -671,7 +744,7 @@ public class RetroreAnnotations extends GhidraScript {
                 (ordinal >= 0 && saved.firstUse() != 0)) {
             throw new InvalidInputException("invalid custom variable record");
         }
-        var type = signatureType(saved.type(), staged, currentProgram.getDataTypeManager());
+        var type = annotationType(saved.type(), staged, currentProgram.getDataTypeManager());
         var storage = variableStorage(saved.storage());
         if (ordinal < 0 && storage.hasStackStorage() && saved.firstUse() != 0) {
             throw new InvalidInputException("a stack local must start at the function entry");
@@ -724,6 +797,15 @@ public class RetroreAnnotations extends GhidraScript {
             case "label" -> symbols.createLabel(address, item.value(), SourceType.USER_DEFINED);
             case "comment" -> listing.setComment(address, CommentType.valueOf(item.commentType()), item.value());
             case "entry_point" -> symbols.addExternalEntryPoint(address);
+            case "data_layout" -> {
+                var layout = item.dataLayout();
+                var type = annotationType(layout.type(), staged, currentProgram.getDataTypeManager());
+                var data = listing.createData(address, type);
+                if (data.getLength() != layout.length() || !layout.type().equals(TypePath.of(data.getDataType()))
+                        || !equivalentType(data.getDataType(), type)) {
+                    throw new IllegalArgumentException("could not apply data layout at " + address);
+                }
+            }
             case "signature" -> {
                 if (item.customStorage() != null) {
                     addCustomSignature(item, listing.getFunctionAt(address), staged);
