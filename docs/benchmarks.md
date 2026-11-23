@@ -25,9 +25,11 @@ headless Ghidra on the same machine at the time (load average about 3), so expec
 | Batch of 5 | 3.68 s | 1 | 2,550 B |
 | Batch of 20 | 3.68 s | 1 | 10,113 B |
 
-- Each launch costs about 3.4 s before any query runs. That covers the JVM, Ghidra startup, opening
-  the project, and compiling the query script.
-- After that, each extra query in a batch costs about 15 ms: (3.677 s − 3.390 s) / 19.
+- Each launch costs about 3.4 s before any query runs. That covers JVM and Ghidra startup, opening
+  the project, and loading the query script. Ghidra caches compiled scripts, so only the first
+  launch after a script changes pays to compile it.
+- Within a launch, queries are warm: each extra query in a batch costs about 15 ms,
+  (3.677 s − 3.390 s) / 19. Every separate command is a cold start that pays the full launch cost again.
 - Running the 20 batched queries as separate commands would take about 71 s and 20 launches.
   The batch takes 3.7 s and 1 launch.
 - Batch output is about 500 bytes per query here. It grows with decompiled C size and reference

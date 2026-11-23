@@ -560,7 +560,9 @@ query. See [benchmarks](docs/benchmarks.md).
 ### Errors, exit statuses, and time budgets
 
 `ghidra import`, `decomp`, `gaps`, `batch`, `xrefs`, `callers`, `callees`, and `func` accept
-`--timeout SECONDS`. Imports default to 3600 seconds and queries to 600. `0` disables the limit.
+`--timeout SECONDS`. Imports default to 3600 seconds and single queries to 600. A batch defaults to
+600 seconds or 60 seconds per query, whichever is larger. `0` disables the limit. `trace --project`
+uses the 600-second query budget.
 When the budget runs out, retrore stops the whole `analyzeHeadless` process group, JVM included.
 It sends SIGTERM first so Ghidra can release the project lock, then SIGKILL after 10 seconds. The
 Python functions in `retrore.ghidra` take the same `timeout` keyword.
@@ -610,7 +612,7 @@ a removed field, increments `version`. The checked-in [unversioned fixtures](tes
 the DOS, Amiga, C64, MSX2, and PC-98 exporters, and the tests check that current code still reads them.
 
 Ghidra query JSON carries a top-level `contract` integer, currently 1. It is present on single queries
-(even with `--fields`), `gaps`, batch reports, and error objects. It is not present inside batch row
+(even with `--fields`), `gaps`, and batch reports. Every `--json` error object from any command carries it too. It is not present inside batch row
 results. Adding fields, query commands, or error codes keeps the contract number. Renaming or removing
 a field, or changing its type or meaning, increments it.
 

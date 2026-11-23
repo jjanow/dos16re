@@ -1,4 +1,7 @@
-"""Exports written before map versioning (no "version" field) stay readable."""
+"""Exports written before map versioning (no "version" field) stay readable.
+
+The MZ fixture also predates runtime signatures, so it has no "compiler" or "runtime_signatures".
+"""
 
 import json
 import os

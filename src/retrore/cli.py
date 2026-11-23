@@ -16,7 +16,7 @@ from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
-from .ghidra import IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
+from .ghidra import BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
 from .image import (
     APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, ImageError,
 )
@@ -749,10 +749,12 @@ def main(argv: list[str] | None = None) -> int:
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries)):
-        default = IMPORT_TIMEOUT if command is import_parser else QUERY_TIMEOUT
+        default = IMPORT_TIMEOUT if command is import_parser else None if command is batch_parser else QUERY_TIMEOUT
+        described = (f"the larger of {QUERY_TIMEOUT} and {BATCH_SECONDS_PER_QUERY} per query"
+                     if default is None else default)
         command.add_argument(
             "--timeout", type=_seconds, default=default, metavar="SECONDS",
-            help=f"stop headless Ghidra after SECONDS (default: {default}; 0 disables the limit)",
+            help=f"stop headless Ghidra after SECONDS (default: {described}; 0 disables the limit)",
         )
 
     args = parser.parse_args(argv)

@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -27,6 +28,7 @@ _DECOMP_LIMITS = {"context": (0, 20), "slice": (1, 128)}
 # Default time budgets in seconds for one analyzeHeadless launch. None or 0 disables the limit.
 IMPORT_TIMEOUT = 3600
 QUERY_TIMEOUT = 600
+BATCH_SECONDS_PER_QUERY = 60
 _KILL_GRACE = 10
 
 
@@ -93,6 +95,7 @@ def _launch(command: list[str], timeout: float | None, label: str | None) -> tup
         **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True}),
     )
     started = time.monotonic()
+    previous = _forward_termination()
     try:
         output, _ = process.communicate(timeout=timeout or None)
         return process.returncode, output
@@ -106,6 +109,24 @@ def _launch(command: list[str], timeout: float | None, label: str | None) -> tup
     except BaseException:
         _kill_group(process, windows)
         raise
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def _exit_on_signal(number: int, frame: object) -> None:
+    raise SystemExit(128 + number)
+
+
+def _forward_termination() -> dict:
+    """Turn SIGTERM and SIGHUP into SystemExit so the new session's JVM is stopped with retrore."""
+    if os.name == "nt" or threading.current_thread() is not threading.main_thread():
+        return {}
+    previous = {}
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(number) is signal.SIG_DFL:
+            previous[number] = signal.signal(number, _exit_on_signal)
+    return previous
 
 
 def _kill_group(process: subprocess.Popen, windows: bool) -> None:
@@ -233,8 +254,12 @@ def _validate_query(request: object) -> None:
             raise GhidraError(f"{name} must be an integer between {minimum} and 2147483647")
 
 
-def query_batch(project: Path, requests: object, *, timeout: float | None = QUERY_TIMEOUT) -> dict:
-    """Run an ordered array of address queries in one read-only Ghidra session."""
+def query_batch(project: Path, requests: object, *, timeout: float | None = None) -> dict:
+    """Run an ordered array of address queries in one read-only Ghidra session.
+
+    The default budget is QUERY_TIMEOUT or BATCH_SECONDS_PER_QUERY per request, whichever is larger.
+    Pass 0 to disable the limit.
+    """
     if not isinstance(requests, list) or not requests:
         raise GhidraError("expected a nonempty JSON array of queries")
     for index, request in enumerate(requests, 1):
@@ -243,6 +268,8 @@ def query_batch(project: Path, requests: object, *, timeout: float | None = QUER
         except GhidraError as error:
             raise GhidraError(f"query {index}: {error}") from error
 
+    if timeout is None:
+        timeout = max(QUERY_TIMEOUT, BATCH_SECONDS_PER_QUERY * len(requests))
     return _query_json(project, "batch", requests, timeout=timeout)
 
 

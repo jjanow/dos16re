@@ -24,7 +24,5 @@
   "relocations": [
     1,
     20
-  ],
-  "compiler": null,
-  "runtime_signatures": []
+  ]
 }

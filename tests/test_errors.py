@@ -2,9 +2,12 @@
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 from io import StringIO
+from pathlib import Path
 
 import pytest
 
@@ -20,11 +23,10 @@ _FAKE = """#!{python}
 import json, os, subprocess, sys, time
 mode = os.environ["FAKE_GHIDRA_MODE"]
 result = sys.argv[-1]
-if mode == "hang":
+if mode in ("hang", "hang_soft"):
     # A grandchild that ignores SIGTERM and holds the output pipe, like a JVM under a shell launcher.
-    child = subprocess.Popen(
-        [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"],
-    )
+    ignore = "signal.signal(signal.SIGTERM, signal.SIG_IGN); " if mode == "hang" else ""
+    child = subprocess.Popen([sys.executable, "-c", f"import signal, time; {{ignore}}time.sleep(300)"])
     with open(os.environ["FAKE_GHIDRA_PID"], "w") as pid_file:
         pid_file.write(str(child.pid))
     time.sleep(300)
@@ -67,6 +69,41 @@ def _error(capsys):
     return report["error"]
 
 
+def _wait_dead(pid):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists() and ") Z " in stat.read_text():
+            return
+        time.sleep(0.1)
+    os.kill(pid, 9)
+    pytest.fail(f"process {pid} survived")
+
+
+def test_sigterm_to_retrore_stops_the_headless_group(fake_ghidra, tmp_path):
+    project = fake_ghidra("hang_soft")
+    pid_file = tmp_path / "grandchild.pid"
+    environment = {**os.environ, "FAKE_GHIDRA_PID": str(pid_file),
+                   "PYTHONPATH": os.pathsep.join(filter(None, (str(Path(ghidra.__file__).parents[1]),
+                                                               os.environ.get("PYTHONPATH"))))}
+    retrore = subprocess.Popen(
+        [sys.executable, "-m", "retrore", "func", "1000", "--project", str(project), "--json"],
+        env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 15
+    while not (pid_file.exists() and pid_file.read_text()):
+        assert time.monotonic() < deadline and retrore.poll() is None, retrore.communicate()
+        time.sleep(0.1)
+    retrore.send_signal(signal.SIGTERM)
+    assert retrore.wait(timeout=20) == 128 + signal.SIGTERM
+    retrore.communicate()
+    _wait_dead(int(pid_file.read_text()))
+
+
 def test_timeout_kills_the_whole_process_group(fake_ghidra, tmp_path, monkeypatch, capsys):
     project = fake_ghidra("hang")
     pid_file = tmp_path / "grandchild.pid"
@@ -79,20 +116,7 @@ def test_timeout_kills_the_whole_process_group(fake_ghidra, tmp_path, monkeypatc
     assert error["code"] == "timeout"
     assert "2 second time budget" in error["message"]
 
-    grandchild = int(pid_file.read_text())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(grandchild, 0)
-        except ProcessLookupError:
-            break
-        with open(f"/proc/{grandchild}/stat") if os.path.exists(f"/proc/{grandchild}/stat") else StringIO("") as stat:
-            if ") Z " in stat.read():  # A zombie waiting for its new parent to reap it is already dead.
-                break
-        time.sleep(0.1)
-    else:
-        os.kill(grandchild, 9)
-        pytest.fail("the grandchild survived the time budget")
+    _wait_dead(int(pid_file.read_text()))
 
 
 def test_timeout_validation_and_disabled_budget(fake_ghidra, capsys):
