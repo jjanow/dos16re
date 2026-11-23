@@ -304,3 +304,34 @@ def test_phantasie_iv_x68k_switches(tmp_path, capsys):
     assert any(
         ref["from"]["unit_address"] == "text:13014" and ref["type"] == "COMPUTED_JUMP" for ref in report["incoming"]
     )
+
+
+def test_pool_of_radiance_procedure_variable_candidates(tmp_path, capsys):
+    directory = os.environ.get("RETRORE_POR_DIR")
+    if not directory or not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set RETRORE_POR_DIR and GHIDRA_HOME to run the real-game Ghidra test")
+    files = {path.name.upper(): path for path in Path(directory).iterdir()}
+    root = files.get("START.EXE") or files["GAME.EXE"]
+    export, project = tmp_path / "export", tmp_path / "por"
+    assert main(["load", str(root), "--overlay", str(files["GAME.OVR"]), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["indirect"]["candidate_sites"] == 4
+
+    def site(address):
+        assert main(["indirect", "--project", str(project), "--at", address, "--json", "--compact"]) == 0
+        row, = json.loads(capsys.readouterr().out)["sites"]
+        return row
+
+    # Turbo Pascal procedure variables live in uninitialized DGROUP; only the stores name their targets.
+    variable = site("tpov_0096:0d70")
+    assert (variable["status"], variable["table"]) == ("candidate", "root_bss:2754")
+    assert [(entry["target"], entry["writer"]) for entry in variable["candidates"]] == [
+        ("root:0994", "tpov_0035:006f"), ("root:06e6", "tpov_0035:008b"),
+    ]
+    assert variable["candidates"][0]["evidence"][:2] == ["relocated", "stored"]
+    # An array of procedure pointers filled in by one routine, read through call far [di+0x6828].
+    array = site("tpov_00b0:001e")
+    assert (array["status"], array["table"], array["stop"], len(array["candidates"])) == (
+        "candidate", "root_bss:23f8", "next_variable", 139)
+    assert array["candidates"][0]["target"] == "root:043a"
