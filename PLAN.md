@@ -14,12 +14,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `trace --evidence` linked mapped DOSBox-X hits, disassembly misses, and
-classified gap examples to the export identity, loader bytes, and available source offsets.
-The standalone suite passed 422 tests with 90 skipped. A Ghidra 12.2 integration test
-verified loader evidence on gap hits in a rebased synthetic DOS trace.
+On 2026-11-23, annotation documents gained Ghidra data type export and replay. Version 2
+bundles a native archive and uses category-qualified types for signatures. Preview reports
+definition conflicts and apply installs types and annotations together. The standalone
+suite passed 422 tests with 91 skipped. Ghidra 12.2 verified legacy replay and a synthetic
+round trip with bitfields, recursive pointers, and a conflict that blocked the entire apply.
 
-Resume Phase 10 with export and replay of user-defined data types in annotations.
+Resume Phase 10 with export and replay of custom function variable storage.
 
 ## Why
 
@@ -366,7 +367,10 @@ release. Continue with the analysis backlog below.
 - **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
   entry points. An optional loader export adds byte and source evidence at each anchor. Transfer
   preserves the source evidence. Replay previews conflicts and applies changes in one transaction.
-  Open: user data types, custom storage, and layout hints.
+  Version 2 bundles program-local structures, unions, enums, typedefs, function definitions, and
+  required dependencies as a Ghidra data type archive. It previews definitions by category and
+  name and installs them before replaying signatures that use them. Version 1 remains supported.
+  Open: custom function variable storage and layout hints.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay

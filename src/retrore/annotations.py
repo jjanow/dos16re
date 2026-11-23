@@ -20,9 +20,11 @@ def _read_json(path: Path) -> dict:
 
 def _read_annotations(path: Path) -> dict:
     content = _read_json(path)
-    if (type(content.get("version")) is not int or content["version"] != 1
-            or not isinstance(content.get("annotations"), list)):
-        raise ghidra.GhidraError("expected a version 1 annotation document")
+    if (type(content.get("version")) is not int or content["version"] not in (1, 2)
+            or not isinstance(content.get("annotations"), list)
+            or ("data_types" in content) != (content["version"] == 2)
+            or (content["version"] == 2 and not isinstance(content["data_types"], dict))):
+        raise ghidra.GhidraError("expected a version 1 or 2 annotation document")
     return content
 
 
@@ -110,7 +112,10 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
                 annotations.append(transferred)
                 continue
             skipped.append({"unit": key[0], "offset": key[1], "kind": item["kind"], "reason": reason})
-        return {"version": 1, "language": after["language"], "sha256": after["sha256"], "annotations": annotations,
-                "transfer": {"skipped": skipped}}
+        report = {"version": 1, "language": after["language"], "sha256": after["sha256"],
+                  "annotations": annotations, "transfer": {"skipped": skipped}}
+        if any(item["kind"] == "signature" and "prototype" in item for item in annotations):
+            report.update(version=2, data_types=source["data_types"])
+        return report
     except (KeyError, TypeError) as error:
         raise ghidra.GhidraError(f"invalid annotation or comparison record: {error}") from error

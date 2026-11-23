@@ -164,6 +164,17 @@ def test_annotation_transfer_preserves_anchors_and_skips_changed_bodies(tmp_path
     assert match["provenance"]["export_evidence"] == proof
     assert match["provenance"]["export"] == source["export"]
 
+    source["version"] = 2
+    source["data_types"] = {"format": "ghidra-gdt", "types": [{"category": "/", "name": "Mode"}], "archive": "AA=="}
+    signature = {"kind": "signature", "unit": "root", "offset": 16, "value": "Mode worker(void)",
+                 "prototype": {"return_type": {"category": "/", "name": "Mode"}, "parameters": []}}
+    source["annotations"].append(signature)
+    annotations.write_text(json.dumps(source), encoding="utf-8")
+    assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["version"] == 2 and report["data_types"] == source["data_types"]
+    assert report["annotations"][-1]["prototype"] == signature["prototype"]
+
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
 def test_non_retrore_project_can_be_queried_read_only(tmp_path):
@@ -243,3 +254,59 @@ def test_annotations_preview_conflict_and_round_trip(tmp_path, capsys):
     conflicts = json.loads(capsys.readouterr().out)
     assert not conflicts["applied"] and conflicts["conflicts"] == conflicts["additions"] == 1
     assert export_annotations(project) == after
+
+
+@pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
+def test_annotation_data_types_round_trip(tmp_path, capsys):
+    source, export, original, fresh = (tmp_path / name for name in ("demo.prg", "export", "original", "fresh"))
+    source.write_bytes(bytes.fromhex("00 c0 a9 07 60"))
+    assert main(["load", str(source), "-o", str(export), "--entry", "c000"]) == 0
+    for project in (original, fresh):
+        assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    def edit_types(project, mode):
+        returncode, log = ghidra._launch([
+            str(ghidra._headless()), *ghidra._project_parts(project),
+            "-process", "image.bin", "-noanalysis", "-scriptPath", str(Path(__file__).parent / "ghidra"),
+            "-postScript", "AnnotationDataTypes.java", mode,
+        ], 60, "synthetic annotation data types")
+        assert not returncode and "Annotation data types checked" in log, log
+
+    edit_types(original, "seed")
+    document = export_annotations(original, export=export)
+    assert document["version"] == 2
+    assert document["data_types"]["format"] == "ghidra-gdt"
+    assert [(row["category"], row["name"]) for row in document["data_types"]["types"]] == [
+        ("/other", "Mode"), ("/records", "Mode"), ("/records", "Node"), ("/records", "NodeRef"),
+        ("/records", "OnSelected"), ("/records", "Selection"),
+    ]
+    signature, = [row for row in document["annotations"] if row["kind"] == "signature"]
+    assert signature["prototype"]["return_type"] == {"category": "/records", "name": "Mode"}
+    assert signature["export_evidence"]["status"] == "consistent"
+    path = tmp_path / "annotations.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    preview = import_annotations(fresh, path)
+    assert not preview["applied"] and preview["conflicts"] == 0
+    assert [row["status"] for row in preview["data_type_changes"]] == ["add"] * 6
+    assert "data_types" not in export_annotations(fresh)
+    assert main(["annotations", "import", str(path), "--project", str(fresh), "--apply", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["applied"]
+    again = import_annotations(fresh, path)
+    assert again["additions"] == again["conflicts"] == 0
+    assert [row["status"] for row in again["data_type_changes"]] == ["unchanged"] * 6
+
+    edit_types(fresh, "conflict")
+    document["annotations"].append({
+        "unit": signature["unit"], "offset": 1, "kind": "comment", "comment_type": "EOL", "value": "unapplied",
+    })
+    path.write_text(json.dumps(document), encoding="utf-8")
+    assert main(["annotations", "import", str(path), "--project", str(fresh), "--apply", "--json"]) == 1
+    conflict = json.loads(capsys.readouterr().out)
+    assert not conflict["applied"] and conflict["additions"] == 2 and conflict["conflicts"] > 0
+    assert conflict["data_type_changes"][0]["status"] == "add"
+    assert conflict["data_type_changes"][1]["status"] == "conflict"
+    remaining = export_annotations(fresh)
+    assert {"category": "/other", "name": "Mode"} not in remaining["data_types"]["types"]
+    assert all(row.get("value") != "unapplied" for row in remaining["annotations"])

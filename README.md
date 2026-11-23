@@ -978,11 +978,21 @@ makes the result `conflict`. Missing or truncated evidence otherwise makes it `u
 ```
 
 The versioned file uses memory unit names and offsets. It carries manually named functions,
-global labels, comments, entry points, and signatures whose types the destination can resolve.
+global labels, comments, entry points, and manually defined function signatures.
 Export includes the Ghidra language and the executable hash when available. Import previews
 additions and conflicts, and applies the entire document in one transaction if it has no conflicts.
-Replaying it again leaves identical annotations unchanged. Custom data type definitions and custom
-register storage require separate Ghidra handling.
+Replaying it again reports identical annotations as unchanged.
+
+Version 2 documents include a Ghidra data type archive for program-local structures, unions, enums,
+typedefs, function definitions, and the dependencies of captured types and signatures. Ghidra stores
+manually created and analyzer-created local definitions alike, so both can appear in the archive.
+The `data_types.types` list gives the category and name of each definition. The Base64
+`data_types.archive` holds the native `.gdt`, including packing, bitfields, and recursive references.
+Typed signatures use category-qualified type names. Preview reports type changes in
+`data_type_changes`. A different definition at the same path blocks the whole apply. Replay
+requires the same Ghidra language and compiler specification, and adds definitions before applying
+signatures. Version 1 documents still replay with textual signatures. Custom variable storage and
+data layout assignments remain separate work.
 
 With `--export OUT`, each annotation includes an `export_evidence` comparison of the byte at its
 anchor. The comparison includes loader source spans and fixups where available, and the document
@@ -1005,7 +1015,8 @@ without establishing that the two routines have identical behavior.
 `annotations transfer` prepares a new annotation document from one comparison page. It carries
 names, signatures, and comments at same-body function entries, records the source and match method
 for each, and lists skipped entries. Source anchor evidence and the export identity travel with the
-source in `provenance`. Use `annotations import` to review it against the destination.
+source in `provenance`. If a typed signature transfers, its data type archive travels with the
+document. Use `annotations import` to review it against the destination.
 
 ### Persistent query workers
 

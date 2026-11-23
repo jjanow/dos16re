@@ -1607,7 +1607,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.json:
                     print(json.dumps(report, indent=2, ensure_ascii=False))
                 else:
-                    print(f"{len(report['annotations'])} annotations. Use --json to export the document.")
+                    types = report.get("data_types", {}).get("types", [])
+                    type_count = f", {len(types)} data types" if types else ""
+                    print(f"{len(report['annotations'])} annotations{type_count}. Use --json to export the document.")
                 return 0
             report = import_annotations(args.project, args.document, apply=args.apply, program=args.program,
                                         timeout=args.timeout)
