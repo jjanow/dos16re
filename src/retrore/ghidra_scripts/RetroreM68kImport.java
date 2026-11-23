@@ -174,6 +174,7 @@ public class RetroreM68kImport extends HeadlessScript {
             new DisassembleCommand(new AddressSet(block.getStart(), block.getEnd()), null, false)
                 .applyTo(currentProgram, monitor);
             block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls");
+            addFpackFixups();
         }
 
         var entry = address(map.getAsJsonObject("entry").get("linear").getAsLong());
@@ -638,6 +639,12 @@ public class RetroreM68kImport extends HeadlessScript {
         }
         function.setVarArgs(true);
         function.setSignatureSource(SourceType.IMPORTED);
+        if (FPACK_STACKED.containsKey(word)) {
+            // XC's stacked FPACK calls work on the caller's stack, which a prototype cannot express. The call
+            // fixup replaces each call with p-code for the operation, so the decompiler shows the result.
+            function.setVarArgs(false);
+            function.setCallFixup(fixupName(word));
+        }
         if (dosPrototypes.containsKey(word)) {
             applyDosPrototype(function, dosPrototypes.get(word));
         }
@@ -654,6 +661,56 @@ public class RetroreM68kImport extends HeadlessScript {
                 new ParameterImpl("right", integer, d1, currentProgram));
         }
         return function;
+    }
+
+    // XC's FPACK calls with operands on the stack (FLOAT2 numbering, XEiJ fefunc.mac). The last value pushed is
+    // the left operand and receives the result; integer operands are longs, F is a 4-byte float, D an 8-byte
+    // double. Each body runs after jsr (sp) pushed its return address, so the operands start at SP + 4.
+    private static final Map<Integer, String> FPACK_STACKED = new LinkedHashMap<>();
+    static {
+        String[][] integer = {{"fee0", "*"}, {"fee1", "s/"}, {"fee2", "s%"}, {"fee3", "*"}, {"fee4", "/"},
+            {"fee5", "%"}};
+        for (var operation : integer) {
+            FPACK_STACKED.put(Integer.parseInt(operation[0], 16),
+                "l:4 = *:4 (SP + 4); r:4 = *:4 (SP + 8); *:4 (SP + 4) = l " + operation[1] + " r;");
+        }
+        FPACK_STACKED.put(0xfee6, "v:4 = *:4 (SP + 4); *:8 (SP + 4) = int2float(v);");
+        FPACK_STACKED.put(0xfee7, "v:8 = *:8 (SP + 4); *:4 (SP + 4) = trunc(v);");
+        FPACK_STACKED.put(0xfee8, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = int2float(v);");
+        FPACK_STACKED.put(0xfee9, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = trunc(v);");
+        FPACK_STACKED.put(0xfeea, "v:4 = *:4 (SP + 4); *:8 (SP + 4) = float2float(v);");
+        FPACK_STACKED.put(0xfeeb, "v:8 = *:8 (SP + 4); *:4 (SP + 4) = float2float(v);");
+        String[] operators = {"f+", "f-", "f*", "f/"};
+        for (int index = 0; index < operators.length; index++) {
+            FPACK_STACKED.put(0xfeed + index,
+                "l:8 = *:8 (SP + 4); r:8 = *:8 (SP + 12); *:8 (SP + 4) = l " + operators[index] + " r;");
+            FPACK_STACKED.put(0xfef3 + index,
+                "l:4 = *:4 (SP + 4); r:4 = *:4 (SP + 8); *:4 (SP + 4) = l " + operators[index] + " r;");
+        }
+        // Comparisons set the condition codes as cmp left - right would, for the signed branches XC emits.
+        String flags = "NF = l f< r; ZF = l f== r; VF = 0; CF = l f< r;";
+        FPACK_STACKED.put(0xfeec, "l:8 = *:8 (SP + 4); r:8 = *:8 (SP + 12); " + flags);
+        FPACK_STACKED.put(0xfef2, "l:4 = *:4 (SP + 4); r:4 = *:4 (SP + 8); " + flags);
+        FPACK_STACKED.put(0xfef8, "l:8 = *:8 (SP + 4); r:8 = int2float(0:4); " + flags);
+        FPACK_STACKED.put(0xfef9, "l:4 = *:4 (SP + 4); r:4 = int2float(0:4); " + flags);
+        FPACK_STACKED.put(0xfefa, "v:8 = *:8 (SP + 4); *:8 (SP + 4) = v f+ int2float(1:4);");
+        FPACK_STACKED.put(0xfefb, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = v f+ int2float(1:4);");
+        FPACK_STACKED.put(0xfefc, "v:8 = *:8 (SP + 4); *:8 (SP + 4) = v f- int2float(1:4);");
+        FPACK_STACKED.put(0xfefd, "v:4 = *:4 (SP + 4); *:4 (SP + 4) = v f- int2float(1:4);");
+    }
+
+    private static String fixupName(int word) {
+        return String.format("retrore_fpack_%04x", word);
+    }
+
+    // Program-specific compiler spec extensions hold the call fixups, so the stock 68000 language stays untouched.
+    private void addFpackFixups() throws Exception {
+        var extension = new ghidra.program.database.SpecExtension(currentProgram);
+        for (var entry : FPACK_STACKED.entrySet()) {
+            String xml = "<callfixup name=\"" + fixupName(entry.getKey()) + "\"><pcode><body><![CDATA[" +
+                entry.getValue() + " SP = SP + 4;]]></body></pcode></callfixup>";
+            extension.addReplaceCompilerSpecExtension(xml, monitor);
+        }
     }
 
     // The line-F word sits where the patched jsr (sp) pushes its return address, so the last value pushed

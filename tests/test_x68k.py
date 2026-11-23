@@ -233,6 +233,59 @@ def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
     capsys.readouterr()
     assert main(["decomp", "text:0000", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     decompiled = json.loads(capsys.readouterr().out)["decompilation"]
-    print(decompiled)
     assert "DOS::_OPEN(" in decompiled and ",1);" in decompiled
     assert "DOS::_WRITE(" in decompiled and "&buffer,0x10);" in decompiled
+
+
+FPACK_TEXT = bytes.fromhex(
+    # modulo(a, b)
+    "202f0004"          # 0000 move.l 4(sp),d0
+    "222f0008"          # 0004 move.l 8(sp),d1
+    "48e7c000"          # 0008 movem.l d0/d1,-(sp)
+    "fee2"              # 000c FPACK __CLMOD
+    "4cdf0003"          # 000e movem.l (sp)+,d0/d1
+    "4e75"              # 0012 rts
+    # halve(double sum): XC pushes the right operand first.
+    "4cf900030000005a"  # 0014 movem.l two,d0/d1
+    "48e7c000"          # 001c movem.l d0/d1,-(sp)
+    "4cef0003000c"      # 0020 movem.l 12(sp),d0/d1
+    "48e7c000"          # 0026 movem.l d0/d1,-(sp)
+    "fef0"              # 002a FPACK __CDDIV
+    "4cdf0003"          # 002c movem.l (sp)+,d0/d1
+    "4fef0008"          # 0030 lea 8(sp),sp
+    "4e75"              # 0034 rts
+    # greater(double a, double b)
+    "4cef0003000c"      # 0036 movem.l 12(sp),d0/d1   b
+    "48e7c000"          # 003c movem.l d0/d1,-(sp)
+    "4cef0003000c"      # 0040 movem.l 12(sp),d0/d1   a
+    "48e7c000"          # 0046 movem.l d0/d1,-(sp)
+    "feec"              # 004a FPACK __CDCMP
+    "4fef0010"          # 004c lea 16(sp),sp
+    "6e04"              # 0050 bgt.b 0056
+    "7000"              # 0052 moveq #0,d0
+    "4e75"              # 0054 rts
+    "7001"              # 0056 moveq #1,d0
+    "4e75"              # 0058 rts
+)
+
+
+def test_x68k_ghidra_stacked_fpack_results(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    source, out, project = (tmp_path / name for name in ("FPACK.X", "out", "project"))
+    symbols = b"".join(_symbol(0x0201, offset, name) for offset, name in (
+        (0, b"modulo"), (0x14, b"halve"), (0x36, b"greater")))
+    source.write_bytes(_x(text=FPACK_TEXT, data=bytes.fromhex("4000000000000000"), bss_size=0,
+                          relocations=pack(">H", 0x18), symbols=symbols, entry=0))
+    assert main(["load", str(source), "-o", str(out)]) == 0
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    def decompile(address):
+        assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)["decompilation"]
+
+    modulo, halve, greater = (decompile(address) for address in ("text:0000", "text:0014", "text:0036"))
+    assert "replaced with injection: retrore_fpack_fee2" in modulo and "param_1 % param_2" in modulo
+    assert "return local_10 / (double)CONCAT44(DAT_0001005a,DAT_0001005e);" in halve  # sum / 2.0
+    assert "if ((double)CONCAT44(param_1,param_2) <= (double)CONCAT44(param_3,param_4)) {" in greater
