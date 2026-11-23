@@ -120,6 +120,9 @@ QUERIES = {
                      "description": "symbol name pattern using * and ?"},
             "unit": _UNIT_FILTER,
             "ignore_case": {"type": "boolean", "default": False, "description": "match names ignoring case"},
+            "generated": {"type": "boolean", "default": False,
+                          "description": "also match Ghidra's generated names for referenced addresses "
+                                         "without a stored symbol, such as DAT_, LAB_, and SUB_"},
             **_paging(1000, 100, "symbols"),
             "compact": _COMPACT,
         },
@@ -158,7 +161,7 @@ QUERIES = {
         "description": "report a function's prototype, callees, and referenced data",
         "parameters": {
             "address": {**_address(), "required": True},
-            **_paging(256, 32, "callees and data references per list"),
+            **_paging(256, 32, "parameters, callees, and data references per list"),
             "compact": _COMPACT,
         },
         "fields": ["function", "prototype", "calling_convention", "return_type", "parameters", "callees", "data"],

@@ -746,6 +746,7 @@ def _trace(args: argparse.Namespace) -> None:
         raise TraceError(str(error)) from error
     report = import_trace(
         args.trace, args.export, runtime_base=args.runtime_base, overlay_segments=overlay_segments, project=args.project,
+        timeout=args.timeout,
     )
     if args.json:
         print(json.dumps(report))
@@ -1005,7 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries),
-                    *map(commands.choices.get, _REGISTRY_COMMANDS)):
+                    *map(commands.choices.get, _REGISTRY_COMMANDS), trace_parser):
         default = IMPORT_TIMEOUT if command is import_parser else None if command is batch_parser else QUERY_TIMEOUT
         described = (f"the larger of {QUERY_TIMEOUT} and {BATCH_SECONDS_PER_QUERY} per query"
                      if default is None else default)

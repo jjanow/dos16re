@@ -235,6 +235,7 @@ def test_dos_bulk_queries(dos_project, capsys, monkeypatch):
     assert context["function"] == {"name": "entry", "entry": "root:0000"}
     assert context["prototype"] == "undefined __cdecl16near entry()"
     assert context["parameters"] == []
+    assert context["pagination"]["parameters"] == {"offset": 0, "total": 0, "returned": 0, "next_offset": None}
     assert [(callee["target"], callee["function"]["name"]) for callee in context["callees"]] == [
         ("root:0015", "FUN_1000_0015"), ("root:0020", "FUN_1000_0020"),
     ]
@@ -329,9 +330,11 @@ def test_c64_bulk_queries(tmp_path, capsys):
     source.write_bytes(_prg(0x0801, _sys_stub() + bytes.fromhex("2000a0 60")))
     addon.write_bytes(_prg(0xA000, bytes.fromhex("a907 8d20d0 60")))
     project = _import(tmp_path, capsys, str(source), "--c64-unit", str(addon), "--c64-bank", "6")
-    lookup, symbols, inventory, graph, context, gaps = (row["result"] for row in query_batch(project, [
+    lookup, symbols, generated, stored, inventory, graph, context, gaps = (row["result"] for row in query_batch(project, [
         {"command": "functions", "addresses": ["080d", "worker:0"], "compact": True},
         {"command": "symbols", "prefix": "cpu_port", "ignore_case": True, "fields": ["name"]},
+        {"command": "symbols", "name": "dat_d020", "ignore_case": True, "generated": True, "compact": True},
+        {"command": "symbols", "name": "DAT_d020"},
         {"command": "inventory", "unit": "worker", "fields": ["functions"], "compact": True},
         {"command": "callgraph", "address": "a005", "direction": "callers", "compact": True},
         {"command": "context", "address": "worker:0", "compact": True, "fields": ["data"]},
@@ -339,6 +342,11 @@ def test_c64_bulk_queries(tmp_path, capsys):
     ])["results"])
     assert [row["entry"] for row in lookup["functions"]] == ["root:000c", "worker:0000"]
     assert symbols["symbols"] == [{"name": "CPU_PORT_DDR"}, {"name": "CPU_PORT_DATA"}]
+    # Ghidra generates DAT_ names for referenced addresses without a stored symbol.
+    assert generated["symbols"] == [
+        {"name": "DAT_d020", "address": "c64_vic:0020", "kind": "Label", "source": "DEFAULT", "namespace": None},
+    ]
+    assert stored["symbols"] == []
     assert inventory["functions"] == [{"name": "FUN_a000", "entry": "worker:0000", "size": 6}]
     assert [node["function"]["entry"] for node in graph["nodes"]] == ["worker:0000", "root:000c"]
     assert context["data"] == [
