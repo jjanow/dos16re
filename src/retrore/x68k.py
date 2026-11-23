@@ -123,6 +123,63 @@ HARDWARE_LABELS = (
 # Calls after which control does not return to the caller.
 DOS_NO_RETURN = (0x00, 0x31, 0x4C)
 
+# Stacked DOS call arguments, first (last pushed, lowest address) first: (name, type, size in bytes).
+# Callers push words with move.w and longs with move.l or pea, so the layout is packed without padding.
+# Widths follow call sites in XC's library and the XEiJ sample sources; mode-dependent calls list only the
+# fixed prefix and are variadic. Every call returns in D0.
+_W = 2
+_L = 4
+_NAME = ("name", "char*", _L)
+_HANDLE = ("handle", "short", _W)
+_BUFFER = ("buffer", "void*", _L)
+DOS_PARAMETERS: dict[int, tuple[tuple[tuple[str, str, int], ...], str, bool]] = {
+    0x00: ((), "int", False), 0x01: ((), "int", False), 0x02: ((("code", "short", _W),), "int", False),
+    0x03: ((), "int", False), 0x04: ((("code", "short", _W),), "int", False),
+    0x05: ((("code", "short", _W),), "int", False), 0x06: ((("code", "short", _W),), "int", False),
+    0x07: ((), "int", False), 0x08: ((), "int", False), 0x09: ((("string", "char*", _L),), "int", False),
+    0x0A: ((_BUFFER,), "int", False), 0x0B: ((), "int", False), 0x0C: ((("mode", "short", _W),), "int", True),
+    0x0D: ((), "int", False), 0x0E: ((("drive", "short", _W),), "int", False),
+    0x0F: ((("mode_drive", "short", _W),), "int", True), 0x10: ((), "int", False), 0x11: ((), "int", False),
+    0x12: ((), "int", False), 0x13: ((), "int", False), 0x19: ((), "int", False),
+    0x1B: ((_HANDLE,), "int", False), 0x1C: ((_BUFFER, _HANDLE), "int", False),
+    0x1D: ((("code", "short", _W), _HANDLE), "int", False), 0x1E: ((("string", "char*", _L), _HANDLE), "int", False),
+    0x1F: ((), "int", False), 0x20: ((("stack", "void*", _L),), "int", False),
+    0x23: ((("mode", "short", _W),), "int", True), 0x24: ((("mode", "short", _W),), "int", True),
+    0x25: ((("vector", "short", _W), ("handler", "void*", _L)), "void*", False), 0x27: ((), "int", False),
+    0x28: ((("time", "int", _L),), "int", False), 0x29: ((_NAME, _BUFFER), "int", False),
+    0x2A: ((), "int", False), 0x2B: ((("date", "short", _W),), "int", False), 0x2C: ((), "int", False),
+    0x2D: ((("time", "short", _W),), "int", False), 0x2E: ((("flag", "short", _W),), "int", False),
+    0x30: ((), "int", False), 0x31: ((("length", "int", _L), ("code", "short", _W)), "int", False),
+    0x33: ((("flag", "short", _W),), "int", False), 0x35: ((("vector", "short", _W),), "void*", False),
+    0x36: ((("drive", "short", _W), _BUFFER), "int", False), 0x37: ((_NAME, _BUFFER), "int", False),
+    0x39: ((_NAME,), "int", False), 0x3A: ((_NAME,), "int", False), 0x3B: ((_NAME,), "int", False),
+    0x3C: ((_NAME, ("attribute", "short", _W)), "int", False), 0x3D: ((_NAME, ("mode", "short", _W)), "int", False),
+    0x3E: ((_HANDLE,), "int", False), 0x3F: ((_HANDLE, _BUFFER, ("length", "int", _L)), "int", False),
+    0x40: ((_HANDLE, _BUFFER, ("length", "int", _L)), "int", False), 0x41: ((_NAME,), "int", False),
+    0x42: ((_HANDLE, ("offset", "int", _L), ("mode", "short", _W)), "int", False),
+    0x43: ((_NAME, ("attribute", "short", _W)), "int", False),
+    0x44: ((("mode", "short", _W), ("unit", "short", _W)), "int", True), 0x45: ((_HANDLE,), "int", False),
+    0x46: ((_HANDLE, ("new_handle", "short", _W)), "int", False),
+    0x47: ((("drive", "short", _W), _BUFFER), "int", False), 0x48: ((("length", "int", _L),), "void*", False),
+    0x49: ((("block", "void*", _L),), "int", False),
+    0x4A: ((("block", "void*", _L), ("length", "int", _L)), "int", False),
+    0x4B: ((("mode", "short", _W), _NAME, ("command", "char*", _L), ("environment", "void*", _L)), "int", False),
+    0x4C: ((("code", "short", _W),), "int", False), 0x4D: ((), "int", False),
+    0x4E: ((_BUFFER, _NAME, ("attribute", "short", _W)), "int", False), 0x4F: ((_BUFFER,), "int", False),
+}
+# Human68k 2.x moved $FF50-$FF5F to $FF80-$FF8F; both numberings take the same arguments.
+for _number, _parameters in {
+    0x50: ((("process", "void*", _L),), "void*", False), 0x51: ((), "void*", False),
+    0x52: ((_NAME, ("environment", "void*", _L), ("value", "char*", _L)), "int", False),
+    0x53: ((_NAME, ("environment", "void*", _L), _BUFFER), "int", False),
+    0x56: ((("old_name", "char*", _L), ("new_name", "char*", _L)), "int", False),
+    0x57: ((_HANDLE, ("date_time", "int", _L)), "int", False),
+    0x58: ((("mode", "short", _W), ("length", "int", _L)), "void*", False),
+    0x5A: ((_NAME, ("attribute", "short", _W)), "int", False), 0x5B: ((_NAME, ("attribute", "short", _W)), "int", False),
+    0x5C: ((("mode", "short", _W), _HANDLE, ("offset", "int", _L), ("length", "int", _L)), "int", False),
+}.items():
+    DOS_PARAMETERS[_number] = DOS_PARAMETERS[_number + 0x30] = _parameters
+
 
 class XError(ValueError):
     """A malformed Human68k executable."""
@@ -242,5 +299,12 @@ def build_x_image(data: bytes, program: str, base: int = DEFAULT_M68K_BASE) -> t
             "dos": {f"{0xFF00 | number:04X}": name for number, name in DOS_CALLS.items()},
             "fpack": {f"{0xFE00 | number:04X}": name for number, name in FPACK_CALLS.items()},
             "no_return": [f"{0xFF00 | number:04X}" for number in DOS_NO_RETURN],
+            "dos_prototypes": {
+                f"{0xFF00 | number:04X}": {
+                    "parameters": [{"name": name, "type": kind, "size": size} for name, kind, size in parameters],
+                    "result": result, "variadic": variadic,
+                }
+                for number, (parameters, result, variadic) in sorted(DOS_PARAMETERS.items())
+            },
         },
     }

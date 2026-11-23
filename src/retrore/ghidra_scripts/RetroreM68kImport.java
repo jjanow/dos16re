@@ -54,6 +54,7 @@ public class RetroreM68kImport extends HeadlessScript {
         0x48e73000, new int[] {2, 3, 0x4cdf000c});
 
     private final Map<Integer, String> callNames = new HashMap<>();
+    private final Map<Integer, JsonObject> dosPrototypes = new HashMap<>();
     private final Set<Integer> noReturn = new HashSet<>();
     private final Map<String, Integer> callCounts = new TreeMap<>();
     private int callSites;
@@ -226,6 +227,11 @@ public class RetroreM68kImport extends HeadlessScript {
         }
         for (var word : calls.getAsJsonArray("no_return")) {
             noReturn.add(Integer.parseInt(word.getAsString(), 16));
+        }
+        if (calls.has("dos_prototypes")) {
+            for (var entry : calls.getAsJsonObject("dos_prototypes").entrySet()) {
+                dosPrototypes.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsJsonObject());
+            }
         }
     }
 
@@ -632,6 +638,9 @@ public class RetroreM68kImport extends HeadlessScript {
         }
         function.setVarArgs(true);
         function.setSignatureSource(SourceType.IMPORTED);
+        if (dosPrototypes.containsKey(word)) {
+            applyDosPrototype(function, dosPrototypes.get(word));
+        }
         if (word >= 0xfe00 && word <= 0xfe09 && word != 0xfe03 && word != 0xfe07) {
             function.setVarArgs(false);
             // Register helpers: D0 op D1, result in D0.
@@ -645,6 +654,40 @@ public class RetroreM68kImport extends HeadlessScript {
                 new ParameterImpl("right", integer, d1, currentProgram));
         }
         return function;
+    }
+
+    // The line-F word sits where the patched jsr (sp) pushes its return address, so the last value pushed
+    // before the call is at +4. Words and longs are packed as pushed, which the 68000 calling convention's
+    // 4-byte stack slots cannot express, so every parameter gets explicit stack storage.
+    private void applyDosPrototype(Function function, JsonObject prototype) throws Exception {
+        var parameters = new ArrayList<ghidra.program.model.listing.Parameter>();
+        int offset = 4;
+        for (var element : prototype.getAsJsonArray("parameters")) {
+            var parameter = element.getAsJsonObject();
+            int size = parameter.get("size").getAsInt();
+            var type = lineFType(parameter.get("type").getAsString());
+            parameters.add(new ParameterImpl(parameter.get("name").getAsString(), type,
+                new VariableStorage(currentProgram, offset, size), currentProgram));
+            offset += size;
+        }
+        var d0 = currentProgram.getRegister("D0");
+        function.updateFunction(null,
+            new ReturnParameterImpl(lineFType(prototype.get("result").getAsString()),
+                new VariableStorage(currentProgram, d0), currentProgram),
+            parameters, FunctionUpdateType.CUSTOM_STORAGE, true, SourceType.IMPORTED);
+        function.setVarArgs(prototype.get("variadic").getAsBoolean());
+        function.setStackPurgeSize(0);
+    }
+
+    private ghidra.program.model.data.DataType lineFType(String name) {
+        var manager = currentProgram.getDataTypeManager();
+        return switch (name) {
+            case "short" -> ghidra.program.model.data.ShortDataType.dataType;
+            case "int" -> IntegerDataType.dataType;
+            case "char*" -> new PointerDataType(ghidra.program.model.data.CharDataType.dataType, 4, manager);
+            case "void*" -> new PointerDataType(ghidra.program.model.data.VoidDataType.dataType, 4, manager);
+            default -> throw new IllegalArgumentException("unknown line-F type " + name);
+        };
     }
 
     private Address address(long value) {

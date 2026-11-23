@@ -189,3 +189,50 @@ def test_x68k_ghidra_import_patches_line_f_calls(tmp_path, capsys):
     assert any(ref["to"]["unit_address"] == "text:0000" for ref in query("xrefs", "data:0006")["outgoing"])
     gap, = query("gaps")["ranges"]
     assert (gap["start"], gap["size"]) == ("text:0030", 2)
+
+
+DOS_TEXT = bytes.fromhex(
+    "3f3c0001"      # 0000 move.w #1,-(sp)             mode
+    "48790000002a"  # 0004 pea name
+    "ff3d"          # 000a DOS _OPEN
+    "5c8f"          # 000c addq.l #6,sp
+    "2f3c00000010"  # 000e move.l #16,-(sp)            length
+    "487900000034"  # 0014 pea buffer
+    "3f00"          # 001a move.w d0,-(sp)             handle
+    "ff40"          # 001c DOS _WRITE
+    "4fef000a"      # 001e lea 10(sp),sp
+    "23c000000044"  # 0022 move.l d0,result
+    "ff00"          # 0028 DOS _EXIT
+)
+
+
+def _dos_x(symbols=b""):
+    return _x(text=DOS_TEXT, data=b"SAVE.DAT".ljust(10, b"\0") + bytes(16), bss_size=4,
+              relocations=pack(">3H", 0x06, 0x10, 0x0E), symbols=symbols, entry=0)
+
+
+def test_x68k_dos_prototypes_in_map():
+    _, program = build_x_image(_dos_x(), "demo")
+    prototypes = program["line_f_calls"]["dos_prototypes"]
+    assert prototypes["FF3D"] == {"parameters": [
+        {"name": "name", "type": "char*", "size": 4}, {"name": "mode", "type": "short", "size": 2},
+    ], "result": "int", "variadic": False}
+    assert [parameter["size"] for parameter in prototypes["FF40"]["parameters"]] == [2, 4, 4]
+    assert [parameter["size"] for parameter in prototypes["FF42"]["parameters"]] == [2, 4, 2]
+    assert prototypes["FF83"] == prototypes["FF53"]
+    assert prototypes["FF44"]["variadic"]
+
+
+def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    source, out, project = (tmp_path / name for name in ("DOS.X", "out", "project"))
+    source.write_bytes(_dos_x(_symbol(0x0201, 0, b"start") + _symbol(0x0202, 0x34, b"buffer")))
+    assert main(["load", str(source), "-o", str(out)]) == 0
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    assert main(["decomp", "text:0000", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    decompiled = json.loads(capsys.readouterr().out)["decompilation"]
+    print(decompiled)
+    assert "DOS::_OPEN(" in decompiled and ",1);" in decompiled
+    assert "DOS::_WRITE(" in decompiled and "&buffer,0x10);" in decompiled
