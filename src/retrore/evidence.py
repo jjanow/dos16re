@@ -33,6 +33,10 @@ class ExportEvidence:
                 raise EvidenceError("runtime segment overrides require a DOS MZ export")
             self.runtime = {unit.name: unit.linear for unit in self.units}
 
+    def identity(self) -> dict:
+        return {"program": self.program.get("program"), "format": self.format,
+                "image_sha256": sha256(self.image).hexdigest()}
+
     def file_spans(self, unit: ImageUnit) -> list[dict]:
         record = self.records[unit.name]
         if "file_spans" in record:
@@ -230,6 +234,12 @@ def _compare_bytes(image: ExportEvidence, location: dict, size: int, project_byt
     return {"status": "consistent", "bytes": observed}
 
 
+def compare_project_range(image: ExportEvidence, region: dict) -> dict:
+    address, data = region["address"], region["bytes"]
+    return {"address": address, "project_bytes": data,
+            **_compare_bytes(image, address, region["size"], data, uninitialized=region["uninitialized"])}
+
+
 def _decomp_evidence(image: ExportEvidence, result: dict) -> dict:
     instruction_bytes = result.pop("_instruction_bytes", None)
     if instruction_bytes is None:
@@ -252,29 +262,91 @@ def _decomp_evidence(image: ExportEvidence, result: dict) -> dict:
     return {**report, "status": "consistent"}
 
 
+def _switch_records(image: ExportEvidence) -> dict:
+    records = {}
+    try:
+        for table in image.program.get("jump_tables", ()):
+            targets = table["targets"]
+            count = len(table.get("cases", targets))
+            width = table.get("entry_size", 4 if image.format in M68K_FORMATS else 2)
+            if type(width) is not int or width not in (2, 4) or count == 0:
+                raise ValueError("invalid jump table size")
+            records[table["address"]["linear"]] = {
+                "guard": table["guard"]["linear"], "table": table["table"]["linear"], "size": width * count,
+                "targets": sorted({target["linear"] for target in targets}),
+            }
+    except (KeyError, TypeError, ValueError) as error:
+        raise ImageError(f"invalid jump table in map.json: {error}") from error
+    return records
+
+
+def _flow_evidence(image: ExportEvidence, switches: dict, result: dict) -> dict:
+    proof = result.pop("_flow_bytes", None)
+    if proof is None:
+        return {"status": "unavailable", "reason": "Ghidra did not return indirect flow evidence"}
+
+    sites = []
+    for item in proof["sites"]:
+        address = item["address"]
+        ranges = []
+        for region in item["ranges"]:
+            comparison = compare_project_range(image, region["range"])
+            if region["truncated"] and comparison["status"] == "consistent":
+                comparison.update(status="unavailable", reason="only a prefix of the range was checked")
+            ranges.append({"role": region["role"], **comparison})
+        site = {"address": address, "ranges": ranges}
+        if item["targets"] is not None:
+            expected = switches[address["linear"]]["targets"]
+            site["targets"] = {"project": item["targets"], "export": expected}
+            if item["targets"] != expected:
+                site["conflicts"] = ["target_mismatch"]
+        statuses = {region["status"] for region in ranges}
+        if "conflicts" in site or "conflict" in statuses:
+            site["status"] = "conflict"
+        elif item["incomplete"] or "unavailable" in statuses:
+            site.update(status="unavailable", reason="indirect flow byte coverage is incomplete")
+        else:
+            site["status"] = "consistent"
+        sites.append(site)
+
+    report = {"sites": sites, "truncated": proof["truncated"]}
+    statuses = {site["status"] for site in sites}
+    if "conflict" in statuses:
+        return {**report, "status": "conflict"}
+    if not sites:
+        return {**report, "status": "unavailable", "reason": "no indirect sites in the returned page"}
+    if "unavailable" in statuses or proof["truncated"]:
+        return {**report, "status": "unavailable", "reason": "indirect flow byte coverage is incomplete"}
+    return {**report, "status": "consistent"}
+
+
 def evidence_bundle(project: Path, requests: list, *, export: Path | None = None, program: str | None = None,
                     timeout: float | None = None) -> dict:
     """Bundle selected query results and compare Ghidra bytes with loader evidence."""
     if not isinstance(requests, list) or not requests:
         raise GhidraError("expected a nonempty JSON array of evidence queries")
+    image = ExportEvidence(export) if export is not None else None
+    switches = None
+    if image is not None and any(isinstance(item, dict) and item.get("command") == "indirect" for item in requests):
+        switches = _switch_records(image)
     report = query_batch(project, [
         {"command": "project-summary", "fields": ["program", "language", "compiler", "function_count"]}, *requests,
-    ], program=program, timeout=timeout, _instruction_bytes=export is not None)
+    ], program=program, timeout=timeout, _instruction_bytes=image is not None, _flow_bytes=switches)
     summary, *rows = report["results"]
     if "error" in summary:
         raise GhidraError(summary["error"]["message"], code=summary["error"]["code"])
     bundle = {**report, "bundle_version": 1, "project": summary["result"], "requests": requests, "results": rows}
-    if export is None:
+    if image is None:
         return bundle
-    image = ExportEvidence(export)
-    bundle["export"] = {"program": image.program.get("program"), "format": image.format,
-                        "image_sha256": sha256(image.image).hexdigest()}
+    bundle["export"] = image.identity()
     for request, row in zip(requests, rows, strict=True):
         if "error" in row:
             continue
         result = row["result"]
         if request["command"] == "decomp":
             row["export_evidence"] = _decomp_evidence(image, result)
+        elif request["command"] == "indirect":
+            row["export_evidence"] = _flow_evidence(image, switches, result)
         elif request["command"] == "disasm":
             if {"start", "size", "rows"} <= result.keys():
                 parts = result["rows"]

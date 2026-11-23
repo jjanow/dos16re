@@ -1318,7 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
     batch_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
     batch_parser.add_argument("--evidence", action="store_true", help="include the query requests and program identity")
     batch_parser.add_argument("--export", metavar="OUT", type=Path,
-                              help="compare disassembly and decompiler instruction bytes with a loader export")
+                              help="compare disassembly, decompiler, and indirect flow bytes with a loader export")
     address_queries = {
         "xrefs": "list references to and from an address",
         "callers": "list calls to a function",
@@ -1348,6 +1348,8 @@ def main(argv: list[str] | None = None) -> int:
     annotations_parser = commands.add_parser("annotations", help="export or replay Ghidra annotations")
     annotations_modes = annotations_parser.add_subparsers(dest="annotations_mode", required=True)
     annotations_export = annotations_modes.add_parser("export", help="export a versioned annotation document")
+    annotations_export.add_argument("--export", metavar="OUT", type=Path,
+                                    help="compare each annotation anchor byte with a loader export")
     annotations_import = annotations_modes.add_parser("import", help="preview or apply an annotation document")
     annotations_import.add_argument("document", type=Path, metavar="FILE")
     annotations_import.add_argument("--apply", action="store_true", help="save all changes if there are no conflicts")
@@ -1598,7 +1600,8 @@ def main(argv: list[str] | None = None) -> int:
                           f"{len(report['transfer']['skipped'])} skipped. Use --json to export the document.")
                 return 0
             if args.annotations_mode == "export":
-                report = export_annotations(args.project, program=args.program, timeout=args.timeout)
+                report = export_annotations(args.project, program=args.program, export=args.export,
+                                            timeout=args.timeout)
                 if args.json:
                     print(json.dumps(report, indent=2, ensure_ascii=False))
                 else:

@@ -826,6 +826,9 @@ are flagged. The query includes original file bytes when Ghidra retains a file m
 
 ```sh
 .venv/bin/retrore indirect --project out/pool-project --status candidate --json
+.venv/bin/retrore batch --project out/pool-project --evidence --export out/pool --json <<'EOF'
+[{"command": "indirect", "status": "candidate", "limit": 5}]
+EOF
 .venv/bin/retrore layout 2820:e820 --project out/ph3-project
 .venv/bin/retrore layout 2820:e820 --project out/ph3-project --name Character --apply
 ```
@@ -950,6 +953,15 @@ operations. The `export_evidence.instructions` array records each distinct instr
 address and `project_bytes` alongside its loader bytes, source spans, and fixups. Evidence covers
 up to 512 distinct instructions per result and sets `truncated` if it omits any.
 
+For `indirect`, `export_evidence.sites` follows the query's filters and page. It compares the dispatch
+instruction, the guard and table of each loader-recovered switch, initialized candidate slots, and
+the instructions that construct stored candidate pointers. Each range includes the Ghidra bytes and
+available loader source spans and fixups. Loader-recovered switches also compare Ghidra's resolved
+target set with the export. A difference reports `target_mismatch`. Evidence is limited to 512 ranges
+per result and 4,096 bytes per range. Older imports may record only the first pointer writer, in which
+case the comparison reports incomplete coverage. A `consistent` site means its reported evidence
+agrees. Pointer candidates still require runtime observation to establish which targets execute.
+
 Each conflicting byte comparison includes a `conflicts` array with codes for address, initialized size,
 and byte mismatches, or incomplete coverage when both sources provide the same number of bytes.
 A range uninitialized in both sources has an `unavailable` comparison. A `decomp` comparison is
@@ -960,6 +972,7 @@ makes the result `conflict`. Missing or truncated evidence otherwise makes it `u
 
 ```sh
 .venv/bin/retrore annotations export --project out/old-project --json > annotations.json
+.venv/bin/retrore annotations export --project out/old-project --export out/old --json > annotations-with-evidence.json
 .venv/bin/retrore annotations import annotations.json --project out/fresh-project --json
 .venv/bin/retrore annotations import annotations.json --project out/fresh-project --apply --json
 ```
@@ -970,6 +983,11 @@ Export includes the Ghidra language and the executable hash when available. Impo
 additions and conflicts, and applies the entire document in one transaction if it has no conflicts.
 Replaying it again leaves identical annotations unchanged. Custom data type definitions and custom
 register storage require separate Ghidra handling.
+
+With `--export OUT`, each annotation includes an `export_evidence` comparison of the byte at its
+anchor. The comparison includes loader source spans and fixups where available, and the document
+records the export image's SHA-256. Replay still uses the document's language and executable
+identity checks.
 
 ### Compare revisions and ports
 
@@ -986,7 +1004,8 @@ without establishing that the two routines have identical behavior.
 
 `annotations transfer` prepares a new annotation document from one comparison page. It carries
 names, signatures, and comments at same-body function entries, records the source and match method
-for each, and lists skipped entries. Use `annotations import` to review it against the destination.
+for each, and lists skipped entries. Source anchor evidence and the export identity travel with the
+source in `provenance`. Use `annotations import` to review it against the destination.
 
 ### Persistent query workers
 

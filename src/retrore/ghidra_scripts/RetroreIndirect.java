@@ -314,7 +314,7 @@ public class RetroreIndirect extends HeadlessScript {
             return "unrelocated";
         }
         evidence.add("initial");
-        return addCandidate(slot, space.getAddress(segment, offset), evidence, null, far, entries);
+        return addCandidate(slot, space.getAddress(segment, offset), evidence, List.of(), far, entries);
     }
 
     /** Add far pointers that instructions store into the slot: an offset and a segment written close together. */
@@ -346,7 +346,9 @@ public class RetroreIndirect extends HeadlessScript {
                 }
                 evidence.add("stored");
                 var target = space.getAddress((int) immediate(segmentSource), (int) immediate(offsetSource));
-                addCandidate(slot, target, evidence, writer.getAddress(), true, entries);
+                var writers = List.of(writer, offsetSource, other, segmentSource).stream()
+                    .map(item -> item.getAddress().getOffset()).distinct().toList();
+                addCandidate(slot, target, evidence, writers, true, entries);
                 break;
             }
         }
@@ -386,7 +388,7 @@ public class RetroreIndirect extends HeadlessScript {
     }
 
     /** Check that a candidate target looks like code and record it; return a stop reason when it does not. */
-    private String addCandidate(Address slot, Address target, List<String> evidence, Address writer, boolean far,
+    private String addCandidate(Address slot, Address target, List<String> evidence, List<Long> writers, boolean far,
             List<Map<String, Object>> entries) throws Exception {
         var block = currentProgram.getMemory().getBlock(target);
         if (block == null || !block.isExecute() || !block.isInitialized()) {
@@ -418,6 +420,10 @@ public class RetroreIndirect extends HeadlessScript {
                 @SuppressWarnings("unchecked")
                 var known = (List<String>) existing.get("evidence");
                 evidence.stream().filter(item -> !known.contains(item)).forEach(known::add);
+                if (!writers.isEmpty() && !existing.containsKey("writers")) {
+                    existing.put("writer", writers.getFirst());
+                    existing.put("writers", writers);
+                }
                 return null;
             }
         }
@@ -425,8 +431,9 @@ public class RetroreIndirect extends HeadlessScript {
         entry.put("slot", slot.getOffset());
         entry.put("target", target.getOffset());
         entry.put("evidence", evidence);
-        if (writer != null) {
-            entry.put("writer", writer.getOffset());
+        if (!writers.isEmpty()) {
+            entry.put("writer", writers.getFirst());
+            entry.put("writers", writers);
         }
         entries.add(entry);
         return null;

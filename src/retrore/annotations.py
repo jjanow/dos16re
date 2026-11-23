@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from . import ghidra, worker
+from .evidence import ExportEvidence, compare_project_range
 
 
 def _read_json(path: Path) -> dict:
@@ -25,9 +26,20 @@ def _read_annotations(path: Path) -> dict:
     return content
 
 
-def export_annotations(project: Path, *, program: str = "image.bin",
+def export_annotations(project: Path, *, program: str = "image.bin", export: Path | None = None,
                        timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
     ghidra._check_program_name(program)
+    if export is not None:
+        image = ExportEvidence(export)
+        request = {"mode": "export", "_anchor_bytes": True}
+        report = (ghidra._report(project, "annotations", request, timeout) if program == "image.bin" else
+                  ghidra._oneshot(project, "annotations", request, timeout, program=program))
+        report["export"] = image.identity()
+        for item in report["annotations"]:
+            region = item.pop("_anchor_bytes", None)
+            item["export_evidence"] = (compare_project_range(image, region) if region is not None else
+                                       {"status": "unavailable", "reason": "Ghidra did not return an anchor byte"})
+        return report
     if program == "image.bin":
         return ghidra._report(project, "annotations", {"mode": "export"}, timeout)
     return ghidra._query(project, "RetroreAnnotations.java", "export", timeout=timeout, program=program)
@@ -85,9 +97,17 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
             elif match["after"]["unit"] is None or type(match["after"]["offset"]) is not int:
                 reason = "destination_has_no_unit"
             else:
-                annotations.append({**item, "unit": match["after"]["unit"], "offset": match["after"]["offset"],
-                                    "provenance": {"sha256": before["sha256"], "unit": key[0], "offset": key[1],
-                                                   "matched_by": match["matched_by"]}})
+                transferred = {**item, "unit": match["after"]["unit"], "offset": match["after"]["offset"]}
+                provenance = {"sha256": before["sha256"], "unit": key[0], "offset": key[1],
+                              "matched_by": match["matched_by"]}
+                if "export_evidence" in transferred:
+                    provenance["export_evidence"] = transferred.pop("export_evidence")
+                    if "export" in source:
+                        provenance["export"] = source["export"]
+                if "provenance" in item:
+                    provenance["previous"] = item["provenance"]
+                transferred["provenance"] = provenance
+                annotations.append(transferred)
                 continue
             skipped.append({"unit": key[0], "offset": key[1], "kind": item["kind"], "reason": reason})
         return {"version": 1, "language": after["language"], "sha256": after["sha256"], "annotations": annotations,

@@ -6,6 +6,7 @@ from struct import pack_into
 import pytest
 
 from retrore.cli import main
+from retrore.evidence import evidence_bundle
 from retrore.jump_tables import JumpTable, M68kJumpTable, recover_jump_tables, recover_m68k_jump_tables
 from retrore.mz import Address, LoadedMZ, MZExecutable
 from retrore.overlays import Overlay, build_image
@@ -236,6 +237,37 @@ def test_ghidra_adds_far_call_table_cross_references(tmp_path, capsys):
     assert main(["func", "root:0094", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     assert json.loads(capsys.readouterr().out)["segments"]["ES"] == 0x1008
 
+    requests = [{"command": "indirect", "at": "root:9", "compact": True, "fields": ["targets"]}]
+    row, = evidence_bundle(project, requests, export=export)["results"]
+    returned, = row["result"]["sites"]
+    assert returned.keys() == {"targets"}
+    assert set(returned["targets"]) == {"root:0060", "root:0092"}
+    assert "_flow_bytes" not in row["result"]
+    proof = row["export_evidence"]
+    assert proof["status"] == "consistent" and not proof["truncated"]
+    site, = proof["sites"]
+    assert site["targets"] == {"project": [0x10060, 0x10092], "export": [0x10060, 0x10092]}
+    instruction, guard, table = site["ranges"]
+    assert (instruction["role"], instruction["project_bytes"]) == ("site", "2eff9f3000")
+    assert (guard["role"], guard["project_bytes"]) == ("guard", "83fb01")
+    assert (table["role"], table["project_bytes"]) == ("table", "1000051012000810")
+    assert table["bytes"]["original"] == "1000050012000800"
+    assert table["bytes"]["file_spans"][0]["file_offset"] == 0x60
+
+    image = export / "image.bin"
+    data = bytearray(image.read_bytes())
+    data[0x34] ^= 1
+    image.write_bytes(data)
+    map_path = export / "map.json"
+    program = json.loads(map_path.read_bytes())
+    program["jump_tables"][0]["targets"][1]["linear"] = 0x10093
+    map_path.write_text(json.dumps(program), encoding="utf-8")
+    row, = evidence_bundle(project, requests, export=export)["results"]
+    assert row["export_evidence"]["status"] == "conflict"
+    site, = row["export_evidence"]["sites"]
+    assert site["conflicts"] == ["target_mismatch"]
+    assert site["ranges"][-1]["conflicts"] == ["byte_mismatch"]
+
 
 def test_ghidra_keeps_candidates_for_far_pointer_tables_and_variables(tmp_path, capsys):
     if not os.environ.get("GHIDRA_HOME"):
@@ -283,6 +315,29 @@ def test_ghidra_keeps_candidates_for_far_pointer_tables_and_variables(tmp_path, 
         ("root:0024", ["relocated", "initial"]), ("root:002a", ["relocated", "initial"]),
     ]
     assert all("seeded" in entry["evidence"] and "prologue" in entry["evidence"] for entry in table["candidates"])
+
+    requests = [
+        {"command": "indirect", "status": "candidate", "limit": 1},
+        {"command": "indirect", "status": "candidate", "offset": 1, "limit": 1},
+        {"command": "indirect", "status": "resolved"},
+    ]
+    stored_page, initial_page, empty = evidence_bundle(project, requests, export=export)["results"]
+    assert [row["export_evidence"]["status"] for row in (stored_page, initial_page, empty)] == [
+        "consistent", "consistent", "unavailable",
+    ]
+    for row in (stored_page, initial_page):
+        site, = row["export_evidence"]["sites"]
+        returned, = row["result"]["sites"]
+        assert site["address"] == returned["address"]
+    stored_ranges = stored_page["export_evidence"]["sites"][0]["ranges"]
+    assert [entry["address"]["unit_address"] for entry in stored_ranges if entry["role"] == "writer"] == [
+        "root:0040", "root:0043", "root:0046", "root:0049",
+    ]
+    assert stored_ranges[2]["bytes"]["evidence"][0]["kind"] == "relocation"
+    initial_ranges = initial_page["export_evidence"]["sites"][0]["ranges"]
+    assert [entry["bytes"]["original"] for entry in initial_ranges if entry["role"] == "slot"] == [
+        "24000000", "2a000000",
+    ]
 
     # Each candidate slot references its target, so xrefs on a handler shows where it can be called from.
     assert main(["xrefs", "root:0030", "--project", str(project), "--json"]) == 0

@@ -154,6 +154,15 @@ def test_annotation_transfer_preserves_anchors_and_skips_changed_bodies(tmp_path
     assert report["transfer"]["skipped"] == [
         {"unit": "root", "offset": 32, "kind": "comment", "reason": "function_match_requires_review"},
     ]
+    proof = {"status": "consistent", "project_bytes": "ea"}
+    source["export"] = {"image_sha256": "loader-image"}
+    source["annotations"][0]["export_evidence"] = proof
+    annotations.write_text(json.dumps(source), encoding="utf-8")
+    assert main(["annotations", "transfer", str(annotations), str(comparison), "--json"]) == 0
+    match, = json.loads(capsys.readouterr().out)["annotations"]
+    assert "export_evidence" not in match
+    assert match["provenance"]["export_evidence"] == proof
+    assert match["provenance"]["export"] == source["export"]
 
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
@@ -204,6 +213,24 @@ def test_annotations_preview_conflict_and_round_trip(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["applied"]
     after = export_annotations(project)
     assert {row["kind"] for row in after["annotations"]} >= {"function_name", "label", "signature", "comment"}
+    assert main(["annotations", "export", "--project", str(project), "--export", str(export), "--json"]) == 0
+    sourced = json.loads(capsys.readouterr().out)
+    comment = next(row for row in sourced["annotations"] if row.get("value") == "Read ☃ mode")
+    proof = comment["export_evidence"]
+    assert proof["status"] == "consistent"
+    assert proof["project_bytes"] == "a9"
+    assert proof["bytes"]["file_spans"][0]["file_offset"] == 2
+    assert sourced["export"]["format"] == "C64_PRG"
+
+    image = export / "image.bin"
+    image.write_bytes(b"\x00" + image.read_bytes()[1:])
+    sourced = export_annotations(project, export=export)
+    comment = next(row for row in sourced["annotations"] if row.get("value") == "Read ☃ mode")
+    assert comment["export_evidence"]["conflicts"] == ["byte_mismatch"]
+    path.write_text(json.dumps(sourced), encoding="utf-8")
+    assert import_annotations(project, path)["conflicts"] == 0
+
+    path.write_text(json.dumps(document), encoding="utf-8")
     again = import_annotations(project, path)
     assert again["additions"] == again["conflicts"] == 0
 

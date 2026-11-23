@@ -14,12 +14,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `batch --evidence --export` added loader comparisons for the instructions behind
-mapped C lines, focused instructions, excerpts, and p-code slices. The standalone suite passed
-422 tests with 90 skipped. Focused Ghidra 12.2 tests verified instruction bytes and source offsets
-from a synthetic DOS program. A persistent worker detected a modified byte in a synthetic C64 export.
+On 2026-11-23, `batch --evidence --export` added loader comparisons for indirect transfers,
+including recovered switch tables and the instructions that write candidate pointers.
+`annotations export --export` added anchor-byte evidence that transfer preserves as source
+provenance. The standalone suite passed 422 tests with 90 skipped. Focused Ghidra 12.2 checks
+covered synthetic DOS, Amiga, and C64 inputs, including changed bytes and targets.
 
-Resume Phase 10 by attaching export evidence to recovered indirect control flow and annotation provenance.
+Resume Phase 10 by attaching loader evidence to observed runtime addresses and static gap hits.
 
 ## Why
 
@@ -358,12 +359,14 @@ release. Continue with the analysis backlog below.
   fields. Both comparisons report address, initialized size, and byte mismatches, plus incomplete
   coverage when both sources provide equal byte counts. The decompiler comparison records each
   instruction's bytes and source spans and flags missing or truncated evidence. A disassembly
-  range uninitialized in both sources reports an unavailable byte comparison. Gap classification
-  can include observed runtime hits. Open: shared evidence for recovered indirect flow, runtime
-  observations, and annotations.
+  range uninitialized in both sources reports an unavailable byte comparison. Indirect flow bundles
+  compare instructions, loader-recovered tables and targets, initial candidate slots, and stored
+  pointer writers. Gap classification can include observed runtime hits. Open: shared evidence for
+  runtime observations.
 - **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
-  entry points. Replay previews conflicts and applies changes in one transaction. Open: user data
-  types, custom storage, and layout hints.
+  entry points. An optional loader export adds byte and source evidence at each anchor. Transfer
+  preserves the source evidence. Replay previews conflicts and applies changes in one transaction.
+  Open: user data types, custom storage, and layout hints.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay

@@ -6,6 +6,7 @@ import pytest
 
 from retrore.amiga import HunkError, build_hunk_image
 from retrore.cli import main
+from retrore.evidence import evidence_bundle
 
 
 def _words(*values):
@@ -85,7 +86,7 @@ def test_unpadded_short_relocations(record):
     ("0c80 00000001 6214 e380 303b000c 4efb0000 7001 4e75 4e75 0002 0006 4e75 0000",
      "relative", "h0:0018", ["h0:0012", "h0:0016"]),
 ])
-def test_amiga_recovers_pc_indexed_switch_tables(code, encoding, table, targets):
+def test_amiga_recovers_pc_indexed_switch_tables(code, encoding, table, targets, tmp_path, capsys):
     text = bytes.fromhex(code)
     source = _words(0x3F3, 0, 1, 0, 0, len(text) // 4, 0x3E9, len(text) // 4) + text + _words(0x3F2)
     _, export = build_hunk_image(source, "switch")
@@ -95,6 +96,21 @@ def test_amiga_recovers_pc_indexed_switch_tables(code, encoding, table, targets)
     assert [target["unit_address"] for target in switch["targets"]] == targets
     if encoding == "branch":
         assert [target["unit_address"] for target in switch["cases"]] == ["h0:0014", "h0:0018"]
+
+    if os.environ.get("GHIDRA_HOME"):
+        member, out, project = (tmp_path / name for name in ("switch", "out", "project"))
+        member.write_bytes(source)
+        assert main(["load", str(member), "-o", str(out)]) == 0
+        assert main(["ghidra", "import", str(out), str(project)]) == 0, capsys.readouterr().err
+        requests = [{"command": "indirect", "at": switch["address"]["unit_address"]}]
+        row, = evidence_bundle(project, requests, export=out)["results"]
+        proof = row["export_evidence"]
+        assert proof["status"] == "consistent"
+        site, = proof["sites"]
+        assert site["targets"]["project"] == [target["linear"] for target in switch["targets"]]
+        table_bytes = site["ranges"][-1]
+        assert (table_bytes["role"], table_bytes["address"]["unit_address"]) == ("table", table)
+        assert table_bytes["project_bytes"] == ("60046006" if encoding == "branch" else "00020006")
 
 
 @pytest.mark.parametrize(

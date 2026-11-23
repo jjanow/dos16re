@@ -58,6 +58,10 @@ public class RetroreQuery extends GhidraScript {
     private record ExcerptLine(int line, String text, boolean focused, List<Location> addresses) {}
     private record MappedLine(int line, String text, List<BodyRange> instructions) {}
     private record InstructionBytes(Location address, String bytes) {}
+    private record ByteRange(Location address, int size, String bytes, boolean uninitialized) {}
+    private record FlowRange(String role, ByteRange range, boolean truncated) {}
+    private record FlowBytes(Location address, List<FlowRange> ranges, List<Long> targets,
+            boolean incomplete) {}
     private record OperandReference(int operand, String type, String source, Location target) {}
     private record SliceValue(String storage, int size) {}
     private record SliceInput(String storage, int size, Integer definition) {}
@@ -173,7 +177,22 @@ public class RetroreQuery extends GhidraScript {
                 throw new IllegalArgumentException("unknown read-only annotation mode " + mode);
             }
             runScript("RetroreAnnotations.java", arguments);
-            return (Map<String, Object>) integral(GSON.fromJson(Files.readString(output), Map.class));
+            var report = (Map<String, Object>) integral(GSON.fromJson(Files.readString(output), Map.class));
+            if (mode.equals("export") && request.has("_anchor_bytes") && report.containsKey("annotations")) {
+                var anchors = new HashMap<Address, ByteRange>();
+                for (var item : (List<Map<String, Object>>) report.get("annotations")) {
+                    monitor.checkCancelled();
+                    var block = currentProgram.getMemory().getBlock((String) item.get("unit"));
+                    var address = block.getStart().addNoWrap(((Number) item.get("offset")).longValue());
+                    var proof = anchors.get(address);
+                    if (proof == null) {
+                        proof = memoryBytes(address, 1);
+                        anchors.put(address, proof);
+                    }
+                    item.put("_anchor_bytes", proof);
+                }
+            }
+            return report;
         } finally {
             Files.deleteIfExists(output);
             if (input != null) {
@@ -491,6 +510,17 @@ public class RetroreQuery extends GhidraScript {
                 "original", HexFormat.of().formatHex(original, 0, read)));
             return;
         }
+    }
+
+    private ByteRange memoryBytes(Address address, int size) throws Exception {
+        var memory = currentProgram.getMemory();
+        var block = memory.getBlock(address);
+        if (block == null || !block.isInitialized()) {
+            return new ByteRange(location(address), size, "", block != null);
+        }
+        var bytes = new byte[(int) Math.min(size, block.getEnd().subtract(address) + 1)];
+        int read = memory.getBytes(address, bytes);
+        return new ByteRange(location(address), size, HexFormat.of().formatHex(bytes, 0, read), false);
     }
 
     private Map<String, Object> projectSummary(Options options) throws Exception {
@@ -1249,6 +1279,8 @@ public class RetroreQuery extends GhidraScript {
             }
         }
         var rows = new ArrayList<Map<String, Object>>();
+        var collector = request.has("_flow_bytes")
+            ? new IndirectBytesCollector(request.getAsJsonObject("_flow_bytes")) : null;
         var counts = new LinkedHashMap<String, Integer>();
         for (String name : List.of("resolved", "candidate", "unresolved")) {
             counts.put(name, 0);
@@ -1268,6 +1300,10 @@ public class RetroreQuery extends GhidraScript {
             counts.merge(state, 1, Integer::sum);
             if (status != null && !status.equals(state)) {
                 continue;
+            }
+            if (collector != null && rows.size() >= options.offset() &&
+                    (options.limit() == null || rows.size() - options.offset() < options.limit())) {
+                collector.add(instruction, flows, stored);
             }
             record.put("status", state);
             var targets = new ArrayList<Object>();
@@ -1325,7 +1361,92 @@ public class RetroreQuery extends GhidraScript {
         report.put("counts", counts);
         report.put("sites", select(page("sites", rows, options, pages), options));
         report.put("pagination", pages);
+        if (collector != null) {
+            report.put("_flow_bytes", Map.of("sites", collector.sites, "truncated", collector.truncated));
+        }
         return report;
+    }
+
+    private final class IndirectBytesCollector {
+        private static final int MAX_RANGES = 512;
+        private static final int MAX_RANGE_BYTES = 4096;
+        private final JsonObject switches;
+        private final List<FlowBytes> sites = new ArrayList<>();
+        private int remaining = MAX_RANGES;
+        private int omitted;
+        private boolean truncated;
+
+        IndirectBytesCollector(JsonObject switches) {
+            this.switches = switches;
+        }
+
+        void add(Instruction instruction, Address[] flows, JsonObject stored) throws Exception {
+            if (remaining == 0) {
+                truncated = true;
+                return;
+            }
+            monitor.checkCancelled();
+            var site = instruction.getAddress();
+            var ranges = new ArrayList<FlowRange>();
+            int previousOmissions = omitted;
+            addRange(ranges, "site", site, instruction.getLength());
+            var table = switches.getAsJsonObject(Long.toString(site.getOffset()));
+            boolean incomplete = false;
+            if (table != null) {
+                incomplete = !addInstruction(ranges, "guard", table.get("guard").getAsLong());
+                addRange(ranges, "table", linearAddress(table.get("table").getAsLong()), table.get("size").getAsInt());
+            }
+            if (stored != null && stored.has("candidates")) {
+                var slots = new TreeSet<Long>();
+                var writers = new TreeSet<Long>();
+                for (var item : stored.getAsJsonArray("candidates")) {
+                    var candidate = item.getAsJsonObject();
+                    var kinds = candidate.getAsJsonArray("evidence").asList();
+                    if (kinds.stream().anyMatch(kind -> kind.getAsString().equals("initial"))) {
+                        slots.add(candidate.get("slot").getAsLong());
+                    }
+                    if (candidate.has("writers")) {
+                        candidate.getAsJsonArray("writers").forEach(writer -> writers.add(writer.getAsLong()));
+                    } else if (candidate.has("writer")) {
+                        writers.add(candidate.get("writer").getAsLong());
+                        incomplete = true;
+                    } else if (kinds.stream().anyMatch(kind -> kind.getAsString().equals("stored"))) {
+                        incomplete = true;
+                    }
+                }
+                for (long slot : slots) {
+                    addRange(ranges, "slot", linearAddress(slot), stored.get("width").getAsInt());
+                }
+                for (long writer : writers) {
+                    incomplete |= !addInstruction(ranges, "writer", writer);
+                }
+            }
+            var targets = table == null ? null : Arrays.stream(flows).map(Address::getOffset).distinct().sorted().toList();
+            sites.add(new FlowBytes(location(site), ranges, targets, incomplete || omitted != previousOmissions));
+        }
+
+        private boolean addInstruction(List<FlowRange> ranges, String role, long offset) throws Exception {
+            var address = linearAddress(offset);
+            var instruction = currentProgram.getListing().getInstructionAt(address);
+            if (instruction == null) {
+                return false;
+            }
+            addRange(ranges, role, address, instruction.getLength());
+            return true;
+        }
+
+        private void addRange(List<FlowRange> ranges, String role, Address address, int size) throws Exception {
+            boolean limited = size > MAX_RANGE_BYTES;
+            if (remaining == 0 || limited) {
+                truncated = true;
+            }
+            if (remaining > 0) {
+                remaining--;
+                ranges.add(new FlowRange(role, memoryBytes(address, Math.min(size, MAX_RANGE_BYTES)), limited));
+            } else {
+                omitted++;
+            }
+        }
     }
 
     private static boolean indirectSite(Instruction instruction) {
