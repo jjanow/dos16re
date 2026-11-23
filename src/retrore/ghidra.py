@@ -28,6 +28,15 @@ class GhidraError(CodedError):
     default_code = "invalid_request"
 
 
+def check_timeout(seconds: object) -> float | None:
+    """Return a valid time budget in seconds: a nonnegative number, or None for the default."""
+    if seconds is None:
+        return None
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not seconds >= 0:
+        raise GhidraError("expected a nonnegative number of seconds")
+    return float(seconds)
+
+
 def _headless() -> Path:
     home = os.environ.get("GHIDRA_HOME", "/snap/ghidra/current/ghidra")
     command = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"

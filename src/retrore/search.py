@@ -9,8 +9,46 @@ _STRING_ENCODINGS = {
 } | dict.fromkeys(FLAT16_FORMATS, "ascii")
 
 
+WIDTHS = (1, 2, 4, 8)
+
+
 class SearchError(ValueError):
     """An invalid search pattern or image export."""
+
+
+def search_pattern(
+    *, hex_bytes: str | None = None, string: str | None = None, constant: str | int | None = None,
+    width: int | None = None,
+) -> tuple[bytes | str | int, int]:
+    """Return the pattern and constant width for exactly one of hex bytes, a string, or a constant.
+
+    A constant is an integer or a decimal or 0x-prefixed string. `width` applies only to constants.
+    """
+    given = [name for name, value in (("bytes", hex_bytes), ("string", string), ("constant", constant))
+             if value is not None]
+    if len(given) != 1:
+        raise SearchError("specify exactly one of bytes, string, or constant")
+    if width is not None and constant is None:
+        raise SearchError("--width requires --constant")
+    if width is not None and (type(width) is not int or width not in WIDTHS):
+        raise SearchError(f"width must be one of {', '.join(map(str, WIDTHS))}")
+    try:
+        if hex_bytes is not None:
+            if not isinstance(hex_bytes, str):
+                raise ValueError("bytes must be a string of hexadecimal digits")
+            return bytes.fromhex(hex_bytes), width or 2
+        if string is not None:
+            if not isinstance(string, str):
+                raise ValueError("string must be a string")
+            return string, width or 2
+        if isinstance(constant, str):
+            base = 16 if constant.lstrip("+-").lower().startswith("0x") else 10
+            return int(constant, base), width or 2
+        if type(constant) is not int:
+            raise ValueError("constant must be an integer or a decimal or 0x-prefixed string")
+        return constant, width or 2
+    except ValueError as error:
+        raise SearchError(str(error)) from error
 
 
 def find_bytes(export: Path, pattern: bytes | str | int, *, width: int = 2, limit: int | None = None) -> dict:
