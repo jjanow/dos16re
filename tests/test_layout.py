@@ -171,3 +171,24 @@ def test_phantasie_iv_character_records(phantasie_iv_project, capsys):
     layout = report["layout"]
     assert (layout["element_size"], layout["count"]) == (8, 6)
     assert layout["count_source"].endswith(" INT_SLESS 6 at text:1740")
+
+
+def test_phantasie_iii_roster_records(tmp_path, capsys):
+    directory = os.environ.get("RETRORE_PH3_DIR")
+    if not directory or not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set RETRORE_PH3_DIR and GHIDRA_HOME to run the real-game Ghidra test")
+    exe = next(path for path in Path(directory).iterdir() if path.name.upper() == "MAIN.EXE")
+    assert main(["load", str(exe), "-o", str(tmp_path / "export")]) == 0
+    assert main(["ghidra", "import", str(tmp_path / "export"), str(tmp_path / "project")]) == 0
+    capsys.readouterr()
+    # The roster: 20 character records of 262 bytes at FAR:0xe820, indexed as es:[bx+0xe820] with bx = i * 0x106.
+    # No reference covers the indexed operands; the displacement scan finds them.
+    report = _json(capsys, "layout", "2820:e820", "--size", str(20 * 262), "--compact", "--project",
+                   str(tmp_path / "project"))
+    layout = report["layout"]
+    assert (layout["kind"], layout["element_size"], layout["count"]) == ("record_array", 262, 20)
+    assert layout["count_source"].endswith(" INT_SLESS 20 after the increment at root:a90b")
+    assert report["strides"][0]["evidence"][0] == "root:1f8c INT_MULT by 0x106"
+    fields = {field["offset"]: field for field in layout["fields"]}
+    assert fields[0x7E]["widths"] == [2] and fields[0x7E]["writes"] == 2  # the roster slot
+    assert fields[0]["bulk"] == 8 and not report["conflicts"]  # record copies and clears, not a field

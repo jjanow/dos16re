@@ -50,6 +50,8 @@ def layout_lines(report: dict) -> list[str]:
         for field in layout["fields"][:_FIELD_PREVIEW]:
             widths = "/".join(str(width) for width in field["widths"])
             inner = f"  inner stride {','.join(map(str, field['inner_strides']))}" if field["inner_strides"] else ""
+            if field.get("bulk"):
+                inner += f"  {field['bulk']} in block loops"
             lines.append(f"  +0x{field['offset']:04x}  width {widths}  {field['reads']} reads  "
                          f"{field['writes']} writes{inner}")
         if len(layout["fields"]) > _FIELD_PREVIEW:

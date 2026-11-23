@@ -1614,6 +1614,7 @@ public class RetroreQuery extends GhidraScript {
         // Fields per offset inside one element.
         var fields = new TreeMap<Long, Map<String, Object>>();
         var fieldWidths = new TreeMap<Long, TreeSet<Integer>>();
+        var bulkWidths = new TreeMap<Long, TreeSet<Integer>>();
         var fieldSites = new TreeMap<Long, List<Object>>();
         for (var access : accesses) {
             long fieldOffset = stride == null ? access.offset() : Math.floorMod(access.offset(), stride);
@@ -1624,37 +1625,51 @@ public class RetroreQuery extends GhidraScript {
                 record.put("writes", 0);
                 record.put("elements", new TreeSet<Long>());
                 record.put("inner_strides", new TreeSet<Long>());
+                record.put("bulk", 0);
                 return record;
             });
             field.merge(access.access().equals("read") ? "reads" : "writes", 1, (a, b) -> (Integer) a + (Integer) b);
             if (stride != null) {
                 ((TreeSet<Long>) field.get("elements")).add(Math.floorDiv(access.offset(), stride));
             }
+            // Loops that step through an element in smaller units (block copies and clears) keep their widths
+            // apart so they do not read as conflicting field widths.
+            boolean bulk = false;
             for (var index : access.index()) {
                 long scale = Math.abs(index.scale());
                 if (scale > 0 && (stride == null || scale < stride) && (scale > 1 || index.variable().startsWith("loop "))) {
                     ((TreeSet<Long>) field.get("inner_strides")).add(scale);
+                    bulk |= index.variable().startsWith("loop ");
                 }
             }
-            fieldWidths.computeIfAbsent(fieldOffset, key -> new TreeSet<>()).add(access.width());
+            if (bulk) {
+                field.merge("bulk", 1, (a, b) -> (Integer) a + (Integer) b);
+            }
+            (bulk ? bulkWidths : fieldWidths).computeIfAbsent(fieldOffset, key -> new TreeSet<>()).add(access.width());
             var sites = fieldSites.computeIfAbsent(fieldOffset, key -> new ArrayList<>());
             if (!sites.contains(access.address()) && sites.size() < 8) {
                 sites.add(access.address());
             }
         }
+        // Conflicts come from single accesses only; block loops report widths when nothing else does.
+        var exactWidths = new TreeMap<>(fieldWidths);
+        bulkWidths.forEach((offset, widths) -> fieldWidths.putIfAbsent(offset, widths));
         var conflicts = new ArrayList<LayoutConflict>();
         Long previous = null;
         for (var entry : fields.entrySet()) {
             long fieldOffset = entry.getKey();
-            var widths = fieldWidths.get(fieldOffset);
-            entry.getValue().put("widths", List.copyOf(widths));
+            entry.getValue().put("widths", List.copyOf(fieldWidths.get(fieldOffset)));
             entry.getValue().put("instructions", fieldSites.get(fieldOffset));
+            var widths = exactWidths.get(fieldOffset);
+            if (widths == null) {
+                continue;
+            }
             if (widths.size() > 1) {
                 conflicts.add(new LayoutConflict(fieldOffset, "widths", List.copyOf(widths), null,
                     fieldSites.get(fieldOffset)));
             }
-            if (previous != null && previous + fieldWidths.get(previous).last() > fieldOffset) {
-                conflicts.add(new LayoutConflict(previous, "overlap", List.copyOf(fieldWidths.get(previous)),
+            if (previous != null && previous + exactWidths.get(previous).last() > fieldOffset) {
+                conflicts.add(new LayoutConflict(previous, "overlap", List.copyOf(exactWidths.get(previous)),
                     fieldOffset, fieldSites.get(previous)));
             }
             previous = fieldOffset;
