@@ -2,24 +2,13 @@
 
 import json
 import os
-import re
 import subprocess
 from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, Z80_FORMATS, image_units, read_map
-
-_QUERY_FIELDS = {
-    "decomp": {"address", "unit_address", "linear", "name", "decompilation"},
-    "xrefs": {"address", "incoming", "outgoing"},
-    "callers": {"function", "callers"},
-    "callees": {"function", "callees"},
-    "func": {"function", "ranges", "size", "address", "segments", "callers"},
-}
-_REFERENCE_OPTIONS = {"limit", "offset", "ref_types", "compact"}
-_DECOMP_LIMITS = {"context": (0, 20), "slice": (1, 128)}
-
+from .queries import QueryError, echo, normalize_query
 
 class GhidraError(ValueError):
     """A headless Ghidra command could not complete."""
@@ -101,71 +90,38 @@ def decompile(address: str, project: Path, **options: object) -> dict:
 
 
 def query_address(command: str, address: str, project: Path, **options: object) -> dict:
-    request = dict(command=command, address=address, **options)
-    _validate_query(request)
-    return _query_json(project, "single", request)
+    return query(project, dict(command=command, address=address, **options))
 
 
-def _validate_query(request: object) -> None:
-    if not isinstance(request, dict) or not {"command", "address"} <= request.keys():
-        raise GhidraError("expected a query object with command and address")
-    command, address = request["command"], request["address"]
-    if not isinstance(command, str) or command not in _QUERY_FIELDS:
-        raise GhidraError("command must use decomp, xrefs, callers, callees, or func")
-    if not isinstance(address, str):
-        raise GhidraError("address must be a string")
-    if not re.fullmatch(r"(?:[^:]+:)?[0-9a-fA-F]{1,8}", address):
-        raise GhidraError("expected a hexadecimal unit:offset, seg:off, or flat address")
-    allowed = {"command", "address", "fields"}
-    fields_allowed = _QUERY_FIELDS[command].copy()
-    if command == "decomp":
-        allowed.update(_DECOMP_LIMITS)
-        for name, (minimum, maximum) in _DECOMP_LIMITS.items():
-            if name in request and (type(request[name]) is not int or not minimum <= request[name] <= maximum):
-                raise GhidraError(f"{name} must be an integer between {minimum} and {maximum}")
-        if "context" in request:
-            fields_allowed.add("excerpt")
-        if "slice" in request:
-            fields_allowed.add("slice")
-        if "context" in request or "slice" in request:
-            fields_allowed.add("focus")
-    else:
-        allowed.update(_REFERENCE_OPTIONS)
-    if command == "xrefs":
-        allowed.add("direction")
-    unknown = request.keys() - allowed
-    if unknown:
-        raise GhidraError(f"unsupported options for {command}: {', '.join(sorted(unknown))}")
-    if "fields" in request:
-        fields = request["fields"]
-        if (not isinstance(fields, list) or not fields
-                or any(not isinstance(field, str) or field not in fields_allowed for field in fields)):
-            raise GhidraError(f"fields for {command} must be a nonempty list chosen from {', '.join(sorted(fields_allowed))}")
-    if "direction" in request and request["direction"] not in ("incoming", "outgoing", "both"):
-        raise GhidraError("direction must be incoming, outgoing, or both")
-    if "ref_types" in request:
-        types = request["ref_types"]
-        if (not isinstance(types, list) or not types
-                or any(not isinstance(kind, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", kind) for kind in types)):
-            raise GhidraError("ref_types must be a nonempty list of Ghidra reference type names")
-    if "compact" in request and type(request["compact"]) is not bool:
-        raise GhidraError("compact must be a boolean")
-    for name, minimum in (("offset", 0), ("limit", 1)):
-        if name in request and (type(request[name]) is not int or not minimum <= request[name] <= 0x7FFFFFFF):
-            raise GhidraError(f"{name} must be an integer between {minimum} and 2147483647")
+def query(project: Path, request: object) -> dict:
+    """Run one query from the registry in a read-only Ghidra session."""
+    return _query_json(project, "single", _normalize(request))
+
+
+def _normalize(request: object) -> dict:
+    try:
+        return normalize_query(request)
+    except QueryError as error:
+        raise GhidraError(str(error)) from error
 
 
 def query_batch(project: Path, requests: object) -> dict:
-    """Run an ordered array of address queries in one read-only Ghidra session."""
+    """Run an ordered array of queries in one read-only Ghidra session."""
     if not isinstance(requests, list) or not requests:
         raise GhidraError("expected a nonempty JSON array of queries")
+    normalized = []
     for index, request in enumerate(requests, 1):
         try:
-            _validate_query(request)
+            normalized.append(_normalize(request))
         except GhidraError as error:
             raise GhidraError(f"query {index}: {error}") from error
 
-    return _query_json(project, "batch", requests)
+    report = _query_json(project, "batch", normalized)
+    report["results"] = [
+        {"command": request["command"], **echo(request), **row}
+        for request, row in zip(requests, report["results"], strict=True)
+    ]
+    return report
 
 
 def analysis_gaps(project: Path) -> dict:
