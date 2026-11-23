@@ -472,8 +472,8 @@ public class RetroreM68kImport extends HeadlessScript {
             monitor.checkCancelled();
             var from = trap.getFallFrom();
             var load = from == null ? null : listing.getInstructionAt(from);
-            if (load == null) {
-                continue;
+            if (load == null || jumpedTo(trap)) {
+                continue;  // A jump to the trap could bring another call number.
             }
             int opcode = memoryWord(load.getAddress());
             int number;
@@ -513,6 +513,15 @@ public class RetroreM68kImport extends HeadlessScript {
             named++;
         }
         return named;
+    }
+
+    private boolean jumpedTo(ghidra.program.model.listing.Instruction instruction) {
+        for (var reference : currentProgram.getReferenceManager().getReferencesTo(instruction.getAddress())) {
+            if (reference.getReferenceType().isFlow()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private int memoryWord(Address address) throws Exception {

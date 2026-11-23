@@ -112,7 +112,7 @@ def test_ghidra_pool_of_radiance_conventions_and_services(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["dos_services"] == 35
     assert report["calling_conventions"] == {
-        "callee_cleanup": 491, "caller_cleanup": 1, "far_pointer_arguments": 356, "no_stack_arguments": 222}
+        "accessed_arguments": 1, "callee_cleanup": 491, "far_pointer_arguments": 356, "no_stack_arguments": 222}
 
     def decompile(address):
         assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err

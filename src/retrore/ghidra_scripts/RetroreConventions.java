@@ -172,11 +172,15 @@ public class RetroreConventions extends HeadlessScript {
         return named;
     }
 
-    // AH from the nearest preceding instruction in the same straight-line run that writes AH or AX.
+    // AH from the nearest preceding instruction in the same straight-line run that writes AH or AX. A jump into
+    // the run after that load could bring another AH, so such sites stay unnamed.
     private Integer serviceNumber(Instruction site) throws Exception {
         var listing = currentProgram.getListing();
         var current = site;
         for (int step = 0; step < 8; step++) {
+            if (jumpedTo(current)) {
+                return null;
+            }
             var from = current.getFallFrom();
             if (from == null) {
                 return null;
@@ -201,6 +205,15 @@ public class RetroreConventions extends HeadlessScript {
             current = previous;
         }
         return null;
+    }
+
+    private boolean jumpedTo(Instruction instruction) {
+        for (var reference : currentProgram.getReferenceManager().getReferencesTo(instruction.getAddress())) {
+            if (reference.getReferenceType().isFlow()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private ghidra.program.model.mem.MemoryBlock serviceBlock() throws Exception {
@@ -373,7 +386,10 @@ public class RetroreConventions extends HeadlessScript {
                     return null;
                 }
             }
-            kind = size == 0 ? "no_stack_arguments" : variadic ? "caller_cleanup_variadic" : "caller_cleanup";
+            // Without a direct caller only the frame accesses give the size, as for Turbo Pascal's text Read
+            // helpers, which leave the file pointer on the stack for the next call.
+            kind = size == 0 ? "no_stack_arguments" : cleanups.isEmpty() ? "accessed_arguments"
+                : variadic ? "caller_cleanup_variadic" : "caller_cleanup";
         }
         if (size == 0 && frame.start() < 0) {
             return null;  // No frame and no stack arguments: leave register routines to the decompiler.
