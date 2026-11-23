@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-"""Benchmark headless Ghidra import and query latency on the README's synthetic C64 program.
+"""Benchmark headless Ghidra import and query latency, and the launches reversing questions need.
+
+By default the benchmark generates the README's synthetic C64 program, imports it, and times single
+queries, batches, and the built-in question scenarios. With --project and --scenarios it measures an
+existing analyzed project instead, such as a large DOS overlay program, without importing anything.
+
+A scenario is a question answered in dependent steps. Each step lists queries that need only the
+results of earlier steps, so one batch can run them together:
+
+    [{"question": "...", "steps": [[{"command": "decomp", "address": "c000"}, ...], [...]]}]
+
+Each scenario runs twice: once with one launch per query, as an agent issuing single commands would,
+and once with one batch per step.
 
 Requires GHIDRA_HOME. Prints a JSON summary on stdout and progress on stderr.
 
     .venv/bin/python tools/bench.py --repeat 3 --batch-sizes 1,5,20
+    .venv/bin/python tools/bench.py --project PROJECT --scenarios questions.json --repeat 1
 """
 
 import argparse
@@ -27,6 +40,26 @@ QUERIES = [
     {"command": "xrefs", "address": "c006", "direction": "outgoing", "ref_types": ["WRITE"], "limit": 1},
     {"command": "func", "address": "c000"},
     {"command": "callers", "address": "c004"},
+]
+
+# Questions about the synthetic program, answered in dependent steps.
+SCENARIOS = [
+    {
+        "question": "What does the entry routine do, and what does its callee do?",
+        "steps": [
+            [{"command": "decomp", "address": "c000"}, {"command": "callees", "address": "c000", "compact": True}],
+            [{"command": "decomp", "address": "c004"}],
+        ],
+    },
+    {
+        "question": "Which routine writes the VIC border color, and how is it reached?",
+        "steps": [
+            [{"command": "xrefs", "address": "d020", "direction": "incoming", "ref_types": ["WRITE"],
+              "compact": True}],
+            [{"command": "context", "address": "c006", "compact": True},
+             {"command": "callgraph", "address": "c006", "direction": "callers", "compact": True}],
+        ],
+    },
 ]
 
 
@@ -83,6 +116,53 @@ def log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _timed(counter: Counter, call) -> dict:
+    before = counter.launches
+    started = time.perf_counter()
+    report = call()
+    return {"seconds": time.perf_counter() - started, "launches": counter.launches - before,
+            "output_bytes": len(json.dumps(report).encode())}
+
+
+def _total(samples: list[dict]) -> dict:
+    return {key: sum(sample[key] for sample in samples) for key in ("seconds", "launches", "output_bytes")}
+
+
+def scenarios(counter: Counter, project: Path, questions: list[dict], repeat: int) -> list[dict]:
+    """Answer each question with one launch per query, then with one batch per step."""
+    results = []
+    for question in questions:
+        steps = question["steps"]
+        log(f"scenario x{repeat}: {question['question']}")
+        separate = [_total([_timed(counter, lambda request=request: ghidra.query(project, request))
+                            for step in steps for request in step]) for _ in range(repeat)]
+        batched = [_total([_timed(counter, lambda step=step: ghidra.query_batch(project, step)) for step in steps])
+                   for _ in range(repeat)]
+        results.append({
+            "question": question["question"],
+            "queries": sum(map(len, steps)),
+            "steps": len(steps),
+            "separate": summarize(separate),
+            "batched": summarize(batched),
+        })
+    return results
+
+
+def measure_project(project: Path, questions: list[dict], repeat: int, batch_sizes: list[int]) -> dict:
+    """Measure scenarios and batch sizes on an existing analyzed project."""
+    counter = Counter()
+    ghidra._launch = counter
+    requests = [request for question in questions for step in question["steps"] for request in step]
+    batches = {}
+    for size in batch_sizes:
+        log(f"batch of {size} x{repeat}")
+        batch = [requests[index % len(requests)] for index in range(size)]
+        batches[str(size)] = summarize([_timed(counter, lambda: ghidra.query_batch(project, batch))
+                                        for _ in range(repeat)])
+    return {"project": project.name, "repeat": repeat, "batch": batches,
+            "scenarios": scenarios(counter, project, questions, repeat)}
+
+
 def benchmark(work: Path, repeat: int, batch_sizes: list[int]) -> dict:
     counter = Counter()
     ghidra._launch = counter
@@ -131,6 +211,7 @@ def benchmark(work: Path, repeat: int, batch_sizes: list[int]) -> dict:
             "launches": largest,
             "estimated_seconds": round(largest * single_median, 3),
         },
+        "scenarios": scenarios(counter, project, SCENARIOS, repeat),
     }
 
 
@@ -139,9 +220,16 @@ def main_bench() -> None:
     parser.add_argument("--repeat", type=int, default=3, help="runs per measurement (default 3)")
     parser.add_argument("--batch-sizes", default="1,5,20", help="comma-separated batch sizes (default 1,5,20)")
     parser.add_argument("--work", type=Path, help="keep the export and project in this new directory")
+    parser.add_argument("--project", type=Path, help="measure this existing analyzed project (needs --scenarios)")
+    parser.add_argument("--scenarios", type=Path, help="JSON file of questions for --project")
     args = parser.parse_args()
     sizes = sorted({int(size) for size in args.batch_sizes.split(",")})
-    if args.work:
+    if bool(args.project) != bool(args.scenarios):
+        parser.error("--project and --scenarios go together")
+    if args.project:
+        questions = json.loads(args.scenarios.read_text(encoding="utf-8"))
+        report = measure_project(args.project, questions, args.repeat, sizes)
+    elif args.work:
         args.work.mkdir(parents=True)
         report = benchmark(args.work, args.repeat, sizes)
     else:
