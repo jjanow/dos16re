@@ -8,7 +8,7 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, Z80_FORMATS, image_units, read_map
+from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, X1_FORMAT, Z80_FORMATS, image_units, read_map
 
 _QUERY_FIELDS = {
     "decomp": {"address", "unit_address", "linear", "name", "decompilation"},
@@ -85,6 +85,9 @@ def import_program(export: Path, project: Path) -> dict:
     if program.get("format") in FLAT16_FORMATS:
         image_units(program, image.stat().st_size)
         language = "z80:LE:16:default" if program["format"] in Z80_FORMATS else "6502:LE:16:default"
+        if program["format"] == X1_FORMAT:
+            # The Z180 variant decodes IN/OUT (C) ports as BC; the plain Z80 variant keeps only C.
+            language = "z180:LE:16:default"
         return _run(
             project, [*options, language], None, str(manifest), pre_script="Retrore8BitImport.java",
         )

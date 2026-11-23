@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from itertools import groupby
 
+from .d88 import D88Disk
 from .image import FLAT16_ADDRESS_LIMIT
 
 
@@ -101,3 +102,38 @@ def place_z80_sources(
         ],
         "units": units, "entry": entry_records[0] if entry_records else None, "entries": entry_records,
     }
+
+
+def disk_span_source(
+    disk: D88Disk, filename: str, name: str, address: int, cylinder: int, head: int, record: int, count: int = 1,
+    size: int | None = None,
+) -> Z80Source:
+    """Read a D88 sector span, optionally truncated to `size` bytes, with original container offsets."""
+    payload = bytearray()
+    spans = []
+    for sector in disk.read_sectors(cylinder, head, record, count):
+        spans.append(SourceSpan(len(payload), sector.file_offset, len(sector.data)))
+        payload.extend(sector.data)
+    if size is not None:
+        payload = payload[:size]
+        spans = [SourceSpan(span.offset, span.file_offset, min(span.size, size - span.offset))
+                 for span in spans if span.offset < size]
+    return Z80Source(name, filename, address, bytes(payload), file_offset=spans[0].file_offset, file_spans=tuple(spans))
+
+
+def copy_z80_source(
+    sources: list[Z80Source], address: int, size: int, destination: int, error: type[ValueError], prefix: str,
+) -> Z80Source:
+    """Copy a span of the topmost load that covers it to a new runtime address."""
+    end = address + size
+    for source in reversed(sources):
+        if source.address < end and address < source.end:
+            if source.address <= address < end <= source.end:
+                offset = address - source.address
+                return Z80Source(
+                    f"copy_{destination:04x}_from_{address:04x}_{size:x}", source.source,
+                    destination, source.data[offset:offset + size], source.disk_file,
+                    file_offset=source.file_offset + offset, file_spans=source.spans(offset, size),
+                )
+            break
+    raise error(f"{prefix} copy {address:x}:{size:x} must fit within a single visible load")
