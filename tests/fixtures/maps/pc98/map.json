@@ -1,0 +1,73 @@
+{
+  "format": "PC98",
+  "program": "demo.bin",
+  "units": [
+    {
+      "name": "root",
+      "source": "demo.bin",
+      "segment": 4096,
+      "linear": 65536,
+      "size": 4,
+      "file_offset": 0,
+      "image_offset": 0
+    }
+  ],
+  "image_origin": 65536,
+  "entry": {
+    "segment": 4096,
+    "offset": 0,
+    "linear": 65536
+  },
+  "entries": [
+    {
+      "segment": 4096,
+      "offset": 0,
+      "linear": 65536
+    }
+  ],
+  "memory_view": "pc9801",
+  "memory_map": [
+    {
+      "name": "conventional_ram",
+      "linear": 0,
+      "size": 655360,
+      "kind": "ram"
+    },
+    {
+      "name": "text_vram",
+      "linear": 655360,
+      "size": 16384,
+      "kind": "vram"
+    },
+    {
+      "name": "blue_vram",
+      "linear": 688128,
+      "size": 32768,
+      "kind": "vram"
+    },
+    {
+      "name": "red_vram",
+      "linear": 720896,
+      "size": 32768,
+      "kind": "vram"
+    },
+    {
+      "name": "green_vram",
+      "linear": 753664,
+      "size": 32768,
+      "kind": "vram"
+    },
+    {
+      "name": "cbus_window",
+      "linear": 786432,
+      "size": 131072,
+      "kind": "expansion"
+    },
+    {
+      "name": "ipl_rom",
+      "linear": 950272,
+      "size": 98304,
+      "kind": "rom"
+    }
+  ]
+}

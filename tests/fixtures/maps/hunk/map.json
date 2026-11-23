@@ -1,0 +1,96 @@
+{
+  "format": "HUNK",
+  "program": "demo",
+  "base_address": 65536,
+  "entry": {
+    "unit_address": "h0:0000",
+    "linear": 65536
+  },
+  "units": [
+    {
+      "name": "h0",
+      "linear": 65536,
+      "image_offset": 0,
+      "size": 8,
+      "memory_flags": 0,
+      "kind": "code",
+      "file_offset": 52,
+      "file_size": 8,
+      "relocations": [
+        {
+          "offset": 2,
+          "target": "h2",
+          "original": 0,
+          "value": 65568
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "name": "h1",
+      "linear": 65552,
+      "image_offset": 16,
+      "size": 16,
+      "memory_flags": 2,
+      "kind": "data",
+      "file_offset": 104,
+      "file_size": 12,
+      "relocations": [
+        {
+          "offset": 0,
+          "target": "h3",
+          "original": 4,
+          "value": 65588
+        },
+        {
+          "offset": 4,
+          "target": "h3",
+          "original": 0,
+          "value": 65584
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "name": "h2",
+      "linear": 65568,
+      "image_offset": 32,
+      "size": 4,
+      "memory_flags": 0,
+      "kind": "code",
+      "file_offset": 156,
+      "file_size": 4,
+      "relocations": [],
+      "symbols": [
+        {
+          "name": "worker",
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "h3",
+      "linear": 65584,
+      "image_offset": 48,
+      "size": 8,
+      "memory_flags": 4,
+      "kind": "bss",
+      "file_offset": null,
+      "file_size": 0,
+      "relocations": [],
+      "symbols": []
+    },
+    {
+      "name": "h4",
+      "linear": 65600,
+      "image_offset": 64,
+      "size": 0,
+      "memory_flags": 0,
+      "kind": "data",
+      "file_offset": 208,
+      "file_size": 0,
+      "relocations": [],
+      "symbols": []
+    }
+  ]
+}

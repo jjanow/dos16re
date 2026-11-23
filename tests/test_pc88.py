@@ -107,7 +107,7 @@ def test_pc88_raw_load_errors(tmp_path, capsys, options, error):
     raw = tmp_path / "demo.bin"
     raw.write_bytes(b"\xc9")
     assert main(["info", str(raw), "--pc88", *options, "--json"]) == 1
-    assert error in json.loads(capsys.readouterr().err)["error"]
+    assert error in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_ghidra_pc88_cross_unit_call_and_io(tmp_path, capsys):

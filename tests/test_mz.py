@@ -116,7 +116,7 @@ def test_cli_preserves_existing_export_and_rolls_back(tmp_path, capsys):
     assert main(["load", str(program), "-o", str(tmp_path), "--json"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "map.json" in json.loads(captured.err)["error"]
+    assert "map.json" in json.loads(captured.err)["error"]["message"]
     assert map_path.read_text() == "{}"
     assert not (tmp_path / "image.bin").exists()
 

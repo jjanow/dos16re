@@ -13,6 +13,7 @@ from capstone.x86 import X86_INS_RET, X86_INS_RETF
 from unicorn import UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_INTR, UC_HOOK_MEM_READ, UC_MODE_16
 from unicorn import Uc, UcError, x86_const as x86
 
+from .image import check_map_version
 from .mz import Address
 
 DEFAULT_INSTRUCTION_LIMIT = 1_000_000
@@ -64,9 +65,8 @@ class Emulator:
     def __init__(self, image: bytes, program_map: dict) -> None:
         self._image = bytes(image)
         self._units: dict[str, tuple[int, int]] = {}
+        check_map_version(program_map)
         try:
-            if program_map["version"] != 1:
-                raise ValueError("unsupported map version")
             if program_map.get("format", "MZ") != "MZ":
                 raise ValueError("routine emulation requires a DOS MZ image")
             units = program_map["units"]

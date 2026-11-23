@@ -15,7 +15,8 @@ from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
-from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
+from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
+from .ghidra import BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, decompile, import_program, query_address, query_batch
 from .image import (
     APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, ImageError,
 )
@@ -428,7 +429,7 @@ def _query_options(args: argparse.Namespace) -> dict:
 
 
 def _decomp(args: argparse.Namespace) -> None:
-    report = decompile(args.address, args.project, **_query_options(args))
+    report = decompile(args.address, args.project, timeout=args.timeout, **_query_options(args))
     if args.json:
         print(json.dumps(report))
         return
@@ -457,7 +458,7 @@ def _decomp(args: argparse.Namespace) -> None:
 
 
 def _address_query(args: argparse.Namespace) -> None:
-    report = query_address(args.command, args.address, args.project, **_query_options(args))
+    report = query_address(args.command, args.address, args.project, timeout=args.timeout, **_query_options(args))
     if args.json:
         print(json.dumps(report))
         return
@@ -489,7 +490,7 @@ def _batch(args: argparse.Namespace) -> int:
     except (json.JSONDecodeError, UnicodeError) as error:
         raise GhidraError(f"invalid batch JSON: {error}") from error
 
-    report = query_batch(args.project, requests)
+    report = query_batch(args.project, requests, timeout=args.timeout)
     results = report["results"]
     errors = [row for row in results if "error" in row]
     if args.json:
@@ -497,7 +498,7 @@ def _batch(args: argparse.Namespace) -> int:
     else:
         print(f"{len(results) - len(errors)}/{len(results)} queries succeeded")
         for row in errors[:_PREVIEW_LIMIT]:
-            print(f"  {row['command']} {row['address']}: {row['error']}")
+            print(f"  {row['command']} {row['address']}: {row['error']['code']}: {row['error']['message']}")
     return int(bool(errors))
 
 
@@ -560,6 +561,13 @@ def _trace(args: argparse.Namespace) -> None:
         print(f"  {row}")
     if total > _PREVIEW_LIMIT or unmapped or report["ignored_lines"]:
         print("Use --json for the full trace report.")
+
+
+def _seconds(value: str) -> float:
+    seconds = float(value)
+    if not seconds >= 0:
+        raise argparse.ArgumentTypeError("expected a nonnegative number of seconds")
+    return seconds
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -740,13 +748,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
+    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries)):
+        default = IMPORT_TIMEOUT if command is import_parser else None if command is batch_parser else QUERY_TIMEOUT
+        described = (f"the larger of {QUERY_TIMEOUT} and {BATCH_SECONDS_PER_QUERY} per query"
+                     if default is None else default)
+        command.add_argument(
+            "--timeout", type=_seconds, default=default, metavar="SECONDS",
+            help=f"stop headless Ghidra after SECONDS (default: {described}; 0 disables the limit)",
+        )
 
     args = parser.parse_args(argv)
     try:
         if args.command == "batch":
             return _batch(args)
         if args.command == "ghidra":
-            report = import_program(args.export, args.project)
+            report = import_program(args.export, args.project, timeout=args.timeout)
             summary = f"Imported {report['units']} units into {args.project}"
             print(json.dumps(report) if args.json else summary)
             return 0
@@ -754,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
             _decomp(args)
             return 0
         if args.command == "gaps":
-            report = analysis_gaps(args.project)
+            report = analysis_gaps(args.project, timeout=args.timeout)
             if args.json:
                 print(json.dumps(report))
             else:
@@ -834,12 +850,12 @@ def main(argv: list[str] | None = None) -> int:
             _export_image(args.output, image, program_map)
     except (Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
             Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, OSError) as error:
-        report = {"error": str(error)}
+        report = {"contract": CONTRACT_VERSION, "error": error_record(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
         message = json.dumps(report) if args.json else f"retrore: {error}"
         print(message, file=sys.stderr)
-        return 1
+        return EXIT_FAILURE
 
     if args.json:
         print(json.dumps(program_map))
