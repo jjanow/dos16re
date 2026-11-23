@@ -290,6 +290,44 @@ def test_ghidra_keeps_candidates_for_far_pointer_tables_and_variables(tmp_path, 
     assert ("root:0208", "DATA") in [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]]
 
 
+def test_ghidra_uses_the_explicit_segment_for_indirect_memory_operands(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    image = bytearray(0x410)
+    code = bytes.fromhex(
+        "ff 1e 00 00"      # call far [0], with DS still pointing at the PSP
+        " 36 ff 1e 00 00"  # call far ss:[0]
+        " 36 ff 1d"        # call far ss:[di], with no encoded displacement
+        " ff d3 c3"       # call bx; ret
+    )
+    image[:len(code)] = code
+    image[0x30:0x35] = bytes.fromhex("55 8b ec 5d cb")
+    pack_into("<HH", image, 0x400, 0x30, 0)
+    exe = tmp_path / "sample.exe"
+    exe.write_bytes(_mz(image, [0x402]))
+    export, project = tmp_path / "export", tmp_path / "indirect"
+    assert main(["load", str(exe), "-o", str(export), "--base-segment", "2000"]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    assert main(["indirect", "--project", str(project), "--json", "--compact"]) == 0, capsys.readouterr().err
+    sites = {site["address"]: site for site in json.loads(capsys.readouterr().out)["sites"]}
+    unknown = sites["root:0000"]
+    assert (unknown["status"], unknown["reason"], unknown["segment"]) == (
+        "unresolved", "segment_unknown", {"register": "DS", "value": None},
+    )
+    assert (unknown["segment_loss"]["address"], unknown["segment_loss"]["reason"]) == ("root:0000", "entry")
+    for address in ("root:0004", "root:0009"):
+        site = sites[address]
+        assert (site["status"], site["segment"], site["table"]) == (
+            "candidate", {"register": "SS", "value": 0x2040}, "root:0400",
+        )
+        candidate, = site["candidates"]
+        assert (candidate["slot"], candidate["target"]) == ("root:0400", "root:0030")
+    assert sites["root:000c"]["reason"] == "register"
+
+
 def test_ghidra_reports_tail_jumps_as_calls(tmp_path, capsys):
     if not os.environ.get("GHIDRA_HOME"):
         pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
@@ -383,6 +421,20 @@ def test_phantasie_iii_switches_in_every_code_segment(phantasie_iii_export, caps
     assert {"from": "root:124bc", "type": "COMPUTED_CALL"} in [
         {"from": caller["from"]["unit_address"], "type": caller["type"]} for caller in report["callers"]
     ]
+
+    requests = [
+        {"command": "indirect", "at": address, "compact": True} for address in ("root:42df", "root:13721")
+    ]
+    batch = tmp_path / "queries.json"
+    batch.write_text(json.dumps(requests), encoding="utf-8")
+    assert main(["batch", str(batch), "--project", str(project), "--evidence", "--json"]) == 0
+    callback, dispatch = (row["result"]["sites"][0] for row in json.loads(capsys.readouterr().out)["results"])
+    assert (callback["status"], callback["segment"], callback["table"]) == (
+        "candidate", {"register": "SS", "value": 0x38C0}, "root:2b224",
+    )
+    candidate, = callback["candidates"]
+    assert candidate["target"] == "root:11914" and "relocated" in candidate["evidence"]
+    assert dispatch["status"] == "unresolved" and dispatch["reason"] == "no_valid_entries"
 
 
 def test_phantasie_iv_x68k_switches(tmp_path, capsys):

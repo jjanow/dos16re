@@ -700,12 +700,12 @@ invalidates any overlapping relocation-backed segment word.
 When a segment register is unknown, the analysis records where and why it was lost (`join`, `call`,
 `unknown_call`, `interrupt`, `load`, `pop`, `write`, or `entry`). `func` reports this as `segment_losses`.
 
-A later pass handles indirect calls and jumps that Ghidra left unresolved. It reads the table or variable
-through the known DS or CS and keeps candidate targets: initial far pointers whose segment word is
-relocated, and offset and segment pairs stored into the slot. Each candidate lists its evidence and
-the writer's address. Candidates get a data reference from their slot but don't join control flow. A gap whose entry a
-relocated pointer names, that starts with `push bp; mov bp,sp`, and that decodes cleanly becomes a
-function.
+A later pass handles indirect calls and jumps that Ghidra left unresolved. It honors explicit segment
+overrides when reading the table or variable and keeps candidate targets from initial far pointers
+whose segment word is relocated and from offset and segment pairs stored into the slot. Each candidate
+lists its evidence and any known writer address. The importer adds a data reference from each
+candidate's slot. It seeds a function in a gap when a relocated pointer names the entry, which begins
+with `push bp; mov bp,sp` and decodes cleanly.
 
 The last pass recovers calling conventions for functions without a signature. It uses `ret n` /
 `retf n` immediates, `add sp,n` or `pop` after calls, and argument reads through `[BP+n]` or
@@ -831,8 +831,10 @@ are flagged. The query includes original file bytes when Ghidra retains a file m
 ```
 
 `indirect` lists each indirect call and jump as `resolved` (with its `targets`), `candidate`, or
-`unresolved` (with a `reason`). Candidate sites give the `table`, the segment used to read it,
-`candidates` with their evidence (`relocated`, `initial`, `stored`, `function_entry`, `prologue`,
+`unresolved` (with a `reason`). When segment analysis recorded where the operand's segment value
+became unknown, `segment_loss` reports the address, reason, and detail. Candidate sites give the
+`table`, the segment used to read it, `candidates` with their evidence
+(`relocated`, `initial`, `stored`, `function_entry`, `prologue`,
 `decodes`, `seeded`) and writer addresses, and why the scan `stop`ped (`sentinel`, `next_variable`,
 `uninitialized`, and others). Filter by `--unit`, `--at`, or `--status`.
 

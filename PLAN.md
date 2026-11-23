@@ -14,15 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, Sega Genesis / Mega Drive gained linear ROM loading, cartridge and vector metadata,
-a configurable SRAM window, and Ghidra entry points and hardware symbols. The U.S./Europe
-`Countdown to Doomsday` cartridge validated source offsets, startup calls, VBlank decompilation,
-and video and SRAM references.
+On 2026-11-23, DOS indirect analysis gained explicit segment override handling, support for
+indexed memory operands without a displacement, and segment loss diagnostics in `indirect`.
+Phantasie III's call at `root:42df` now reports a relocation-backed candidate at `root:11914`.
 
-The standalone suite passed 418 tests with 89 skipped. All 507 tests passed with the Ghidra 12.2
-and opt-in suites enabled, using Python 3.14 and JDK 25.
+Synthetic Ghidra tests verified the override and loss diagnostics. Opt-in checks verified the
+Phantasie III result in `batch --evidence` and Pool of Radiance's stored procedure pointer candidates.
+The standalone suite passed 418 tests with 90 skipped. All 508 tests passed with Ghidra 12.2
+and the opt-in suites enabled, using Python 3.14 and JDK 25.
 
-Resume with unresolved indirect transfers in Phase 9 or shared evidence categories in Phase 10.
+Resume with Phase 10's shared evidence categories, or use runtime observations to investigate
+Phantasie III's unresolved dispatch at `root:13721` in Phase 9.
 X1turbo validation still awaits the Gold Box release.
 
 ## Why
@@ -316,8 +318,12 @@ release. Continue with the analysis backlog below.
   Far CS jump and call tables use relocated selector words for destination evidence. Amiga
   Phantasie I and III each recover 22 switches, and Atari ST Phantasie II recovers 15 in `PHANT.PRG`
   and 3 in `UTILIT2.PRG`. `trace --classify-gaps` attaches runtime hit evidence to static gaps.
-  Open: sites with unknown DS and PH3's dispatch at `root:13721`, where the zero-extended
-  index allows 256 values but the available bytes do not corroborate 256 targets.
+  The DOS indirect pass reads segment override prefixes from the instruction bytes and recognizes
+  indexed memory operands without a displacement. `indirect` reports `segment_loss` with the origin
+  and reason when the operand's segment is genuinely unknown. In Phantasie III, `root:42df` reads
+  `SS:[2624]` and finds the relocation-backed candidate `root:11914`.
+  Open: genuinely unknown segment values and Phantasie III's dispatch at `root:13721`. Its
+  zero-extended index allows 256 values, and the available bytes do not corroborate a table of that size.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry
   as a result. X68000 DOS stubs have prototypes for about 80 calls. Call fixups model stacked FPACK

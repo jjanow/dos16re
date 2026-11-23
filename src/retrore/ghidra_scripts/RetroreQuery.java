@@ -1310,6 +1310,12 @@ public class RetroreQuery extends GhidraScript {
                     : stored.has("reason") ? stored.get("reason").getAsString() : "no_valid_entries";
             }
             record.put("reason", reason);
+            if ("segment_unknown".equals(reason) && segment != null) {
+                Object loss = segmentLosses(instruction.getAddress(), compact).get(segment.get("register"));
+                if (loss != null) {
+                    record.put("segment_loss", loss);
+                }
+            }
             rows.add(record);
         }
         var pages = new LinkedHashMap<String, Page>();

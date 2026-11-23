@@ -20,6 +20,7 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.util.StringPropertyMap;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,6 +41,7 @@ public class RetroreIndirect extends HeadlessScript {
     private final TreeSet<Integer> rootSegments = new TreeSet<>();
     private String rootName;
     private PseudoDisassembler pseudo;
+    private StringPropertyMap segmentLosses;
 
     @Override
     public void run() throws Exception {
@@ -89,6 +91,7 @@ public class RetroreIndirect extends HeadlessScript {
         }
 
         var properties = currentProgram.getUsrPropertyManager();
+        segmentLosses = properties.getStringPropertyMap("RetroreSegmentLosses");
         var store = properties.getStringPropertyMap(PROPERTY);
         if (store == null) {
             store = properties.createStringPropertyMap(PROPERTY);
@@ -206,28 +209,18 @@ public class RetroreIndirect extends HeadlessScript {
         boolean far = instruction.getMnemonicString().toUpperCase().endsWith("F");
         record.put("kind", instruction.getFlowType().isCall() ? "call" : "jump");
         record.put("width", far ? 4 : 2);
-        Register segment = null;
-        var indexes = new ArrayList<Register>();
-        long displacement = 0;
-        boolean memory = false;
-        for (Object object : instruction.getOpObjects(0)) {
-            if (object instanceof Register register) {
-                if (register.getName().matches("[CDES]S")) {
-                    segment = register;
-                } else {
-                    indexes.add(register);
-                }
-            } else if (object instanceof Scalar scalar) {
-                displacement = scalar.getUnsignedValue() & 0xFFFF;
-            }
-        }
-        for (var reference : instruction.getOperandReferences(0)) {
-            memory |= reference.isMemoryReference();
-        }
-        memory |= (instruction.getOperandType(0) & ghidra.program.model.lang.OperandType.DYNAMIC) != 0;
-        if (!memory && displacement == 0) {
-            record.put("reason", "register");  // call bx, jmp (a0): no table to read.
+        if (!instruction.getDefaultOperandRepresentation(0).contains("[")) {
+            record.put("reason", "register");
             return record;
+        }
+        var indexes = new ArrayList<Register>();
+        int displacement = 0;
+        for (Object object : instruction.getOpObjects(0)) {
+            if (object instanceof Register register && !register.getName().matches("[CDEFGS]S")) {
+                indexes.add(register);
+            } else if (object instanceof Scalar scalar) {
+                displacement = (int) scalar.getUnsignedValue() & 0xFFFF;
+            }
         }
         for (var register : indexes) {
             if (register.getName().equals("BP") || register.getName().equals("SP")) {
@@ -235,19 +228,17 @@ public class RetroreIndirect extends HeadlessScript {
                 return record;
             }
         }
-        if (segment == null) {
-            segment = currentProgram.getRegister("DS");
-        }
+        String segment = memorySegment(instruction);
         Integer segmentValue = segmentValue(instruction, segment);
         var segmentRecord = new LinkedHashMap<String, Object>();
-        segmentRecord.put("register", segment.getName());
+        segmentRecord.put("register", segment);
         segmentRecord.put("value", segmentValue);
         record.put("segment", segmentRecord);
         if (segmentValue == null) {
             record.put("reason", "segment_unknown");
             return record;
         }
-        var table = space.getAddress(segmentValue, (int) displacement);
+        var table = space.getAddress(segmentValue, displacement);
         record.put("table", table.getOffset());
         int limit = indexes.isEmpty() ? 1 : MAX_ENTRIES;
         var entries = new ArrayList<Map<String, Object>>();
@@ -279,6 +270,24 @@ public class RetroreIndirect extends HeadlessScript {
             record.put("reason", indexes.isEmpty() ? stop : "no_valid_entries");
         }
         return record;
+    }
+
+    /** Ghidra can omit an explicit segment override from the operand of a far memory transfer. */
+    private static String memorySegment(Instruction instruction) throws Exception {
+        String segment = "DS";
+        for (byte value : instruction.getBytes()) {
+            switch (value & 0xff) {
+                case 0x26 -> segment = "ES";
+                case 0x2e -> segment = "CS";
+                case 0x36 -> segment = "SS";
+                case 0x3e -> segment = "DS";
+                case 0x64 -> segment = "FS";
+                case 0x65 -> segment = "GS";
+                case 0x66, 0x67, 0xf0, 0xf2, 0xf3 -> { }
+                default -> { return segment; }
+            }
+        }
+        return segment;
     }
 
     /** Add the slot's initial value as a candidate; return why it is not one otherwise. */
@@ -433,11 +442,21 @@ public class RetroreIndirect extends HeadlessScript {
         return false;
     }
 
-    private Integer segmentValue(Instruction instruction, Register segment) {
-        if (segment.getName().equals("CS")) {
+    private Integer segmentValue(Instruction instruction, String segment) {
+        if (segment.equals("CS")) {
             return codeSegment(instruction.getAddress());
         }
-        var value = currentProgram.getProgramContext().getRegisterValue(segment, instruction.getAddress());
+        String losses = segmentLosses == null ? null : segmentLosses.getString(instruction.getAddress());
+        if (losses != null) {
+            for (String loss : losses.split(";")) {
+                if (loss.startsWith(segment + "=")) {
+                    return null;
+                }
+            }
+        }
+        Register register = currentProgram.getRegister(segment);
+        var value = register == null ? null :
+            currentProgram.getProgramContext().getRegisterValue(register, instruction.getAddress());
         return value == null || !value.hasValue() ? null : value.getUnsignedValue().intValue();
     }
 
