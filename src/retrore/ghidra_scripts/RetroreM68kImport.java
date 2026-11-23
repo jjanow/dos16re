@@ -169,6 +169,9 @@ public class RetroreM68kImport extends HeadlessScript {
             }
             block.setExecute(true);
             block.setWrite(false);
+            // Every slot is an rts, so unused stubs do not show up as undefined gaps.
+            new DisassembleCommand(new AddressSet(block.getStart(), block.getEnd()), null, false)
+                .applyTo(currentProgram, monitor);
             block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls");
         }
 
@@ -250,6 +253,7 @@ public class RetroreM68kImport extends HeadlessScript {
         }
         // Reanalysis can split XC entries again, so join them once more after the last round.
         merged += mergeTrailingLinks();
+        restoreCallOverrides();
         JsonObject report = new JsonObject();
         if (Files.isRegularFile(result)) {
             var previous = JsonParser.parseString(Files.readString(result));
@@ -400,6 +404,40 @@ public class RetroreM68kImport extends HeadlessScript {
         return seeded;
     }
 
+    // Non-returning analysis gives calls to exit stubs a CALL_RETURN flow override, which turns the stub
+    // reference into a computed call. Put the override reference back; the stub itself does not return.
+    private void restoreCallOverrides() throws Exception {
+        var references = currentProgram.getReferenceManager();
+        var listing = currentProgram.getListing();
+        var block = currentProgram.getMemory().getBlock(CALL_BLOCK);
+        var sites = new ArrayList<Reference>();
+        for (var address : references.getReferenceDestinationIterator(new AddressSet(block.getStart(),
+                block.getEnd()), true)) {
+            for (var reference : references.getReferencesTo(address)) {
+                sites.add(reference);
+            }
+        }
+        for (var reference : sites) {
+            var instruction = listing.getInstructionAt(reference.getFromAddress());
+            if (instruction == null || (memoryWord(instruction.getAddress()) != (JSR_SP & 0xffff))) {
+                continue;
+            }
+            if (instruction.getFlowOverride() != FlowOverride.NONE) {
+                instruction.setFlowOverride(FlowOverride.NONE);
+            }
+            if (reference.getReferenceType() != RefType.CALL_OVERRIDE_UNCONDITIONAL) {
+                references.delete(reference);
+                var restored = references.addMemoryReference(reference.getFromAddress(), reference.getToAddress(),
+                    RefType.CALL_OVERRIDE_UNCONDITIONAL, SourceType.IMPORTED, Reference.MNEMONIC);
+                references.setPrimary(restored, true);
+            }
+        }
+    }
+
+    private int memoryWord(Address address) throws Exception {
+        return currentProgram.getMemory().getShort(address) & 0xffff;
+    }
+
     private Map<String, Object> lineFReport() {
         var report = new LinkedHashMap<String, Object>();
         report.put("call_sites", callSites);
@@ -504,9 +542,9 @@ public class RetroreM68kImport extends HeadlessScript {
         String group = word >= 0xff00 ? "DOS" : "FPACK";
         instruction.setComment(CodeUnit.EOL_COMMENT,
             String.format("retrore: %s %s (line-F $%04X patched to jsr (sp) for analysis)", group, name, word));
-        if (noReturn.contains(word)) {
-            instruction.setFlowOverride(FlowOverride.CALL_RETURN);
-        } else if (instruction.getFallThrough() != null) {
+        // The stub of an exit call is non-returning, so the bytes after it are left alone. A flow override
+        // would replace the stub reference and turn the call back into an indirect jsr (sp).
+        if (!noReturn.contains(word) && instruction.getFallThrough() != null) {
             disassemble(instruction.getFallThrough());
         }
         callSites++;

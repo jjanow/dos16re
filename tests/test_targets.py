@@ -405,3 +405,52 @@ def test_ghidra_analyzes_phantasie_atari8(tmp_path, capsys):
     assert (write["type"], write["to"]["unit_address"]) == ("WRITE", "atari8_antic:000e")
     decompiled = query("decomp", "root_a7b4:0009")["decompilation"]
     assert "FUN_4702(" in decompiled and "NMIEN" in decompiled
+
+
+@pytest.fixture
+def phantasie_iv_x68k_export(tmp_path, capsys):
+    files = _game_files("RETRORE_PH4_X68K_DIR")
+    assert main(["load", str(files["P4.X"]), "-o", str(tmp_path), "--json"]) == 0
+    return tmp_path, json.loads(capsys.readouterr().out)
+
+
+def test_phantasie_iv_x68k_layout(phantasie_iv_x68k_export):
+    output, program = phantasie_iv_x68k_export
+    text, data, bss = program["units"]
+    assert program["entry"] == {"unit_address": "text:3cc28", "linear": 0x4CC28}
+    assert (text["size"], data["size"], bss["size"]) == (0x3D65E, 0xCD68, 0x463A6)
+    assert sum(len(unit["relocations"]) for unit in program["units"]) == 11122
+    assert program["header"]["symbols"] == {"text": 705, "data": 54, "bss": 14, "common": 217, "other": 25}
+    assert len(bss["symbols"]) == 14 + 217
+    offsets = {symbol["name"]: symbol["offset"] for symbol in text["symbols"]}
+    assert (offsets["_load"], offsets["_save"], offsets["_diskmenu"]) == (0x12FA, 0x1714, 0x1AB4)
+    image = (output / "image.bin").read_bytes()
+    assert image[bss["image_offset"]:] == bytes(bss["size"])
+
+
+def test_ghidra_analyzes_phantasie_iv_x68k(phantasie_iv_x68k_export, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    output, _ = phantasie_iv_x68k_export
+    project = output / "phantasie-iv"
+    assert main(["ghidra", "import", str(output), str(project), "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["relocations"] == 11122
+    calls = report["line_f"]["calls"]
+    # Every XC multiply and float-to-double call that a linear sweep finds in reachable code is patched.
+    assert (calls["__CLMUL"], calls["__CFTOD"], calls["_EXIT2"]) == (1521, 133, 2)
+    assert "_CHANGE_PR" not in calls  # $FFFF words in data embedded in TEXT stay untouched
+
+    def query(command, address):
+        assert main([command, address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)
+
+    opening, = query("callers", "0100007a")["callers"]
+    assert opening["to_function"]["name"] == "_OPEN"
+    assert opening["from"]["unit_address"] == "text:3c094"
+    saving = query("decomp", "text:1714")["decompilation"]
+    assert "local_8 * 0xbe" in saving  # 190-byte character records
+    for size in ("0x13a", "0x76c", "0x532", "0x134"):
+        assert f",{size});" in saving
+    assert query("func", "text:35d1a")["function"]["name"] == "_rand"  # XC entry bra and trailing link
+    assert "FPACK::__CUMOD(" in query("decomp", "text:35d0c")["decompilation"]
