@@ -55,6 +55,7 @@ public class RetroreM68kImport extends HeadlessScript {
 
     private final Map<Integer, String> callNames = new HashMap<>();
     private final Map<Integer, JsonObject> dosPrototypes = new HashMap<>();
+    private final Map<Integer, String> iocsNames = new HashMap<>();
     private final Set<Integer> noReturn = new HashSet<>();
     private final Map<String, Integer> callCounts = new TreeMap<>();
     private int callSites;
@@ -164,8 +165,9 @@ public class RetroreM68kImport extends HeadlessScript {
             // analysis misreads that split as a call that never returns and drops the code after its callers.
             // Line-F exit calls get explicit flow overrides instead.
             setAnalysisOption(currentProgram, "Non-Returning Functions - Discovered", "false");
-            var block = memory.createInitializedBlock(CALL_BLOCK, address(CALL_BASE), 0x400, (byte) 0, monitor, false);
-            for (int index = 0; index < 0x200; index++) {
+            // DOS stubs, then FPACK stubs, then IOCS stubs, 256 two-byte slots each.
+            var block = memory.createInitializedBlock(CALL_BLOCK, address(CALL_BASE), 0x600, (byte) 0, monitor, false);
+            for (int index = 0; index < 0x300; index++) {
                 memory.setShort(block.getStart().addNoWrap(index * 2L), RTS);
             }
             block.setExecute(true);
@@ -173,7 +175,7 @@ public class RetroreM68kImport extends HeadlessScript {
             // Every slot is an rts, so unused stubs do not show up as undefined gaps.
             new DisassembleCommand(new AddressSet(block.getStart(), block.getEnd()), null, false)
                 .applyTo(currentProgram, monitor);
-            block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls");
+            block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls and IOCS calls");
             addFpackFixups();
         }
 
@@ -229,6 +231,11 @@ public class RetroreM68kImport extends HeadlessScript {
         for (var word : calls.getAsJsonArray("no_return")) {
             noReturn.add(Integer.parseInt(word.getAsString(), 16));
         }
+        if (calls.has("iocs")) {
+            for (var entry : calls.getAsJsonObject("iocs").entrySet()) {
+                iocsNames.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsString());
+            }
+        }
         if (calls.has("dos_prototypes")) {
             for (var entry : calls.getAsJsonObject("dos_prototypes").entrySet()) {
                 dosPrototypes.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsJsonObject());
@@ -261,6 +268,7 @@ public class RetroreM68kImport extends HeadlessScript {
         // Reanalysis can split XC entries again, so join them once more after the last round.
         merged += mergeTrailingLinks();
         restoreCallOverrides();
+        int iocs = nameIocsCalls();
         JsonObject report = new JsonObject();
         if (Files.isRegularFile(result)) {
             var previous = JsonParser.parseString(Files.readString(result));
@@ -271,6 +279,7 @@ public class RetroreM68kImport extends HeadlessScript {
         var lineF = gson.toJsonTree(lineFReport()).getAsJsonObject();
         lineF.addProperty("seeded_symbols", seeded);
         lineF.addProperty("merged_entries", merged);
+        lineF.addProperty("iocs_calls", iocs);
         report.add("line_f", lineF);
         return report;
     }
@@ -439,6 +448,71 @@ public class RetroreM68kImport extends HeadlessScript {
                 references.setPrimary(restored, true);
             }
         }
+    }
+
+    // IOCS calls are trap #15 with the call number in D0. Name the sites where the instruction just before the trap
+    // loads D0 with a constant, and turn each trap into a call to a named stub that the decompiler shows.
+    private int nameIocsCalls() throws Exception {
+        var memory = currentProgram.getMemory();
+        var block = memory.getBlock(CALL_BLOCK);
+        if (iocsNames.isEmpty() || block.getSize() < 0x600) {
+            return 0;
+        }
+        var listing = currentProgram.getListing();
+        var references = currentProgram.getReferenceManager();
+        var code = memory.getExecuteSet().subtract(new AddressSet(block.getStart(), block.getEnd()));
+        var sites = new ArrayList<ghidra.program.model.listing.Instruction>();
+        for (var instruction : listing.getInstructions(code, true)) {
+            if (instruction.getLength() == 2 && memoryWord(instruction.getAddress()) == 0x4e4f) {
+                sites.add(instruction);
+            }
+        }
+        int named = 0;
+        for (var trap : sites) {
+            monitor.checkCancelled();
+            var from = trap.getFallFrom();
+            var load = from == null ? null : listing.getInstructionAt(from);
+            if (load == null) {
+                continue;
+            }
+            int opcode = memoryWord(load.getAddress());
+            int number;
+            if ((opcode & 0xff00) == 0x7000 && load.getLength() == 2) {
+                number = opcode & 0xff;                                                 // moveq #n,d0
+            } else if (opcode == 0x203c && load.getLength() == 6) {
+                number = memory.getByte(load.getAddress().addNoWrap(5)) & 0xff;         // move.l #n,d0
+            } else if (opcode == 0x303c && load.getLength() == 4) {
+                number = memory.getByte(load.getAddress().addNoWrap(3)) & 0xff;         // move.w #n,d0
+            } else {
+                continue;
+            }
+            String name = iocsNames.get(number);
+            if (name == null) {
+                continue;
+            }
+            var entry = block.getStart().addNoWrap(0x400 + number * 2L);
+            var function = getFunctionAt(entry);
+            if (function == null) {
+                disassemble(entry);
+                Namespace namespace = currentProgram.getSymbolTable().getOrCreateNameSpace(
+                    currentProgram.getGlobalNamespace(), "IOCS", SourceType.IMPORTED);
+                function = createFunction(entry, name);
+                function.setParentNamespace(namespace);
+                function.setComment(String.format("X68000 IOCS call $%02X (trap #15)", number));
+            }
+            boolean present = false;
+            for (var reference : references.getReferencesFrom(trap.getAddress())) {
+                present |= reference.getToAddress().equals(entry);
+            }
+            if (!present) {
+                var reference = references.addMemoryReference(trap.getAddress(), entry,
+                    RefType.CALLOTHER_OVERRIDE_CALL, SourceType.IMPORTED, Reference.MNEMONIC);
+                references.setPrimary(reference, true);
+            }
+            trap.setComment(CodeUnit.EOL_COMMENT, String.format("retrore: IOCS %s ($%02X)", name, number));
+            named++;
+        }
+        return named;
     }
 
     private int memoryWord(Address address) throws Exception {

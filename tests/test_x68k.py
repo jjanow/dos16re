@@ -193,16 +193,19 @@ def test_x68k_ghidra_import_patches_line_f_calls(tmp_path, capsys):
 
 DOS_TEXT = bytes.fromhex(
     "3f3c0001"      # 0000 move.w #1,-(sp)             mode
-    "48790000002a"  # 0004 pea name
+    "487900000030"  # 0004 pea name
     "ff3d"          # 000a DOS _OPEN
     "5c8f"          # 000c addq.l #6,sp
     "2f3c00000010"  # 000e move.l #16,-(sp)            length
-    "487900000034"  # 0014 pea buffer
+    "48790000003a"  # 0014 pea buffer
     "3f00"          # 001a move.w d0,-(sp)             handle
     "ff40"          # 001c DOS _WRITE
     "4fef000a"      # 001e lea 10(sp),sp
-    "23c000000044"  # 0022 move.l d0,result
-    "ff00"          # 0028 DOS _EXIT
+    "23c00000004a"  # 0022 move.l d0,result
+    "7210"          # 0028 moveq #16,d1
+    "7010"          # 002a moveq #$10,d0
+    "4e4f"          # 002c IOCS _CRTMOD
+    "ff00"          # 002e DOS _EXIT
 )
 
 
@@ -227,14 +230,19 @@ def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
     if not os.environ.get("GHIDRA_HOME"):
         pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
     source, out, project = (tmp_path / name for name in ("DOS.X", "out", "project"))
-    source.write_bytes(_dos_x(_symbol(0x0201, 0, b"start") + _symbol(0x0202, 0x34, b"buffer")))
+    source.write_bytes(_dos_x(_symbol(0x0201, 0, b"start") + _symbol(0x0202, 0x3a, b"buffer")))
     assert main(["load", str(source), "-o", str(out)]) == 0
-    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
     capsys.readouterr()
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["line_f"]["iocs_calls"] == 1
     assert main(["decomp", "text:0000", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     decompiled = json.loads(capsys.readouterr().out)["decompilation"]
     assert "DOS::_OPEN(" in decompiled and ",1);" in decompiled
     assert "DOS::_WRITE(" in decompiled and "&buffer,0x10);" in decompiled
+    assert "IOCS::_CRTMOD(" in decompiled
+    assert main(["callers", "01000420", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    calling, = json.loads(capsys.readouterr().out)["callers"]
+    assert calling["from"]["unit_address"] == "text:002c"
 
 
 FPACK_TEXT = bytes.fromhex(
@@ -297,8 +305,9 @@ def test_ghidra_phantasie_iv_dos_and_fpack_calls(tmp_path, capsys):
         pytest.skip("set RETRORE_PH4_X68K_DIR and GHIDRA_HOME to run the real-game test")
     out, project = tmp_path / "out", tmp_path / "project"
     assert main(["load", os.path.join(directory, "P4.X"), "-o", str(out)]) == 0
-    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
     capsys.readouterr()
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["line_f"]["iocs_calls"] == 38
 
     def decompile(address):
         assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
@@ -314,3 +323,4 @@ def test_ghidra_phantasie_iv_dos_and_fpack_calls(tmp_path, capsys):
     # Stacked FPACK doubles: _avg_attr is (anc1 + anc2) / 2.0, _frand is rand(100) / 100.0.
     assert "return (dVar2 + dVar1) / local_24;" in decompile("text:ba90")
     assert "return (double)iVar1 / 100.0;" in decompile("text:30996")
+    assert "IOCS::_CRTMOD();" in decompile("text:3b676")  # XC's _CRTMOD wrapper: moveq #$10,d0; trap #15
