@@ -95,6 +95,7 @@ public class RetroreConventions extends HeadlessScript {
     private static final Set<String> ARGUMENT_REGISTERS = Set.of("EAX", "EBX", "ECX", "EDX", "ESI", "EDI");
 
     private SegmentedAddressSpace space;
+    private int farPointers;
 
     private record Frame(int start, Map<Integer, Integer> sizes, Set<Integer> pointers, Set<Integer> bytes) {}
 
@@ -313,6 +314,7 @@ public class RetroreConventions extends HeadlessScript {
                 counts.merge(kind, 1, Integer::sum);
             }
         }
+        counts.put("far_pointer_arguments", farPointers);
         return counts;
     }
 
@@ -357,7 +359,7 @@ public class RetroreConventions extends HeadlessScript {
                 return null;
             }
             size = purge;
-            kind = far ? "pascal_far" : "pascal_near";
+            kind = "callee_cleanup";
         } else {
             var cleanups = callerCleanups(function);
             if (cleanups.isEmpty()) {
@@ -371,7 +373,7 @@ public class RetroreConventions extends HeadlessScript {
                     return null;
                 }
             }
-            kind = far ? "cdecl_far" : "cdecl_near";
+            kind = size == 0 ? "no_stack_arguments" : variadic ? "caller_cleanup_variadic" : "caller_cleanup";
         }
         if (size == 0 && frame.start() < 0) {
             return null;  // No frame and no stack arguments: leave register routines to the decompiler.
@@ -384,20 +386,21 @@ public class RetroreConventions extends HeadlessScript {
             if (slot == 4) {
                 type = frame.pointers().contains(offset) ? new PointerDataType(VoidDataType.dataType, 4, manager)
                     : Undefined4DataType.dataType;
+                if (frame.pointers().contains(offset)) {
+                    farPointers++;
+                }
             } else {
                 type = frame.bytes().contains(offset) ? ByteDataType.dataType : Undefined2DataType.dataType;
             }
-            parameters.add(new ParameterImpl(String.format("param_%x", offset + (far ? 4 : 2)), type, currentProgram));
+            // Explicit stack offsets: dynamic storage would align far pointers to four bytes.
+            int stack = offset + (far ? 4 : 2);
+            parameters.add(new ParameterImpl(null, type, stack, currentProgram));
             offset += slot;
         }
         function.setCallingConvention(far ? "__stdcall16far" : "__stdcall16near");
-        function.replaceParameters(parameters, FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, true,
-            SourceType.ANALYSIS);
+        function.replaceParameters(parameters, FunctionUpdateType.CUSTOM_STORAGE, true, SourceType.ANALYSIS);
         function.setStackPurgeSize(purge);
         function.setVarArgs(variadic);
-        if (!frame.pointers().isEmpty()) {
-            kind += "_far_pointer";
-        }
         return kind;
     }
 

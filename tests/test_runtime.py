@@ -81,7 +81,7 @@ def test_ghidra_dos_conventions_and_services(tmp_path, capsys):
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)
     assert report["dos_services"] == 2
-    assert report["calling_conventions"] == {"cdecl_near": 1, "pascal_near_far_pointer": 1}
+    assert report["calling_conventions"] == {"callee_cleanup": 1, "caller_cleanup": 1, "far_pointer_arguments": 1}
 
     def decompile(address):
         assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
