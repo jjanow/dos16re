@@ -90,18 +90,20 @@ def launch_environment(java_home: str | None) -> dict:
 
 
 def _run(
-    project: Path, options: list[str], script: str | None, *arguments: str, pre_script: str | None = None,
-    timeout: float | None = QUERY_TIMEOUT, setup: dict | None = None,
+    project: Path, options: list[str], script: str | tuple[str, ...] | None, *arguments: str,
+    pre_script: str | None = None, timeout: float | None = QUERY_TIMEOUT, setup: dict | None = None,
 ) -> dict:
     """Run analyzeHeadless once. setup is a worker.launch_setup() record of another process's launcher and
-    JAVA_HOME to use instead of this process's, for a worker host answering that process."""
+    JAVA_HOME to use instead of this process's, for a worker host answering that process. Several post
+    scripts run in order with the same arguments; each later one may extend the result file."""
     launcher = setup["launcher"] if setup else _headless()
     scripts = files("retrore").joinpath("ghidra_scripts")
-    label = script or pre_script
+    post_scripts = (script,) if isinstance(script, str) else tuple(script or ())
+    label = post_scripts[0] if post_scripts else pre_script
     with as_file(scripts) as script_dir, TemporaryDirectory() as temp:
         result_file = Path(temp) / "result.json"
         script_args = [*arguments, str(result_file)]
-        script_options = ["-postScript", script, *script_args] if script else []
+        script_options = [option for name in post_scripts for option in ("-postScript", name, *script_args)]
         if pre_script:
             script_options = ["-preScript", pre_script, *script_args, *script_options]
         command = [str(launcher), *_project_parts(project), *options, "-scriptPath", str(script_dir), *script_options]
@@ -270,7 +272,8 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
         image_units(program, image.stat().st_size)
     return _run(
         project, [*options, "x86:LE:16:Real Mode"],
-        "RetroreSegments.java", str(manifest), pre_script="RetroreImport.java", timeout=timeout,
+        ("RetroreSegments.java", "RetroreIndirect.java"), str(manifest), pre_script="RetroreImport.java",
+        timeout=timeout,
     )
 
 

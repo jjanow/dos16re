@@ -591,7 +591,7 @@ def _batch(args: argparse.Namespace) -> int:
     return int(bool(errors))
 
 
-_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage")
+_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "indirect")
 
 
 def _add_query_parser(commands: argparse._SubParsersAction, command: str) -> argparse.ArgumentParser:
@@ -650,6 +650,20 @@ def _print_continue(report: dict) -> None:
         print(f"Continue with --offset {min(offsets)}")
 
 
+def _indirect_row(row: dict) -> str:
+    """One line per indirect site: where, what, and its targets, candidates, or the reason for neither."""
+    head = f"{_location(row['address'])}  {row['instruction']}  {row['status']}"
+    if row.get("targets"):
+        return f"{head}: {', '.join(_location(target) for target in row['targets'][:4])}" + (
+            " ..." if len(row["targets"]) > 4 else "")
+    if row.get("candidates"):
+        shown = ", ".join(
+            f"{_location(entry['target'])} ({'/'.join(entry['evidence'])})" for entry in row["candidates"][:3])
+        more = f" +{len(row['candidates']) - 3}" if len(row["candidates"]) > 3 else ""
+        return f"{head}: {shown}{more}; table {_location(row['table'])}, stop {row['stop']}"
+    return f"{head}: {row.get('reason')}"
+
+
 def _registry_query(args: argparse.Namespace) -> int:
     report = query(args.project, _registry_request(args), timeout=args.timeout)
     command = args.command
@@ -696,6 +710,9 @@ def _registry_query(args: argparse.Namespace) -> int:
             " ".join(filter(None, (_location(row["address"]), row["name"], row["type"], "/".join(row["access"]))))
             for row in report["data"]
         ])
+    elif command == "indirect":
+        print("  ".join(f"{count} {name}" for name, count in report["counts"].items()))
+        _print_page(report, "sites", [_indirect_row(row) for row in report["sites"]])
     else:
         _print_page(report, "units", [
             f"{row['unit']}  {row['size']} bytes  {row['instruction_bytes']} code  {row['data_bytes']} data  "

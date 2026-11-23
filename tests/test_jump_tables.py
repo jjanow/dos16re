@@ -177,6 +177,72 @@ def test_recovers_m68k_switch_through_relocated_pointers(branch, expected):
     assert recover_m68k_jump_tables(bytes(code), 0x10000, relocations[:2]) == []
 
 
+def _mz(image, relocations):
+    header = bytearray(48)
+    file_size = len(header) + len(image)
+    pack_into(
+        "<2s13H", header, 0,
+        b"MZ", file_size % 512, (file_size + 511) // 512, len(relocations), 3, 0, 0,
+        0x40, 0x3E, 0, 0, 0, 0x1C, 0,
+    )
+    for index, offset in enumerate(relocations):
+        pack_into("<2H", header, 0x1C + 4 * index, offset, 0)
+    return bytes(header) + bytes(image)
+
+
+def test_ghidra_keeps_candidates_for_far_pointer_tables_and_variables(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    image = bytearray(0x210)
+    code = bytes.fromhex(
+        "b8 20 00 8e d8"         # mov ax, DGROUP; mov ds, ax
+        " e8 38 00"              # call setup
+        " ff 1e 08 00"           # call far [8]: a procedure variable that setup assigns
+        " 83 e3 01 d1 e3 d1 e3"  # and bx,1; shl bx,1; shl bx,1
+        " ff 9f 00 00"           # call far [bx+0]: a table of two far pointers
+        " c3"
+    )
+    setup = bytes.fromhex(
+        "b8 30 00 ba 00 00"      # mov ax, offset handler; mov dx, seg handler
+        " a3 08 00 89 16 0a 00"  # mov [8], ax; mov [0xa], dx
+        " c3"
+    )
+    image[:len(code)] = code
+    image[0x40:0x40 + len(setup)] = setup
+    for start in (0x24, 0x2A, 0x30):
+        image[start:start + 5] = bytes.fromhex("55 8b ec 5d cb")  # push bp; mov bp,sp; pop bp; retf
+    pack_into("<4H", image, 0x200, 0x24, 0, 0x2A, 0)
+    exe = tmp_path / "sample.exe"
+    exe.write_bytes(_mz(image, [1, 0x44, 0x202, 0x206]))
+    export, project = tmp_path / "export", tmp_path / "indirect"
+    assert main(["load", str(exe), "-o", str(export), "--base-segment", "2000"]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["indirect"] == {
+        "sites": 2, "candidate_sites": 2, "unresolved_sites": 0, "seeded_functions": 3,
+    }
+
+    assert main(["indirect", "--project", str(project), "--json", "--compact"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert report["counts"] == {"resolved": 0, "candidate": 2, "unresolved": 0}
+    variable, table = report["sites"]
+    assert (variable["address"], variable["status"], variable["stop"]) == ("root:0008", "candidate", "variable")
+    stored, = variable["candidates"]
+    assert (stored["slot"], stored["target"], stored["writer"]) == ("root:0208", "root:0030", "root:0046")
+    assert stored["evidence"][:2] == ["relocated", "stored"]
+    assert (table["table"], table["stop"], table["segment"]) == ("root:0200", "next_variable",
+                                                                 {"register": "DS", "value": 0x2020})
+    assert [(entry["target"], entry["evidence"][:2]) for entry in table["candidates"]] == [
+        ("root:0024", ["relocated", "initial"]), ("root:002a", ["relocated", "initial"]),
+    ]
+    assert all("seeded" in entry["evidence"] and "prologue" in entry["evidence"] for entry in table["candidates"])
+
+    # Each candidate slot references its target, so xrefs on a handler shows where it can be called from.
+    assert main(["xrefs", "root:0030", "--project", str(project), "--json"]) == 0
+    refs = json.loads(capsys.readouterr().out)
+    assert ("root:0208", "DATA") in [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]]
+
+
 @pytest.fixture
 def phantasie_iii_export(tmp_path, capsys):
     directory = os.environ.get("RETRORE_PH3_DIR")
