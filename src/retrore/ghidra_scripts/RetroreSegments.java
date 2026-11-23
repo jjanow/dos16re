@@ -57,6 +57,7 @@ public class RetroreSegments extends HeadlessScript {
     private final ArrayDeque<Address> pending = new ArrayDeque<>();
     private final Map<String, Integer> overlaySegments = new HashMap<>();
     private Startup startup;
+    private final Map<String, Object> segmentStats = new LinkedHashMap<>();
 
     private static class State {
         final Map<Register, Integer> registers = new HashMap<>();
@@ -114,6 +115,9 @@ public class RetroreSegments extends HeadlessScript {
                 "program", currentProgram.getName(), "units", map.getAsJsonArray("units").size(),
                 "far_procedures", farProcedures, "runtime_signatures", runtimeSignatures
             ));
+            if (!segmentStats.isEmpty()) {
+                report.put("segment_analysis", segmentStats);
+            }
             if (map.has("format") && map.get("format").getAsString().equals("PC98")) {
                 report.put("format", "PC98");
                 report.put("memory_view", map.get("memory_view").getAsString());
@@ -586,6 +590,8 @@ public class RetroreSegments extends HeadlessScript {
         var listing = currentProgram.getListing();
         var memory = currentProgram.getMemory();
         var refs = currentProgram.getReferenceManager();
+        int references = 0;
+        var targets = new HashSet<Address>();
         for (var entry : new TreeMap<>(states).entrySet()) {
             monitor.checkCancelled();
             Instruction instruction = getInstructionAt(entry.getKey());
@@ -615,8 +621,28 @@ public class RetroreSegments extends HeadlessScript {
                     SourceType.ANALYSIS, access.operand());
                 refs.setPrimary(ref, true);
                 nameGlobal((SegmentedAddress) target, access.size());
+                references++;
+                targets.add(target);
             }
         }
+        int functionCount = 0;
+        var known = new LinkedHashMap<String, Integer>();
+        for (Register segment : List.of(ds, es, ss)) {
+            known.put(segment.getName(), 0);
+        }
+        for (var function : currentProgram.getFunctionManager().getFunctions(true)) {
+            functionCount++;
+            State state = states.get(function.getEntryPoint());
+            for (Register segment : List.of(ds, es, ss)) {
+                if (state != null && state.registers.get(segment) != null) {
+                    known.merge(segment.getName(), 1, Integer::sum);
+                }
+            }
+        }
+        segmentStats.put("data_references", references);
+        segmentStats.put("data_targets", targets.size());
+        segmentStats.put("functions", functionCount);
+        segmentStats.put("entry_known", known);
     }
 
     private void nameGlobal(SegmentedAddress address, int size) throws Exception {
