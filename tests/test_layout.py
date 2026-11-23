@@ -63,12 +63,17 @@ def test_layout_text():
     ]
 
 
-# A record loop: for (i = 0; i < 6; i++) touch rec[i] at 0x200, 12 bytes per record. Offset 0 is read as a
-# word and written as a byte (a width conflict); the word at offset 2 overlaps the byte read at offset 3.
-_RECORD_LOOP = bytes.fromhex(
+# Three routines over data in the image. 0x10: for (i = 0; i < 6; i++) touch rec[i] at 0x200, 12 bytes per
+# record; offset 0 is read as a word and written as a byte (a width conflict) and the word at offset 2 overlaps
+# the byte read at offset 3. 0x38: strlen of the text at 0x260. 0x4a: sum the eight-word table at 0x270.
+_PROGRAM = bytes.fromhex(
     "0e 1f"              # DS = CS
-    " 31 c9"             # xor cx, cx
-    " 89 c8"             # 0004: mov ax, cx
+    " e8 0b 00"          # call 0010
+    " e8 30 00"          # call 0038
+    " e8 3f 00"          # call 004a
+    " c3 90 90 90 90"
+    " 31 c9"             # 0010: xor cx, cx
+    " 89 c8"             # 0012: mov ax, cx
     " bb 0c 00"          # mov bx, 12
     " f7 e3"             # mul bx
     " 89 c3"             # mov bx, ax
@@ -79,16 +84,27 @@ _RECORD_LOOP = bytes.fromhex(
     " a3 50 02"          # mov [0x250], ax
     " 41"                # inc cx
     " 83 f9 06"          # cmp cx, 6
-    " 7c db"             # jl 0004
+    " 7c db"             # jl 0012
     " c3"
+    " 31 db"             # 0038: xor bx, bx
+    " 8a 87 60 02"       # 003a: mov al, [bx+0x260]
+    " 84 c0 74 03"       # test al, al; jz 0045
+    " 43 eb f5"          # inc bx; jmp 003a
+    " 89 1e 52 02 c3"    # 0045: mov [0x252], bx; ret
+    " 31 c0 31 c9"       # 004a: xor ax, ax; xor cx, cx
+    " 89 cb d1 e3"       # 004e: mov bx, cx; shl bx, 1
+    " 03 87 70 02"       # add ax, [bx+0x270]
+    " 41 83 f9 08 7c f2"  # inc cx; cmp cx, 8; jl 004e
+    " a3 54 02 c3"       # mov [0x254], ax; ret
 )
+_IMAGE = (_PROGRAM.ljust(0x260, b"\0") + b"HELLO\0").ljust(0x270, b"\0") + bytes(range(0x81, 0x91)) + bytes(16)
 
 
 @pytest.fixture(scope="module")
 def record_project(tmp_path_factory):
     if not os.environ.get("GHIDRA_HOME"):
         pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
-    image = _RECORD_LOOP.ljust(0x260, b"\0")
+    image = _IMAGE
     header = bytearray(32)
     size = len(header) + len(image)
     pack_into("<2s13H", header, 0, b"MZ", size % 512, (size + 511) // 512, 0, 2, 32, 32, 0x30, 0x200, 0, 0, 0, 28, 0)
@@ -111,19 +127,26 @@ def test_layout_recovers_a_record_array(record_project, tmp_path, capsys):
     report = _json(capsys, "layout", "root:0200", "--size", "72", "--compact", "--project", str(record_project))
     layout = report["layout"]
     assert (layout["kind"], layout["element_size"], layout["count"]) == ("record_array", 12, 6)
-    assert layout["count_source"].endswith(" INT_SLESS 6 after the increment at root:0027")
+    assert layout["count_source"].endswith(" INT_SLESS 6 after the increment at root:0035")
     assert [(field["offset"], field["widths"]) for field in layout["fields"]] == [(0, [1, 2]), (2, [2]), (3, [1])]
     assert [(row["offset"], row["kind"]) for row in report["conflicts"]] == [(0, "widths"), (2, "overlap")]
     stride, = report["strides"]
     assert stride["stride"] == 12 and any("INT_MULT by 0xc" in note for note in stride["evidence"])
     accesses = {(row["address"], row["access"], row["width"], row["offset"]) for row in report["accesses"]}
-    assert accesses == {("root:000d", "write", 1, 0), ("root:0012", "write", 2, 2), ("root:0018", "read", 2, 0),
-                        ("root:001c", "read", 1, 3)}
+    assert accesses == {("root:001b", "write", 1, 0), ("root:0020", "write", 2, 2), ("root:0026", "read", 2, 0),
+                        ("root:002a", "read", 1, 3)}
     assert "struct layout_1000_0200 layout_1000_0200_array[6];" in report["proposal"]["c"]
 
     text = main(["layout", "root:0200", "--size", "72", "--project", str(record_project)])
     assert text == 0
     assert capsys.readouterr().out.splitlines()[0] == "record_array  6 x 0xc bytes  (72 bytes, given)"
+
+    # The text at 0x260 is walked a byte at a time; the word table at 0x270 is only read.
+    text = _json(capsys, "layout", "root:0260", "--size", "16", "--project", str(record_project))["layout"]
+    assert (text["kind"], text["element_size"], text["initial_text"]) == ("string", 1, "HELLO")
+    table = _json(capsys, "layout", "root:0270", "--size", "16", "--project", str(record_project))["layout"]
+    assert (table["kind"], table["element_size"], table["count"], table["read_only"]) == ("array", 2, 8, True)
+    assert table["count_source"].endswith(" INT_SLESS 8 after the increment at root:005a")
 
     # Applying writes the structure array into a copy of the project.
     copy = tmp_path / "copy"
@@ -150,8 +173,8 @@ def phantasie_iv_project(tmp_path_factory):
 
 
 def test_phantasie_iv_character_records(phantasie_iv_project, capsys):
-    # _gmb (bss:2ebd6) runs to _pmb: ten 190-byte records. _save reads fields 0x22 (88fbe), 0x23, 0xb4 (89050),
-    # 0xb5, and 0xba of each record, indexed through `muls.l` by 0xbe (rewritten from __CLMUL).
+    # _gmb (bss:2ebd6) runs to _pmb: ten 190-byte records. _save reads fields 0x22 (88fbe) and 0x23 and writes
+    # 0xb4 (89050), 0xb5, and 0xba of each record, indexed through `muls.l` by 0xbe (rewritten from __CLMUL).
     project = str(phantasie_iv_project)
     report = _json(capsys, "layout", "88f9c", "--compact", "--project", project)
     layout = report["layout"]
@@ -162,8 +185,8 @@ def test_phantasie_iv_character_records(phantasie_iv_project, capsys):
     stride = report["strides"][0]
     assert stride["stride"] == 190 and "text:1754 INT_MULT by 0xbe" in stride["evidence"] + [
         note for row in report["accesses"] for index in row["index"] for note in index["evidence"]]
-    save = {(row["address"], row["offset"]) for row in report["accesses"] if row["function"] == "_save"}
-    assert {("text:1766", 0x22), ("text:1794", 0x23)} <= save
+    save = {(row["address"], row["access"], row["offset"]) for row in report["accesses"] if row["function"] == "_save"}
+    assert {("text:1766", "read", 0x22), ("text:1794", "read", 0x23), ("text:17ca", "write", 0xB4)} <= save
     assert not report["conflicts"]
 
     # A second table in _save: six 8-byte entries at 4f66e indexed by `asl.l #3`, bounded by `cmp.l #6`.

@@ -9,6 +9,7 @@ from .errors import CONTRACT_VERSION
 from .queries import QueryError, normalize_query
 
 _FIELD_PREVIEW = 12
+_PROPOSAL_PREVIEW = 16
 
 
 def apply_layout(project: Path, request: dict, *, timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
@@ -68,6 +69,9 @@ def layout_lines(report: dict) -> list[str]:
         applied = report["applied"]
         lines.append(f"applied {applied['data_type']} ({applied['length']} bytes)")
     elif "proposal" in report:
+        proposal = report["proposal"]["c"].splitlines()
         lines.append("proposal (apply with --apply):")
-        lines.extend("  " + line for line in report["proposal"]["c"].splitlines())
+        lines.extend("  " + line for line in proposal[:_PROPOSAL_PREVIEW])
+        if len(proposal) > _PROPOSAL_PREVIEW:
+            lines.append("  Use --json for the full proposal.")
     return lines
