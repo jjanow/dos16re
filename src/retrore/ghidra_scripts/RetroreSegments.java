@@ -553,11 +553,14 @@ public class RetroreSegments extends HeadlessScript {
             } else if (flow.isJump()) {
                 State jumped = output.copy();
                 jumped.set(cs, targetCS(instruction, input));
-                // A computed jump into another function's body is more likely a misread table than a
-                // real transfer, and joining its state would erase that function's context.
-                var source = flow.isComputed() ? getFunctionContaining(address) : null;
+                // A jump into the middle of another function is either a misread table or a shared
+                // error or exit tail. Joining its state would erase the context that function's own
+                // paths establish, so only jumps within a function or to a function entry carry state.
+                var source = getFunctionContaining(address);
                 for (Address target : instruction.getFlows()) {
-                    if (source != null && !source.getBody().contains(target)) {
+                    var owner = getFunctionContaining(target);
+                    if (source != null && owner != null && !owner.equals(source) &&
+                            !owner.getEntryPoint().equals(target)) {
                         skippedJumps++;
                         continue;
                     }
@@ -830,9 +833,6 @@ public class RetroreSegments extends HeadlessScript {
                 }
             }
             stackHandled = true;
-        } else if (instruction.getFlowType().isCall()) {
-            applyCall(instruction, input, output);
-            stackHandled = true;
         } else if (op.equals("INT") || op.equals("INTO")) {
             // Assume interrupt handlers keep DS, SS, and the stack; ES and general registers can change.
             for (Register register : summarized) {
@@ -840,6 +840,9 @@ public class RetroreSegments extends HeadlessScript {
                     output.lose(register, new Loss(at, "interrupt", instruction.toString()));
                 }
             }
+            stackHandled = true;
+        } else if (instruction.getFlowType().isCall()) {
+            applyCall(instruction, input, output);
             stackHandled = true;
         } else if (op.equals("LEAVE")) {
             restoreFrame(input, output);
@@ -985,29 +988,40 @@ public class RetroreSegments extends HeadlessScript {
         return scalar == null ? null : (int) scalar.getUnsignedValue() & WORD_MASK;
     }
 
-    // A word of the frame addressed as [BP+n], counted from the saved BP toward the caller's arguments.
-    private Integer frameIndex(Access access, State state, int delta) {
+    // A stack word addressed as [BP+n]. Arguments and the saved BP come from the words tracked when BP
+    // was set; locals below BP come from the current stack while its height is known.
+    private record Slot(List<Integer> words, int index) {
+        Integer get() {
+            return words.get(index);
+        }
+    }
+
+    private Slot frameSlot(Access access, State state, int delta) {
         if (!access.bases().equals(List.of(bp)) || !access.segment().equals(ss)) {
             return null;
         }
         return frameSlot(state, (short) access.offset() + delta);
     }
 
-    private static Integer frameSlot(State state, int displacement) {
-        if (state.frame == null || displacement < 0 || displacement % 2 != 0) {
+    private static Slot frameSlot(State state, int displacement) {
+        if (state.frame == null || displacement % 2 != 0) {
             return null;
         }
-        int index = state.frame.size() - 1 - displacement / 2;
-        return index < 0 ? null : index;
+        if (displacement >= 0) {
+            int index = state.frame.size() - 1 - displacement / 2;
+            return index < 0 ? null : new Slot(state.frame, index);
+        }
+        if (state.height == UNKNOWN_HEIGHT || state.frameHeight == UNKNOWN_HEIGHT) {
+            return null;
+        }
+        int index = state.stack.size() - 1 - (state.height - (state.frameHeight - displacement / 2));
+        return index < 0 || index >= state.stack.size() ? null : new Slot(state.stack, index);
     }
 
     private Integer memoryWord(Access access, State state, int delta) {
-        Integer index = frameIndex(access, state, delta);
-        if (index != null) {
-            return state.frame.get(index);
-        }
         if (access.bases().contains(bp)) {
-            return null;
+            Slot slot = frameSlot(access, state, delta);
+            return slot == null ? null : slot.get();
         }
         Address address = target(access, state);
         return address == null ? null : words.get(address.getOffset() + delta);
@@ -1015,12 +1029,9 @@ public class RetroreSegments extends HeadlessScript {
 
     // The offset half of a far pointer: a tracked frame word, or an initialized word nothing writes.
     private Integer offsetWord(Access access, State state) throws Exception {
-        Integer index = frameIndex(access, state, 0);
-        if (index != null) {
-            return state.frame.get(index);
-        }
         if (access.bases().contains(bp)) {
-            return null;
+            Slot slot = frameSlot(access, state, 0);
+            return slot == null ? null : slot.get();
         }
         Address address = target(access, state);
         if (address == null || !words.containsKey(address.getOffset() + 2) ||
@@ -1036,9 +1047,9 @@ public class RetroreSegments extends HeadlessScript {
         }
         int start = (short) access.offset();
         for (int word = Math.floorDiv(start, 2) * 2; word < start + access.size(); word += 2) {
-            Integer index = frameSlot(output, word);
-            if (index != null) {
-                output.frame.set(index, word == start && access.size() == 2 ? value : null);
+            Slot slot = frameSlot(output, word);
+            if (slot != null) {
+                slot.words().set(slot.index(), word == start && access.size() == 2 ? value : null);
             }
         }
     }
