@@ -67,6 +67,10 @@ def _flatten(schema: dict) -> dict:
     return {key: value for key, value in schema.items() if key not in ("oneOf", "anyOf", "allOf")}
 
 
+class UnknownTool(LookupError):
+    """No tool has the requested name."""
+
+
 class InvalidArguments(GhidraError):
     """Tool arguments outside the query request, such as project or timeout, are invalid."""
 
@@ -163,6 +167,9 @@ def _project(arguments: dict) -> Path:
 def _timeout(arguments: dict, default: float | None) -> float | None:
     if "timeout" not in arguments:
         return default
+    if arguments["timeout"] is None:
+        # Passing None to the query functions would disable the budget; require a number instead.
+        raise InvalidArguments("timeout: expected a nonnegative number of seconds")
     try:
         return check_timeout(arguments["timeout"])
     except GhidraError as error:
@@ -197,7 +204,7 @@ def _call_where_is(arguments: dict) -> dict:
 
 
 def call_tool(name: str, arguments: dict) -> dict:
-    """Run a tool and return an MCP CallToolResult. Unknown tool names raise KeyError."""
+    """Run a tool and return an MCP CallToolResult. Unknown tool names raise UnknownTool."""
     if name == "batch":
         run = _call_batch
     elif name == "where_is":
@@ -206,7 +213,7 @@ def call_tool(name: str, arguments: dict) -> dict:
         def run(arguments: dict) -> dict:
             return _call_query(name, arguments)
     else:
-        raise KeyError(name)
+        raise UnknownTool(name)
     try:
         report, failed = run(arguments), False
     except HANDLED_ERRORS as error:
@@ -277,7 +284,7 @@ class Server:
                 raise _RpcError(INVALID_PARAMS, "tool arguments must be an object")
             try:
                 result = call_tool(name, arguments)
-            except KeyError:
+            except UnknownTool:
                 raise _RpcError(INVALID_PARAMS, f"Unknown tool: {name}") from None
         else:
             raise _RpcError(METHOD_NOT_FOUND, f"Method not found: {method}")

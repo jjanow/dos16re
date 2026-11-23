@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 from pathlib import Path
@@ -328,8 +329,10 @@ def test_mcp_session(tmp_path):
         {"jsonrpc": "2.0", "id": 9, "method": "ping"},
         {"jsonrpc": "2.0", "id": 10, "method": "resources/list"},
         "not json",
+        _call(11, "func", {"project": missing, "address": "c000", "timeout": None}),
+        _call(12, "batch", {"project": missing, "requests": [{"command": "func"}], "timeout": None}),
     ])
-    assert len(responses) == 12
+    assert len(responses) == 14
     initialized = responses[0]["result"]
     assert initialized["protocolVersion"] == "2025-11-25"
     assert initialized["capabilities"] == {"tools": {"listChanged": False}}
@@ -344,7 +347,9 @@ def test_mcp_session(tmp_path):
     assert json.loads(not_found["content"][0]["text"]) == not_found["structuredContent"]
     for identifier, message in ((3, "expected a hexadecimal unit:offset"), (4, "depth must be an integer between 1"),
                                 (5, "timeout: expected a nonnegative number"), (6, "the tool name selects"),
-                                (7, "expected a nonempty JSON array")):
+                                (7, "expected a nonempty JSON array"),
+                                (11, "timeout: expected a nonnegative number"),
+                                (12, "timeout: expected a nonnegative number")):
         result = responses[identifier]["result"]
         assert result["isError"] is True, identifier
         error = result["structuredContent"]["error"]
@@ -455,3 +460,23 @@ def test_mcp_query_matches_the_cli(tmp_path, capsys):
         assert result["content"] == [{"type": "text", "text": output.strip()}]
     callees = json.loads(single)["callees"]
     assert [callee["to_function"]["name"] for callee in callees] == ["FUN_c004"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="select() needs a POSIX pipe")
+def test_mcp_answers_each_line_before_stdin_closes():
+    process = subprocess.Popen(
+        [sys.executable, "-m", "retrore", "mcp", "--json"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env=_environment(),
+    )
+    try:
+        for message in [*_initialize(), {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]:
+            process.stdin.write(json.dumps(message) + "\n")
+            process.stdin.flush()
+            if "id" in message:
+                ready, _, _ = select.select([process.stdout], [], [], 30)
+                assert ready, "no response before stdin closed"
+                assert json.loads(process.stdout.readline())["id"] == message["id"]
+    finally:
+        process.stdin.close()
+        assert process.wait(timeout=30) == 0
+        process.stdout.close()

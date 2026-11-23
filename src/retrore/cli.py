@@ -969,7 +969,7 @@ def main(argv: list[str] | None = None) -> int:
     schema_parser = commands.add_parser("schema", help="print the JSON Schema of query requests and errors")
     schema_parser.add_argument("--json", action="store_true", help="print the JSON Schema document")
     mcp_parser = commands.add_parser("mcp", help="serve queries to MCP clients over stdio")
-    mcp_parser.set_defaults(json=False)
+    mcp_parser.add_argument("--json", action="store_true", help="accepted for consistency; output is always JSON-RPC")
     search_parser = commands.add_parser("where-is", help="find a byte pattern across exported units")
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     pattern = search_parser.add_mutually_exclusive_group(required=True)

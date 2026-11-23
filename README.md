@@ -131,7 +131,8 @@ and `requests`, the same array `retrore batch` reads. `where_is` takes `export` 
 `string`, or `constant`, with an optional `width`. A call runs through the same validation and
 functions as the CLI. Its `structuredContent` and text content hold the JSON that `--json` prints.
 An error result has `isError: true` and carries the `--json` error object with `code`, `message`,
-and `hint`. A batch whose rows fail still succeeds and reports `error` in those rows. The `gaps` tool
+and `hint`. A batch with failed rows, or a `functions` call with failed lookups, still succeeds
+and reports `error` in those rows, although the CLI exits with status 1. The `gaps` tool
 always uses the paged form, like `retrore gaps --limit N`. Exporting and importing programs stays
 with `retrore load` and `retrore ghidra import`.
 
