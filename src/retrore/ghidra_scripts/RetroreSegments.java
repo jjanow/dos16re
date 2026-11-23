@@ -18,6 +18,7 @@ import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.QWordDataType;
 import ghidra.program.model.data.ShortDataType;
 import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.Undefined;
 import ghidra.program.model.data.UnsignedShortDataType;
 import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.data.WordDataType;
@@ -48,24 +49,53 @@ import java.util.TreeMap;
 
 public class RetroreSegments extends HeadlessScript {
     private static final int WORD_MASK = 0xffff;
-    private static final int STACK_LIMIT = 8;
+    // While summarizing a function, values from SYMBOL up stand for a register's value at entry.
+    private static final int SYMBOL = 0x10000;
+    private static final int STACK_LIMIT = 16;
+    private static final int UNKNOWN_HEIGHT = Integer.MIN_VALUE;
+    private static final int SUMMARY_PASSES = 6;
+    private static final int SUMMARY_STEPS = 50000;
+    private static final int CONTEXT_ROUNDS = 4;
+    // Per instruction: "REG=origin;..." with the linear address where each unknown segment value was lost.
+    private static final String LOSS_MAP = "RetroreSegmentLosses";
+    // Per origin: one "REG\treason\tdetail" line for each segment register lost there.
+    private static final String LOSS_ORIGIN_MAP = "RetroreSegmentLossOrigins";
     private SegmentedAddressSpace space;
-    private Register cs, ds, es, ss, sp;
+    private Register cs, ds, es, ss, sp, bp;
+    private List<Register> segmentRegisters;
+    private List<Register> summarized;
+    private List<Register> baseRegisters;
     private final Map<Long, Integer> words = new HashMap<>();
+    private final HashSet<Long> written = new HashSet<>();
     private final Map<Address, List<Access>> accesses = new HashMap<>();
     private final Map<Address, State> states = new HashMap<>();
     private final ArrayDeque<Address> pending = new ArrayDeque<>();
     private final Map<String, Integer> overlaySegments = new HashMap<>();
+    private final Map<Address, Summary> symbolicSummaries = new HashMap<>();
+    private Map<Address, Summary> contextSummaries = new HashMap<>();
     private Startup startup;
+    private int skippedJumps;
+    private final Map<String, Object> segmentStats = new LinkedHashMap<>();
+
+    // Why a register has no known value: the instruction where it was lost and a reason code.
+    private record Loss(Address at, String reason, String detail) {}
 
     private static class State {
         final Map<Register, Integer> registers = new HashMap<>();
-        final List<Integer> stack = new ArrayList<>();
+        final Map<Register, Loss> losses = new HashMap<>();
+        final List<Integer> stack = new ArrayList<>(); // newest word last
+        int height; // words pushed since function entry
+        List<Integer> frame; // stack words when BP was set to SP, newest last
+        int frameHeight = UNKNOWN_HEIGHT;
 
         State copy() {
             State result = new State();
             result.registers.putAll(registers);
+            result.losses.putAll(losses);
             result.stack.addAll(stack);
+            result.height = height;
+            result.frame = frame == null ? null : new ArrayList<>(frame);
+            result.frameHeight = frameHeight;
             return result;
         }
 
@@ -74,22 +104,96 @@ public class RetroreSegments extends HeadlessScript {
                 registers.remove(register);
             } else {
                 registers.put(register, value);
+                losses.remove(register);
             }
         }
 
-        // Keep only values that agree on every incoming path.
-        boolean merge(State incoming) {
-            boolean changed = registers.entrySet().removeIf(
-                entry -> !entry.getValue().equals(incoming.registers.get(entry.getKey())));
-            if (stack.size() != incoming.stack.size()) {
-                changed |= !stack.isEmpty();
-                stack.clear();
+        void lose(Register register, Loss loss) {
+            registers.remove(register);
+            if (loss != null) {
+                losses.put(register, loss);
+            }
+        }
+
+        void push(Integer value) {
+            if (stack.size() == STACK_LIMIT) {
+                stack.removeFirst();
+            }
+            stack.add(value);
+            if (height != UNKNOWN_HEIGHT) {
+                height++;
+            }
+        }
+
+        Integer pop() {
+            if (height != UNKNOWN_HEIGHT) {
+                height--;
+            }
+            return stack.isEmpty() ? null : stack.removeLast();
+        }
+
+        void drop(int count) {
+            for (int index = 0; index < count; index++) {
+                pop();
+            }
+        }
+
+        void forgetStack() {
+            stack.clear();
+            height = UNKNOWN_HEIGHT;
+        }
+
+        // Keep only values that agree on every incoming path. Loss records never requeue a state.
+        boolean merge(State incoming, Address at) {
+            boolean changed = false;
+            for (var entry : new ArrayList<>(registers.entrySet())) {
+                Register register = entry.getKey();
+                Integer other = incoming.registers.get(register);
+                if (!entry.getValue().equals(other)) {
+                    registers.remove(register);
+                    Loss loss = other != null
+                        ? new Loss(at, "join", String.format("paths disagree: %04x and %04x", entry.getValue(), other))
+                        : incoming.losses.get(register);
+                    losses.put(register, loss != null ? loss : new Loss(at, "join", "a path has no known value"));
+                    changed = true;
+                }
+            }
+            for (var entry : incoming.losses.entrySet()) {
+                if (!registers.containsKey(entry.getKey())) {
+                    losses.putIfAbsent(entry.getKey(), entry.getValue());
+                }
+            }
+            if (height != incoming.height) {
+                changed |= height != UNKNOWN_HEIGHT || !stack.isEmpty();
+                forgetStack();
             } else {
-                for (int index = 0; index < stack.size(); index++) {
-                    if (stack.get(index) != null && !stack.get(index).equals(incoming.stack.get(index))) {
-                        stack.set(index, null);
-                        changed = true;
-                    }
+                changed |= mergeWords(stack, incoming.stack);
+            }
+            if (frame != null) {
+                if (incoming.frame == null || frameHeight != incoming.frameHeight) {
+                    frame = null;
+                    frameHeight = UNKNOWN_HEIGHT;
+                    changed = true;
+                } else {
+                    changed |= mergeWords(frame, incoming.frame);
+                }
+            }
+            return changed;
+        }
+
+        // Align two stacks at their newest word, drop words only one of them tracks, and forget disagreements.
+        private static boolean mergeWords(List<Integer> mine, List<Integer> theirs) {
+            boolean changed = false;
+            int keep = Math.min(mine.size(), theirs.size());
+            if (keep < mine.size()) {
+                mine.subList(0, mine.size() - keep).clear();
+                changed = true;
+            }
+            for (int index = 1; index <= keep; index++) {
+                Integer word = mine.get(mine.size() - index);
+                if (word != null && !word.equals(theirs.get(theirs.size() - index))) {
+                    mine.set(mine.size() - index, null);
+                    changed = true;
                 }
             }
             return changed;
@@ -97,7 +201,12 @@ public class RetroreSegments extends HeadlessScript {
     }
 
     private record Startup(int dgroup, Address call) {}
-    private record Access(int operand, Register segment, int offset, int size, RefType type) {}
+    private record Access(int operand, Register segment, int offset, List<Register> bases, int size, RefType type) {}
+    // Register values when a function returns: concrete values or SYMBOL + index for an entry value.
+    // A missing register is changed to an unknown value. Purge counts argument words the return removes.
+    private record Summary(Map<Register, Integer> exits, Integer purge, boolean far,
+            Map<Register, Integer> assumptions) {}
+
 
     @Override
     public void run() throws Exception {
@@ -114,6 +223,9 @@ public class RetroreSegments extends HeadlessScript {
                 "program", currentProgram.getName(), "units", map.getAsJsonArray("units").size(),
                 "far_procedures", farProcedures, "runtime_signatures", runtimeSignatures
             ));
+            if (!segmentStats.isEmpty()) {
+                report.put("segment_analysis", segmentStats);
+            }
             if (map.has("format") && map.get("format").getAsString().equals("PC98")) {
                 report.put("format", "PC98");
                 report.put("memory_view", map.get("memory_view").getAsString());
@@ -256,12 +368,21 @@ public class RetroreSegments extends HeadlessScript {
         };
     }
 
+
     private void applySegments(JsonObject map) throws Exception {
         cs = currentProgram.getRegister("CS");
         ds = currentProgram.getRegister("DS");
         es = currentProgram.getRegister("ES");
         ss = currentProgram.getRegister("SS");
         sp = currentProgram.getRegister("SP");
+        bp = currentProgram.getRegister("BP");
+        segmentRegisters = List.of(ds, es, ss);
+        summarized = new ArrayList<>();
+        for (String name : List.of("AX", "CX", "DX", "BX", "BP", "SI", "DI", "DS", "ES", "SS")) {
+            summarized.add(currentProgram.getRegister(name));
+        }
+        baseRegisters = List.of(currentProgram.getRegister("BX"), currentProgram.getRegister("SI"),
+            currentProgram.getRegister("DI"), bp);
         var memory = currentProgram.getMemory();
         var units = map.getAsJsonArray("units");
         boolean pc98 = map.has("format") && map.get("format").getAsString().equals("PC98");
@@ -285,6 +406,9 @@ public class RetroreSegments extends HeadlessScript {
         Address entry = space.getAddress(codeSegment, entryRecord.get("offset").getAsInt());
         State initial = new State();
         initial.set(cs, codeSegment);
+        Loss psp = new Loss(entry, "entry", "DS and ES hold the PSP at program entry");
+        initial.lose(ds, psp);
+        initial.lose(es, psp);
         if (map.has("stack")) {
             initial.set(ss, map.getAsJsonObject("stack").get("segment").getAsInt());
         }
@@ -299,16 +423,42 @@ public class RetroreSegments extends HeadlessScript {
                 State state = new State();
                 state.set(cs, segment);
                 entryStates.merge(start, state, (previous, incoming) -> {
-                    previous.merge(incoming);
+                    previous.merge(incoming, start);
                     return previous;
                 });
             }
         }
 
+        // Summaries say which registers each function preserves, sets, or changes. Summaries computed
+        // under the entry values the whole-program pass found apply only where a call matches them.
+        summarize(symbolicSummaries, false);
+        int rounds = 1;
+        for (;; rounds++) {
+            analyzeProgram(entryStates);
+            if (rounds == CONTEXT_ROUNDS) {
+                break;
+            }
+            var previous = contextSummaries;
+            contextSummaries = new HashMap<>();
+            summarize(contextSummaries, true);
+            if (contextSummaries.equals(previous)) {
+                break;
+            }
+        }
+        segmentStats.put("rounds", rounds);
+        segmentStats.put("summaries", symbolicSummaries.size());
+        segmentStats.put("context_summaries", contextSummaries.size());
+        segmentStats.put("skipped_jumps", skippedJumps);
+        writeContextAndReferences();
+    }
+
+    private void analyzeProgram(Map<Address, State> entryStates) throws Exception {
+        var memory = currentProgram.getMemory();
         // A direct write may invalidate a segment word even when another path first reads it.
         // Re-run after removing such words so no context depends on their initial contents.
         do {
             states.clear();
+            skippedJumps = 0;
             for (var seed : entryStates.entrySet()) {
                 offer(seed.getKey(), seed.getValue());
             }
@@ -317,14 +467,20 @@ public class RetroreSegments extends HeadlessScript {
                 Address start = function.getEntryPoint();
                 if (!states.containsKey(start)) {
                     State detached = new State();
-                    detached.set(ds, startup == null ? null : startup.dgroup());
+                    Loss none = new Loss(start, "entry", "no analyzed caller reaches this function");
+                    if (startup == null) {
+                        detached.lose(ds, none);
+                    } else {
+                        detached.set(ds, startup.dgroup());
+                    }
+                    detached.lose(es, none);
+                    detached.lose(ss, none);
                     detached.set(cs, overlaySegments.get(memory.getBlock(start).getName()));
                     offer(start, detached);
                 }
             }
             follow();
         } while (removeWrittenWords());
-        writeContextAndReferences();
     }
 
     private Startup findStartup(Address address, State state, int callDepth) throws Exception {
@@ -374,7 +530,7 @@ public class RetroreSegments extends HeadlessScript {
         if (previous == null) {
             states.put(address, state.copy());
             pending.add(address);
-        } else if (previous.merge(state)) {
+        } else if (previous.merge(state, address)) {
             pending.add(address);
         }
     }
@@ -398,7 +554,17 @@ public class RetroreSegments extends HeadlessScript {
             } else if (flow.isJump()) {
                 State jumped = output.copy();
                 jumped.set(cs, targetCS(instruction, input));
+                // A jump into the middle of another function is either a misread table or a shared
+                // error or exit tail. Joining its state would erase the context that function's own
+                // paths establish, so only jumps within a function or to a function entry carry state.
+                var source = getFunctionContaining(address);
                 for (Address target : instruction.getFlows()) {
+                    var owner = getFunctionContaining(target);
+                    if (source != null && owner != null && !owner.equals(source) &&
+                            !owner.getEntryPoint().equals(target)) {
+                        skippedJumps++;
+                        continue;
+                    }
                     offer(target, jumped);
                 }
             }
@@ -409,10 +575,25 @@ public class RetroreSegments extends HeadlessScript {
     private State callState(Instruction instruction, State input) throws Exception {
         State callee = new State();
         callee.set(cs, targetCS(instruction, input));
-        for (Register segment : List.of(ds, es, ss)) {
-            callee.set(segment, input.registers.get(segment));
+        for (Register segment : segmentRegisters) {
+            Integer value = input.registers.get(segment);
+            if (value == null) {
+                callee.lose(segment, input.losses.get(segment));
+            } else {
+                callee.set(segment, value);
+            }
         }
+        // The callee sees the caller's pushed arguments below its return address.
+        callee.stack.addAll(input.stack);
+        for (int word = farCall(instruction) ? 2 : 1; word > 0; word--) {
+            callee.push(null);
+        }
+        callee.height = 0;
         return callee;
+    }
+
+    private static boolean farCall(Instruction instruction) throws Exception {
+        return (instruction.getByte(0) & 0xff) == 0x9a || instruction.getMnemonicString().endsWith("F");
     }
 
     private Integer targetCS(Instruction instruction, State input) throws Exception {
@@ -427,51 +608,368 @@ public class RetroreSegments extends HeadlessScript {
         return input.registers.get(cs);
     }
 
-    private State transfer(Instruction instruction, State input) {
+    // Compute a summary for every function, letting callers use their callees' summaries, until no
+    // summary changes or the pass limit is reached.
+    private void summarize(Map<Address, Summary> summaries, boolean contextual) throws Exception {
+        var functions = currentProgram.getFunctionManager();
+        for (int pass = 0; pass < SUMMARY_PASSES; pass++) {
+            boolean changed = false;
+            for (var function : functions.getFunctions(true)) {
+                monitor.checkCancelled();
+                Address entry = function.getEntryPoint();
+                State start = new State();
+                for (int index = 0; index < summarized.size(); index++) {
+                    start.set(summarized.get(index), SYMBOL + index);
+                }
+                var assumptions = new HashMap<Register, Integer>();
+                if (contextual) {
+                    State known = states.get(entry);
+                    for (Register segment : segmentRegisters) {
+                        Integer value = known == null ? null : known.registers.get(segment);
+                        if (value != null) {
+                            assumptions.put(segment, value);
+                            start.set(segment, value);
+                        }
+                    }
+                    start.set(cs, known == null ? null : known.registers.get(cs));
+                    if (assumptions.isEmpty()) {
+                        continue;
+                    }
+                }
+                Summary summary = summarize(function, start, assumptions);
+                if (!Objects.equals(summaries.get(entry), summary)) {
+                    changed = true;
+                    if (summary == null) {
+                        summaries.remove(entry);
+                    } else {
+                        summaries.put(entry, summary);
+                    }
+                }
+            }
+            if (!changed) {
+                break;
+            }
+        }
+    }
+
+    private Summary summarize(ghidra.program.model.listing.Function function, State start,
+            Map<Register, Integer> assumptions) throws Exception {
+        var body = function.getBody();
+        var local = new HashMap<Address, State>();
+        var queue = new ArrayDeque<Address>();
+        Address entry = function.getEntryPoint();
+        local.put(entry, start);
+        queue.add(entry);
+        State exit = null;
+        Integer purge = null;
+        Boolean far = null;
+        boolean balanced = true;
+        for (int steps = 0; !queue.isEmpty(); steps++) {
+            if (steps == SUMMARY_STEPS) {
+                return null;
+            }
+            Address address = queue.remove();
+            Instruction instruction = getInstructionAt(address);
+            if (instruction == null) {
+                return null;
+            }
+            State input = local.get(address);
+            String mnemonic = instruction.getMnemonicString();
+            if (mnemonic.startsWith("RET") || mnemonic.startsWith("IRET")) {
+                if (exit == null) {
+                    exit = input.copy();
+                } else {
+                    exit.merge(input, address);
+                }
+                int opcode = instruction.getByte(0) & 0xff;
+                boolean farReturn = opcode == 0xca || opcode == 0xcb;
+                int words = opcode == 0xc2 || opcode == 0xca ? (int) instruction.getScalar(0).getUnsignedValue() / 2 : 0;
+                if (opcode == 0xcf || input.height != 0 || (purge != null && purge != words) ||
+                        (far != null && far != farReturn)) {
+                    balanced = false;
+                }
+                purge = words;
+                far = farReturn;
+                continue;
+            }
+            var flow = instruction.getFlowType();
+            State output = transfer(instruction, input);
+            if (flow.isJump()) {
+                Address[] targets = instruction.getFlows();
+                if (flow.isComputed() && targets.length == 0) {
+                    return null;
+                }
+                for (Address target : targets) {
+                    if (!body.contains(target)) {
+                        return null;
+                    }
+                    offerLocal(local, queue, target, output);
+                }
+            }
+            Address next = instruction.getFallThrough();
+            if (next != null) {
+                if (!body.contains(next)) {
+                    return null;
+                }
+                offerLocal(local, queue, next, output);
+            }
+        }
+        if (exit == null) {
+            return null;
+        }
+        var exits = new HashMap<Register, Integer>();
+        for (Register register : summarized) {
+            Integer value = exit.registers.get(register);
+            if (value != null) {
+                exits.put(register, value);
+            }
+        }
+        return new Summary(exits, balanced ? purge : null, far, assumptions);
+    }
+
+    private static void offerLocal(Map<Address, State> local, ArrayDeque<Address> queue, Address address, State state) {
+        State previous = local.get(address);
+        if (previous == null) {
+            local.put(address, state.copy());
+            queue.add(address);
+        } else if (previous.merge(state, address)) {
+            queue.add(address);
+        }
+    }
+
+    private Summary summaryAt(Instruction instruction, State input) {
+        Address[] targets = instruction.getFlows();
+        if (targets.length != 1 || instruction.getFlowType().isComputed()) {
+            return null;
+        }
+        Summary contextual = contextSummaries.get(targets[0]);
+        if (contextual != null && contextual.assumptions().entrySet().stream().allMatch(
+                assumption -> assumption.getValue().equals(input.registers.get(assumption.getKey())))) {
+            return contextual;
+        }
+        return symbolicSummaries.get(targets[0]);
+    }
+
+    // Apply the callee's summary: preserved and set registers carry over, and the caller's stack
+    // loses the arguments the callee removes. Without a summary, keep DS and SS by convention.
+    private void applyCall(Instruction instruction, State input, State output) throws Exception {
+        Address at = instruction.getAddress();
+        Summary summary = summaryAt(instruction, input);
+        Address[] targets = instruction.getFlows();
+        String callee = targets.length == 1 ? targets[0].toString() : "an indirect target";
+        for (Register register : summarized) {
+            boolean conventional = register.equals(ds) || register.equals(ss);
+            Integer exit = summary == null ? null : summary.exits().get(register);
+            if (exit == null) {
+                if (!conventional) {
+                    output.lose(register, summary == null
+                        ? new Loss(at, "unknown_call", "no summary for " + callee)
+                        : new Loss(at, "call", callee + " changes " + register.getName()));
+                }
+            } else if (exit >= SYMBOL) {
+                Register source = summarized.get(exit - SYMBOL);
+                Integer value = input.registers.get(source);
+                if (value != null) {
+                    output.set(register, value);
+                } else {
+                    Loss loss = input.losses.get(source);
+                    output.lose(register, loss != null ? loss
+                        : new Loss(at, "call", callee + " copies " + source.getName() + " into " + register.getName()));
+                }
+            } else {
+                output.set(register, exit);
+            }
+        }
+        boolean keepFrame = summary == null || Integer.valueOf(SYMBOL + summarized.indexOf(bp)).equals(summary.exits().get(bp));
+        if (summary != null && summary.purge() != null) {
+            // PUSH CS / CALL near / RETF also removes the pushed CS.
+            output.drop(summary.purge() + (summary.far() && !farCall(instruction) ? 1 : 0));
+        } else {
+            output.forgetStack();
+        }
+        if (!keepFrame) {
+            output.frame = null;
+            output.frameHeight = UNKNOWN_HEIGHT;
+        }
+    }
+
+    private State transfer(Instruction instruction, State input) throws Exception {
         State output = input.copy();
+        Address at = instruction.getAddress();
         String op = instruction.getMnemonicString();
         Register dest = instruction.getNumOperands() == 0 ? null : instruction.getRegister(0);
+        boolean stackWritten = false;
         for (Object result : instruction.getResultObjects()) {
             if (result instanceof Register written) {
-                output.registers.keySet().removeIf(
-                    tracked -> tracked.getBaseRegister().equals(written.getBaseRegister()));
-                if (written.getBaseRegister().equals(sp.getBaseRegister())) {
-                    output.stack.clear();
+                Register base = written.getBaseRegister();
+                if (base.equals(sp.getBaseRegister())) {
+                    stackWritten = true;
+                    continue;
+                }
+                if (base.equals(bp.getBaseRegister())) {
+                    output.frame = null;
+                    output.frameHeight = UNKNOWN_HEIGHT;
+                }
+                var affected = new HashSet<>(output.registers.keySet());
+                affected.addAll(summarized);
+                for (Register tracked : affected) {
+                    if (tracked.getBaseRegister().equals(base)) {
+                        output.lose(tracked, new Loss(at, "write", instruction.toString()));
+                    }
                 }
             }
         }
 
-        if (op.equals("PUSH") || op.equals("POP") || op.equals("PUSHF") || op.equals("POPF")) {
-            output.stack.clear();
-            output.stack.addAll(input.stack);
-            if (op.startsWith("PUSH")) {
-                if (output.stack.size() == STACK_LIMIT) {
-                    output.stack.removeFirst();
-                }
-                output.stack.add(op.equals("PUSH") ? value(instruction, 0, input) : null);
-            } else {
-                Integer word = output.stack.isEmpty() ? null : output.stack.removeLast();
-                if (dest != null && dest.getBitLength() == 16) {
+        boolean stackHandled = false;
+        if (op.equals("PUSH") || op.equals("PUSHF")) {
+            output.push(op.equals("PUSH") ? value(instruction, 0, input) : null);
+            stackHandled = true;
+        } else if (op.equals("POP") || op.equals("POPF")) {
+            Integer word = output.pop();
+            if (dest != null && dest.getBitLength() == 16) {
+                if (word != null) {
                     output.set(dest, word);
+                } else {
+                    output.lose(dest, new Loss(at, "pop", "the popped word is not tracked"));
                 }
             }
-        } else if (instruction.getFlowType().isCall() || op.equals("INT") || op.equals("INTO")) {
-            // Assume the usual DOS calling convention for DS and SS. ES and general registers
-            // can be clobbered and a callee can remove arguments from the stack.
-            output.registers.keySet().retainAll(List.of(cs, ds, ss));
-            output.stack.clear();
-        } else if (dest != null && dest.getBitLength() == 16) {
-            if (op.equals("MOV")) {
-                output.set(dest, value(instruction, 1, input));
-            } else if (op.equals("XOR") && dest.equals(instruction.getRegister(1))) {
-                output.set(dest, 0);
-            } else if (op.equals("XCHG") && instruction.getRegister(1) != null) {
-                Register source = instruction.getRegister(1);
-                output.set(dest, input.registers.get(source));
-                output.set(source, input.registers.get(dest));
+            stackHandled = true;
+        } else if (op.equals("INT") || op.equals("INTO")) {
+            // Assume interrupt handlers keep DS, SS, and the stack; ES and general registers can change.
+            for (Register register : summarized) {
+                if (!register.equals(ds) && !register.equals(ss)) {
+                    output.lose(register, new Loss(at, "interrupt", instruction.toString()));
+                }
+            }
+            stackHandled = true;
+        } else if (instruction.getFlowType().isCall()) {
+            applyCall(instruction, input, output);
+            stackHandled = true;
+        } else if (op.equals("LEAVE")) {
+            restoreFrame(input, output);
+            Integer saved = output.pop();
+            output.set(bp, saved);
+            stackHandled = true;
+        } else if (dest != null && dest.equals(sp)) {
+            Scalar scalar = instruction.getScalar(1);
+            int amount = scalar == null ? -1 : (int) scalar.getUnsignedValue() & WORD_MASK;
+            if ((op.equals("ADD") || op.equals("SUB")) && amount >= 0 && amount % 2 == 0 &&
+                    instruction.getRegister(1) == null) {
+                for (int word = 0; word < amount / 2; word++) {
+                    if (op.equals("ADD")) {
+                        output.pop();
+                    } else {
+                        output.push(null);
+                    }
+                }
+                stackHandled = true;
+            } else if (op.equals("MOV") && bp.equals(instruction.getRegister(1))) {
+                restoreFrame(input, output);
+                stackHandled = true;
+            }
+        } else if (op.equals("MOV") && bp.equals(dest) && sp.equals(instruction.getRegister(1))) {
+            output.frame = new ArrayList<>(input.stack);
+            output.frameHeight = input.height;
+        }
+        if (stackWritten && !stackHandled) {
+            output.forgetStack();
+        }
+
+        if (op.equals("LES") || op.equals("LDS")) {
+            Register segment = op.equals("LES") ? es : ds;
+            Integer offset = null;
+            Integer selector = null;
+            for (Access access : accesses(instruction)) {
+                if (access.operand() == 1) {
+                    offset = offsetWord(access, input);
+                    selector = memoryWord(access, input, 2);
+                }
+            }
+            if (dest != null) {
+                setOrLose(output, dest, offset, new Loss(at, "load", "the far pointer offset is not a known constant"));
+            }
+            setOrLose(output, segment, selector, new Loss(at, "load", "the far pointer segment is not a relocated word"));
+        } else if (dest != null && dest.getBitLength() == 16 && !dest.equals(sp)) {
+            Integer result = null;
+            boolean handled = true;
+            Integer left = input.registers.get(dest);
+            switch (op) {
+                case "MOV" -> result = value(instruction, 1, input);
+                case "XOR", "SUB" -> {
+                    if (dest.equals(instruction.getRegister(1))) {
+                        result = 0;
+                    } else if (op.equals("SUB")) {
+                        result = arithmetic(left, value(instruction, 1, input), -1);
+                    }
+                }
+                case "ADD" -> result = arithmetic(left, value(instruction, 1, input), 1);
+                case "INC" -> result = arithmetic(left, 1, 1);
+                case "DEC" -> result = arithmetic(left, 1, -1);
+                case "LEA" -> result = effectiveOffset(instruction, 1, input);
+                case "XCHG" -> {
+                    Register source = instruction.getRegister(1);
+                    if (source != null) {
+                        Integer right = input.registers.get(source);
+                        setOrLose(output, source, left, input.losses.get(dest));
+                        result = right;
+                    }
+                }
+                default -> handled = false;
+            }
+            if (handled) {
+                setOrLose(output, dest, result, lossFor(instruction, input));
+            }
+        }
+        if (output.frame != null) {
+            for (Access access : accesses(instruction)) {
+                if (access.type().isWrite()) {
+                    storeFrameWord(output, access, op.equals("MOV") ? value(instruction, 1, input) : null);
+                }
             }
         }
         return output;
+    }
+
+    private static void setOrLose(State output, Register register, Integer value, Loss loss) {
+        if (value == null) {
+            output.lose(register, loss);
+        } else {
+            output.set(register, value);
+        }
+    }
+
+    private void restoreFrame(State input, State output) {
+        if (input.frame == null) {
+            output.forgetStack();
+            return;
+        }
+        output.stack.clear();
+        output.stack.addAll(input.frame);
+        output.height = input.frameHeight;
+    }
+
+    private static Integer arithmetic(Integer left, Integer right, int sign) {
+        if (left == null || right == null || left >= SYMBOL || right >= SYMBOL) {
+            return null;
+        }
+        return (left + sign * right) & WORD_MASK;
+    }
+
+    // Explain why the destination of a register write has no known value.
+    private Loss lossFor(Instruction instruction, State input) {
+        Address at = instruction.getAddress();
+        Register source = instruction.getNumOperands() > 1 ? instruction.getRegister(1) : null;
+        if (source != null && input.losses.containsKey(source) && !input.registers.containsKey(source)) {
+            return input.losses.get(source);
+        }
+        for (Access access : accesses(instruction)) {
+            if (access.operand() == 1) {
+                Address address = target(access, input);
+                return new Loss(at, "load", address == null ? "the operand address is not known"
+                    : "the word at " + address + " is not a relocated segment value");
+            }
+        }
+        return new Loss(at, "write", instruction.toString());
     }
 
     private Integer value(Instruction instruction, int operand, State input) {
@@ -481,54 +979,151 @@ public class RetroreSegments extends HeadlessScript {
         }
         for (Access access : accesses(instruction)) {
             if (access.operand() == operand && access.size() == 2) {
-                Address address = target(access, input);
-                return address == null ? null : words.get(address.getOffset());
+                return memoryWord(access, input, 0);
             }
         }
-        Scalar scalar = instruction.getScalar(operand);
-        if (scalar != null && !instruction.getDefaultOperandRepresentation(operand).contains("[")) {
-            return (int) scalar.getUnsignedValue() & WORD_MASK;
+        if (instruction.getDefaultOperandRepresentation(operand).contains("[")) {
+            return null;
         }
-        return null;
+        Scalar scalar = instruction.getScalar(operand);
+        return scalar == null ? null : (int) scalar.getUnsignedValue() & WORD_MASK;
+    }
+
+    // A stack word addressed as [BP+n]. Arguments and the saved BP come from the words tracked when BP
+    // was set; locals below BP come from the current stack while its height is known.
+    private record Slot(List<Integer> words, int index) {
+        Integer get() {
+            return words.get(index);
+        }
+    }
+
+    private Slot frameSlot(Access access, State state, int delta) {
+        if (!access.bases().equals(List.of(bp)) || !access.segment().equals(ss)) {
+            return null;
+        }
+        return frameSlot(state, (short) access.offset() + delta);
+    }
+
+    private static Slot frameSlot(State state, int displacement) {
+        if (state.frame == null || displacement % 2 != 0) {
+            return null;
+        }
+        if (displacement >= 0) {
+            int index = state.frame.size() - 1 - displacement / 2;
+            return index < 0 ? null : new Slot(state.frame, index);
+        }
+        if (state.height == UNKNOWN_HEIGHT || state.frameHeight == UNKNOWN_HEIGHT) {
+            return null;
+        }
+        int index = state.stack.size() - 1 - (state.height - (state.frameHeight - displacement / 2));
+        return index < 0 || index >= state.stack.size() ? null : new Slot(state.stack, index);
+    }
+
+    private Integer memoryWord(Access access, State state, int delta) {
+        if (access.bases().contains(bp)) {
+            Slot slot = frameSlot(access, state, delta);
+            return slot == null ? null : slot.get();
+        }
+        Address address = target(access, state);
+        return address == null ? null : words.get(address.getOffset() + delta);
+    }
+
+    // The offset half of a far pointer: a tracked frame word, or an initialized word nothing writes.
+    private Integer offsetWord(Access access, State state) throws Exception {
+        if (access.bases().contains(bp)) {
+            Slot slot = frameSlot(access, state, 0);
+            return slot == null ? null : slot.get();
+        }
+        Address address = target(access, state);
+        if (address == null || !words.containsKey(address.getOffset() + 2) ||
+                written.contains(address.getOffset()) || written.contains(address.getOffset() + 1)) {
+            return null;
+        }
+        return currentProgram.getMemory().getShort(address) & WORD_MASK;
+    }
+
+    private void storeFrameWord(State output, Access access, Integer value) {
+        if (!access.bases().equals(List.of(bp)) || !access.segment().equals(ss)) {
+            return;
+        }
+        int start = (short) access.offset();
+        for (int word = Math.floorDiv(start, 2) * 2; word < start + access.size(); word += 2) {
+            Slot slot = frameSlot(output, word);
+            if (slot != null) {
+                slot.words().set(slot.index(), word == start && access.size() == 2 ? value : null);
+            }
+        }
+    }
+
+    private Integer effectiveOffset(Instruction instruction, int operand, State input) {
+        int offset = 0;
+        for (Object object : instruction.getOpObjects(operand)) {
+            if (object instanceof Scalar scalar) {
+                offset += (int) scalar.getValue();
+            } else if (object instanceof Register register && baseRegisters.contains(register)) {
+                Integer value = input.registers.get(register);
+                if (value == null || value >= SYMBOL) {
+                    return null;
+                }
+                offset += value;
+            } else {
+                return null;
+            }
+        }
+        return offset & WORD_MASK;
     }
 
     private List<Access> accesses(Instruction instruction) {
         return accesses.computeIfAbsent(instruction.getAddress(), ignored -> {
             var result = new ArrayList<Access>();
             var pcode = instruction.getPcode();
+            var segmentOps = new ArrayList<PcodeOp>();
+            for (PcodeOp op : pcode) {
+                if (op.getOpcode() == PcodeOp.CALLOTHER && op.getNumInputs() == 3 && op.getInput(1).isRegister() &&
+                        currentProgram.getLanguage().getUserDefinedOpName((int) op.getInput(0).getOffset())
+                            .equals("segment")) {
+                    segmentOps.add(op);
+                }
+            }
+            var computed = segmentOps.stream().filter(op -> !op.getInput(2).isConstant()).toList();
             for (int index = 0; index < instruction.getNumOperands(); index++) {
                 if (!instruction.getDefaultOperandRepresentation(index).contains("[")) {
                     continue;
                 }
-                // Direct memory operands have a displacement and at most a segment override.
+                // Memory operands have a displacement, base and index registers, and a segment override.
                 Register override = null;
-                Integer offset = null;
+                int offset = 0;
+                var bases = new ArrayList<Register>();
+                boolean simple = true;
                 for (Object object : instruction.getOpObjects(index)) {
                     if (object instanceof Scalar scalar) {
-                        offset = (int) scalar.getUnsignedValue() & WORD_MASK;
-                    } else if (object instanceof Register register &&
-                            List.of(cs, ds, es, ss).contains(register)) {
+                        offset = (offset + (int) scalar.getValue()) & WORD_MASK;
+                    } else if (object instanceof Register register && segmentRegisters.contains(register)) {
                         override = register;
+                    } else if (object instanceof Register register && register.equals(cs)) {
+                        override = register;
+                    } else if (object instanceof Register register && baseRegisters.contains(register)) {
+                        bases.add(register);
                     } else {
-                        offset = null;
+                        simple = false;
                         break;
                     }
                 }
-                if (offset == null) {
+                if (!simple) {
                     continue;
                 }
-                for (PcodeOp op : pcode) {
-                    if (op.getOpcode() != PcodeOp.CALLOTHER || op.getNumInputs() != 3 ||
-                            !op.getInput(1).isRegister() || !op.getInput(2).isConstant() ||
-                            op.getInput(2).getOffset() != offset ||
-                            !currentProgram.getLanguage().getUserDefinedOpName(
-                                (int) op.getInput(0).getOffset()).equals("segment")) {
-                        continue;
-                    }
+                final int displacement = offset;
+                var candidates = bases.isEmpty()
+                    ? segmentOps.stream().filter(op -> op.getInput(2).isConstant() &&
+                        op.getInput(2).getOffset() == displacement).toList()
+                    : computed.size() == 1 ? computed : List.<PcodeOp>of();
+                Register expected = override != null ? override : bases.contains(bp) ? ss : ds;
+                for (PcodeOp op : candidates) {
                     var base = op.getInput(1);
                     Register segment = currentProgram.getRegister(base.getAddress(), base.getSize());
-                    if (segment == null || !List.of(cs, ds, es, ss).contains(segment) ||
-                            (override != null && !override.equals(segment))) {
+                    if (segment == null || !(segmentRegisters.contains(segment) || segment.equals(cs)) ||
+                            (override != null && !override.equals(segment)) ||
+                            (!bases.isEmpty() && !expected.equals(segment))) {
                         continue;
                     }
                     boolean read = false;
@@ -547,7 +1142,7 @@ public class RetroreSegments extends HeadlessScript {
                     }
                     if (read || write) {
                         RefType type = write ? (read ? RefType.READ_WRITE : RefType.WRITE) : RefType.READ;
-                        result.add(new Access(index, segment, offset, size, type));
+                        result.add(new Access(index, segment, displacement, List.copyOf(bases), size, type));
                         break;
                     }
                 }
@@ -558,13 +1153,21 @@ public class RetroreSegments extends HeadlessScript {
 
     private Address target(Access access, State state) {
         Integer segment = state.registers.get(access.segment());
-        return segment == null ? null : space.getAddress(segment, access.offset());
+        if (segment == null || segment >= SYMBOL) {
+            return null;
+        }
+        int offset = access.offset();
+        for (Register base : access.bases()) {
+            Integer value = state.registers.get(base);
+            if (value == null || value >= SYMBOL) {
+                return null;
+            }
+            offset += value;
+        }
+        return space.getAddress(segment, offset & WORD_MASK);
     }
 
     private boolean removeWrittenWords() throws Exception {
-        if (words.isEmpty()) {
-            return false;
-        }
         boolean changed = false;
         for (var entry : states.entrySet()) {
             monitor.checkCancelled();
@@ -574,6 +1177,9 @@ public class RetroreSegments extends HeadlessScript {
                     long start = address.getOffset();
                     for (long index = start - 1; index < start + access.size(); index++) {
                         changed |= words.remove(index) != null;
+                        if (index >= start) {
+                            changed |= written.add(index);
+                        }
                     }
                 }
             }
@@ -586,19 +1192,44 @@ public class RetroreSegments extends HeadlessScript {
         var listing = currentProgram.getListing();
         var memory = currentProgram.getMemory();
         var refs = currentProgram.getReferenceManager();
+        var properties = currentProgram.getUsrPropertyManager();
+        properties.removePropertyMap(LOSS_MAP);
+        properties.removePropertyMap(LOSS_ORIGIN_MAP);
+        var lossMap = properties.createStringPropertyMap(LOSS_MAP);
+        var originMap = properties.createStringPropertyMap(LOSS_ORIGIN_MAP);
+        var origins = new TreeMap<Address, Map<String, Loss>>();
+        int direct = 0;
+        int based = 0;
+        int farPointers = 0;
+        var targets = new HashSet<Address>();
         for (var entry : new TreeMap<>(states).entrySet()) {
             monitor.checkCancelled();
             Instruction instruction = getInstructionAt(entry.getKey());
             State state = entry.getValue();
-            for (Register segment : List.of(ds, es, ss)) {
+            var lost = new StringBuilder();
+            for (Register segment : segmentRegisters) {
                 Integer value = state.registers.get(segment);
                 if (value != null) {
                     context.setValue(segment, instruction.getMinAddress(), instruction.getMaxAddress(),
                         BigInteger.valueOf(value));
+                } else if (state.losses.containsKey(segment)) {
+                    Loss loss = state.losses.get(segment);
+                    lost.append(lost.isEmpty() ? "" : ";").append(segment.getName()).append('=')
+                        .append(Long.toHexString(loss.at().getOffset()));
+                    origins.computeIfAbsent(loss.at(), ignored -> new LinkedHashMap<>())
+                        .putIfAbsent(segment.getName(), loss);
                 }
             }
+            if (!lost.isEmpty()) {
+                lossMap.add(entry.getKey(), lost.toString());
+            }
+            String op = instruction.getMnemonicString();
+            if ((op.equals("LES") || op.equals("LDS")) &&
+                    transfer(instruction, state).registers.containsKey(op.equals("LES") ? es : ds)) {
+                farPointers++;
+            }
             for (Access access : accesses(instruction)) {
-                if (access.segment().equals(cs)) {
+                if (access.segment().equals(cs) || access.bases().contains(bp)) {
                     continue;
                 }
                 Address target = target(access, state);
@@ -615,9 +1246,51 @@ public class RetroreSegments extends HeadlessScript {
                     SourceType.ANALYSIS, access.operand());
                 refs.setPrimary(ref, true);
                 nameGlobal((SegmentedAddress) target, access.size());
+                if (access.bases().isEmpty()) {
+                    direct++;
+                } else {
+                    based++;
+                }
+                targets.add(target);
             }
         }
+        for (var origin : origins.entrySet()) {
+            var lines = new StringBuilder();
+            for (var loss : origin.getValue().entrySet()) {
+                lines.append(loss.getKey()).append('\t').append(loss.getValue().reason()).append('\t')
+                    .append(loss.getValue().detail().replace('\t', ' ').replace('\n', ' ')).append('\n');
+            }
+            originMap.add(origin.getKey(), lines.toString());
+        }
+
+        int functionCount = 0;
+        var known = new LinkedHashMap<String, Integer>();
+        var entryLosses = new LinkedHashMap<String, Map<String, Integer>>();
+        for (Register segment : segmentRegisters) {
+            known.put(segment.getName(), 0);
+            entryLosses.put(segment.getName(), new TreeMap<>());
+        }
+        for (var function : currentProgram.getFunctionManager().getFunctions(true)) {
+            functionCount++;
+            State state = states.get(function.getEntryPoint());
+            for (Register segment : segmentRegisters) {
+                if (state != null && state.registers.get(segment) != null) {
+                    known.merge(segment.getName(), 1, Integer::sum);
+                } else {
+                    Loss loss = state == null ? null : state.losses.get(segment);
+                    entryLosses.get(segment.getName()).merge(loss == null ? "none" : loss.reason(), 1, Integer::sum);
+                }
+            }
+        }
+        segmentStats.put("data_references", direct + based);
+        segmentStats.put("register_references", based);
+        segmentStats.put("far_pointer_loads", farPointers);
+        segmentStats.put("data_targets", targets.size());
+        segmentStats.put("functions", functionCount);
+        segmentStats.put("entry_known", known);
+        segmentStats.put("entry_losses", entryLosses);
     }
+
 
     private void nameGlobal(SegmentedAddress address, int size) throws Exception {
         var listing = currentProgram.getListing();
@@ -630,11 +1303,17 @@ public class RetroreSegments extends HeadlessScript {
             default -> null;
         };
         if (type != null && block.getEnd().subtract(address) >= size - 1L) {
+            // Replace only undefined bytes or Ghidra's sized placeholders (undefined2 and the like)
+            // that lie entirely within the access.
+            Address end = address.addNoWrap(size - 1);
             boolean undefined = true;
-            for (int index = 0; index < size; index++) {
-                undefined &= listing.getUndefinedDataAt(address.addNoWrap(index)) != null;
+            for (int index = 0; index < size && undefined; index++) {
+                var unit = listing.getDataContaining(address.addNoWrap(index));
+                undefined = unit != null && Undefined.isUndefined(unit.getDataType()) &&
+                    unit.getMinAddress().compareTo(address) >= 0 && unit.getMaxAddress().compareTo(end) <= 0;
             }
             if (undefined) {
+                listing.clearCodeUnits(address, end, false);
                 listing.createData(address, type);
             }
         }

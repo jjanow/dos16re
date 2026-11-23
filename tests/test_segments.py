@@ -24,7 +24,9 @@ def _import_program(tmp_path, capsys, exe, *options):
     assert main(["load", str(exe), "-o", str(export), "--json", *options]) == 0
     program = json.loads(capsys.readouterr().out)
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
-    assert json.loads(capsys.readouterr().out)["units"] == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["units"] == 1
+    program["import"] = report
     return project, program
 
 
@@ -108,19 +110,233 @@ def test_tracks_segment_values_and_drops_conflicting_or_mutable_values(tmp_path,
     assert json.loads(capsys.readouterr().out)["segments"]["ES"] is None
 
 
+class _Code:
+    """Assemble 16-bit code from hex chunks with near-call labels and relocated segment immediates."""
+
+    def __init__(self):
+        self.data = bytearray()
+        self.labels = {}
+        self.calls = []
+        self.relocations = []
+
+    def emit(self, text):
+        self.data += bytes.fromhex(text)
+
+    def label(self, name):
+        self.labels[name] = len(self.data)
+
+    def call(self, name, opcode=b"\xe8"):
+        self.data += opcode + b"\0\0"
+        self.calls.append((len(self.data) - 2, name))
+
+    def jump(self, name):
+        self.call(name, b"\xe9")
+
+    def segment(self, opcode, paragraph):
+        self.emit(opcode)
+        self.relocations.append(len(self.data))
+        self.data += paragraph.to_bytes(2, "little")
+
+    def finish(self):
+        for position, name in self.calls:
+            pack_into("<h", self.data, position, self.labels[name] - position - 2)
+        return bytes(self.data)
+
+
+def test_carries_segments_across_calls_far_pointers_and_frames(tmp_path, capsys):
+    code = _Code()
+    code.segment("b8", 0x20)
+    code.emit("8e d8")                              # DS = DGROUP
+    code.call("set_es")
+    code.label("after_set")
+    code.emit("26 a1 10 00")                        # the callee set ES = FAR
+    code.call("keep_es")
+    code.label("after_keep")
+    code.emit("26 a3 12 00")                        # the callee saved and restored ES
+    code.emit("8c db 8e c3")                        # mov bx, ds; mov es, bx
+    code.label("alias")
+    code.emit("26 a3 14 00")
+    code.emit("c4 3e 40 00")                        # les di, [0x40]: relocated far pointer in DGROUP
+    code.label("far_pointer")
+    code.emit("26 8b 45 02")                        # mov ax, es:[di+2]
+    code.segment("b8", 0x30)
+    code.emit("50 b8 30 00 50")                     # push FAR; push 0x30
+    code.call("pointer_argument")
+    code.segment("b8", 0x30)
+    code.emit("8e c0")                              # ES = FAR
+    code.call("frame")
+    code.label("after_frame")
+    code.emit("26 a3 20 00")                        # the callee restored ES from its frame
+    code.call("clobber")
+    code.label("after_clobber")
+    code.emit("26 a3 16 00")
+    code.emit("1e 07 ff d6")                        # push ds; pop es; call si
+    code.label("after_unknown_call")
+    code.emit("26 a3 18 00")
+    code.emit("1e 07 85 db 74 05")                  # ES = DGROUP, or FAR on one path
+    code.segment("b8", 0x30)
+    code.emit("8e c0")
+    code.label("join")
+    code.emit("26 a3 1a 00")
+    code.emit("8e 06 46 00")                        # mov es, [0x46]: not a relocated word
+    code.label("after_load")
+    code.emit("26 a3 1c 00")
+    code.emit("b8 00 4c cd 21 eb fe")
+    code.label("set_es")
+    code.segment("b8", 0x30)
+    code.emit("8e c0 c3")
+    code.label("keep_es")
+    code.emit("06")
+    code.segment("b8", 0x40)
+    code.emit("8e c0 26 a3 00 00 07 c3")
+    code.label("pointer_argument")
+    code.emit("55 8b ec c4 5e 04")                  # les bx, [bp+4]
+    code.label("argument_use")
+    code.emit("26 8b 07 5d c2 04 00")               # mov ax, es:[bx]; pop bp; ret 4
+    code.label("clobber")
+    code.emit("8e 06 44 00 c3")
+    code.label("frame")
+    code.emit("55 8b ec 83 ec 02 8c 46 fe")         # save ES in a local
+    code.call("clobber")
+    code.emit("8e 46 fe")                           # restore ES from the local
+    code.label("frame_use")
+    code.emit("26 a1 1e 00 8b e5 5d c3")
+    image = bytearray(0x480)
+    image[:len(code.data)] = code.finish()
+    pack_into("<4H", image, 0x240, 0x20, 0x40, 0x1234, 0x5678)
+    relocations = [(position, 0) for position in code.relocations] + [(0x42, 0x20)]
+    header = bytearray(0x1C + 4 * len(relocations))
+    header += bytes(-len(header) % 16)
+    file_size = len(header) + len(image)
+    pack_into(
+        "<2s13H", header, 0,
+        b"MZ", file_size % 512, (file_size + 511) // 512, len(relocations), len(header) // 16, 0, 0,
+        0x46, 0x3E, 0, 0, 0, 0x1C, 0,
+    )
+    for index, (offset, segment) in enumerate(relocations):
+        pack_into("<2H", header, 0x1C + 4 * index, offset, segment)
+    exe = tmp_path / "calls.exe"
+    exe.write_bytes(header + image)
+    project, program = _import_program(tmp_path, capsys, exe, "--base-segment", "2000")
+    assert program["relocations"] == sorted([*code.relocations, 0x242])
+
+    def at(name):
+        return f"2000:{code.labels[name]:04x}"
+
+    _check_references(
+        project,
+        f"{at('after_set')},ES,2030,1,2030:0010,word,FAR2030_0010",
+        f"{at('after_keep')},ES,2030,0,2030:0012,word,FAR2030_0012",
+        f"{at('alias')},ES,2020,0,2020:0014,word,DGROUP_0014",
+        f"{at('far_pointer')},ES,2040,1,2040:0022,word,FAR2040_0022",
+        f"{at('argument_use')},ES,2030,1,2030:0030,word,FAR2030_0030",
+        f"{at('frame_use')},ES,2030,1,2030:001e,word,FAR2030_001e",
+        f"{at('after_frame')},ES,2030,0,2030:0020,word,FAR2030_0020",
+        f"{at('after_clobber')},ES,?",
+        f"{at('after_unknown_call')},ES,?",
+        f"{at('join')},ES,?",
+        f"{at('after_load')},ES,?",
+    )
+
+    # Each unknown ES names the instruction that lost it: the call, the join, or the load.
+    expected = {
+        "after_clobber": ("call", 3),
+        "after_unknown_call": ("unknown_call", 2),
+        "join": ("join", 0),
+        "after_load": ("load", 4),
+    }
+    for name, (reason, back) in expected.items():
+        assert main(["func", at(name), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        report = json.loads(capsys.readouterr().out)
+        assert report["segments"]["ES"] is None
+        loss = report["segment_losses"]["ES"]
+        assert (loss["reason"], loss["address"]["linear"]) == (reason, 0x20000 + code.labels[name] - back), loss
+    assert main(["func", at("after_load"), "--project", str(project)]) == 0
+    assert "ES lost at root:" in capsys.readouterr().out
+
+
+def _mz(code, data):
+    """Wrap code at paragraph 0 and DGROUP words at paragraph 0x20 in an MZ file."""
+    image = bytearray(0x480)
+    image[:len(code.data)] = code.finish()
+    pack_into(f"<{len(data)}H", image, 0x200, *data)
+    relocations = code.relocations
+    header = bytearray(0x1C + 4 * len(relocations))
+    header += bytes(-len(header) % 16)
+    file_size = len(header) + len(image)
+    pack_into(
+        "<2s13H", header, 0,
+        b"MZ", file_size % 512, (file_size + 511) // 512, len(relocations), len(header) // 16, 0, 0,
+        0x46, 0x3E, 0, 0, 0, 0x1C, 0,
+    )
+    for index, offset in enumerate(relocations):
+        pack_into("<2H", header, 0x1C + 4 * index, offset, 0)
+    return bytes(header + image)
+
+
+def test_jumps_into_another_function_keep_its_context(tmp_path, capsys):
+    code = _Code()
+    code.segment("b8", 0x20)
+    code.emit("8e d8")                              # DS = DGROUP
+    code.call("shared")
+    code.call("tail")
+    code.call("error")
+    code.call("entry_jump")
+    code.emit("b8 00 4c cd 21 eb fe")
+    code.label("shared")
+    code.emit("90")
+    code.label("middle")
+    code.emit("a1 10 00 c3")                        # mov ax, [0x10]; ret
+    code.label("tail")
+    code.emit("a1 12 00 c3")
+    code.label("error")
+    code.segment("b8", 0x30)
+    code.emit("8e d8")                              # DS = FAR
+    code.jump("middle")
+    code.label("entry_jump")
+    code.segment("b8", 0x30)
+    code.emit("8e d8")                              # DS = FAR
+    code.jump("tail")
+    exe = tmp_path / "jumps.exe"
+    exe.write_bytes(_mz(code, [0x1111, 0x2222, 0x3333]))
+    project, program = _import_program(tmp_path, capsys, exe, "--base-segment", "2000")
+    assert program["import"]["segment_analysis"]["skipped_jumps"] >= 1
+
+    # The error path's jump into the middle of `shared` does not erase the DGROUP that `shared`
+    # receives from its caller, while the jump to `tail`'s entry still joins its context.
+    _check_references(
+        project,
+        f"2000:{code.labels['middle']:04x},DS,2020,1,2020:0010,word,DGROUP_0010",
+        f"2000:{code.labels['tail']:04x},DS,?",
+    )
+    assert main(["func", f"2000:{code.labels['tail']:04x}", "--project", str(project), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["segment_losses"]["DS"]["reason"] == "join"
+
+
 def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
     directory = os.environ.get("RETRORE_PH3_DIR")
     if not directory:
         pytest.skip("set RETRORE_PH3_DIR to run the real-game test")
     exe = next(path for path in Path(directory).iterdir() if path.name.upper() == "MAIN.EXE")
-    project, _ = _import_program(tmp_path, capsys, exe)
+    project, program = _import_program(tmp_path, capsys, exe)
 
     # The save-game code reads and writes a word through the relocated FAR segment.
+    # 1000:125d, called from main, keeps DGROUP now that a misread jump table no longer joins
+    # main's context. int86 at 1000:5276 and 1000:2840 receive far pointers that every caller
+    # pushes as relocated FAR segment and offset.
     _check_references(
         project,
         "13b2:452a,ES,2820,1,2820:97f0,word,FAR2820_97f0",
         "13b2:467d,ES,2820,0,2820:97f0,word,FAR2820_97f0",
+        "1000:1274,ES,2820,0,2820:aa30,word,FAR2820_aa30",
+        "1000:52af,DS,2820,1,2820:b7f6,word,FAR2820_b7f6",
+        "1000:2851,ES,2820,0,2820:09fa,byte,FAR2820_09fa",
     )
+    # Before summaries and loss tracking, 247 of 380 functions entered with a known DS and the
+    # import added 1,903 data references.
+    analysis = program["import"]["segment_analysis"]
+    assert analysis["entry_known"]["DS"] >= 360
+    assert analysis["data_references"] >= 2500
 
 
 def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, monkeypatch):
