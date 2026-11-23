@@ -283,21 +283,57 @@ The analysis backlog below applies to existing and future platforms.
 
 ### Phase 9: better code and data recovery
 
-- Extend DOS segment analysis to track CS, DS, ES, and SS across call boundaries with per-function
-  summaries. Recover `LDS`/`LES`, stack-relative pointers, segment aliases, and far pointers built
-  from relocation-backed words and offset arithmetic. Track selective memory effects and show
-  where joined paths or unknown calls caused loss of precision.
-- Recover more compiler switch patterns, near and far indirect calls, callback tables, tail calls,
-  and dispatch through writable tables. Keep candidate targets and their evidence when a target
-  cannot be proved. Apply equivalent recovery to banked and position-independent code as available.
-- Improve calling-convention recovery for Pascal, C, and assembly, including segmented pointer
-  arguments, stack cleanup, register parameters, and return locations. Expand runtime signatures
-  with synthetic probes and match known OS calls and hardware interfaces per platform.
-- Detect likely code in undefined ranges, flag conflicting code and data interpretations, and
-  corroborate candidates with call targets, relocations, and traces.
-- Recover typed arrays, packed records, globals, strings, and table layouts from access patterns.
-  Explain widths, strides, and conflicting observations. Add platform-aware string search,
-  relocation and pointer searches, and entry-point and symbol lookup across units.
+- **Implemented for DOS.** Segment values carry across calls through per-function summaries (registers
+  preserved, set, or copied, and argument words popped), with contextual summaries for agreeing callers
+  and at most 4 rounds. The analysis follows the stack and `[BP+n]` slots, resolves `LES`/`LDS` from
+  relocated far pointers in memory or from a far pointer every caller passes, and resolves `[BX/SI/DI+n]`
+  operands with known registers. `func` reports `segment_losses` (where and why each unknown segment
+  register was lost). A jump into another function's middle no longer passes its segment state there,
+  which is not strictly sound for shared runtime tails; the import counts these jumps.
+  **Validated:** Phantasie III's import adds 2,548 data references (was 1,903). The functions entering
+  with DS known rose from 247 of 380 to 365. `1000:1274` references `FAR2820_aa30`, and `int86` at
+  `1000:5276` resolves `LDS DI,[BP+8]` to `FAR2820_b7f6` from all 5 callers. Pool of Radiance
+  `root:852f` resolves `LES DI,ES:[DI]` to `root_bss:114e`.
+  Open: SS stays unknown at functions no analyzed caller reaches; stack slots go stale after writes
+  through `[BP+SI+n]`, string instructions, or unresolved pointers; Ghidra keeps its own references where
+  retrore records ES as unknown; most PoR heap far pointers can't be resolved statically.
+- **Implemented.** More switch patterns: `jbe`/`jb` bounds, `sub` bias, mask bounds, byte indexes, and
+  near call tables. A root switch is read against the nearest relocated code segment. The XC 68k switch is
+  recognized on X68000. A pass after segment analysis keeps candidate targets for unresolved indirect calls
+  and jumps, with evidence and the writer's address (`indirect` query). `gaps --classify` scores gaps as
+  code, data, or padding with evidence. A gap whose entry a relocated pointer names, that has a prologue,
+  and that decodes cleanly is seeded as a function. Ghidra already treats tail jumps to function entries as calls.
+  **Validated:** Phantasie III recovers 22 tables (was 0), including the sound driver's call table
+  at `218f:0bcc`, and has 448 functions (was 380). `root:532c`, reached only through a relocated far
+  pointer, is now a function. Phantasie I has 17 tables (was 15), and Mystic SCORE still decompiles.
+  P4.X resolves all 41 computed jumps (was 32). In Pool of Radiance, `tpov_0096:0d70 CALLF [0x6b84]` gets
+  candidates `root:0994` and `root:06e6`, written at `tpov_0035:006f` and `:008b`.
+  Open: sites with unknown DS; PH3's 256-entry byte-index table at `root:13721`; far CS jump tables;
+  trace coverage as gap evidence; 68k switches for the Amiga and Atari ST loaders.
+- **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
+  It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry
+  as a result. X68000 DOS stubs have prototypes for about 80 calls. Call fixups model stacked FPACK
+  remainder, conversion, float, double, and compare helpers. `trap #15` IOCS calls are named.
+  **Validated:** P4.X shows `DOS::_WRITE(handle,buffer,length)` in `_write` at `text:3c2dc`,
+  `uVar2 % param_1 + 1` in `_rand`, and `(dVar2 + dVar1) / local_24` in `_avg_attr`. Pool of Radiance
+  names 35 `int 21h` sites. It recovers 491 callee-cleanup functions and 356 far pointer arguments, and
+  Seek at `root:c4e3` tests `extraout_CF` instead of a multiply's carry.
+  Open: new runtime signatures need original toolchains for probes (none on the dev machine); PH3's
+  medium-model MSC runtime; `_frand` lost the `_rand` argument after the fixups; a leftover `swi(0x21)`
+  before each named service; IOCS register arguments; DX:AX and Real48 returns; functions taking register
+  arguments.
+- **Implemented.** Searches without Ghidra: `where-is --string` tries each platform's encodings
+  (PETSCII and screen codes, high-bit Apple II, ATASCII, Shift-JIS, and others), `--pointer` finds
+  stored near, far, or absolute pointers and marks relocated ones, `relocs` filters relocations, and
+  `lookup` finds symbols by name pattern or nearest address. The `layout` query infers arrays, records,
+  and strings from accesses. It reports strides with their evidence, count bounds, fields, conflicts,
+  and a C proposal. `--apply` creates the type.
+  **Validated:** P4.X `_gmb` at `88f9c` is 10 × 190-byte records (stride from `text:1754`). Phantasie III's
+  roster at `2820:e820` is 20 × 262 bytes (stride from `root:1f8c`). Atari 8-bit Phantasie I's
+  copy-protection quiz is found in screen codes at `9f5c`, and C64 "Minotaur" in PETSCII at `TOWNR:0187`.
+  Open: Apple II strings on real data; split low/high 6502 address tables; 68k short absolute pointers;
+  `layout` drops functions beyond `max_functions` without a truncation flag; `--apply` replaces existing
+  data without a separate warning.
 
 ### Phase 10: inspectable evidence and reusable analysis
 
