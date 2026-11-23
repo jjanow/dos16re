@@ -12,16 +12,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22 (second session), fixed automatic overlay placement (Phase 1) and added the persistent
-query worker (Phase 8). Overlay units now start above the root's stack and minimum allocation, and the
-importer adds an uninitialized `root_bss` block, so PoR's `DGROUP_4433` keeps its name. Through a warm
-worker, a PoR question that took 8 to 12 s batched now answers in about 0.1 s, and a CLI query through
-the daemon in about 0.11 s. `tools/deploy.sh --hooks --mcp` deploys committed `main` to
-`~/.local/share/retrore`, registers `retrore mcp` with Claude Code at user scope, and redeploys from git
-hooks when `main` moves. With Ghidra 12.2 and the PoR and Phantasie I/III inputs, 327 tests passed with
-23 skipped; the standalone suite passed 302 with 48 skipped.
+On 2026-11-22 (third session), closed the POSIX worker follow-ups in Phase 8. `ghidra import` and
+`worker stop` now cancel a running worker query instead of waiting up to about 60 s and then
+reporting `project_locked`. Daemons follow each caller's Ghidra installation and
+`JAVA_HOME`, and leave no lock or log files after a clean exit. A cancellation or timeout during a
+worker request no longer passes through the one-shot fallback, because `GhidraError` is a
+`ValueError` and was caught as an unreadable response. With Ghidra 12.2 and the PoR and Phantasie I/III inputs, 330
+tests passed with 23 skipped. The standalone suite passed 305 with 48 skipped.
 
-Resume with the worker follow-ups under Phase 8, then Sharp X68000 and Phase 9.
+Resume with Sharp X68000, then Phase 9. Windows worker hosting remains untested.
 
 ## Why
 
@@ -251,10 +250,12 @@ The analysis backlog below applies to existing and future platforms.
   request stops the worker's process group, and a request the worker cannot answer runs one-shot.
   `ghidra import` stops the project's worker first, and `RETRORE_WORKER=0` opts out. Workers exit
   after 15 idle minutes. Measured against the PoR questions in [benchmarks](docs/benchmarks.md).
-- **Open.** Worker follow-ups: `ghidra import` waits only about 60 s for a running worker query and
-  then reports `project_locked` instead of cancelling it. A daemon keeps the environment and
-  `GHIDRA_HOME` of whoever started it. Empty `.lock` and small `.log` files remain in the runtime
-  directory after daemons exit. In-process hosting on Windows is untested, and Windows has no daemon.
+- **Implemented.** Stopping a worker host (`ghidra import`, `worker stop`, idle exit) cancels the
+  request in progress with `cancelled` instead of waiting for it. Each request carries the caller's
+  analyzeHeadless path and `JAVA_HOME`, and the host restarts its JVM when they change. One-shot
+  fallbacks inside a daemon still use the daemon's environment. Hosts remove
+  their lock files, and daemons remove their logs on a clean exit.
+- **Open.** In-process worker hosting on Windows is untested, and Windows has no daemon.
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
 - **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested

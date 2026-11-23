@@ -105,6 +105,19 @@ def _paths(key: Path) -> dict[str, Path]:
     return {suffix: base.with_suffix("." + suffix) for suffix in ("sock", "lock", "log")}
 
 
+def launch_setup() -> dict:
+    """The Ghidra launcher and Java selection of this process, which a worker must use to answer it."""
+    return {"launcher": str(ghidra._headless()), "java_home": os.environ.get("JAVA_HOME")}
+
+
+def _environment(setup: dict, token: str) -> dict:
+    environment = {**os.environ, TOKEN_ENV: token}
+    environment.pop("JAVA_HOME", None)
+    if setup.get("java_home"):
+        environment["JAVA_HOME"] = setup["java_home"]
+    return environment
+
+
 class WorkerCrash(Exception):
     """The worker failed a request in a way a one-shot launch reports differently, or died."""
 
@@ -112,11 +125,13 @@ class WorkerCrash(Exception):
 class _Budget:
     """One request's time budget and cancellation event."""
 
-    def __init__(self, timeout: float | None, cancel: threading.Event | None) -> None:
+    def __init__(self, timeout: float | None, cancel: threading.Event | None,
+                 shutdown: threading.Event | None = None) -> None:
         self.timeout = timeout or None
         self.started = time.monotonic()
         self.deadline = self.started + timeout if timeout else None
         self.cancel = cancel
+        self.shutdown = shutdown  # set when the host stops while the request runs
 
     def wait(self, cap: float = _POLL) -> float:
         if self.deadline is None:
@@ -137,6 +152,9 @@ class _Budget:
     def error(self, stopped: bool = True) -> GhidraError | None:
         """The error to raise once the request is cancelled or out of time, or None while it may continue."""
         suffix = "; the headless process group was stopped" if stopped else " waiting for the project's worker"
+        if self.shutdown is not None and self.shutdown.is_set():
+            return GhidraError(f"Ghidra {LABEL} was cancelled because the project's worker was stopped, for "
+                               "example by `retrore ghidra import` or `retrore worker stop`", code="cancelled")
         if self.cancelled():
             if stopped:
                 return GhidraError(f"Ghidra {LABEL} was cancelled{suffix}", code="cancelled")
@@ -161,15 +179,17 @@ class Worker:
         self._next_id = 0
         self.started_at: float | None = None
         self.requests = 0
+        self.setup: dict | None = None  # launch_setup() of the running JVM
 
     def running(self) -> bool:
         return self._channel is not None and self.process is not None and self.process.poll() is None
 
-    def start(self, budget: _Budget) -> None:
+    def start(self, budget: _Budget, setup: dict | None = None) -> None:
         """Launch analyzeHeadless and wait for the script to connect back, within the request's budget."""
         global STARTS
         self.kill()
-        launcher = ghidra._headless()
+        setup = setup or launch_setup()
+        launcher = setup["launcher"]
         token = secrets.token_hex(16)
         listener = socket.create_server(("127.0.0.1", 0))
         try:
@@ -184,10 +204,11 @@ class Worker:
             self.log.clear()
             self.process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                encoding="utf-8", errors="replace", env={**os.environ, TOKEN_ENV: token},
+                encoding="utf-8", errors="replace", env=_environment(setup, token),
                 **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True}),
             )
             STARTS += 1
+            self.setup = setup
             self.started_at = time.monotonic()
             self.requests = 0
             drain = threading.Thread(target=self._drain, args=(self.process,), name="retrore-worker-log",
@@ -227,10 +248,13 @@ class Worker:
             for line in process.stdout:
                 self.log.append(line)
 
-    def request(self, mode: str, payload: object, budget: _Budget) -> object:
-        """Send one request and return the script's report."""
+    def request(self, mode: str, payload: object, budget: _Budget, setup: dict | None = None) -> object:
+        """Send one request and return the script's report, from a JVM started with the given setup."""
+        setup = setup or launch_setup()
+        if self.running() and self.setup != setup:
+            self.stop()  # The caller selected another Ghidra installation or Java runtime.
         if not self.running():
-            self.start(budget)
+            self.start(budget, setup)
         self._next_id += 1
         identifier = self._next_id
         line = json.dumps({"id": identifier, "mode": mode, "input": payload}, separators=(",", ":")) + "\n"
@@ -241,6 +265,8 @@ class Worker:
             raise WorkerCrash(f"the worker closed its connection: {error}") from None
         try:
             response = json.loads(self._read_line(budget))
+        except GhidraError:
+            raise  # The budget ran out or the request was cancelled (GhidraError is a ValueError).
         except (ValueError, UnicodeError) as error:
             self.kill()
             raise WorkerCrash(f"the worker sent an unreadable response: {error}") from None
@@ -315,6 +341,7 @@ class Worker:
                     process.stdout.close()
         self._scripts.close()
         self.started_at = None
+        self.setup = None
 
 
 _RETRY = object()
@@ -339,9 +366,11 @@ class Host:
         self._busy = 0
         self._last_used = time.monotonic()
         self._disabled_until = 0.0
+        self._shutdown = threading.Event()  # cancels the request in progress when the host closes
         self._on_close = on_close
         self._server: socket.socket | None = None
         self._lock_file = None
+        self._lock_path: Path | None = None
         self.socket_path: Path | None = None
         if listen and sockets_supported():
             self._listen()
@@ -357,13 +386,21 @@ class Host:
             return  # Serve this process only.
         if len(os.fsencode(paths["sock"])) > _SOCKET_LIMIT:
             return
-        handle = open(paths["lock"], "a+")
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
-            raise HostExists(self.project) from None
-        self._lock_file = handle
+        while True:
+            handle = open(paths["lock"], "a+")
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                handle.close()
+                raise HostExists(self.project) from None
+            try:
+                current = os.stat(paths["lock"])
+            except FileNotFoundError:
+                current = None
+            if current is not None and os.path.samestat(current, os.fstat(handle.fileno())):
+                break
+            handle.close()  # A closing host removed this lock file after it was opened here.
+        self._lock_file, self._lock_path = handle, paths["lock"]
         with contextlib.suppress(FileNotFoundError):
             paths["sock"].unlink()  # stale: its host released the lock
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -447,8 +484,10 @@ class Host:
         watcher.start()
         try:
             timeout = message.get("timeout")
+            setup = message.get("setup")
             report = self.query(str(message.get("mode")), message.get("input"),
-                                float(timeout) if timeout else None, cancel)
+                                float(timeout) if timeout else None, cancel,
+                                setup if isinstance(setup, dict) and setup.get("launcher") else None)
             return {"retry": True} if report is _RETRY else {"report": report}
         except GhidraError as error:
             return {"error": {"code": error.code, "message": str(error)}}
@@ -459,15 +498,21 @@ class Host:
 
     # Requests.
 
-    def query(self, mode: str, payload: object, timeout: float | None, cancel: threading.Event | None) -> object:
-        """Return the script's report for one request, raise GhidraError, or return _RETRY once closed."""
-        budget = _Budget(timeout, cancel)
+    def query(self, mode: str, payload: object, timeout: float | None, cancel: threading.Event | None,
+              setup: dict | None = None) -> object:
+        """Return the script's report for one request, raise GhidraError, or return _RETRY once closed.
+
+        setup is the caller's launch_setup(); requests from this process use the process's own.
+        """
+        budget = _Budget(timeout, cancel, self._shutdown)
         with self._state:
             if self.closed.is_set():
                 return _RETRY
             self._busy += 1
         try:
             while not self._lock.acquire(timeout=budget.wait()):
+                if self.closed.is_set():
+                    return _RETRY
                 error = budget.error(stopped=False)
                 if error is not None:
                     raise error
@@ -478,7 +523,7 @@ class Host:
                 if error is not None:
                     raise error
                 self.requests += 1
-                return self._answer(mode, payload, budget)
+                return self._answer(mode, payload, budget, setup or launch_setup())
             finally:
                 self._lock.release()
         finally:
@@ -486,10 +531,10 @@ class Host:
                 self._busy -= 1
                 self._last_used = time.monotonic()
 
-    def _answer(self, mode: str, payload: object, budget: _Budget) -> object:
+    def _answer(self, mode: str, payload: object, budget: _Budget, setup: dict) -> object:
         if time.monotonic() >= self._disabled_until:
             try:
-                return ghidra._checked(self.worker.request(mode, payload, budget), LABEL)
+                return ghidra._checked(self.worker.request(mode, payload, budget, setup), LABEL)
             except WorkerCrash:
                 self.worker.kill()
             except GhidraError as error:
@@ -501,17 +546,21 @@ class Host:
         remaining = budget.remaining()
         if remaining is not None and remaining <= 0:
             raise budget.error()
-        with contextlib.ExitStack() as stack:
-            if budget.cancel is not None:
-                stack.enter_context(ghidra.cancellable(budget.cancel))
-            return ghidra._oneshot(self.project, mode, payload, remaining)
+        with _either(budget.cancel, self._shutdown) as cancel, ghidra.cancellable(cancel):
+            try:
+                return ghidra._oneshot(self.project, mode, payload, remaining)
+            except GhidraError as error:
+                stopped = budget.error()
+                if error.code == "cancelled" and stopped is not None:
+                    raise stopped from None
+                raise
 
     def warm(self, timeout: float | None = ghidra.QUERY_TIMEOUT) -> None:
         """Start the worker now so the first query does not wait for it."""
         budget = _Budget(timeout, None)
         with self._lock:
             if not self.closed.is_set() and not self.worker.running():
-                self.worker.start(budget)
+                self.worker.start(budget, launch_setup())
 
     def status(self) -> dict:
         worker = self.worker
@@ -541,6 +590,7 @@ class Host:
         with self._state:
             closing = self.closed.is_set()
             self.closed.set()
+            self._shutdown.set()
         if closing:
             self.finished.wait()
             return
@@ -553,10 +603,40 @@ class Host:
         with self._lock:
             self.worker.stop()
         if self._lock_file is not None:
+            with contextlib.suppress(OSError):
+                self._lock_path.unlink()  # while still locked; the next host creates a new file
             self._lock_file.close()
         if self._on_close is not None:
             self._on_close(self)
         self.finished.set()
+
+
+@contextlib.contextmanager
+def _either(first: threading.Event | None, second: threading.Event):
+    """An event that is set once either event is set, for as long as the context lasts."""
+    if first is None:
+        yield second
+        return
+    merged, done = threading.Event(), threading.Event()
+
+    def relay() -> None:
+        while True:
+            if first.is_set() or second.is_set():
+                merged.set()
+                return
+            if done.wait(_POLL):
+                return
+
+    if first.is_set() or second.is_set():
+        merged.set()
+
+    thread = threading.Thread(target=relay, name="retrore-worker-cancel", daemon=True)
+    thread.start()
+    try:
+        yield merged
+    finally:
+        done.set()
+        thread.join()
 
 
 class HostExists(Exception):
@@ -693,10 +773,11 @@ def route(project: Path, mode: str, payload: object, timeout: float | None) -> o
 def _remote(key: Path, mode: str, payload: object, timeout: float | None, cancel: threading.Event | None) -> object:
     """Send a query to another process's host. Returns _RETRY when none answers."""
     budget = _Budget(timeout, cancel)
+    setup = launch_setup()  # Outside the try: a missing Ghidra is the caller's error, not a reason to retry.
     # The host enforces the budget; this deadline only guards against a host that stopped responding.
     deadline = None if budget.deadline is None else budget.deadline + 2 * ghidra._KILL_GRACE + STOP_GRACE + 5
     try:
-        reply = _call(key, {"op": "query", "mode": mode, "input": payload, "timeout": timeout},
+        reply = _call(key, {"op": "query", "mode": mode, "input": payload, "timeout": timeout, "setup": setup},
                       deadline=deadline, cancel=cancel)
     except InterruptedError:
         raise GhidraError(f"Ghidra {LABEL} was cancelled; the headless process group was stopped",
@@ -815,7 +896,16 @@ def serve(project: Path, idle: float | None = None, *, warm: bool = True) -> int
         pass
     host.join_clients(10)
     print(f"retrore worker {os.getpid()} stopped", file=sys.stderr, flush=True)
+    _remove_own_log(host.project)
     return 0
+
+
+def _remove_own_log(key: Path) -> None:
+    """Remove the log that `start` sent this daemon's output to, once the daemon exits cleanly."""
+    with contextlib.suppress(GhidraError, OSError, ValueError):
+        log = _paths(key)["log"]
+        if os.path.samestat(os.fstat(sys.stderr.fileno()), os.stat(log)):
+            log.unlink()
 
 
 def start(project: Path, idle: float | None = None, timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
@@ -827,6 +917,9 @@ def start(project: Path, idle: float | None = None, timeout: float | None = ghid
     if record is not None:
         return {**record, "started": False}
     log = _paths(key)["log"]
+    # A new file, so a daemon that is still exiting cannot recognize it as its own log and remove it.
+    with contextlib.suppress(FileNotFoundError):
+        log.unlink()
     package = str(Path(__file__).resolve().parents[1])
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (package, os.environ.get("PYTHONPATH"))))}
     environment.pop(TOKEN_ENV, None)

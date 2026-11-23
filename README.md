@@ -700,7 +700,11 @@ registry queries, and `trace --project`), from any shell, goes through it. A que
 the current user. `worker serve` runs the daemon in the foreground.
 
 `retrore mcp` hosts its own workers the same way, and query commands in other shells use them too.
-`retrore ghidra import` stops a project's worker before it writes the project. Set `RETRORE_WORKER=0`
+`retrore ghidra import` stops a project's worker before it writes the project. A query still running
+there fails with `cancelled`, and the import does not wait for it to finish. Each query runs on the
+Ghidra installation and `JAVA_HOME` of the command that sent it. When those differ from the running
+worker's, the worker restarts with the new settings. A one-shot fallback inside a daemon uses the
+daemon's own settings. Set `RETRORE_WORKER=0`
 to launch Ghidra for every query. Ghidra locks a project per session, so with workers disabled a query
 on a project that a worker holds fails with `project_locked`, and the message names the worker.
 
@@ -712,7 +716,9 @@ lock, retrore uses one-shot launches for the next minute.
 
 Daemons listen on a unix socket named after the project path in `$XDG_RUNTIME_DIR/retrore`, or in
 `RETRORE_WORKER_DIR` when set, a directory only the current user can write. The worker connects
-back to retrore on a loopback port and proves itself with a one-time token. Windows has no daemon;
+back to retrore on a loopback port and proves itself with a one-time token. A daemon removes its
+socket and lock file when it exits, and its log too when it exits cleanly. A daemon that fails
+keeps its log, and when it fails to start, the `worker start` error quotes the log's last lines. Windows has no daemon;
 `retrore mcp` still keeps workers in its own process there.
 
 The `retrore.queries` module defines every query command, its parameters with JSON Schema types,

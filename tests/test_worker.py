@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -285,6 +286,60 @@ def test_a_closed_client_connection_cancels_the_daemon_request(fake):
     _wait_dead(jvm)
     assert worker.status(fake.project)["ghidra"] == "stopped"
     assert worker.stop_all() == [str(worker.project_key(fake.project))]
+
+
+def test_stopping_a_daemon_cancels_its_request_and_cleans_up(fake):
+    started = worker.start(fake.project)
+    daemon, jvm = started["pid"], fake.worker_pid()
+    runtime = worker.runtime_dir()
+    assert sorted(path.suffix for path in runtime.iterdir()) == [".lock", ".log", ".sock"]
+    outcome = {}
+
+    def slow_query() -> None:
+        try:
+            ghidra.query(fake.project, {"command": "func", "address": "aaaa"})
+        except GhidraError as error:
+            outcome["error"] = error
+
+    thread = threading.Thread(target=slow_query)
+    thread.start()
+    time.sleep(1)
+    began = time.monotonic()
+    # `retrore ghidra import` calls this before writing the project.
+    assert worker.stop(fake.project)
+    assert time.monotonic() - began < 10
+    thread.join(10)
+    assert outcome["error"].code == "cancelled" and "worker was stopped" in str(outcome["error"])
+    _wait_dead(jvm)
+    _wait_dead(daemon)
+    assert list(runtime.iterdir()) == []
+
+
+def test_a_query_with_another_ghidra_restarts_the_daemons_worker(fake, tmp_path):
+    assert worker.start(fake.project)["started"]
+    jvm = fake.worker_pid()
+    other = tmp_path / "other-ghidra"
+    shutil.copytree(tmp_path / "ghidra", other)
+    fake.pid_file.unlink()
+    child = subprocess.run([sys.executable, "-m", "retrore", "func", "c000", "--project", str(fake.project),
+                            "--json"], capture_output=True, text=True, env=_environment(GHIDRA_HOME=str(other)),
+                           check=True, timeout=60)
+    restarted = fake.worker_pid()
+    assert json.loads(child.stdout)["pid"] == restarted != jvm
+    _wait_dead(jvm)
+    assert fake.launches == ["serve", "serve"]
+    # The same setup keeps the new worker.
+    child = subprocess.run([sys.executable, "-m", "retrore", "func", "c000", "--project", str(fake.project),
+                            "--json"], capture_output=True, text=True, env=_environment(GHIDRA_HOME=str(other)),
+                           check=True, timeout=60)
+    assert json.loads(child.stdout)["pid"] == restarted
+    assert fake.launches == ["serve", "serve"]
+
+
+def test_workers_launch_with_the_callers_java(monkeypatch):
+    monkeypatch.setenv("JAVA_HOME", "/opt/daemon-java")
+    assert worker._environment({"java_home": "/opt/caller-java"}, "t")["JAVA_HOME"] == "/opt/caller-java"
+    assert "JAVA_HOME" not in worker._environment({"java_home": None}, "t")
 
 
 def test_cli_queries_reach_a_hosting_process(hosted):
