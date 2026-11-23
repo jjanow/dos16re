@@ -511,7 +511,8 @@ public class RetroreQuery extends GhidraScript {
         }
         var block = unit(request);
         var found = new ArrayList<Symbol>();
-        for (Symbol symbol : currentProgram.getSymbolTable().getAllSymbols(false)) {
+        boolean generated = request.has("generated") && request.get("generated").getAsBoolean();
+        for (Symbol symbol : currentProgram.getSymbolTable().getAllSymbols(generated)) {
             monitor.checkCancelled();
             var address = symbol.getAddress();
             if (address.isMemoryAddress() && (block == null || block.contains(address))
@@ -691,7 +692,7 @@ public class RetroreQuery extends GhidraScript {
                 parameters.add(new FunctionParameter(parameter.getName(), parameter.getDataType().getDisplayName(),
                     parameter.getVariableStorage().toString()));
             }
-            report.put("parameters", parameters);
+            report.put("parameters", page("parameters", parameters, options, pages));
         }
         if (options.includes("callees")) {
             var targets = new TreeMap<Address, Integer>();

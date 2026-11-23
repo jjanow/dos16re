@@ -7,7 +7,7 @@ from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 
-from .ghidra import trace_coverage
+from .ghidra import QUERY_TIMEOUT, trace_coverage
 from .image import ImageUnit, image_units, read_map
 from .mz import Address
 
@@ -53,6 +53,7 @@ def _runtime_units(
 def import_trace(
     trace: Path, export: Path, *, runtime_base: int | None = None,
     overlay_segments: dict[str, int] | None = None, project: Path | None = None,
+    timeout: float | None = QUERY_TIMEOUT,
 ) -> dict:
     image = export / "image.bin"
     program = read_map(export)
@@ -95,7 +96,7 @@ def import_trace(
             "sha256": sha256(image.read_bytes()).hexdigest(),
             "units": [asdict(unit) for unit in units],
             "hits": mapped,
-        })
+        }, timeout=timeout)
     return {
         "instructions": counts.total(), "ignored_lines": ignored,
         "mapped": mapped, "unmapped": unmapped, "analysis": analysis,

@@ -746,6 +746,7 @@ def _trace(args: argparse.Namespace) -> None:
         raise TraceError(str(error)) from error
     report = import_trace(
         args.trace, args.export, runtime_base=args.runtime_base, overlay_segments=overlay_segments, project=args.project,
+        timeout=args.timeout,
     )
     if args.json:
         print(json.dumps(report))
@@ -789,135 +790,246 @@ def _seconds(value: str) -> float:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
+def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
+    """Build the image and map selected by parsed info or load options, with a text summary."""
+    data = args.program.read_bytes()
+    hunk = data.startswith(HUNK_MAGIC)
+    m68k = hunk or data.startswith(PRG_MAGIC)
+    extension = args.program.suffix.lower()
+    atari8 = args.atari8 or args.atari8_raw or (
+        not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or extension in DISK_SUFFIXES)
+        and (extension in (".atr", ".xex") or
+             extension not in (".d64", ".prg") and data.startswith((ATR_MAGIC, XEX_MAGIC)))
+    )
+    if not args.pc88 and (args.pc88_disk is not None or args.pc88_sector or args.pc88_copy or args.pc88_unit
+                         or args.pc88_low or args.pc88_high):
+        raise Pc88Error("PC-88 options require --pc88")
+    if not args.pc98 and (args.pc98_disk is not None or args.pc98_sector or args.pc98_unit or args.pc98_entry):
+        raise Pc98Error("PC-98 options require --pc98")
+    if not args.x1 and (args.x1_disk is not None or args.x1_ipl or args.x1_sector or args.x1_copy
+                        or args.x1_unit or args.x1_view):
+        raise X1Error("X1 options require --x1")
+    if args.x1:
+        image, program_map = _x1_image(args, data)
+    elif args.pc98:
+        image, program_map = _pc98_image(args, data)
+    elif args.pc88:
+        image, program_map = _pc88_image(args, data)
+    elif args.msx2:
+        image, program_map = _msx2_image(args, data)
+    elif args.msx2_unit or args.msx2_copy:
+        raise Msx2Error("--msx2-unit and --msx2-copy require --msx2")
+    elif atari8:
+        image, program_map = _atari8_image(args, data)
+    elif args.atari8_unit or args.atari8_portb is not None:
+        raise Atari8Error("--atari8-unit and --atari8-portb require an Atari 8-bit program")
+    elif args.apple2 or args.apple2_raw or args.apple2_disk_order or (not args.c64 and extension in DISK_SUFFIXES):
+        image, program_map = _apple2_image(args, data)
+    elif args.apple2_unit or args.apple2_lc is not None:
+        raise Apple2Error("--apple2-unit and --apple2-lc require an Apple II program")
+    elif args.c64 or args.disk_file or extension == ".d64" or (
+        extension == ".prg" and not (m68k or data.startswith(b"MZ"))
+    ):
+        image, program_map = _c64_image(args, data)
+    elif args.c64_unit or args.c64_bank is not None or args.entry:
+        raise C64Error("--c64-unit and --c64-bank require C64, while --entry accepts 8-bit programs")
+    elif m68k:
+        if args.base_segment is not None or args.overlay:
+            raise MZError("--base-segment and --overlay apply to DOS executables")
+        base_address = DEFAULT_M68K_BASE if args.base_address is None else args.base_address
+        loader = build_hunk_image if hunk else build_prg_image
+        image, program_map = loader(data, args.program.name, base_address)
+    else:
+        if args.base_address is not None:
+            raise MZError("--base-address applies to Amiga, Atari ST, and 8-bit programs")
+        executable = MZExecutable.parse(data)
+        base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
+        loaded = executable.load(base_segment)
+        overlays = [
+            Overlay(path.name, path.stem, path.read_bytes(), segment)
+            for path, segment in args.overlay
+        ]
+        image, program_map = build_image(loaded, args.program.name, overlays)
+    lines = []
+    if program_map["format"] == "HUNK":
+        lines.append(f"Amiga Hunk  entry h0:0000 ({base_address:06x})  {len(program_map['units'])} hunks")
+    elif program_map["format"] == "PRG":
+        lines.append(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
+        lines.append("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
+    elif program_map["format"] == PC98_FORMAT:
+        entry = program_map["entry"]
+        lines.append(f"PC-98  entry {entry['segment']:04x}:{entry['offset']:04x}  {len(program_map['units'])} units")
+    elif program_map["format"] in FLAT16_FORMATS:
+        entries = program_map["entries"]
+        if program_map["format"] == APPLE2_FORMAT:
+            platform = f"Apple II  LC {program_map['language_card']:04x}"
+        elif program_map["format"] == ATARI8_FORMAT:
+            platform = f"Atari 8-bit  PORTB {program_map['portb']:02x}"
+        elif program_map["format"] == MSX2_FORMAT:
+            platform = "MSX2  MSX-DOS RAM"
+        elif program_map["format"] == PC88_FORMAT:
+            platform = f"PC-88  {program_map['memory_view']}"
+        elif program_map["format"] == X1_FORMAT:
+            ipl = program_map.get("ipl")
+            platform = f"X1  {program_map['memory_view']}" + (f"  IPL {ipl['name']!r}" if ipl else "")
+        else:
+            platform = f"C64 PRG  bank {program_map['bank']}"
+        lines.append(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")
+        if entries:
+            addresses = ", ".join(f"{entry['linear']:04x}" for entry in entries[:_PREVIEW_LIMIT])
+            lines.append(f"  entries  {addresses}")
+        for unit in program_map["units"][:_PREVIEW_LIMIT]:
+            lines.append(f"  {unit['name']}  {unit['linear']:04x}  {unit['size']} bytes")
+    else:
+        packer = f" ({loaded.packer})" if loaded.packer else ""
+        lines.append(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")
+        lines.append(f"root  {loaded.base_segment:04x}:0000  {len(loaded.image)} bytes")
+        compiler = program_map["compiler"]
+        if compiler:
+            identity = " ".join(filter(None, (compiler["family"], compiler["version"])))
+            lines.append(f"compiler  {identity}")
+        if overlays:
+            unit_count = len(program_map["units"]) - 1
+            stub_count = len(program_map.get("stubs", []))
+            lines.append(f"{unit_count} overlay units, {stub_count} stubs")
+    return image, program_map, lines
+
+
+def program_options() -> argparse.ArgumentParser:
+    """Return a parent parser with the program argument and the options shared by info and load."""
+    command = argparse.ArgumentParser(add_help=False)
+    command.add_argument("program", type=Path, metavar="PROGRAM")
+    base = command.add_mutually_exclusive_group()
+    base.add_argument(
+        "--base-segment",
+        type=_hex_segment,
+        metavar="HEX",
+        help=f"DOS load segment (default: {DEFAULT_BASE_SEGMENT:04x}) or raw PC-98 load segment",
+    )
+    base.add_argument(
+        "--base-address", type=_hex_address, metavar="HEX",
+        help=f"Amiga/Atari ST base (default {DEFAULT_M68K_BASE:06x}) or 8-bit program load address",
+    )
+    command.add_argument(
+        "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
+        help="add a Turbo Pascal overlay bank or raw overlay (optionally at hex SEG)",
+    )
+    platform = command.add_mutually_exclusive_group()
+    platform.add_argument("--c64", action="store_true", help="interpret the input as a Commodore 64 program")
+    platform.add_argument("--apple2", action="store_true", help="interpret the input as an Apple II program")
+    platform.add_argument("--apple2-raw", action="store_true", help="load raw Apple II bytes at --base-address")
+    platform.add_argument("--atari8", action="store_true", help="interpret the input as an Atari 8-bit program")
+    platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
+    platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
+    platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
+    platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
+    platform.add_argument("--x1", action="store_true", help="interpret the input as a Sharp X1 D88 disk or raw file")
+    command.add_argument(
+        "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
+        help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
+    )
+    command.add_argument(
+        "--c64-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
+        help="add a co-resident PRG file (optional hex load address override)",
+    )
+    command.add_argument(
+        "--c64-bank", type=_hex_address, metavar="HEX",
+        help=f"effective C64 bank bits CHAREN/HIRAM/LORAM (0–7, default {DEFAULT_BANK})",
+    )
+    command.add_argument(
+        "--apple2-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
+        help="add a co-resident DOS binary or raw Apple II file at @HEX",
+    )
+    command.add_argument(
+        "--apple2-disk-order", choices=("dos", "prodos", "physical"),
+        help="override Apple II sector ordering and interpret the input as a sector image",
+    )
+    command.add_argument(
+        "--apple2-lc", type=_hex_address, metavar="HEX",
+        help=f"effective Apple II Language Card switch (c080–c08f, default {DEFAULT_LC:04x})",
+    )
+    command.add_argument(
+        "--atari8-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
+        help="load an additional Atari XEX or raw file at @HEX",
+    )
+    command.add_argument(
+        "--atari8-portb", type=_hex_address, metavar="HEX",
+        help=f"effective Atari XL/XE PORTB byte (default {DEFAULT_PORTB:02x})",
+    )
+    command.add_argument(
+        "--msx2-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
+        help="load an additional MSX2 file at its runtime address",
+    )
+    command.add_argument(
+        "--msx2-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
+        help="copy a hexadecimal root RAM span to DEST before loading MSX2 overlays",
+    )
+    command.add_argument("--pc88-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
+    command.add_argument(
+        "--pc88-sector", type=_disk_sector, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
+        help="load a disk sector span by decimal cylinder, head, and sector ID (default: IPL at c000)",
+    )
+    command.add_argument(
+        "--pc88-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
+        help="copy a hexadecimal span after the root and disk loads and before additional raw files",
+    )
+    command.add_argument(
+        "--pc88-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
+        help="load an additional raw PC-88 file at its runtime address",
+    )
+    command.add_argument("--pc88-low", choices=LOW_BANKS, help="select visible memory below 8000")
+    command.add_argument("--pc88-high", choices=HIGH_BANKS, help="select RAM or a graphics VRAM plane at c000")
+    command.add_argument("--pc98-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
+    command.add_argument(
+        "--pc98-sector", type=_disk_sector, action="append", default=[], metavar="C:H:R[+COUNT]@SEG",
+        help="load a decimal disk sector span at hexadecimal SEG:0000 (default: IPL at 1fc0:0000)",
+    )
+    command.add_argument(
+        "--pc98-unit", type=_overlay, action="append", default=[], metavar="FILE@SEG",
+        help="load a co-resident raw PC-98 file at hexadecimal SEG:0000",
+    )
+    command.add_argument(
+        "--pc98-entry", type=_segmented_address, action="append", default=[], metavar="SEG:OFF",
+        help="seed PC-98 analysis at a hexadecimal segment and offset (repeatable)",
+    )
+    command.add_argument("--x1-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
+    command.add_argument(
+        "--x1-ipl", action="store_true",
+        help="load the IPL boot payload before explicit X1 sectors (default when no sectors are selected)",
+    )
+    command.add_argument(
+        "--x1-sector", dest="x1_sector", type=_x1_chr, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
+        help="load a disk sector span by decimal cylinder, head, and sector ID",
+    )
+    command.add_argument(
+        "--x1-lsn", dest="x1_sector", type=_x1_lsn, action="append", metavar="LSN[+COUNT]@HEX",
+        help="load a disk sector span by hexadecimal X1 logical sector number (16 sectors per side)",
+    )
+    command.add_argument(
+        "--x1-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
+        help="copy a hexadecimal span after the disk loads and before additional raw files",
+    )
+    command.add_argument(
+        "--x1-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
+        help="load an additional raw X1 file at its runtime address",
+    )
+    command.add_argument("--x1-view", choices=X1_VIEWS, help="select RAM or the IPL ROM for reads below 8000")
+    command.add_argument(
+        "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
+        help="seed 8-bit machine-code analysis at this address (repeatable)",
+    )
+    return command
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retrore", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    load_parser = commands.add_parser("load", help="export a program image")
+    program_parent = program_options()
+    load_parser = commands.add_parser("load", parents=[program_parent], help="export a program image")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
-    info_parser = commands.add_parser("info", help="summarize a program image")
-
+    info_parser = commands.add_parser("info", parents=[program_parent], help="summarize a program image")
     for command in (load_parser, info_parser):
-        command.add_argument("program", type=Path, metavar="PROGRAM")
-        base = command.add_mutually_exclusive_group()
-        base.add_argument(
-            "--base-segment",
-            type=_hex_segment,
-            metavar="HEX",
-            help=f"DOS load segment (default: {DEFAULT_BASE_SEGMENT:04x}) or raw PC-98 load segment",
-        )
-        base.add_argument(
-            "--base-address", type=_hex_address, metavar="HEX",
-            help=f"Amiga/Atari ST base (default {DEFAULT_M68K_BASE:06x}) or 8-bit program load address",
-        )
         command.add_argument("--json", action="store_true", help="print JSON")
-        command.add_argument(
-            "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
-            help="add a Turbo Pascal overlay bank or raw overlay (optionally at hex SEG)",
-        )
-        platform = command.add_mutually_exclusive_group()
-        platform.add_argument("--c64", action="store_true", help="interpret the input as a Commodore 64 program")
-        platform.add_argument("--apple2", action="store_true", help="interpret the input as an Apple II program")
-        platform.add_argument("--apple2-raw", action="store_true", help="load raw Apple II bytes at --base-address")
-        platform.add_argument("--atari8", action="store_true", help="interpret the input as an Atari 8-bit program")
-        platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
-        platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
-        platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
-        platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
-        platform.add_argument("--x1", action="store_true", help="interpret the input as a Sharp X1 D88 disk or raw file")
-        command.add_argument(
-            "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
-            help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
-        )
-        command.add_argument(
-            "--c64-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
-            help="add a co-resident PRG file (optional hex load address override)",
-        )
-        command.add_argument(
-            "--c64-bank", type=_hex_address, metavar="HEX",
-            help=f"effective C64 bank bits CHAREN/HIRAM/LORAM (0–7, default {DEFAULT_BANK})",
-        )
-        command.add_argument(
-            "--apple2-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
-            help="add a co-resident DOS binary or raw Apple II file at @HEX",
-        )
-        command.add_argument(
-            "--apple2-disk-order", choices=("dos", "prodos", "physical"),
-            help="override Apple II sector ordering and interpret the input as a sector image",
-        )
-        command.add_argument(
-            "--apple2-lc", type=_hex_address, metavar="HEX",
-            help=f"effective Apple II Language Card switch (c080–c08f, default {DEFAULT_LC:04x})",
-        )
-        command.add_argument(
-            "--atari8-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
-            help="load an additional Atari XEX or raw file at @HEX",
-        )
-        command.add_argument(
-            "--atari8-portb", type=_hex_address, metavar="HEX",
-            help=f"effective Atari XL/XE PORTB byte (default {DEFAULT_PORTB:02x})",
-        )
-        command.add_argument(
-            "--msx2-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
-            help="load an additional MSX2 file at its runtime address",
-        )
-        command.add_argument(
-            "--msx2-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
-            help="copy a hexadecimal root RAM span to DEST before loading MSX2 overlays",
-        )
-        command.add_argument("--pc88-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
-        command.add_argument(
-            "--pc88-sector", type=_disk_sector, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
-            help="load a disk sector span by decimal cylinder, head, and sector ID (default: IPL at c000)",
-        )
-        command.add_argument(
-            "--pc88-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
-            help="copy a hexadecimal span after the root and disk loads and before additional raw files",
-        )
-        command.add_argument(
-            "--pc88-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
-            help="load an additional raw PC-88 file at its runtime address",
-        )
-        command.add_argument("--pc88-low", choices=LOW_BANKS, help="select visible memory below 8000")
-        command.add_argument("--pc88-high", choices=HIGH_BANKS, help="select RAM or a graphics VRAM plane at c000")
-        command.add_argument("--pc98-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
-        command.add_argument(
-            "--pc98-sector", type=_disk_sector, action="append", default=[], metavar="C:H:R[+COUNT]@SEG",
-            help="load a decimal disk sector span at hexadecimal SEG:0000 (default: IPL at 1fc0:0000)",
-        )
-        command.add_argument(
-            "--pc98-unit", type=_overlay, action="append", default=[], metavar="FILE@SEG",
-            help="load a co-resident raw PC-98 file at hexadecimal SEG:0000",
-        )
-        command.add_argument(
-            "--pc98-entry", type=_segmented_address, action="append", default=[], metavar="SEG:OFF",
-            help="seed PC-98 analysis at a hexadecimal segment and offset (repeatable)",
-        )
-        command.add_argument("--x1-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
-        command.add_argument(
-            "--x1-ipl", action="store_true",
-            help="load the IPL boot payload before explicit X1 sectors (default when no sectors are selected)",
-        )
-        command.add_argument(
-            "--x1-sector", dest="x1_sector", type=_x1_chr, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
-            help="load a disk sector span by decimal cylinder, head, and sector ID",
-        )
-        command.add_argument(
-            "--x1-lsn", dest="x1_sector", type=_x1_lsn, action="append", metavar="LSN[+COUNT]@HEX",
-            help="load a disk sector span by hexadecimal X1 logical sector number (16 sectors per side)",
-        )
-        command.add_argument(
-            "--x1-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
-            help="copy a hexadecimal span after the disk loads and before additional raw files",
-        )
-        command.add_argument(
-            "--x1-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
-            help="load an additional raw X1 file at its runtime address",
-        )
-        command.add_argument("--x1-view", choices=X1_VIEWS, help="select RAM or the IPL ROM for reads below 8000")
-        command.add_argument(
-            "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
-            help="seed 8-bit machine-code analysis at this address (repeatable)",
-        )
 
     ghidra_parser = commands.add_parser("ghidra", help="manage a headless Ghidra import")
     ghidra_commands = ghidra_parser.add_subparsers(dest="ghidra_command", required=True)
@@ -1005,7 +1117,7 @@ def main(argv: list[str] | None = None) -> int:
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries),
-                    *map(commands.choices.get, _REGISTRY_COMMANDS)):
+                    *map(commands.choices.get, _REGISTRY_COMMANDS), trace_parser):
         default = IMPORT_TIMEOUT if command is import_parser else None if command is batch_parser else QUERY_TIMEOUT
         described = (f"the larger of {QUERY_TIMEOUT} and {BATCH_SECONDS_PER_QUERY} per query"
                      if default is None else default)
@@ -1062,64 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "trace":
             _trace(args)
             return 0
-        data = args.program.read_bytes()
-        hunk = data.startswith(HUNK_MAGIC)
-        m68k = hunk or data.startswith(PRG_MAGIC)
-        extension = args.program.suffix.lower()
-        atari8 = args.atari8 or args.atari8_raw or (
-            not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or extension in DISK_SUFFIXES)
-            and (extension in (".atr", ".xex") or
-                 extension not in (".d64", ".prg") and data.startswith((ATR_MAGIC, XEX_MAGIC)))
-        )
-        if not args.pc88 and (args.pc88_disk is not None or args.pc88_sector or args.pc88_copy or args.pc88_unit
-                             or args.pc88_low or args.pc88_high):
-            raise Pc88Error("PC-88 options require --pc88")
-        if not args.pc98 and (args.pc98_disk is not None or args.pc98_sector or args.pc98_unit or args.pc98_entry):
-            raise Pc98Error("PC-98 options require --pc98")
-        if not args.x1 and (args.x1_disk is not None or args.x1_ipl or args.x1_sector or args.x1_copy
-                            or args.x1_unit or args.x1_view):
-            raise X1Error("X1 options require --x1")
-        if args.x1:
-            image, program_map = _x1_image(args, data)
-        elif args.pc98:
-            image, program_map = _pc98_image(args, data)
-        elif args.pc88:
-            image, program_map = _pc88_image(args, data)
-        elif args.msx2:
-            image, program_map = _msx2_image(args, data)
-        elif args.msx2_unit or args.msx2_copy:
-            raise Msx2Error("--msx2-unit and --msx2-copy require --msx2")
-        elif atari8:
-            image, program_map = _atari8_image(args, data)
-        elif args.atari8_unit or args.atari8_portb is not None:
-            raise Atari8Error("--atari8-unit and --atari8-portb require an Atari 8-bit program")
-        elif args.apple2 or args.apple2_raw or args.apple2_disk_order or (not args.c64 and extension in DISK_SUFFIXES):
-            image, program_map = _apple2_image(args, data)
-        elif args.apple2_unit or args.apple2_lc is not None:
-            raise Apple2Error("--apple2-unit and --apple2-lc require an Apple II program")
-        elif args.c64 or args.disk_file or extension == ".d64" or (
-            extension == ".prg" and not (m68k or data.startswith(b"MZ"))
-        ):
-            image, program_map = _c64_image(args, data)
-        elif args.c64_unit or args.c64_bank is not None or args.entry:
-            raise C64Error("--c64-unit and --c64-bank require C64, while --entry accepts 8-bit programs")
-        elif m68k:
-            if args.base_segment is not None or args.overlay:
-                raise MZError("--base-segment and --overlay apply to DOS executables")
-            base_address = DEFAULT_M68K_BASE if args.base_address is None else args.base_address
-            loader = build_hunk_image if hunk else build_prg_image
-            image, program_map = loader(data, args.program.name, base_address)
-        else:
-            if args.base_address is not None:
-                raise MZError("--base-address applies to Amiga, Atari ST, and 8-bit programs")
-            executable = MZExecutable.parse(data)
-            base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
-            loaded = executable.load(base_segment)
-            overlays = [
-                Overlay(path.name, path.stem, path.read_bytes(), segment)
-                for path, segment in args.overlay
-            ]
-            image, program_map = build_image(loaded, args.program.name, overlays)
+        image, program_map, summary = build_program(args)
         if args.command == "load":
             _export_image(args.output, image, program_map)
     except HANDLED_ERRORS as error:
@@ -1132,45 +1187,6 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(program_map))
     elif args.command == "load":
         print(f"Wrote image.bin and map.json to {args.output}")
-    elif program_map["format"] == "HUNK":
-        print(f"Amiga Hunk  entry h0:0000 ({base_address:06x})  {len(program_map['units'])} hunks")
-    elif program_map["format"] == "PRG":
-        print(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
-        print("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
-    elif program_map["format"] == PC98_FORMAT:
-        entry = program_map["entry"]
-        print(f"PC-98  entry {entry['segment']:04x}:{entry['offset']:04x}  {len(program_map['units'])} units")
-    elif program_map["format"] in FLAT16_FORMATS:
-        entries = program_map["entries"]
-        if program_map["format"] == APPLE2_FORMAT:
-            platform = f"Apple II  LC {program_map['language_card']:04x}"
-        elif program_map["format"] == ATARI8_FORMAT:
-            platform = f"Atari 8-bit  PORTB {program_map['portb']:02x}"
-        elif program_map["format"] == MSX2_FORMAT:
-            platform = "MSX2  MSX-DOS RAM"
-        elif program_map["format"] == PC88_FORMAT:
-            platform = f"PC-88  {program_map['memory_view']}"
-        elif program_map["format"] == X1_FORMAT:
-            ipl = program_map.get("ipl")
-            platform = f"X1  {program_map['memory_view']}" + (f"  IPL {ipl['name']!r}" if ipl else "")
-        else:
-            platform = f"C64 PRG  bank {program_map['bank']}"
-        print(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")
-        if entries:
-            addresses = ", ".join(f"{entry['linear']:04x}" for entry in entries[:_PREVIEW_LIMIT])
-            print(f"  entries  {addresses}")
-        for unit in program_map["units"][:_PREVIEW_LIMIT]:
-            print(f"  {unit['name']}  {unit['linear']:04x}  {unit['size']} bytes")
     else:
-        packer = f" ({loaded.packer})" if loaded.packer else ""
-        print(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")
-        print(f"root  {loaded.base_segment:04x}:0000  {len(loaded.image)} bytes")
-        compiler = program_map["compiler"]
-        if compiler:
-            identity = " ".join(filter(None, (compiler["family"], compiler["version"])))
-            print(f"compiler  {identity}")
-        if overlays:
-            unit_count = len(program_map["units"]) - 1
-            stub_count = len(program_map.get("stubs", []))
-            print(f"{unit_count} overlay units, {stub_count} stubs")
+        print("\n".join(summary))
     return 0

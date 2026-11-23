@@ -15,6 +15,9 @@ HINTS = {
     "timeout": "Raise --timeout (0 disables the limit) or split the work into smaller batches.",
     "headless_failed": "Read the log excerpt in the message. Check JAVA_HOME and that no other process holds the "
                        "project lock.",
+    "project_locked": "Another Ghidra session has the project open. Close it, or wait for the other query to "
+                      "finish; one project serves one headless session at a time.",
+    "cancelled": "The client cancelled the request.",
     "script_error": "A retrore Ghidra script failed. Re-import the export with the current retrore if the project "
                     "is old, then report the message if it persists.",
     "invalid_request": "Fix the request. See `retrore COMMAND --help` and the README's query documentation.",

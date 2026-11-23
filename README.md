@@ -125,7 +125,7 @@ array of requests), `error`, and `error_report` (the `--json` error object). The
 ```
 
 `retrore mcp` serves the same queries to [MCP](https://modelcontextprotocol.io) clients over stdio.
-It offers one tool per query command, `batch`, and `where_is`. Query tools take the request
+It offers one tool per query command, `batch`, `where_is`, `info`, and `load`. Query tools take the request
 parameters as arguments, plus `project` and an optional `timeout` in seconds. `batch` takes `project`
 and `requests`, the same array `retrore batch` reads. `where_is` takes `export` and one of `bytes`,
 `string`, or `constant`, with an optional `width`. A call runs through the same validation and
@@ -133,8 +133,15 @@ functions as the CLI. Its `structuredContent` and text content hold the JSON tha
 An error result has `isError: true` and carries the `--json` error object with `code`, `message`,
 and `hint`. A batch with failed rows, or a `functions` call with failed lookups, still succeeds
 and reports `error` in those rows, although the CLI exits with status 1. The `gaps` tool
-always uses the paged form, like `retrore gaps --limit N`. Exporting and importing programs stays
-with `retrore load` and `retrore ghidra import`.
+always uses the paged form, like `retrore gaps --limit N`.
+
+`info` and `load` take `program` and the options of `retrore info` and `retrore load`, named as in
+the CLI with underscores, such as `base_segment`, `overlay`, `disk_file`, `x1_lsn`, and `entry`.
+`load` also requires `output`. Flags are booleans, repeatable options are arrays of strings, and
+values use the CLI's text formats, such as `"c000"` and `"OV1.OVR@2000"`. The tool passes them
+through the CLI's parser, so the result is the program map that `--json` prints and usage errors
+become `invalid_request`. `load` never overwrites an existing `image.bin` or `map.json`. Importing
+into Ghidra stays with `retrore ghidra import`.
 
 Add the server to Claude Code with `claude mcp add retrore -- retrore mcp`, or put this entry in an
 MCP client's configuration, such as a project's `.mcp.json`. Use the absolute path to
@@ -147,8 +154,14 @@ MCP client's configuration, such as a project's `.mcp.json`. Use the absolute pa
 The server supports clients that open with `initialize` (MCP 2025-11-25 and earlier) and clients
 that send the protocol version with each request (MCP 2026-07-28). Some tool-calling APIs reject
 `oneOf`, `anyOf`, and `allOf` at the top level of a tool's input schema. The tool schemas therefore
-state those constraints in their descriptions, and retrore still enforces them. Each call launches
-Ghidra once and blocks the server until it returns, so prefer `batch` for several queries.
+state those constraints in their descriptions, and retrore still enforces them.
+
+Tool calls run on up to four worker threads and may finish out of order. Ghidra locks a project
+while a headless session has it open, so calls on the same project wait for each other; calls on
+other projects and the `where_is`, `info`, and `load` tools run alongside them. Each query call
+launches Ghidra once, so prefer `batch` for several queries on one project. A client that sends
+`notifications/cancelled` for a call in progress stops its headless run, process group included, and
+gets no response for that call. A cancelled call that is still waiting for its project never starts.
 
 ## DOS loader
 
@@ -639,7 +652,7 @@ Pass a UTF-8 JSON file as the positional argument or pipe the array on stdin. Ea
 a `command` and that command's required parameters, such as `address` or `unit`. Optional fields
 match the individual commands, with underscores in place of dashes. Use the arrays `fields`,
 `ref_types`, `addresses`, and `names`, the integers `limit`, `offset`, `context`, `slice`, `depth`,
-and `max_nodes`, the booleans `compact` and `ignore_case`, and the strings `direction`, `unit`,
+and `max_nodes`, the booleans `compact`, `ignore_case`, and `generated`, and the strings `direction`, `unit`,
 `name`, `prefix`, and `glob` where supported. retrore validates every request before it starts
 Ghidra. The JSON response contains `contract` and a `results` array in request order. Each row
 echoes `command` and the identifying parameters `address`, `unit`, `name`, `prefix`, or `glob` that
@@ -674,7 +687,7 @@ lists. A `next_offset` other than `null` means more records remain.
 | Command | Request | Result |
 |---|---|---|
 | `functions` | `addresses` and `names`, up to 256 in total | One row per address, then one per function matching each exact name |
-| `symbols` | One of `name`, `prefix`, or `glob`, with optional `unit` and `ignore_case` | Stored symbols ordered by address, up to 100 per page by default and at most 1000 |
+| `symbols` | One of `name`, `prefix`, or `glob`, with optional `unit`, `ignore_case`, and `generated` | Symbols ordered by address, up to 100 per page by default and at most 1000 |
 | `inventory` | `unit` | The unit's bounds, functions, labels, and defined data, each paged separately |
 | `callgraph` | `address`, `direction`, `depth`, `max_nodes` | Functions reached from the root and the call edges between them |
 | `context` | `address` | Prototype, calling convention, return type, parameters, callees, and referenced data |
@@ -688,7 +701,9 @@ the code `no_function` or `address_not_found`, and the CLI then exits with statu
 
 `symbols` matches names exactly, by prefix, or by a glob in which `*` matches any run of characters
 and `?` matches one. It covers names stored in the project, such as functions, imported labels, and
-the segment-tracking names on DOS. Ghidra's generated `LAB_` and `DAT_` names are not stored.
+the segment-tracking names on DOS. Ghidra generates names such as `LAB_`, `DAT_`, and `SUB_` for
+referenced addresses without a stored symbol. Add `generated` (`--generated`) to match those too,
+for example to look up a `DAT_` name from decompiled C. Generated names have the source `DEFAULT`.
 Records give the name, address, kind, source, and namespace (`null` for global names).
 
 `callgraph` walks callers or callees (the default) from the function containing the address, in
@@ -702,7 +717,7 @@ has unvisited callers or callees. `truncated.nodes` is true when the node cap st
 once per target address. Each data reference gives the address, symbol name, defined data type and
 size at that address (`null` when the bytes are undefined), the reference types, and
 `access_widths`: the byte widths the referencing instructions load or store, taken from their
-p-code. Callees and data are paged with a default limit of 32 and a maximum of 256.
+p-code. Parameters, callees, and data are paged with a default limit of 32 and a maximum of 256.
 
 With `--unit`, `--limit`, `--offset`, or `--fields`, `gaps` uses the shared paging contract.
 `undefined_bytes` then totals the ranges that match the filter. Plain `gaps` keeps its original
@@ -716,9 +731,10 @@ and any `error`.
 ### Errors, exit statuses, and time budgets
 
 `ghidra import`, `decomp`, `gaps`, `batch`, `xrefs`, `callers`, `callees`, `func`, `functions`,
-`symbols`, `inventory`, `callgraph`, `context`, and `coverage` accept `--timeout SECONDS`. Imports default to 3600 seconds and single queries to 600. A batch defaults to
-600 seconds or 60 seconds per query, whichever is larger. `0` disables the limit. `trace --project`
-uses the 600-second query budget.
+`symbols`, `inventory`, `callgraph`, `context`, `coverage`, and `trace` accept `--timeout SECONDS`.
+Imports default to 3600 seconds and single queries to 600. A batch defaults to
+600 seconds or 60 seconds per query, whichever is larger. `0` disables the limit. `trace` applies
+the budget to its `--project` comparison.
 When the budget runs out, retrore stops the whole `analyzeHeadless` process group, JVM included.
 It sends SIGTERM first so Ghidra can release the project lock, then SIGKILL after 10 seconds. The
 Python functions in `retrore.ghidra` take the same `timeout` keyword.
@@ -745,6 +761,8 @@ With `--json`, a failed command prints this object to stderr:
 | `unsupported_map_version` | `map.json` comes from a newer retrore |
 | `timeout` | The headless run exceeded `--timeout` |
 | `headless_failed` | `analyzeHeadless` exited without a result; the message ends with the log tail |
+| `project_locked` | Another Ghidra session holds the project lock |
+| `cancelled` | An MCP client cancelled the call (the server sends no response for it) |
 | `script_error` | A retrore Ghidra script reported an unclassified failure |
 | `invalid_request` | The query or batch request failed validation |
 | `address_not_found` | The address is malformed for the project or outside the loaded image |

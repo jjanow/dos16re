@@ -8,6 +8,7 @@ import sys
 import time
 from io import StringIO
 from pathlib import Path
+from struct import pack_into
 
 import pytest
 
@@ -117,6 +118,23 @@ def test_timeout_kills_the_whole_process_group(fake_ghidra, tmp_path, monkeypatc
     assert "2 second time budget" in error["message"]
 
     _wait_dead(int(pid_file.read_text()))
+
+
+def test_trace_comparison_has_a_time_budget(fake_ghidra, tmp_path, monkeypatch, capsys):
+    project = fake_ghidra("hang")
+    monkeypatch.setenv("FAKE_GHIDRA_PID", str(tmp_path / "grandchild.pid"))
+    monkeypatch.setattr(ghidra, "_KILL_GRACE", 1)
+    header = bytearray(32)
+    pack_into("<2s13H", header, 0, b"MZ", 48, 1, 0, 2, 32, 32, 2, 0x100, 0, 0, 0, 28, 0)
+    exe, export, trace = tmp_path / "sample.exe", tmp_path / "export", tmp_path / "LOGCPU.TXT"
+    exe.write_bytes(header + b"\xc3".ljust(16, b"\0"))
+    trace.write_text("1000:0000  ret\n", encoding="utf-8")
+    assert main(["load", str(exe), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["trace", str(trace), "--export", str(export), "--project", str(project),
+                 "--timeout", "2", "--json"]) == 1
+    assert _error(capsys)["code"] == "timeout"
+    _wait_dead(int((tmp_path / "grandchild.pid").read_text()))
 
 
 def test_timeout_validation_and_disabled_budget(fake_ghidra, capsys):
