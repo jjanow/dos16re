@@ -328,6 +328,8 @@ class Host:
         self.idle = idle or idle_timeout()
         self.worker = Worker(self.project)
         self.closed = threading.Event()
+        self.finished = threading.Event()
+        self._clients: set[threading.Thread] = set()
         self.requests = 0
         self.fallbacks = 0
         self._lock = threading.Lock()
@@ -383,10 +385,29 @@ class Host:
                 connection, _ = server.accept()
             except (OSError, ValueError):
                 return
-            threading.Thread(target=self._client, args=(connection,), name="retrore-worker-client",
-                             daemon=True).start()
+            thread = threading.Thread(target=self._client, args=(connection,), name="retrore-worker-client",
+                                      daemon=True)
+            with self._state:
+                self._clients.add(thread)
+            thread.start()
+
+    def join_clients(self, timeout: float) -> None:
+        """Wait for connections in progress to send their replies, such as the reply to `stop`."""
+        deadline = time.monotonic() + timeout
+        with self._state:
+            clients = list(self._clients)
+        for thread in clients:
+            if thread is not threading.current_thread():
+                thread.join(max(0.0, deadline - time.monotonic()))
 
     def _client(self, connection: socket.socket) -> None:
+        try:
+            self._serve_client(connection)
+        finally:
+            with self._state:
+                self._clients.discard(threading.current_thread())
+
+    def _serve_client(self, connection: socket.socket) -> None:
         with connection:
             try:
                 message = json.loads(_receive_line(connection, time.monotonic() + 30))
@@ -516,9 +537,11 @@ class Host:
     def close(self) -> None:
         """Stop the worker, stop listening, and release the project. Waits for a request in progress."""
         with self._state:
-            if self.closed.is_set():
-                return
+            closing = self.closed.is_set()
             self.closed.set()
+        if closing:
+            self.finished.wait()
+            return
         if self._server is not None:
             with contextlib.suppress(OSError):
                 self._server.close()
@@ -531,6 +554,7 @@ class Host:
             self._lock_file.close()
         if self._on_close is not None:
             self._on_close(self)
+        self.finished.set()
 
 
 class HostExists(Exception):
@@ -785,8 +809,9 @@ def serve(project: Path, idle: float | None = None, *, warm: bool = True) -> int
             print(f"retrore: {error}", file=sys.stderr, flush=True)
             host.close()
             return 1
-    while not host.closed.wait(1):
+    while not host.finished.wait(1):
         pass
+    host.join_clients(10)
     print(f"retrore worker {os.getpid()} stopped", file=sys.stderr, flush=True)
     return 0
 
