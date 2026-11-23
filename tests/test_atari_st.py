@@ -67,9 +67,9 @@ def test_atari_st_export_and_search(tmp_path, capsys):
     matches = json.loads(capsys.readouterr().out)["matches"]
     assert matches and all(match["unit_address"].startswith("text:") for match in matches)
     assert main(["call", "text:0", "--export", str(out), "--json"]) == 1
-    assert "requires a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]
+    assert "requires a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]["message"]
     assert main(["trace", str(tmp_path / "log"), "--export", str(out), "--json"]) == 1
-    assert "require a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]
+    assert "require a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 @pytest.mark.parametrize("absolute", [0, 1])

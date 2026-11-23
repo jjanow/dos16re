@@ -132,7 +132,7 @@ def test_apple2_raw_and_language_card_placement(tmp_path, capsys):
     helper.write_bytes(b"\x60")
     command = ["info", str(raw), "--apple2-raw", "--base-address", "d000", "--json"]
     assert main(command) == 1
-    assert "outside visible RAM" in json.loads(capsys.readouterr().err)["error"]
+    assert "outside visible RAM" in json.loads(capsys.readouterr().err)["error"]["message"]
     command += ["--apple2-lc", "c088", "--apple2-unit", str(helper) + "@e000"]
     assert main(command) == 0
     program = json.loads(capsys.readouterr().out)
@@ -141,9 +141,9 @@ def test_apple2_raw_and_language_card_placement(tmp_path, capsys):
         (0xD000, False, None), (0xE000, False, None),
     ]
     assert main([*command, "--apple2-unit", str(raw) + "@d000"]) == 1
-    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]
+    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]["message"]
     assert main([*command, "--entry", "ffff"]) == 1
-    assert "outside the loaded binaries" in json.loads(capsys.readouterr().err)["error"]
+    assert "outside the loaded binaries" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_apple2_ghidra_import_and_queries(tmp_path, capsys):

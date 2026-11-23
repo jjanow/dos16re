@@ -15,9 +15,14 @@ from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
-from .ghidra import GhidraError, analysis_gaps, decompile, import_program, query, query_address, query_batch
+from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
+from .ghidra import (
+    BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, decompile, import_program,
+    query, query_address, query_batch,
+)
 from .image import (
-    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, ImageError,
+    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT,
+    ImageError,
 )
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, MZExecutable, UnsupportedPacker
@@ -30,6 +35,13 @@ from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build
 from .queries import QUERIES, option_names
 from .search import SearchError, find_bytes
 from .trace import TraceError, import_trace
+from .x1 import DISK_SUFFIXES as X1_DISK_SUFFIXES
+from .x1 import MEMORY_VIEWS as X1_VIEWS
+from .x1 import X1Error, build_x1_image
+from .x1 import boot_source as x1_boot_source
+from .x1 import copy_source as x1_copy_source
+from .x1 import disk_source as x1_disk_source
+from .x1 import lsn_source as x1_lsn_source
 from .z80 import Z80Source
 
 _PREVIEW_LIMIT = 10
@@ -85,6 +97,21 @@ def _disk_sector(value: str) -> tuple[int, int, int, int, int]:
     except ValueError:
         raise argparse.ArgumentTypeError("expected decimal C:H:R[+COUNT] and hexadecimal @HEX") from None
     return cylinder, head, record, sectors, _hex_address(address)
+
+
+def _x1_chr(value: str) -> tuple:
+    return ("chr", *_disk_sector(value))
+
+
+def _x1_lsn(value: str) -> tuple:
+    span, at, address = value.partition("@")
+    lsn, plus, count = span.partition("+")
+    try:
+        if not at:
+            raise ValueError
+        return "lsn", int(lsn, 16), int(count) if plus else 1, _hex_address(address)
+    except (ValueError, argparse.ArgumentTypeError):
+        raise argparse.ArgumentTypeError("expected hexadecimal LSN, decimal [+COUNT], and hexadecimal @HEX") from None
 
 
 def _segmented_address(value: str) -> Address:
@@ -295,6 +322,51 @@ def _pc88_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     return build_pc88_image(sources, filename, entries, low or "ram", args.pc88_high or "ram", disk)
 
 
+def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
+    if args.base_segment is not None or args.overlay:
+        raise X1Error("--base-segment and --overlay apply to DOS executables")
+    if args.disk_file:
+        raise X1Error("select X1 disk sectors with --x1-sector or --x1-lsn, or omit them for the IPL")
+    if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
+            or args.apple2_disk_order or args.atari8_unit or args.atari8_portb is not None
+            or args.msx2_unit or args.msx2_copy):
+        raise X1Error("other platform options cannot be used with --x1")
+    filename = args.program.name
+    disk = header = None
+    entries = args.entry
+    sources = []
+    if args.program.suffix.lower() in X1_DISK_SUFFIXES or args.x1_sector or args.x1_disk is not None or args.x1_ipl:
+        if args.base_address is not None:
+            raise X1Error("set disk load addresses with --x1-sector C:H:R[+COUNT]@HEX or --x1-lsn LSN[+COUNT]@HEX")
+        disk = D88Disk(data, args.x1_disk if args.x1_disk is not None else 1)
+        if args.x1_ipl or not args.x1_sector:
+            boot, header = x1_boot_source(disk, filename)
+            sources.append(boot)
+            entries = [header.exec_address, *entries]
+        for kind, *selection in args.x1_sector:
+            if kind == "chr":
+                cylinder, head, record, count, address = selection
+                name = f"sector_{cylinder}_{head}_{record}_{address:04x}"
+                source = x1_disk_source(disk, filename, name, address, cylinder, head, record, count)
+            else:
+                lsn, count, address = selection
+                source = x1_lsn_source(disk, filename, f"lsn_{lsn:04x}_{address:04x}", address, lsn, count)
+            sources.append(source if sources else Z80Source(
+                "root", source.source, source.address, source.data,
+                file_offset=source.file_offset, file_spans=source.file_spans))
+    elif args.base_address is None:
+        raise X1Error("--base-address is required for raw X1 files")
+    else:
+        sources.append(Z80Source("root", filename, args.base_address, data))
+    for address, size, destination in args.x1_copy:
+        sources.append(x1_copy_source(sources, address, size, destination))
+    for path, address in args.x1_unit:
+        if address is None:
+            raise X1Error(f"specify an X1 load address for {path.name!r} with @HEX")
+        sources.append(Z80Source(path.stem, path.name, address, path.read_bytes()))
+    return build_x1_image(sources, filename, entries, args.x1_view or "ram", disk, header)
+
+
 def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     if (args.base_address is not None or args.overlay or args.disk_file or args.entry
             or args.c64_unit or args.c64_bank is not None
@@ -429,7 +501,7 @@ def _query_options(args: argparse.Namespace) -> dict:
 
 
 def _decomp(args: argparse.Namespace) -> None:
-    report = decompile(args.address, args.project, **_query_options(args))
+    report = decompile(args.address, args.project, timeout=args.timeout, **_query_options(args))
     if args.json:
         print(json.dumps(report))
         return
@@ -458,7 +530,7 @@ def _decomp(args: argparse.Namespace) -> None:
 
 
 def _address_query(args: argparse.Namespace) -> None:
-    report = query_address(args.command, args.address, args.project, **_query_options(args))
+    report = query_address(args.command, args.address, args.project, timeout=args.timeout, **_query_options(args))
     if args.json:
         print(json.dumps(report))
         return
@@ -490,7 +562,7 @@ def _batch(args: argparse.Namespace) -> int:
     except (json.JSONDecodeError, UnicodeError) as error:
         raise GhidraError(f"invalid batch JSON: {error}") from error
 
-    report = query_batch(args.project, requests)
+    report = query_batch(args.project, requests, timeout=args.timeout)
     results = report["results"]
     errors = [row for row in results if "error" in row]
     if args.json:
@@ -499,7 +571,7 @@ def _batch(args: argparse.Namespace) -> int:
         print(f"{len(results) - len(errors)}/{len(results)} queries succeeded")
         for row in errors[:_PREVIEW_LIMIT]:
             target = "".join(f" {value}" for key, value in row.items() if key not in ("command", "error"))
-            print(f"  {row['command']}{target}: {row['error']}")
+            print(f"  {row['command']}{target}: {row['error']['code']}: {row['error']['message']}")
     return int(bool(errors))
 
 
@@ -563,13 +635,13 @@ def _print_continue(report: dict) -> None:
 
 
 def _registry_query(args: argparse.Namespace) -> int:
-    report = query(args.project, _registry_request(args))
+    report = query(args.project, _registry_request(args), timeout=args.timeout)
     command = args.command
     if args.json:
         print(json.dumps(report))
     elif command == "functions":
         _print_page(report, "functions", [
-            f"{row['query']}: {row['error']}" if "error" in row else f"{_location(row['entry'])}  {row['prototype']}"
+            f"{row['query']}: {row['error']['message']}" if "error" in row else f"{_location(row['entry'])}  {row['prototype']}"
             for row in report["functions"]
         ])
     elif command == "symbols":
@@ -620,7 +692,7 @@ def _registry_query(args: argparse.Namespace) -> int:
 
 
 def _paged_gaps(args: argparse.Namespace) -> None:
-    report = query(args.project, _registry_request(args))
+    report = query(args.project, _registry_request(args), timeout=args.timeout)
     if args.json:
         print(json.dumps(report))
         return
@@ -694,6 +766,13 @@ def _trace(args: argparse.Namespace) -> None:
         print("Use --json for the full trace report.")
 
 
+def _seconds(value: str) -> float:
+    seconds = float(value)
+    if not seconds >= 0:
+        raise argparse.ArgumentTypeError("expected a nonnegative number of seconds")
+    return seconds
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retrore", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -728,6 +807,7 @@ def main(argv: list[str] | None = None) -> int:
         platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
         platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
         platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
+        platform.add_argument("--x1", action="store_true", help="interpret the input as a Sharp X1 D88 disk or raw file")
         command.add_argument(
             "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
             help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
@@ -796,6 +876,28 @@ def main(argv: list[str] | None = None) -> int:
             "--pc98-entry", type=_segmented_address, action="append", default=[], metavar="SEG:OFF",
             help="seed PC-98 analysis at a hexadecimal segment and offset (repeatable)",
         )
+        command.add_argument("--x1-disk", type=int, metavar="INDEX", help="select a 1-based disk in a D88 container")
+        command.add_argument(
+            "--x1-ipl", action="store_true",
+            help="load the IPL boot payload before explicit X1 sectors (default when no sectors are selected)",
+        )
+        command.add_argument(
+            "--x1-sector", dest="x1_sector", type=_x1_chr, action="append", default=[], metavar="C:H:R[+COUNT]@HEX",
+            help="load a disk sector span by decimal cylinder, head, and sector ID",
+        )
+        command.add_argument(
+            "--x1-lsn", dest="x1_sector", type=_x1_lsn, action="append", metavar="LSN[+COUNT]@HEX",
+            help="load a disk sector span by hexadecimal X1 logical sector number (16 sectors per side)",
+        )
+        command.add_argument(
+            "--x1-copy", type=_runtime_copy, action="append", default=[], metavar="SRC:SIZE@DEST",
+            help="copy a hexadecimal span after the disk loads and before additional raw files",
+        )
+        command.add_argument(
+            "--x1-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
+            help="load an additional raw X1 file at its runtime address",
+        )
+        command.add_argument("--x1-view", choices=X1_VIEWS, help="select RAM or the IPL ROM for reads below 8000")
         command.add_argument(
             "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
             help="seed 8-bit machine-code analysis at this address (repeatable)",
@@ -882,13 +984,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
+    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries),
+                    *map(commands.choices.get, _REGISTRY_COMMANDS)):
+        default = IMPORT_TIMEOUT if command is import_parser else None if command is batch_parser else QUERY_TIMEOUT
+        described = (f"the larger of {QUERY_TIMEOUT} and {BATCH_SECONDS_PER_QUERY} per query"
+                     if default is None else default)
+        command.add_argument(
+            "--timeout", type=_seconds, default=default, metavar="SECONDS",
+            help=f"stop headless Ghidra after SECONDS (default: {described}; 0 disables the limit)",
+        )
 
     args = parser.parse_args(argv)
     try:
         if args.command == "batch":
             return _batch(args)
         if args.command == "ghidra":
-            report = import_program(args.export, args.project)
+            report = import_program(args.export, args.project, timeout=args.timeout)
             summary = f"Imported {report['units']} units into {args.project}"
             print(json.dumps(report) if args.json else summary)
             return 0
@@ -897,11 +1008,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command in _REGISTRY_COMMANDS:
             return _registry_query(args)
-        if args.command == "gaps" and any(getattr(args, name) is not None for name in ("unit", "limit", "offset", "fields")):
+        paging = ("unit", "limit", "offset", "fields")
+        if args.command == "gaps" and any(getattr(args, name) is not None for name in paging):
             _paged_gaps(args)
             return 0
         if args.command == "gaps":
-            report = analysis_gaps(args.project)
+            report = analysis_gaps(args.project, timeout=args.timeout)
             if args.json:
                 print(json.dumps(report))
             else:
@@ -938,7 +1050,12 @@ def main(argv: list[str] | None = None) -> int:
             raise Pc88Error("PC-88 options require --pc88")
         if not args.pc98 and (args.pc98_disk is not None or args.pc98_sector or args.pc98_unit or args.pc98_entry):
             raise Pc98Error("PC-98 options require --pc98")
-        if args.pc98:
+        if not args.x1 and (args.x1_disk is not None or args.x1_ipl or args.x1_sector or args.x1_copy
+                            or args.x1_unit or args.x1_view):
+            raise X1Error("X1 options require --x1")
+        if args.x1:
+            image, program_map = _x1_image(args, data)
+        elif args.pc98:
             image, program_map = _pc98_image(args, data)
         elif args.pc88:
             image, program_map = _pc88_image(args, data)
@@ -980,13 +1097,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "load":
             _export_image(args.output, image, program_map)
     except (Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
-            Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, OSError) as error:
-        report = {"error": str(error)}
+            Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error, OSError) as error:
+        report = {"contract": CONTRACT_VERSION, "error": error_record(error)}
         if isinstance(error, UnsupportedPacker):
             report["packer"] = error.packer
         message = json.dumps(report) if args.json else f"retrore: {error}"
         print(message, file=sys.stderr)
-        return 1
+        return EXIT_FAILURE
 
     if args.json:
         print(json.dumps(program_map))
@@ -1010,6 +1127,9 @@ def main(argv: list[str] | None = None) -> int:
             platform = "MSX2  MSX-DOS RAM"
         elif program_map["format"] == PC88_FORMAT:
             platform = f"PC-88  {program_map['memory_view']}"
+        elif program_map["format"] == X1_FORMAT:
+            ipl = program_map.get("ipl")
+            platform = f"X1  {program_map['memory_view']}" + (f"  IPL {ipl['name']!r}" if ipl else "")
         else:
             platform = f"C64 PRG  bank {program_map['bank']}"
         print(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")

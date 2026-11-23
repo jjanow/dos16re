@@ -38,7 +38,8 @@ def test_every_query_has_a_cli_command(command, capsys):
     with pytest.raises(SystemExit) as exit_info:
         main([command, "--help"])
     assert exit_info.value.code == 0
-    assert "--project" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "--project" in output and "--timeout" in output
 
 
 @pytest.mark.parametrize("request_, message", [
@@ -100,7 +101,7 @@ def test_defaults_and_echo():
 
 def test_fields_require_json(tmp_path, capsys):
     assert main(["symbols", "--glob", "*", "--fields", "name", "--project", str(tmp_path / "p"), "--json"]) == 1
-    assert "Ghidra project not found" in json.loads(capsys.readouterr().err)["error"]
+    assert "Ghidra project not found" in json.loads(capsys.readouterr().err)["error"]["message"]
     assert main(["symbols", "--glob", "*", "--fields", "name", "--project", str(tmp_path / "p")]) == 1
     assert "--fields requires --json" in capsys.readouterr().err
 
@@ -176,7 +177,8 @@ def test_dos_bulk_queries(dos_project, capsys, monkeypatch):
     assert len(launches) == 1
     assert [row["command"] for row in rows] == [request["command"] for request in requests]
     assert rows[2]["prefix"] == "FUN_" and rows[7]["unit"] == "missing" and rows[8]["address"] == "root:0"
-    assert "unknown unit missing" in rows[7]["error"]
+    assert rows[7]["error"]["code"] == "address_not_found"
+    assert rows[7]["error"]["message"] == "unknown unit missing"
     (lookup, narrow, prefixed, glob, unit_name, inventory, inventory_page, _, shallow, deep, capped, callers,
      context, far, gaps, overlay_gaps, coverage, callees) = (row.get("result") for row in rows)
 
@@ -187,9 +189,11 @@ def test_dos_bulk_queries(dos_project, capsys, monkeypatch):
         "prototype": "undefined __cdecl16near entry()", "calling_convention": "__cdecl16near",
     }
     assert far_routine["entry"] == "root:0015" and far_routine["calling_convention"] == "__stdcall16far"
-    assert missing == {"query": "root:12", "error": "no analyzed function contains root:12"}
+    assert (missing["query"], missing["error"]["code"]) == ("root:12", "no_function")
+    assert missing["error"]["message"] == "no analyzed function contains root:12" and missing["error"]["hint"]
     assert by_name == {**far_routine, "query": "FUN_1000_0015"}
-    assert unknown == {"query": "nope", "error": "no analyzed function named nope"}
+    assert (unknown["query"], unknown["error"]["code"]) == ("nope", "no_function")
+    assert unknown["error"]["message"] == "no analyzed function named nope"
     assert lookup["pagination"]["functions"] == {"offset": 0, "total": 5, "returned": 5, "next_offset": None}
     assert narrow["functions"] == [{"query": "root:15", "prototype": "undefined __stdcall16far FUN_1000_0015()"}]
     assert narrow["pagination"]["functions"]["next_offset"] == 2
@@ -263,14 +267,14 @@ def test_dos_bulk_queries(dos_project, capsys, monkeypatch):
     # The CLI commands return the same JSON as the batch.
     cli_lookup = _cli(capsys, "functions", "root:0", "1000:0016", "root:12", "--name", "FUN_1000_0015",
                       "--name", "nope", "--compact", "--project", project, "--json", status=1)
-    assert json.loads(cli_lookup) == lookup
+    assert json.loads(cli_lookup) == {"contract": 1, **lookup}
     assert json.loads(_cli(capsys, "callgraph", "root:0", "--depth", "1", "--compact", "--project", project,
-                           "--json")) == shallow
+                           "--json")) == {"contract": 1, **shallow}
     assert json.loads(_cli(capsys, "context", "root:15", "--fields", "calling_convention,callees",
-                           "--project", project, "--json")) == far
+                           "--project", project, "--json")) == {"contract": 1, **far}
     assert json.loads(_cli(capsys, "symbols", "--glob", "fun_1000_00??", "--ignore-case", "--limit", "2",
-                           "--compact", "--project", project, "--json")) == glob
-    assert json.loads(_cli(capsys, "gaps", "--limit", "2", "--project", project, "--json")) == gaps
+                           "--compact", "--project", project, "--json")) == {"contract": 1, **glob}
+    assert json.loads(_cli(capsys, "gaps", "--limit", "2", "--project", project, "--json")) == {"contract": 1, **gaps}
 
     text = _cli(capsys, "callgraph", "root:0", "--depth", "1", "--project", project)
     assert text.splitlines()[:2] == ["root:0000  entry", "Walk truncated by depth limit."]

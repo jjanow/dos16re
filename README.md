@@ -2,7 +2,7 @@
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
-and NEC PC-88 and PC-98 programs.
+NEC PC-88 and PC-98 programs, and Sharp X1 programs.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -403,6 +403,51 @@ Ghidra imports the program as 16-bit real-mode x86 and represents VRAM and IPL R
 blocks. Query loaded code by `seg:off` or `unit:offset` and graphics references by block name,
 such as `blue_vram:0012`. [MAME PC-9801 memory map](https://github.com/mamedev/mame/blob/master/src/mame/nec/pc9801.cpp)
 
+## Sharp X1 loader
+
+Pass `--x1` to `info` or `load`. A `.d88` or `.d77` image defaults to the IPL boot entry. This is
+the 32-byte header in cylinder 0, head 0, sector ID 1, with attribute `01`, a 13-byte name,
+extension `Sys`, and the payload size, load address, and execution address at `+12`, `+14`, and
+`+16`. Its 16-bit starting logical sector is at `+1E`. The loader reads the payload from that sector,
+truncates it to the header size, and seeds analysis at the execution address. Logical sectors
+fill both sides of a cylinder in turn: track = LSN / 16, head = track & 1, cylinder = track / 2,
+sector ID = LSN % 16 + 1. For a container with multiple disks, use `--x1-disk INDEX` (1-based).
+A raw input needs `--base-address HEX`.
+[X Millennium built-in IPL](https://github.com/r-type/xmil-libretro/blob/master/io/defipl.res)
+
+```sh
+.venv/bin/retrore info DISK.d88 --x1 --json
+.venv/bin/retrore load DISK.d88 --x1 --x1-ipl --x1-lsn 80+112@100 --entry 100 -o out/x1
+.venv/bin/retrore ghidra import out/x1 out/x1-project
+.venv/bin/retrore decomp 100 --project out/x1-project --json
+```
+
+Repeat `--x1-lsn LSN[+COUNT]@HEX` (hexadecimal logical sector, decimal count) or
+`--x1-sector C:H:R[+COUNT]@HEX` (decimal cylinder, head, sector ID, and count) to load disk spans.
+These options apply in the order given. Explicit spans replace the IPL payload unless you
+also pass `--x1-ipl`, which loads the payload first as `root`. `map.json` records the IPL header
+under `ipl` and original container offsets in `file_spans`. Use `--x1-copy SRC:SIZE@DEST` to
+copy a span of one visible load, then repeat `--x1-unit FILE@HEX` for raw files. Later loads
+replace overlapping bytes. Export separate layouts for alternative stages.
+
+At reset, the IPL ROM covers reads below `$8000`, while writes reach RAM. The IPL turns the ROM
+off with a write to port `$1E00` before it jumps to the payload. A write to `$1D00` turns it back
+on. The default view is RAM. Use `--x1-view ipl-rom` to represent the ROM window as uninitialized
+memory. Devices and VRAM are in the 16-bit I/O space, addressed through `OUT (C),r` with the full
+`BC` value. Ghidra imports X1 exports with its Z180 language variant. Unlike the plain Z80
+variant, which keeps only `C`, it decodes these ports as `BC`. That variant omits the undocumented
+Z80 instructions (`IXH`/`IXL`/`IYH`/`IYL` forms, `SLL`, and the `ED 4E`/`ED 6E` mode mirrors), so
+code that uses them stops at a bad instruction. Phantasie I's analysis coverage is the same under both variants. The importer maps the whole I/O space and
+labels the cartridge ROM, FDC, palette, priority, PCG, CRTC, sub-CPU, PPI, PSG, IPL ROM switch,
+CTC, attribute VRAM, text VRAM, and graphics VRAM blocks. For example, the command
+`xrefs x1_crtc:0001 --project out/x1-project --json` lists writes to the CRTC data register.
+X1turbo bank memory and its additional devices aren't modeled yet.
+
+The Phantasie I Program Disk's IPL entry `PHANTASIE 1` loads 12 sectors from LSN `$370` (C27 H1 R1)
+at `$BF80` and runs `$C000`. The example `load` above adds the second stage. The routine at `$C3D8`
+reads `$70` sectors from LSN `$80` to `$0100`, and `$C465` jumps there.
+[MAME X1 memory and I/O maps](https://github.com/mamedev/mame/blob/master/src/mame/sharp/x1.cpp)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -556,11 +601,13 @@ match the individual commands, with underscores in place of dashes. Use the arra
 `ref_types`, `addresses`, and `names`, the integers `limit`, `offset`, `context`, `slice`, `depth`,
 and `max_nodes`, the booleans `compact` and `ignore_case`, and the strings `direction`, `unit`,
 `name`, `prefix`, and `glob` where supported. retrore validates every request before it starts
-Ghidra. The JSON response contains a `results` array in request order. Each row echoes `command`
-and the identifying parameters `address`, `unit`, `name`, `prefix`, or `glob` that the request
-contains. It then includes either `result`, with the individual command's JSON, or `error`. The CLI
-writes the whole batch report to stdout and exits with status 1 if any query fails. An invalid
-request array or a headless launch failure uses the command's error stream.
+Ghidra. The JSON response contains `contract` and a `results` array in request order. Each row
+echoes `command` and the identifying parameters `address`, `unit`, `name`, `prefix`, or `glob` that
+the request contains. It then includes either `result`, with the individual command's JSON, or an `error` object with `code`,
+`message`, and `hint`. The CLI writes the whole batch report to stdout and exits with status 1 if
+any query fails. An invalid request array or a headless launch failure uses the command's error
+stream. A batch launches Ghidra once, so it costs about the same as one single query. See
+[benchmarks](docs/benchmarks.md).
 
 The `retrore.queries` module defines every query command, its parameters with JSON Schema types,
 ranges, and defaults, its selectable fields, and its caps. `query_definitions()` returns them as
@@ -595,8 +642,8 @@ lists. A `next_offset` other than `null` means more records remain.
 
 `functions` reports each function's name, entry, inclusive body ranges, size, prototype, and
 calling convention. Each row starts with `query`, the address or name it answers. A row for an
-address outside any function or an unknown name has `error` in place of the record, and the CLI then
-exits with status 1. Lookups use Ghidra's function names, including defaults like `FUN_1000_0015`.
+address outside any function or an unknown name has an `error` object in place of the record, with
+the code `no_function` or `address_not_found`, and the CLI then exits with status 1. Lookups use Ghidra's function names, including defaults like `FUN_1000_0015`.
 
 `symbols` matches names exactly, by prefix, or by a glob in which `*` matches any run of characters
 and `?` matches one. It covers names stored in the project, such as functions, imported labels, and
@@ -624,6 +671,65 @@ output. `coverage` counts undefined bytes in initialized units only.
 `--fields functions,data`. Lists that are not selected are not computed. For `functions`, `symbols`,
 `gaps`, and `coverage`, `--fields` selects fields within each record. `functions` rows keep `query`
 and any `error`.
+
+### Errors, exit statuses, and time budgets
+
+`ghidra import`, `decomp`, `gaps`, `batch`, `xrefs`, `callers`, `callees`, `func`, `functions`,
+`symbols`, `inventory`, `callgraph`, `context`, and `coverage` accept `--timeout SECONDS`. Imports default to 3600 seconds and single queries to 600. A batch defaults to
+600 seconds or 60 seconds per query, whichever is larger. `0` disables the limit. `trace --project`
+uses the 600-second query budget.
+When the budget runs out, retrore stops the whole `analyzeHeadless` process group, JVM included.
+It sends SIGTERM first so Ghidra can release the project lock, then SIGKILL after 10 seconds. The
+Python functions in `retrore.ghidra` take the same `timeout` keyword.
+
+With `--json`, a failed command prints this object to stderr:
+
+```json
+{"contract": 1, "error": {"code": "no_function", "message": "no analyzed function contains c00a", "hint": "..."}}
+```
+
+| Exit status | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | The command failed and printed an error, or a batch finished with at least one failed query |
+| 2 | Invalid command-line usage, reported by argparse in plain text even with `--json` |
+
+`code` is stable, and scripts should branch on it. `message` and `hint` are for people and may change.
+
+| Code | Meaning |
+|---|---|
+| `ghidra_not_found` | `GHIDRA_HOME` does not contain `support/analyzeHeadless` |
+| `project_not_found` | The `--project` path has no `.gpr` file |
+| `export_invalid` | `map.json` or `image.bin` is missing or invalid |
+| `unsupported_map_version` | `map.json` comes from a newer retrore |
+| `timeout` | The headless run exceeded `--timeout` |
+| `headless_failed` | `analyzeHeadless` exited without a result; the message ends with the log tail |
+| `script_error` | A retrore Ghidra script reported an unclassified failure |
+| `invalid_request` | The query or batch request failed validation |
+| `address_not_found` | The address is malformed for the project or outside the loaded image |
+| `no_function` | No analyzed function or instruction contains the address |
+| `project_mismatch` | A trace was compared with a project imported from a different image |
+| `query_failed` | Ghidra could not answer the query, for example when decompilation fails |
+| `unsupported_packer` | The DOS executable uses a packer retrore cannot unpack; `packer` names it |
+| `input_invalid` | The input program or options are invalid for the selected platform |
+| `io_error` | A file could not be read or written |
+
+Batch rows and failed `functions` lookup rows use the same `error` object, with the query codes
+`address_not_found`, `no_function`, and `query_failed`. An unknown `unit` reports `address_not_found`.
+
+### Versions and compatibility
+
+`map.json` carries an integer major `version`, currently 1. Readers treat a map without `version`
+as version 1. They reject a larger version with `unsupported_map_version` and other invalid
+values with `export_invalid`. New optional fields do not change the version, and readers ignore
+fields they do not know. A change that older readers would misread, such as a changed meaning or
+a removed field, increments `version`. The checked-in [unversioned fixtures](tests/fixtures/maps) cover
+the DOS, Amiga, C64, MSX2, and PC-98 exporters, and the tests check that current code still reads them.
+
+Ghidra query JSON carries a top-level `contract` integer, currently 1. It is present on single queries
+(even with `--fields`), `gaps`, and batch reports. Every `--json` error object from any command carries it too. It is not present inside batch row
+results. Adding fields, query commands, or error codes keeps the contract number. Renaming or removing
+a field, or changing its type or meaning, increments it.
 
 ## Emulator harness
 
@@ -709,7 +815,8 @@ the extracted Amiga directories containing `game` and `PhantasieIII` respectivel
 the Phantasie III MSX2 Scenario Disk `.dsk` image. Set `RETRORE_PH3_PC88_DIR` to the directory
 containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. Set
 `RETRORE_PH3_PC98_DIR` to the directory containing the Phantasie III PC-98 Program and Utility Disk
-`.d88` images. The Ghidra tests use
+`.d88` images. Set `RETRORE_PH1_X1_DIR` to the directory containing the Phantasie I X1 Program and
+Player Disk `.d88` images. The Ghidra tests use
 `GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
 input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and

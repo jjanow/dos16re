@@ -4,7 +4,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .errors import CodedError
 from .mz import Address
+
+# Major version of map.json. Writers set "version" to this value; additive fields keep it unchanged.
+MAP_VERSION = 1
 
 DEFAULT_M68K_BASE = 0x10000
 M68K_ADDRESS_LIMIT = 0x1000000
@@ -15,16 +19,34 @@ ATARI8_FORMAT = "ATARI8"
 MSX2_FORMAT = "MSX2"
 PC88_FORMAT = "PC88"
 PC98_FORMAT = "PC98"
+X1_FORMAT = "X1"
 PC98_RAM_END = 0xA0000
 MOS6502_FORMATS = (C64_FORMAT, APPLE2_FORMAT, ATARI8_FORMAT)
-Z80_FORMATS = (MSX2_FORMAT, PC88_FORMAT)
+Z80_FORMATS = (MSX2_FORMAT, PC88_FORMAT, X1_FORMAT)
 FLAT16_FORMATS = (*MOS6502_FORMATS, *Z80_FORMATS)
 FLAT16_ADDRESS_LIMIT = MOS6502_ADDRESS_LIMIT = 0x10000
 _FLAT_LIMITS = dict.fromkeys(M68K_FORMATS, M68K_ADDRESS_LIMIT) | dict.fromkeys(FLAT16_FORMATS, FLAT16_ADDRESS_LIMIT)
 
 
-class ImageError(ValueError):
+class ImageError(CodedError):
     """An invalid image export."""
+
+    default_code = "export_invalid"
+
+
+def check_map_version(program: object) -> int:
+    """Return a map's major version. Maps without "version" predate versioning and read as version 1."""
+    if not isinstance(program, dict):
+        raise ImageError("invalid map.json: expected a JSON object")
+    version = program.get("version", 1)
+    if type(version) is not int or version < 1:
+        raise ImageError(f"invalid map.json: version must be a positive integer, not {version!r}")
+    if version > MAP_VERSION:
+        raise ImageError(
+            f"map.json version {version} is newer than supported version {MAP_VERSION}",
+            code="unsupported_map_version",
+        )
+    return version
 
 
 @dataclass(frozen=True)
@@ -50,8 +72,12 @@ class ImageUnit:
 def read_map(export: Path) -> dict:
     try:
         program = json.loads((export / "map.json").read_text(encoding="utf-8"))
-        if program["version"] != 1:
-            raise ValueError("unsupported map version")
+    except FileNotFoundError as error:
+        raise ImageError(f"map.json not found in {export}") from error
+    except (UnicodeError, ValueError) as error:
+        raise ImageError(f"invalid map.json: {error}") from error
+    check_map_version(program)
+    try:
         if program.get("format", "MZ") not in ("MZ", PC98_FORMAT, *_FLAT_LIMITS):
             raise ValueError("unsupported image format")
         return program

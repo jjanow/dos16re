@@ -47,8 +47,8 @@ def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):
     }
 
     assert main([*command, "--overlay-segment", "OV1=2001", "--json"]) == 1
-    assert "runtime ranges overlap" in json.loads(capsys.readouterr().err)["error"]
+    assert "runtime ranges overlap" in json.loads(capsys.readouterr().err)["error"]["message"]
 
     trace.write_text("2000:00010000\n", encoding="ascii")
     assert main([*command, "--json"]) == 1
-    assert "no 16-bit DOSBox-X instruction addresses" in json.loads(capsys.readouterr().err)["error"]
+    assert "no 16-bit DOSBox-X instruction addresses" in json.loads(capsys.readouterr().err)["error"]["message"]

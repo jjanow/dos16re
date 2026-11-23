@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, image_units, read_map
+from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, ImageError, image_units, read_map
 
 _STRING_ENCODINGS = {
     "MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii", PC98_FORMAT: "cp932",
@@ -23,6 +23,8 @@ def find_bytes(export: Path, pattern: bytes | str | int, *, width: int = 2, limi
             pattern = pattern.encode(_STRING_ENCODINGS[image_format])
         elif isinstance(pattern, int):
             pattern = pattern.to_bytes(width, "big" if image_format in M68K_FORMATS else "little", signed=pattern < 0)
+    except ImageError:
+        raise
     except (ValueError, OverflowError) as error:
         raise SearchError(str(error)) from error
     if not pattern:

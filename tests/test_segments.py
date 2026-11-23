@@ -28,6 +28,12 @@ def _import_program(tmp_path, capsys, exe, *options):
     return project, program
 
 
+def _single(capsys):
+    report = json.loads(capsys.readouterr().out)
+    assert report.pop("contract") == 1
+    return report
+
+
 def _check_references(project, *checks):
     script_path = Path(__file__).parent / "ghidra"
     result = subprocess.run(
@@ -138,7 +144,7 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, mo
     assert json.loads(capsys.readouterr().out)["far_procedures"] == 1
 
     assert main(["decomp", "root:10", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    result = json.loads(capsys.readouterr().out)
+    result = _single(capsys)
     assert "__stdcall16far" in result["decompilation"]
 
     requests = [
@@ -166,12 +172,13 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, mo
     assert len(launches) == 1
     batch = json.loads(captured.out)["results"]
     assert [{name: row[name] for name in ("command", "address")} for row in batch] == requests
-    assert "no analyzed function" in batch[1]["error"]
+    assert "no analyzed function" in batch[1]["error"]["message"]
+    assert batch[1]["error"]["code"] == "no_function"
     assert batch[0]["result"] == result
     assert batch[2]["result"]["unit_address"] == "OV1:0000"
 
     assert main(["callers", "1000:0013", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    callers = json.loads(capsys.readouterr().out)
+    callers = _single(capsys)
     assert batch[3]["result"] == callers
     assert callers["function"]["entry"]["unit_address"] == "root:0010"
     call, = callers["callers"]
@@ -179,24 +186,24 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, mo
     assert call["to_function"] == callers["function"]
 
     assert main(["callees", "root:0", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    callees = json.loads(capsys.readouterr().out)
+    callees = _single(capsys)
     assert batch[4]["result"] == callees
     assert callees["callees"][0] == call
     assert [edge["to"]["unit_address"] for edge in callees["callees"]] == ["root:0010", "root:001c"]
 
     assert main(["callees", "root:1c", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    overlay_call, = json.loads(capsys.readouterr().out)["callees"]
+    overlay_call, = _single(capsys)["callees"]
     entry = overlay_call["to_function"]["entry"]
     assert entry["unit_address"] == "OV1:0000"
     assert entry["linear"] == 0x11000
 
     assert main(["xrefs", "root:5", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    xrefs = json.loads(capsys.readouterr().out)
+    xrefs = _single(capsys)
     assert batch[5]["result"] == xrefs
     assert call in xrefs["outgoing"]
 
     assert main(["func", "root:10", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    function = json.loads(capsys.readouterr().out)
+    function = _single(capsys)
     assert batch[6]["result"] == function
     assert function["size"] == 10
     assert [(span["start"]["unit_address"], span["end"]["unit_address"]) for span in function["ranges"]] == [
@@ -225,10 +232,13 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, mo
     assert pages[4] == {key: result[key] for key in ("unit_address", "name")}
     assert main(["callees", "root:0", "--project", str(project), "--limit", "1", "--compact",
                  "--fields", "callees", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == pages[0]
+    assert _single(capsys) == pages[0]
 
     assert main(["func", "root:e", "--project", str(project), "--json"]) == 1
-    assert "no analyzed function" in json.loads(capsys.readouterr().err)["error"]
+    error = json.loads(capsys.readouterr().err)["error"]
+    assert error["code"] == "no_function" and "no analyzed function" in error["message"]
+    assert main(["func", "nosuchunit:0", "--project", str(project), "--json"]) == 1
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "address_not_found"
 
     assert main(["gaps", "--project", str(project) + ".gpr", "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)

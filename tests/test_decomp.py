@@ -47,7 +47,7 @@ def test_focused_decompilation(tmp_path, capsys):
     rows = query_batch(project, [{"command": "decomp", **request} for request in requests])["results"]
     limited, call, branch, store, optimized = (row["result"] for row in rows)
     assert main(["decomp", "root:8", "--project", str(project), "--context", "1", "--slice", "1", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == limited
+    assert json.loads(capsys.readouterr().out) == {"contract": 1, **limited}
     assert limited["unit_address"] == "root:0000"
     assert limited["focus"]["address"]["unit_address"] == "root:0007"
     assert limited["focus"]["bytes"] == "e80b00"

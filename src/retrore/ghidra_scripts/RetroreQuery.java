@@ -116,7 +116,7 @@ public class RetroreQuery extends GhidraScript {
                 default -> throw new IllegalArgumentException("unknown query mode " + args[0]);
             };
         } catch (IllegalArgumentException | AddressOutOfBoundsException | AddressOverflowException error) {
-            report = Map.of("error", errorMessage(error));
+            report = Map.of("error", errorObject(error));
         } finally {
             if (decompiler != null) {
                 decompiler.dispose();
@@ -137,7 +137,7 @@ public class RetroreQuery extends GhidraScript {
             try {
                 row.put("result", query(request));
             } catch (IllegalArgumentException | AddressOutOfBoundsException | AddressOverflowException error) {
-                row.put("error", errorMessage(error));
+                row.put("error", errorObject(error));
             }
             results.add(row);
         }
@@ -146,6 +146,39 @@ public class RetroreQuery extends GhidraScript {
 
     private static String errorMessage(Exception error) {
         return Objects.toString(error.getMessage(), error.getClass().getSimpleName());
+    }
+
+    /** An error with a stable code from retrore.errors. Throw it to report a code explicitly. */
+    static final class QueryError extends IllegalArgumentException {
+        final String code;
+
+        QueryError(String code, String message) {
+            super(message);
+            this.code = code;
+        }
+    }
+
+    private static Map<String, Object> errorObject(Exception error) {
+        String message = errorMessage(error);
+        String code;
+        if (error instanceof QueryError coded) {
+            code = coded.code;
+        } else if (error instanceof AddressOutOfBoundsException || error instanceof AddressOverflowException
+                || error instanceof NumberFormatException || message.startsWith("address outside")
+                || message.startsWith("offset outside") || message.startsWith("unknown unit")
+                || message.startsWith("expected a seg:off")) {
+            code = "address_not_found";
+        } else if (message.startsWith("no analyzed")) {
+            code = "no_function";
+        } else if (message.startsWith("Ghidra project")) {
+            code = "project_mismatch";
+        } else {
+            code = "query_failed";
+        }
+        var object = new LinkedHashMap<String, Object>();
+        object.put("code", code);
+        object.put("message", message);
+        return object;
     }
 
     private Map<String, Object> trace(JsonObject trace) throws Exception {
@@ -371,7 +404,7 @@ public class RetroreQuery extends GhidraScript {
     private Function containing(String input) throws Exception {
         var function = getFunctionContaining(resolve(input));
         if (function == null) {
-            throw new IllegalArgumentException("no analyzed function contains " + input);
+            throw new QueryError("no_function", "no analyzed function contains " + input);
         }
         return function;
     }
@@ -386,7 +419,7 @@ public class RetroreQuery extends GhidraScript {
                 return block;
             }
         }
-        throw new IllegalArgumentException("unknown unit " + name);
+        throw new QueryError("address_not_found", "unknown unit " + name);
     }
 
     private static AddressSet span(MemoryBlock block) {
@@ -419,7 +452,7 @@ public class RetroreQuery extends GhidraScript {
             try {
                 row.putAll(functionRecord(containing(input), options));
             } catch (IllegalArgumentException | AddressOutOfBoundsException | AddressOverflowException error) {
-                row.put("error", errorMessage(error));
+                row.put("error", errorObject(error));
             }
             rows.add(row);
         }
@@ -437,7 +470,7 @@ public class RetroreQuery extends GhidraScript {
             if (matches.isEmpty()) {
                 var row = new LinkedHashMap<String, Object>();
                 row.put("query", name);
-                row.put("error", "no analyzed function named " + name);
+                row.put("error", errorObject(new QueryError("no_function", "no analyzed function named " + name)));
                 rows.add(row);
             }
             for (var function : matches) {
