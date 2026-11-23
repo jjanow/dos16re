@@ -289,3 +289,28 @@ def test_x68k_ghidra_stacked_fpack_results(tmp_path, capsys):
     assert "replaced with injection: retrore_fpack_fee2" in modulo and "param_1 % param_2" in modulo
     assert "return local_10 / (double)CONCAT44(DAT_0001005a,DAT_0001005e);" in halve  # sum / 2.0
     assert "if ((double)CONCAT44(param_1,param_2) <= (double)CONCAT44(param_3,param_4)) {" in greater
+
+
+def test_ghidra_phantasie_iv_dos_and_fpack_calls(tmp_path, capsys):
+    directory = os.environ.get("RETRORE_PH4_X68K_DIR")
+    if not directory or not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set RETRORE_PH4_X68K_DIR and GHIDRA_HOME to run the real-game test")
+    out, project = tmp_path / "out", tmp_path / "project"
+    assert main(["load", os.path.join(directory, "P4.X"), "-o", str(out)]) == 0
+    assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    def decompile(address):
+        assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)["decompilation"]
+
+    # _save writes each file through _xwrite, which calls XC's _open, _write, and _close.
+    assert "_xwrite(1,s_goods_0_0004f670,&_item,0x13a);" in decompile("text:1714")
+    assert "_open(acStack_1c,0x4402,1);" in decompile("text:31924")
+    assert "DOS::_OPEN(unaff_A2,0);" in decompile("text:3c086")  # XC's open helper, path in A2
+    writing = decompile("text:3c2dc")
+    assert "DOS::_WRITE(handle,buffer,length);" in writing and "DOS::_WRITE(handle,&DAT_0004c3de,2);" in writing
+    assert "DOS::_SEEK(handle,0,1);" in decompile("text:3bd3c")
+    # Stacked FPACK doubles: _avg_attr is (anc1 + anc2) / 2.0, _frand is rand(100) / 100.0.
+    assert "return (dVar2 + dVar1) / local_24;" in decompile("text:ba90")
+    assert "return (double)iVar1 / 100.0;" in decompile("text:30996")
