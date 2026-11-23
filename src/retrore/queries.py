@@ -90,7 +90,7 @@ QUERIES = {
     "func": {
         "description": "report a function's bounds, segment context, and callers",
         "parameters": {"address": {**_address(), "required": True}, **_REFERENCE_OPTIONS},
-        "fields": ["function", "ranges", "size", "address", "segments", "callers"],
+        "fields": ["function", "ranges", "size", "address", "segments", "segment_losses", "callers"],
         "fields_scope": "result",
         "echo": ["address"],
     },

@@ -18,6 +18,7 @@ import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.QWordDataType;
 import ghidra.program.model.data.ShortDataType;
 import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.Undefined;
 import ghidra.program.model.data.UnsignedShortDataType;
 import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.data.WordDataType;
@@ -1302,11 +1303,17 @@ public class RetroreSegments extends HeadlessScript {
             default -> null;
         };
         if (type != null && block.getEnd().subtract(address) >= size - 1L) {
+            // Replace only undefined bytes or Ghidra's sized placeholders (undefined2 and the like)
+            // that lie entirely within the access.
+            Address end = address.addNoWrap(size - 1);
             boolean undefined = true;
-            for (int index = 0; index < size; index++) {
-                undefined &= listing.getUndefinedDataAt(address.addNoWrap(index)) != null;
+            for (int index = 0; index < size && undefined; index++) {
+                var unit = listing.getDataContaining(address.addNoWrap(index));
+                undefined = unit != null && Undefined.isUndefined(unit.getDataType()) &&
+                    unit.getMinAddress().compareTo(address) >= 0 && unit.getMaxAddress().compareTo(end) <= 0;
             }
             if (undefined) {
+                listing.clearCodeUnits(address, end, false);
                 listing.createData(address, type);
             }
         }

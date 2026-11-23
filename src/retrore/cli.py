@@ -568,6 +568,8 @@ def _address_query(args: argparse.Namespace) -> None:
         )
         if segments:
             print(f"{_location(report['address'])}  {segments}")
+        for name, loss in report.get("segment_losses", {}).items():
+            print(f"  {name} lost at {_location(loss['address'])}: {loss['reason']}, {loss['detail']}")
     _print_references(("callers" if args.command == "func" else args.command,), report)
 
 

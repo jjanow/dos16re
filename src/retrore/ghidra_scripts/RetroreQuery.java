@@ -431,6 +431,47 @@ public class RetroreQuery extends GhidraScript {
             }
             report.put("segments", segments);
         }
+        if (options.includes("segment_losses")) {
+            report.put("segment_losses", segmentLosses(address, options.compact()));
+        }
+    }
+
+    // Where and why each unknown segment register at an address lost its value, as recorded by
+    // RetroreSegments. Projects imported before the record existed report no losses.
+    private Map<String, Object> segmentLosses(Address address, boolean compact) {
+        var losses = new LinkedHashMap<String, Object>();
+        var properties = currentProgram.getUsrPropertyManager();
+        var lossMap = properties.getStringPropertyMap("RetroreSegmentLosses");
+        var originMap = properties.getStringPropertyMap("RetroreSegmentLossOrigins");
+        var instruction = currentProgram.getListing().getInstructionContaining(address);
+        if (lossMap == null || originMap == null || instruction == null) {
+            return losses;
+        }
+        String record = lossMap.getString(instruction.getAddress());
+        if (record == null) {
+            return losses;
+        }
+        var space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+        for (String item : record.split(";")) {
+            String[] parts = item.split("=", 2);
+            Address origin = space.getAddress(Long.parseLong(parts[1], 16));
+            String reason = null;
+            String detail = null;
+            String lines = originMap.getString(origin);
+            for (String line : lines == null ? new String[0] : lines.split("\n")) {
+                String[] fields = line.split("\t", 3);
+                if (fields.length == 3 && fields[0].equals(parts[0])) {
+                    reason = fields[1];
+                    detail = fields[2];
+                }
+            }
+            var loss = new LinkedHashMap<String, Object>();
+            loss.put("address", addressRecord(origin, compact));
+            loss.put("reason", reason);
+            loss.put("detail", detail);
+            losses.put(parts[0], loss);
+        }
+        return losses;
     }
 
     private List<CrossReference> referenceRecords(String group, List<Reference> references, Options options,
