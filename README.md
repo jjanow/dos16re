@@ -532,9 +532,11 @@ To retrieve the instruction bytes at any returned address, query it with `--cont
 
 ### Batch Ghidra queries
 
-`batch` runs `decomp`, `xrefs`, `callers`, `callees`, and `func` against one project in a single
-read-only headless session. Decompilations share one decompiler. The command works with projects
-from every supported platform and accepts the same addresses as the individual commands.
+`batch` runs every Ghidra query command against one project in a single read-only headless
+session: `decomp`, `xrefs`, `callers`, `callees`, `func`, and the
+[bulk queries](#bulk-lookups-inventories-and-call-graphs). Decompilations share one decompiler. The
+command works with projects from every supported platform and accepts the same addresses as the
+individual commands.
 
 ```sh
 .venv/bin/retrore batch --project out/phantasie-project --json <<'EOF'
@@ -542,18 +544,86 @@ from every supported platform and accepts the same addresses as the individual c
   {"command": "decomp", "address": "OV1:20bb"},
   {"command": "decomp", "address": "OV1:20a5", "context": 2, "slice": 12},
   {"command": "callers", "address": "OV1:20bb"},
-  {"command": "xrefs", "address": "OV1:20a5", "direction": "outgoing", "limit": 10, "compact": true}
+  {"command": "xrefs", "address": "OV1:20a5", "direction": "outgoing", "limit": 10, "compact": true},
+  {"command": "context", "address": "OV1:20bb", "compact": true}
 ]
 EOF
 ```
 
 Pass a UTF-8 JSON file as the positional argument or pipe the array on stdin. Each request contains
-a `command` and an `address`. Optional fields match the individual commands. Use the arrays `fields`
-and `ref_types`, the integers `limit`, `offset`, `context`, and `slice`, the boolean `compact`, and
-the string `direction` where supported. The JSON response contains a `results` array in request order. Each
-row echoes those two fields and includes either `result`, with the individual command's JSON, or
-`error`. The CLI writes the whole batch report to stdout and exits with status 1 if any query fails.
-An invalid request array or a headless launch failure uses the command's error stream.
+a `command` and that command's required parameters, such as `address` or `unit`. Optional fields
+match the individual commands, with underscores in place of dashes. Use the arrays `fields`,
+`ref_types`, `addresses`, and `names`, the integers `limit`, `offset`, `context`, `slice`, `depth`,
+and `max_nodes`, the booleans `compact` and `ignore_case`, and the strings `direction`, `unit`,
+`name`, `prefix`, and `glob` where supported. retrore validates every request before it starts
+Ghidra. The JSON response contains a `results` array in request order. Each row echoes `command`
+and the identifying parameters `address`, `unit`, `name`, `prefix`, or `glob` that the request
+contains. It then includes either `result`, with the individual command's JSON, or `error`. The CLI
+writes the whole batch report to stdout and exits with status 1 if any query fails. An invalid
+request array or a headless launch failure uses the command's error stream.
+
+The `retrore.queries` module defines every query command, its parameters with JSON Schema types,
+ranges, and defaults, its selectable fields, and its caps. `query_definitions()` returns them as
+plain data. Validation, the CLI, and `batch` use the same definitions.
+
+### Bulk lookups, inventories, and call graphs
+
+These queries answer common orientation questions in one launch, or many in one `batch`. Each
+accepts `--json`, `--compact`, `--limit N`, and `--offset N`. Text output previews up to ten records
+per list. Each one has a default limit and a hard maximum, and always reports `pagination` for its
+lists. A `next_offset` other than `null` means more records remain.
+
+```sh
+.venv/bin/retrore functions OV1:20bb OV1:20a5 --name main --project out/phantasie-project --json
+.venv/bin/retrore symbols --glob 'FAR*' --unit root --project out/phantasie-project
+.venv/bin/retrore inventory OV1 --project out/phantasie-project --limit 50
+.venv/bin/retrore callgraph OV1:20bb --direction callers --depth 3 --project out/phantasie-project
+.venv/bin/retrore context OV1:20bb --project out/phantasie-project --json
+.venv/bin/retrore coverage --project out/phantasie-project
+.venv/bin/retrore gaps --unit OV1 --limit 20 --project out/phantasie-project --json
+```
+
+| Command | Request | Result |
+|---|---|---|
+| `functions` | `addresses` and `names`, up to 256 in total | One row per address, then one per function matching each exact name |
+| `symbols` | One of `name`, `prefix`, or `glob`, with optional `unit` and `ignore_case` | Stored symbols ordered by address, up to 100 per page by default and at most 1000 |
+| `inventory` | `unit` | The unit's bounds, functions, labels, and defined data, each paged separately |
+| `callgraph` | `address`, `direction`, `depth`, `max_nodes` | Functions reached from the root and the call edges between them |
+| `context` | `address` | Prototype, calling convention, return type, parameters, callees, and referenced data |
+| `gaps` | Optional `unit` | Undefined ranges in executable units, as for plain `gaps` |
+| `coverage` | Optional `unit` | Per-unit counts of functions, instruction bytes, data bytes, and undefined bytes |
+
+`functions` reports each function's name, entry, inclusive body ranges, size, prototype, and
+calling convention. Each row starts with `query`, the address or name it answers. A row for an
+address outside any function or an unknown name has `error` in place of the record, and the CLI then
+exits with status 1. Lookups use Ghidra's function names, including defaults like `FUN_1000_0015`.
+
+`symbols` matches names exactly, by prefix, or by a glob in which `*` matches any run of characters
+and `?` matches one. It covers names stored in the project, such as functions, imported labels, and
+the segment-tracking names on DOS. Ghidra's generated `LAB_` and `DAT_` names are not stored.
+Records give the name, address, kind, source, and namespace (`null` for global names).
+
+`callgraph` walks callers or callees (the default) from the function containing the address, in
+breadth-first order. `depth` is 1 to 4 (default 2). `max_nodes` caps the walk at 1 to 512 functions,
+including the root (default 128). Nodes record their depth from the root. Edges always run from
+caller to callee and count call sites. `truncated.depth` is true when a function at the depth limit
+has unvisited callers or callees. `truncated.nodes` is true when the node cap stopped the walk.
+`unresolved` counts calls without an analyzed function at the other end.
+
+`context` lists the routine's callees once per target, with call counts, and its data references
+once per target address. Each data reference gives the address, symbol name, defined data type and
+size at that address (`null` when the bytes are undefined), the reference types, and
+`access_widths`: the byte widths the referencing instructions load or store, taken from their
+p-code. Callees and data are paged with a default limit of 32 and a maximum of 256.
+
+With `--unit`, `--limit`, `--offset`, or `--fields`, `gaps` uses the shared paging contract.
+`undefined_bytes` then totals the ranges that match the filter. Plain `gaps` keeps its original
+output. `coverage` counts undefined bytes in initialized units only.
+
+`--fields` selects top-level result fields for `inventory`, `callgraph`, and `context`, such as
+`--fields functions,data`. Lists that are not selected are not computed. For `functions`, `symbols`,
+`gaps`, and `coverage`, `--fields` selects fields within each record. `functions` rows keep `query`
+and any `error`.
 
 ## Emulator harness
 
