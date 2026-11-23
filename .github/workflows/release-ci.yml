@@ -3,6 +3,8 @@ name: Release CI
 on:
   release:
     types: [published]
+  # Manual runs verify changes that can't be tested locally, such as Windows worker hosting.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,3 +46,64 @@ jobs:
         run: |
           "$RUNNER_TEMP/retrore-test/bin/retrore" --help
           "$RUNNER_TEMP/retrore-test/bin/python" -I -m pytest -q tests
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build and install the wheel
+        run: |
+          python -m pip wheel --no-deps --wheel-dir dist .
+          python -m venv "$RUNNER_TEMP/retrore-test"
+          "$RUNNER_TEMP/retrore-test/Scripts/python" -m pip install dist/retrore-*.whl pytest
+
+      - name: Test the installed wheel without Ghidra
+        run: |
+          "$RUNNER_TEMP/retrore-test/Scripts/retrore" --help
+          "$RUNNER_TEMP/retrore-test/Scripts/python" -I -m pytest -q tests
+
+      - name: Install Ghidra 12.2
+        id: ghidra
+        if: success() || failure()
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=ghidra_12.2_PUBLIC_20261016.zip
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.2_build/$archive"
+          printf '%s  %s\n' '2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67' "$archive" | sha256sum --check
+          7z x -bd -y "$archive" > /dev/null
+          test -f "$RUNNER_TEMP/ghidra_12.2_PUBLIC/support/analyzeHeadless.bat"
+          echo "GHIDRA_HOME=$(cygpath -w "$RUNNER_TEMP/ghidra_12.2_PUBLIC")" >> "$GITHUB_ENV"
+
+      # Every worker test must run here: a skipped one would leave Windows hosting unverified.
+      - name: Test workers and the MCP server with Ghidra
+        if: (success() || failure()) && steps.ghidra.outcome == 'success'
+        run: |
+          "$RUNNER_TEMP/retrore-test/Scripts/python" -I -m pytest -q -rs tests/test_worker.py tests/test_adapter.py \
+            | tee "$RUNNER_TEMP/worker-tests.txt"
+          status=${PIPESTATUS[0]}
+          if grep -E '^SKIPPED.*(test_worker\.py|test_mcp_query_matches_the_cli)' "$RUNNER_TEMP/worker-tests.txt"; then
+            echo "::error::worker or MCP Ghidra tests were skipped on Windows"
+            exit 1
+          fi
+          exit "$status"
+
+      - name: Test the synthetic programs with Ghidra
+        if: (success() || failure()) && steps.ghidra.outcome == 'success'
+        run: |
+          "$RUNNER_TEMP/retrore-test/Scripts/python" -I -m pytest -q -rs tests \
+            --ignore=tests/test_worker.py --ignore=tests/test_adapter.py

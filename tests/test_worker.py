@@ -398,6 +398,32 @@ def test_tcp_hosts_answer_only_connections_with_their_token(hosted):
     assert status["socket"] == f"127.0.0.1:{record['port']}" and status["ghidra"] == "ready"
 
 
+def test_endpoints_of_exited_hosts_are_skipped_without_connecting(tmp_path, monkeypatch):
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait()
+    assert worker._process_alive(os.getpid()) and not worker._process_alive(exited.pid)
+    assert worker._process_alive(None) and worker._process_alive("7")
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("connected to an exited host's port")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    endpoint = tmp_path / "project.addr"
+    endpoint.write_text(json.dumps({"port": 9, "token": "0" * 32, "pid": exited.pid}), encoding="utf-8")
+    assert worker._connect(endpoint) is None
+    assert worker._call_endpoint(endpoint, {"op": "status"}) is None
+
+
+def test_a_daemon_that_fails_to_import_reports_its_output(fake, tmp_path, monkeypatch):
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "capstone.py").write_text('raise ImportError("broken capstone for the test")\n', encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(broken))
+    with pytest.raises(GhidraError) as caught:
+        worker.start(fake.project, timeout=60)
+    assert caught.value.code == "headless_failed" and "broken capstone for the test" in str(caught.value)
+
+
 def test_mcp_hosts_workers_that_cli_queries_reach(fake):
     process = subprocess.Popen([sys.executable, "-m", "retrore", "mcp"], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, text=True, env=_environment())
