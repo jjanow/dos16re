@@ -125,9 +125,12 @@ class _Code:
     def label(self, name):
         self.labels[name] = len(self.data)
 
-    def call(self, name):
-        self.data += b"\xe8\0\0"
+    def call(self, name, opcode=b"\xe8"):
+        self.data += opcode + b"\0\0"
         self.calls.append((len(self.data) - 2, name))
+
+    def jump(self, name):
+        self.call(name, b"\xe9")
 
     def segment(self, opcode, paragraph):
         self.emit(opcode)
@@ -250,6 +253,64 @@ def test_carries_segments_across_calls_far_pointers_and_frames(tmp_path, capsys)
         assert (loss["reason"], loss["address"]["linear"]) == (reason, 0x20000 + code.labels[name] - back), loss
     assert main(["func", at("after_load"), "--project", str(project)]) == 0
     assert "ES lost at root:" in capsys.readouterr().out
+
+
+def _mz(code, data):
+    """Wrap code at paragraph 0 and DGROUP words at paragraph 0x20 in an MZ file."""
+    image = bytearray(0x480)
+    image[:len(code.data)] = code.finish()
+    pack_into(f"<{len(data)}H", image, 0x200, *data)
+    relocations = code.relocations
+    header = bytearray(0x1C + 4 * len(relocations))
+    header += bytes(-len(header) % 16)
+    file_size = len(header) + len(image)
+    pack_into(
+        "<2s13H", header, 0,
+        b"MZ", file_size % 512, (file_size + 511) // 512, len(relocations), len(header) // 16, 0, 0,
+        0x46, 0x3E, 0, 0, 0, 0x1C, 0,
+    )
+    for index, offset in enumerate(relocations):
+        pack_into("<2H", header, 0x1C + 4 * index, offset, 0)
+    return bytes(header + image)
+
+
+def test_jumps_into_another_function_keep_its_context(tmp_path, capsys):
+    code = _Code()
+    code.segment("b8", 0x20)
+    code.emit("8e d8")                              # DS = DGROUP
+    code.call("shared")
+    code.call("tail")
+    code.call("error")
+    code.call("entry_jump")
+    code.emit("b8 00 4c cd 21 eb fe")
+    code.label("shared")
+    code.emit("90")
+    code.label("middle")
+    code.emit("a1 10 00 c3")                        # mov ax, [0x10]; ret
+    code.label("tail")
+    code.emit("a1 12 00 c3")
+    code.label("error")
+    code.segment("b8", 0x30)
+    code.emit("8e d8")                              # DS = FAR
+    code.jump("middle")
+    code.label("entry_jump")
+    code.segment("b8", 0x30)
+    code.emit("8e d8")                              # DS = FAR
+    code.jump("tail")
+    exe = tmp_path / "jumps.exe"
+    exe.write_bytes(_mz(code, [0x1111, 0x2222, 0x3333]))
+    project, program = _import_program(tmp_path, capsys, exe, "--base-segment", "2000")
+    assert program["import"]["segment_analysis"]["skipped_jumps"] >= 1
+
+    # The error path's jump into the middle of `shared` does not erase the DGROUP that `shared`
+    # receives from its caller, while the jump to `tail`'s entry still joins its context.
+    _check_references(
+        project,
+        f"2000:{code.labels['middle']:04x},DS,2020,1,2020:0010,word,DGROUP_0010",
+        f"2000:{code.labels['tail']:04x},DS,?",
+    )
+    assert main(["func", f"2000:{code.labels['tail']:04x}", "--project", str(project), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["segment_losses"]["DS"]["reason"] == "join"
 
 
 def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):

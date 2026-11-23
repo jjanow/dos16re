@@ -431,7 +431,7 @@ public class RetroreQuery extends GhidraScript {
             }
             report.put("segments", segments);
         }
-        if (options.includes("segment_losses")) {
+        if (options.includes("segment_losses") && address.getAddressSpace() instanceof SegmentedAddressSpace) {
             report.put("segment_losses", segmentLosses(address, options.compact()));
         }
     }
