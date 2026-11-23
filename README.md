@@ -2,7 +2,7 @@
 
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
-and NEC PC-88 and PC-98 programs.
+NEC PC-88 and PC-98 programs, and Sharp X1 programs.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -403,6 +403,51 @@ Ghidra imports the program as 16-bit real-mode x86 and represents VRAM and IPL R
 blocks. Query loaded code by `seg:off` or `unit:offset` and graphics references by block name,
 such as `blue_vram:0012`. [MAME PC-9801 memory map](https://github.com/mamedev/mame/blob/master/src/mame/nec/pc9801.cpp)
 
+## Sharp X1 loader
+
+Pass `--x1` to `info` or `load`. A `.d88` or `.d77` image defaults to the IPL boot entry. This is
+the 32-byte header in cylinder 0, head 0, sector ID 1, with attribute `01`, a 13-byte name,
+extension `Sys`, and the payload size, load address, and execution address at `+12`, `+14`, and
+`+16`. Its 16-bit starting logical sector is at `+1E`. The loader reads the payload from that sector,
+truncates it to the header size, and seeds analysis at the execution address. Logical sectors
+fill both sides of a cylinder in turn: track = LSN / 16, head = track & 1, cylinder = track / 2,
+sector ID = LSN % 16 + 1. For a container with multiple disks, use `--x1-disk INDEX` (1-based).
+A raw input needs `--base-address HEX`.
+[X Millennium built-in IPL](https://github.com/r-type/xmil-libretro/blob/master/io/defipl.res)
+
+```sh
+.venv/bin/retrore info DISK.d88 --x1 --json
+.venv/bin/retrore load DISK.d88 --x1 --x1-ipl --x1-lsn 80+112@100 --entry 100 -o out/x1
+.venv/bin/retrore ghidra import out/x1 out/x1-project
+.venv/bin/retrore decomp 100 --project out/x1-project --json
+```
+
+Repeat `--x1-lsn LSN[+COUNT]@HEX` (hexadecimal logical sector, decimal count) or
+`--x1-sector C:H:R[+COUNT]@HEX` (decimal cylinder, head, sector ID, and count) to load disk spans.
+These options apply in the order given. Explicit spans replace the IPL payload unless you
+also pass `--x1-ipl`, which loads the payload first as `root`. `map.json` records the IPL header
+under `ipl` and original container offsets in `file_spans`. Use `--x1-copy SRC:SIZE@DEST` to
+copy a span of one visible load, then repeat `--x1-unit FILE@HEX` for raw files. Later loads
+replace overlapping bytes. Export separate layouts for alternative stages.
+
+At reset, the IPL ROM covers reads below `$8000`, while writes reach RAM. The IPL turns the ROM
+off with a write to port `$1E00` before it jumps to the payload. A write to `$1D00` turns it back
+on. The default view is RAM. Use `--x1-view ipl-rom` to represent the ROM window as uninitialized
+memory. Devices and VRAM are in the 16-bit I/O space, addressed through `OUT (C),r` with the full
+`BC` value. Ghidra imports X1 exports with its Z180 language variant. Unlike the plain Z80
+variant, which keeps only `C`, it decodes these ports as `BC`. That variant omits the undocumented
+Z80 instructions (`IXH`/`IXL`/`IYH`/`IYL` forms, `SLL`, and the `ED 4E`/`ED 6E` mode mirrors), so
+code that uses them stops at a bad instruction. Phantasie I's analysis coverage is the same under both variants. The importer maps the whole I/O space and
+labels the cartridge ROM, FDC, palette, priority, PCG, CRTC, sub-CPU, PPI, PSG, IPL ROM switch,
+CTC, attribute VRAM, text VRAM, and graphics VRAM blocks. For example, the command
+`xrefs x1_crtc:0001 --project out/x1-project --json` lists writes to the CRTC data register.
+X1turbo bank memory and its additional devices aren't modeled yet.
+
+The Phantasie I Program Disk's IPL entry `PHANTASIE 1` loads 12 sectors from LSN `$370` (C27 H1 R1)
+at `$BF80` and runs `$C000`. The example `load` above adds the second stage. The routine at `$C3D8`
+reads `$70` sectors from LSN `$80` to `$0100`, and `$C465` jumps there.
+[MAME X1 memory and I/O maps](https://github.com/mamedev/mame/blob/master/src/mame/sharp/x1.cpp)
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -700,7 +745,8 @@ the extracted Amiga directories containing `game` and `PhantasieIII` respectivel
 the Phantasie III MSX2 Scenario Disk `.dsk` image. Set `RETRORE_PH3_PC88_DIR` to the directory
 containing the Phantasie III PC-88 Program and Utility Disk `.d88` images. Set
 `RETRORE_PH3_PC98_DIR` to the directory containing the Phantasie III PC-98 Program and Utility Disk
-`.d88` images. The Ghidra tests use
+`.d88` images. Set `RETRORE_PH1_X1_DIR` to the directory containing the Phantasie I X1 Program and
+Player Disk `.d88` images. The Ghidra tests use
 `GHIDRA_HOME` and include synthetic programs for all supported platforms. Tests skip when their
 input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and

@@ -45,6 +45,7 @@ public class Retrore8BitImport extends HeadlessScript {
             case "ATARI8" -> "atari8_";
             case "MSX2" -> "msx2_";
             case "PC88" -> "pc88_";
+            case "X1" -> "x1_";
             default -> throw new IllegalArgumentException("Unsupported 8-bit image format " + format);
         };
         for (var element : units) {
@@ -80,11 +81,14 @@ public class Retrore8BitImport extends HeadlessScript {
         String viewKey = switch (format) {
             case "C64_PRG" -> "bank";
             case "APPLE2" -> "language_card";
-            case "MSX2", "PC88" -> "memory_view";
+            case "MSX2", "PC88", "X1" -> "memory_view";
             default -> "portb";
         };
         Object view;
-        if (viewKey.equals("memory_view")) {
+        if (map.has("io_map")) {
+            addIoMap(map.getAsJsonArray("io_map"), prefix);
+            view = map.get(viewKey).getAsString();
+        } else if (viewKey.equals("memory_view")) {
             addZ80Labels(format, prefix);
             view = map.get(viewKey).getAsString();
         } else {
@@ -132,6 +136,38 @@ public class Retrore8BitImport extends HeadlessScript {
         block.setVolatile(true);
         for (var port : ports.entrySet()) {
             symbols.createLabel(io.getAddress(port.getKey()), port.getValue(), SourceType.IMPORTED);
+        }
+    }
+
+    private void addIoMap(com.google.gson.JsonArray regions, String prefix) throws Exception {
+        var symbols = currentProgram.getSymbolTable();
+        var memory = currentProgram.getMemory();
+        var io = currentProgram.getAddressFactory().getAddressSpace("io");
+        var space = new AddressSet(io.getMinAddress(), io.getMaxAddress());
+        // Drop processor-default port names (the Z180 variant names its internal registers).
+        for (var symbol : symbols.getSymbols(space, ghidra.program.model.symbol.SymbolType.LABEL, true)) {
+            symbol.delete();
+        }
+        var unmapped = new AddressSet(space);
+        for (var element : regions) {
+            monitor.checkCancelled();
+            var region = element.getAsJsonObject();
+            var start = io.getAddress(region.get("port").getAsLong());
+            var block = memory.createUninitializedBlock(prefix + region.get("name").getAsString(), start,
+                region.get("size").getAsLong(), false);
+            block.setVolatile(true);
+            unmapped.delete(block.getStart(), block.getEnd());
+            for (var label : region.getAsJsonArray("labels")) {
+                var entry = label.getAsJsonObject();
+                symbols.createLabel(io.getAddress(entry.get("port").getAsLong()), entry.get("name").getAsString(),
+                    SourceType.IMPORTED);
+            }
+        }
+        for (var range : unmapped.getAddressRanges()) {
+            var base = range.getMinAddress();
+            var block = memory.createUninitializedBlock(
+                String.format("%sio_%04x", prefix, base.getOffset()), base, range.getLength(), false);
+            block.setVolatile(true);
         }
     }
 
