@@ -1,3 +1,4 @@
+from dataclasses import replace
 from struct import pack, pack_into, unpack_from
 
 import pytest
@@ -14,7 +15,7 @@ def make_overlay(signature=b"FBOV"):
     pack_into("<BHH", root, 0, 0x9A, 0x20, base + 1)
     pack_into("<HHI4H", root, 16, 0x3FCD, 0, file_offset, 6, 2, 1, 0)
     pack_into("<HHB", root, 48, 0x3FCD, 5, 0)
-    loaded = LoadedMZ(base, bytes(root), Address(base, 0), Address(base, 0x100), (Address(0, 3),))
+    loaded = LoadedMZ(base, bytes(root), Address(base, 0), Address(base, 0x50), (Address(0, 3),))
     payload = pack("<BHHBH", 0x9A, 0x20, 1, 0xCB, 3)
     bank = signature + (pack("<I", len(payload)) if file_offset == 8 else b"") + payload
     return loaded, Overlay("code.ovr", "code", bank)
@@ -70,3 +71,28 @@ def test_raw_overlays_respect_explicit_layout_and_gaps():
     clashing = Overlay("d.ovr", "d", b"d", 0x1007)
     with pytest.raises(MZError, match="overlap"):
         build_image(root, "test.exe", [placed, clashing])
+
+
+def test_automatic_overlays_clear_stack_and_minimum_allocation():
+    root, _ = make_overlay()
+    raw = Overlay("a.ovr", "a", b"abc")
+
+    # The stack top lies above the file image.
+    stacked = replace(root, stack=Address(0x1008, 0x40))
+    _, program = build_image(stacked, "test.exe", [raw])
+    assert program["memory_end"] == 0x100C0
+    assert program["units"][1]["segment"] == 0x100C
+
+    # SP 0 means the stack occupies the whole of SS.
+    wrapped = replace(root, stack=Address(0x1001, 0))
+    assert wrapped.memory_end == 0x20010
+
+    # Uninitialized data from the header's minimum allocation lies above the stack.
+    allocated = replace(stacked, min_alloc_paragraphs=0x20)
+    _, program = build_image(allocated, "test.exe", [raw])
+    assert program["units"][1]["segment"] == 0x1025
+
+    # Explicit placements only have to clear the file image.
+    explicit = Overlay("b.ovr", "b", b"b", 0x1006)
+    _, program = build_image(allocated, "test.exe", [explicit, raw])
+    assert [unit["segment"] for unit in program["units"][1:]] == [0x1006, 0x1025]

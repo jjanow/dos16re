@@ -76,13 +76,11 @@ platforms used by the remaster projects, starting with AmigaDOS.
 The documented stub `0085:0039` resolves to `GAME.OVR` file offset `0x21AED`. Phantasie I's LZEXE-packed
 `PHANTASI.EXE` loads alongside both flat overlays at distinct segments.
 
-**Open bug.** Automatic overlay placement starts right after the root's file image. It ignores the
-program's uninitialized data, its stack, and the header's minimum allocation. In PoR the root image ends at
-linear `0x20BF0` but the stack top is `24F2:4000` (`0x28F20`). `tpov_0016` and the units after it
-therefore cover DGROUP's uninitialized data: `DGROUP_4433`, one of the `LOADPIECES` flags, resolves
-to `tpov_0016:0003`. Place automatic units above the image end, the initial stack top, and
-`min_alloc` for unpacked headers. Then re-run the PoR and Phantasie opt-in validations, whose overlay
-segments will move.
+**Fixed 2026-11-22.** Automatic overlay placement used to start right after the root's file image, so in
+PoR `tpov_0016` and later units covered DGROUP's uninitialized data and stack (`DGROUP_4433` resolved to
+`tpov_0016:0003`). Automatic units now start above the image end, the initial stack top, and `min_alloc`
+for unpacked headers (`memory_end` in `map.json`). The importer creates an uninitialized `root_bss` block
+up to that limit. In PoR the first overlay unit moved from `0x20BF0` to `0x28F20`.
 
 ### Phase 2: Ghidra import
 

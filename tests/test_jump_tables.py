@@ -42,7 +42,7 @@ def test_recovers_biased_inline_table_with_duplicate_targets():
         " 2e ff a7 08 40 c3"       # jmp word ptr cs:[bx+0x4008]; default: ret
     )
     assert recover_jump_tables(code) == []
-    root = LoadedMZ(0x1000, b"\xc3", Address(0x1000, 0), Address(0x1000, 0x100))
+    root = LoadedMZ(0x1000, b"\xc3", Address(0x1000, 0), Address(0x1000, 1))
     exported, program = build_image(root, "test.exe", [Overlay("test.ovr", "test", code)])
 
     assert exported[0x10:] == code

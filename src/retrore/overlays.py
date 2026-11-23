@@ -135,7 +135,12 @@ def _read_units(root: bytes, overlays: list[Overlay]) -> list[_Unit]:
     return units
 
 
-def _place_units(root_end: int, units: list[_Unit]) -> list[int]:
+def _place_units(root_end: int, memory_end: int, units: list[_Unit]) -> list[int]:
+    """Assign segments to units without one.
+
+    Explicit segments only have to clear the root's file image. Automatic placement also clears
+    the root's uninitialized data, minimum allocation, and initial stack, which end at memory_end.
+    """
     used = []
     for unit in units:
         if unit.segment is None:
@@ -150,7 +155,7 @@ def _place_units(root_end: int, units: list[_Unit]) -> list[int]:
         raise MZError("explicit overlay segments overlap")
 
     segments = []
-    next_start = root_end
+    next_start = max(root_end, memory_end)
     for unit in units:
         if unit.segment is not None:
             segments.append(unit.segment)
@@ -238,6 +243,7 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
         "version": 1, "format": "MZ", "program": program,
         "entry": address_record(root.entry), "stack": address_record(root.stack),
         "relocation_count": len(root.relocations), "units": [root_record],
+        "memory_end": root.memory_end,
     }
     fixup_positions = {fixup.linear for fixup in root.relocations}
     if root.packer:
@@ -249,7 +255,8 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
         return root.image, program_map
 
     units = _read_units(root.image, overlays)
-    segments = _place_units(origin + max(len(root.image), 1), units)
+    root_end = origin + max(len(root.image), 1)
+    segments = _place_units(root_end, root.memory_end, units)
     image = bytearray(root.image)
     stub_targets = {}
     stub_records = []
