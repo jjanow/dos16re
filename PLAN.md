@@ -290,8 +290,8 @@ The analysis backlog below applies to existing and future platforms.
   operands with known registers. `func` reports `segment_losses` (where and why each unknown segment
   register was lost). A jump into another function's middle no longer passes its segment state there,
   which is not strictly sound for shared runtime tails; the import counts these jumps.
-  **Validated:** Phantasie III's import adds 2,548 data references (was 1,903). The functions entering
-  with DS known rose from 247 of 380 to 365. `1000:1274` references `FAR2820_aa30`, and `int86` at
+  **Validated:** with all Phase 9 passes, Phantasie III's import adds 3,027 data references (was 1,903).
+  Functions entering with DS known went from 247 of 380 to 423 of 448, and with ES known from 0 to 94. `1000:1274` references `FAR2820_aa30`, and `int86` at
   `1000:5276` resolves `LDS DI,[BP+8]` to `FAR2820_b7f6` from all 5 callers. Pool of Radiance
   `root:852f` resolves `LES DI,ES:[DI]` to `root_bss:114e`.
   Open: SS stays unknown at functions no analyzed caller reaches; stack slots go stale after writes
