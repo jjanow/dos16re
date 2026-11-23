@@ -463,9 +463,16 @@ public class RetroreSegments extends HeadlessScript {
                 offer(seed.getKey(), seed.getValue());
             }
             follow();
-            for (var function : currentProgram.getFunctionManager().getFunctions(true)) {
-                Address start = function.getEntryPoint();
-                if (!states.containsKey(start)) {
+            // Seed functions that no analyzed path reaches, one at a time, callers before callees: a
+            // callee seeded too early would merge its callers' arguments and values into its default
+            // state instead of receiving them. Functions without call references go first.
+            for (boolean roots : List.of(true, false)) {
+                for (var function : currentProgram.getFunctionManager().getFunctions(true)) {
+                    monitor.checkCancelled();
+                    Address start = function.getEntryPoint();
+                    if (states.containsKey(start) || (roots && called(function))) {
+                        continue;
+                    }
                     State detached = new State();
                     Loss none = new Loss(start, "entry", "no analyzed caller reaches this function");
                     if (startup == null) {
@@ -477,10 +484,21 @@ public class RetroreSegments extends HeadlessScript {
                     detached.lose(ss, none);
                     detached.set(cs, overlaySegments.get(memory.getBlock(start).getName()));
                     offer(start, detached);
+                    follow();
                 }
             }
-            follow();
         } while (removeWrittenWords());
+    }
+
+    // Whether another function's code calls this function directly.
+    private boolean called(ghidra.program.model.listing.Function function) {
+        for (var reference : currentProgram.getReferenceManager().getReferencesTo(function.getEntryPoint())) {
+            if (reference.getReferenceType().isCall() && !function.getBody().contains(reference.getFromAddress()) &&
+                    getInstructionAt(reference.getFromAddress()) != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Startup findStartup(Address address, State state, int callDepth) throws Exception {
