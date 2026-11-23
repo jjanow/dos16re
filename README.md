@@ -151,6 +151,16 @@ MCP client's configuration, such as a project's `.mcp.json`. Use the absolute pa
 {"mcpServers": {"retrore": {"command": "retrore", "args": ["mcp"]}}}
 ```
 
+To keep a deployed copy that tracks development, run `tools/deploy.sh --hooks --mcp` from a clone.
+It installs the committed tip of `main` (never the working tree) into its own virtual environment
+under `~/.local/share/retrore`, writes a `~/.local/bin/retrore` wrapper that defaults `GHIDRA_HOME`
+to `/snap/ghidra/current/ghidra`, registers `retrore mcp` with Claude Code at user scope, and
+installs `post-commit`, `post-merge`, and `post-rewrite` hooks. The hooks redeploy in the background
+whenever `main` moves in that clone (log in `~/.local/share/retrore/deploy.log`; the deployed commit
+is in `COMMIT` there). Running MCP servers keep the code they started with, so reconnect `retrore` in
+Claude Code's `/mcp` menu, or start a new session, after an update. Rerun the script to deploy by hand.
+`RETRORE_DEPLOY_DIR`, `RETRORE_DEPLOY_BRANCH`, `RETRORE_BIN_DIR`, and `GHIDRA_HOME` override the defaults.
+
 The server supports clients that open with `initialize` (MCP 2025-11-25 and earlier) and clients
 that send the protocol version with each request (MCP 2026-07-28). Some tool-calling APIs reject
 `oneOf`, `anyOf`, and `allOf` at the top level of a tool's input schema. The tool schemas therefore

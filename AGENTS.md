@@ -10,6 +10,11 @@ AmigaDOS Hunk executables, and other platforms as they are added. See `PLAN.md` 
   environment variables and skip when unset.
 - Every CLI command supports `--json`; keep default output short.
 - Keep `README.md` and `PLAN.md` current as phases land.
+- The deployed copy (`~/.local/share/retrore`, the `retrore` command on `PATH`, and the user-scope
+  `retrore` MCP server) is installed by `tools/deploy.sh` and redeployed by git hooks whenever `main`
+  moves in this checkout. Check `~/.local/share/retrore/COMMIT` against `main` and rerun the script if
+  they differ. Running MCP servers need a `/mcp` reconnect to pick up a new deployment.
+- Tests in an agent worktree need `PYTHONPATH=$PWD/src`; the `.venv` editable install points at this checkout.
 - **“wrap it”** is a session command. Update `PLAN.md` with open items and a short “Last session”
   entry covering completed work, verification, and where to resume. Remove stale session notes and
   markers. Verify the changes, commit and push the session’s retrore work, and prune merged agent

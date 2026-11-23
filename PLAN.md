@@ -12,17 +12,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22, closed the remaining Phase 8 items. `context` pages its parameters, and `symbols --generated`
-matches Ghidra's generated `DAT_`/`LAB_`/`SUB_` names. `trace --project` takes `--timeout`. The MCP server
-gained `info` and `load` tools (the CLI's program options now live in `program_options()` and
-`build_program()`) and runs calls concurrently, queued per project and cancellable. Project lock
-failures report `project_locked`. `tools/bench.py` measures question scenarios, and a Pool of Radiance
-run showed that dependent steps, not batch size, dominate. With Ghidra 12.2 and the PoR inputs, 306 tests
-passed with 27 skipped. The standalone suite passed 286 with 47 skipped.
+On 2026-11-22 (second session), fixed automatic overlay placement (Phase 1) and added the persistent
+query worker (Phase 8). Overlay units now start above the root's stack and minimum allocation, and the
+importer adds an uninitialized `root_bss` block, so PoR's `DGROUP_4433` keeps its name. Through a warm
+worker, a PoR question that took 8 to 12 s batched now answers in about 0.1 s, and a CLI query through
+the daemon in about 0.11 s. `tools/deploy.sh --hooks --mcp` deploys committed `main` to
+`~/.local/share/retrore`, registers `retrore mcp` with Claude Code at user scope, and redeploys from git
+hooks when `main` moves. With Ghidra 12.2 and the PoR and Phantasie I/III inputs, 327 tests passed with
+23 skipped; the standalone suite passed 302 with 48 skipped.
 
-The PoR run also exposed a Phase 1 bug: automatic overlay placement overlaps DGROUP's uninitialized
-data and stack (see Phase 1). Resume by fixing that, then build the persistent query worker
-(Phase 8 **Next**). After that come Sharp X68000 and Phase 9.
+Resume with the worker follow-ups under Phase 8, then Sharp X68000 and Phase 9.
 
 ## Why
 
@@ -252,6 +251,10 @@ The analysis backlog below applies to existing and future platforms.
   request stops the worker's process group, and a request the worker cannot answer runs one-shot.
   `ghidra import` stops the project's worker first, and `RETRORE_WORKER=0` opts out. Workers exit
   after 15 idle minutes. Measured against the PoR questions in [benchmarks](docs/benchmarks.md).
+- **Open.** Worker follow-ups: `ghidra import` waits only about 60 s for a running worker query and
+  then reports `project_locked` instead of cancelling it. A daemon keeps the environment and
+  `GHIDRA_HOME` of whoever started it. Empty `.lock` and small `.log` files remain in the runtime
+  directory after daemons exit. In-process hosting on Windows is untested, and Windows has no daemon.
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
 - **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested
