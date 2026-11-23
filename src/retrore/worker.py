@@ -4,14 +4,16 @@ A worker is one analyzeHeadless process that keeps a project open read-only and 
 through RetroreQuery.java's serve mode. It saves the 3–4 second launch that every one-shot query pays.
 
 Ghidra locks a project per session, so each project has at most one worker, owned by a host. A host
-is either a `retrore worker serve` daemon or a long-lived process such as `retrore mcp`. On POSIX
-systems the host also listens on a unix socket in the runtime directory, so other retrore processes
-on the same project send their queries through it instead of failing with `project_locked`, and
-`retrore ghidra import` can stop it before writing the project.
+is either a `retrore worker serve` daemon or a long-lived process such as `retrore mcp`. The host
+also listens for other retrore processes, so queries on the same project go through it instead of
+failing with `project_locked`, and `retrore ghidra import` can stop it before writing the project.
+On POSIX systems it listens on a unix socket in the runtime directory. Windows Python has no unix
+sockets, so there the host listens on a loopback TCP port and writes the port and a random token to
+an endpoint file in the runtime directory; every connection must present that token.
 
 The channel between a host and its JVM is a loopback TCP connection that the JVM opens back to the
 host; it proves itself with a one-time token passed in the environment. Requests and responses are
-newline-delimited JSON. The host's unix socket carries one request and one response per connection.
+newline-delimited JSON. A connection to the host carries one request and one response.
 
 Requests keep the one-shot contract: the same reports, error codes, time budgets, and cancellation.
 A request that outlives its budget, or is cancelled, stops the worker's process group; the next
@@ -46,6 +48,8 @@ IDLE_TIMEOUT = 900  # seconds without requests before a host stops its worker an
 START_FAILURE_COOLDOWN = 60  # seconds of one-shot launches after a worker failed to start
 STOP_GRACE = 10  # seconds a worker gets to close the project after a shutdown request
 TOKEN_ENV = "RETRORE_WORKER_TOKEN"
+TRANSPORT_ENV = "RETRORE_WORKER_TRANSPORT"  # internal: "tcp" selects the Windows transport on POSIX, for tests
+LOG_ENV = "RETRORE_WORKER_LOG"  # internal: the log `start` sent a daemon's output to
 _POLL = 0.2
 _SOCKET_LIMIT = 100  # bytes; sun_path holds 104 to 108 depending on the system
 _MAX_LINE = 1 << 30
@@ -71,8 +75,10 @@ def idle_timeout() -> float:
     return IDLE_TIMEOUT
 
 
-def sockets_supported() -> bool:
-    return os.name != "nt" and hasattr(socket, "AF_UNIX")
+def transport() -> str:
+    """How hosts listen for other processes: "unix" sockets on POSIX, "tcp" on loopback with a token elsewhere."""
+    forced = os.environ.get(TRANSPORT_ENV, "").strip().lower() == "tcp"
+    return "unix" if os.name != "nt" and hasattr(socket, "AF_UNIX") and not forced else "tcp"
 
 
 def project_key(project: Path) -> Path:
@@ -88,6 +94,8 @@ def runtime_dir() -> Path:
         path = Path(configured)
     elif os.environ.get("XDG_RUNTIME_DIR"):
         path = Path(os.environ["XDG_RUNTIME_DIR"]) / "retrore"
+    elif os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        path = Path(os.environ["LOCALAPPDATA"]) / "retrore" / "workers"
     else:
         path = Path(tempfile.gettempdir()) / f"retrore-{os.getuid() if hasattr(os, 'getuid') else 'user'}"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -102,7 +110,30 @@ def runtime_dir() -> Path:
 def _paths(key: Path) -> dict[str, Path]:
     digest = hashlib.sha256(str(key).encode()).hexdigest()[:16]
     base = runtime_dir() / digest
-    return {suffix: base.with_suffix("." + suffix) for suffix in ("sock", "lock", "log")}
+    return {suffix: base.with_suffix("." + suffix) for suffix in ("sock", "addr", "lock", "log")}
+
+
+def _endpoint(paths: dict[str, Path]) -> Path:
+    """The unix socket, or for the TCP transport the file that holds the port and token."""
+    return paths["sock"] if transport() == "unix" else paths["addr"]
+
+
+def _try_lock(handle) -> bool:
+    """Take an exclusive lock on an open file without waiting. The system releases it when the process ends."""
+    if os.name == "nt":
+        import msvcrt
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
 
 
 def launch_setup() -> dict:
@@ -111,11 +142,7 @@ def launch_setup() -> dict:
 
 
 def _environment(setup: dict, token: str) -> dict:
-    environment = {**os.environ, TOKEN_ENV: token}
-    environment.pop("JAVA_HOME", None)
-    if setup.get("java_home"):
-        environment["JAVA_HOME"] = setup["java_home"]
-    return environment
+    return {**ghidra.launch_environment(setup.get("java_home")), TOKEN_ENV: token}
 
 
 class WorkerCrash(Exception):
@@ -348,7 +375,7 @@ _RETRY = object()
 
 
 class Host:
-    """Owns a project's worker, serializes its requests, and serves other processes on a unix socket."""
+    """Owns a project's worker, serializes its requests, and serves other processes on its endpoint."""
 
     def __init__(self, project: Path, *, owner: str, idle: float | None = None, listen: bool = True,
                  on_close=None) -> None:
@@ -371,28 +398,28 @@ class Host:
         self._server: socket.socket | None = None
         self._lock_file = None
         self._lock_path: Path | None = None
-        self.socket_path: Path | None = None
-        if listen and sockets_supported():
+        self.socket_path: Path | None = None  # the unix socket or TCP endpoint file, removed on close
+        self.address: str | None = None  # where other processes reach this host
+        self._token: str | None = None  # TCP connections must present it
+        if listen:
             self._listen()
         threading.Thread(target=self._reap, name="retrore-worker-idle", daemon=True).start()
 
-    # Unix socket hosting.
+    # Hosting for other processes.
 
     def _listen(self) -> None:
-        import fcntl
         try:
             paths = _paths(self.project)
         except (GhidraError, OSError):
             return  # Serve this process only.
-        if len(os.fsencode(paths["sock"])) > _SOCKET_LIMIT:
+        kind = transport()
+        if kind == "unix" and len(os.fsencode(paths["sock"])) > _SOCKET_LIMIT:
             return
         while True:
             handle = open(paths["lock"], "a+")
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
+            if not _try_lock(handle):
                 handle.close()
-                raise HostExists(self.project) from None
+                raise HostExists(self.project)
             try:
                 current = os.stat(paths["lock"])
             except FileNotFoundError:
@@ -401,17 +428,33 @@ class Host:
                 break
             handle.close()  # A closing host removed this lock file after it was opened here.
         self._lock_file, self._lock_path = handle, paths["lock"]
+        endpoint = _endpoint(paths)
         with contextlib.suppress(FileNotFoundError):
-            paths["sock"].unlink()  # stale: its host released the lock
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            server.bind(str(paths["sock"]))
-            os.chmod(paths["sock"], 0o600)
-            server.listen(16)
-        except OSError:
-            server.close()
-            return
-        self._server, self.socket_path = server, paths["sock"]
+            endpoint.unlink()  # stale: its host released the lock
+        if kind == "unix":
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                server.bind(str(endpoint))
+                os.chmod(endpoint, 0o600)
+                server.listen(16)
+            except OSError:
+                server.close()
+                return
+            self.address = str(endpoint)
+        else:
+            token = secrets.token_hex(16)
+            try:
+                server = socket.create_server(("127.0.0.1", 0), backlog=16)
+            except OSError:
+                return
+            port = server.getsockname()[1]
+            try:
+                _write_private(endpoint, json.dumps({"port": port, "token": token, "pid": os.getpid()}))
+            except OSError:
+                server.close()
+                return
+            self._token, self.address = token, f"127.0.0.1:{port}"
+        self._server, self.socket_path = server, endpoint
         threading.Thread(target=self._accept, name="retrore-worker-accept", daemon=True).start()
 
     def _accept(self) -> None:
@@ -453,6 +496,11 @@ class Host:
                 op = message.get("op") if isinstance(message, dict) else None
             except (OSError, ValueError, UnicodeError, TimeoutError):
                 return
+            if self._token is not None:
+                offered = message.get("token") if isinstance(message, dict) else None
+                if not isinstance(offered, str) or not secrets.compare_digest(offered.encode("utf-8"),
+                                                                             self._token.encode("utf-8")):
+                    return  # Not a retrore process of this user; answer nothing.
             if op == "status":
                 reply = {"status": self.status()}
             elif op == "stop":
@@ -548,7 +596,8 @@ class Host:
             raise budget.error()
         with _either(budget.cancel, self._shutdown) as cancel, ghidra.cancellable(cancel):
             try:
-                return ghidra._oneshot(self.project, mode, payload, remaining)
+                # The caller's launcher and JAVA_HOME, as for the worker.
+                return ghidra._oneshot(self.project, mode, payload, remaining, setup)
             except GhidraError as error:
                 stopped = budget.error()
                 if error.code == "cancelled" and stopped is not None:
@@ -573,7 +622,7 @@ class Host:
             "uptime_seconds": round(time.monotonic() - worker.started_at, 1) if worker.started_at else None,
             "requests": self.requests, "fallbacks": self.fallbacks,
             "idle_seconds": round(idle, 1), "idle_timeout": self.idle,
-            "socket": str(self.socket_path) if self.socket_path else None,
+            "socket": self.address,
         }
 
     # Lifetime.
@@ -603,9 +652,15 @@ class Host:
         with self._lock:
             self.worker.stop()
         if self._lock_file is not None:
-            with contextlib.suppress(OSError):
-                self._lock_path.unlink()  # while still locked; the next host creates a new file
-            self._lock_file.close()
+            if os.name == "nt":
+                # Windows cannot remove an open file, and no other process can remove it while it is open.
+                self._lock_file.close()
+                with contextlib.suppress(OSError):
+                    self._lock_path.unlink()
+            else:
+                with contextlib.suppress(OSError):
+                    self._lock_path.unlink()  # while still locked; the next host creates a new file
+                self._lock_file.close()
         if self._on_close is not None:
             self._on_close(self)
         self.finished.set()
@@ -664,23 +719,62 @@ def _receive_line(connection: socket.socket, deadline: float | None, cancel: thr
                 raise ConnectionError("oversized response")
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Replace a file with one only this user can read, so a reader never sees it half written."""
+    partial = path.with_name(path.name + ".tmp")
+    descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(descriptor, "w", encoding="utf-8") as output:
+        output.write(text)
+    os.replace(partial, path)
+
+
+def _connect(endpoint: Path) -> tuple[socket.socket, str | None] | None:
+    """Connect to a host's unix socket or TCP endpoint file. Returns the connection and the token to send."""
+    if endpoint.suffix == ".sock":
+        if not hasattr(socket, "AF_UNIX") or not endpoint.exists():
+            return None
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(str(endpoint))
+        except (FileNotFoundError, ConnectionRefusedError):
+            connection.close()
+            return None
+        except BaseException:
+            connection.close()
+            raise
+        return connection, None
+    try:
+        record = json.loads(endpoint.read_text(encoding="utf-8"))
+        port, token = int(record["port"]), str(record["token"])
+    except (OSError, ValueError, UnicodeError, KeyError, TypeError):
+        return None  # No host, a host replacing the file, or not an endpoint file.
+    try:
+        connection = socket.create_connection(("127.0.0.1", port), timeout=10)
+    except OSError:
+        return None  # A host that exited without removing its endpoint file.
+    connection.settimeout(None)
+    return connection, token
+
+
 def _call(key: Path, message: dict, *, deadline: float | None = None,
           cancel: threading.Event | None = None) -> dict | None:
-    """Send one operation to the project's host socket. Returns None when no host is listening."""
-    if not sockets_supported():
-        return None
+    """Send one operation to the project's host. Returns None when no host is listening."""
     try:
-        path = _paths(key)["sock"]
+        endpoint = _endpoint(_paths(key))
     except (GhidraError, OSError):
         return None
-    if not path.exists():
+    return _call_endpoint(endpoint, message, deadline=deadline, cancel=cancel)
+
+
+def _call_endpoint(endpoint: Path, message: dict, *, deadline: float | None = None,
+                   cancel: threading.Event | None = None) -> dict | None:
+    opened = _connect(endpoint)
+    if opened is None:
         return None
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection, token = opened
     with connection:
-        try:
-            connection.connect(str(path))
-        except (FileNotFoundError, ConnectionRefusedError):
-            return None
+        if token is not None:
+            message = {**message, "token": token}
         connection.sendall((json.dumps(message) + "\n").encode("utf-8"))
         reply = json.loads(_receive_line(connection, deadline, cancel))
     return reply if isinstance(reply, dict) else None
@@ -830,17 +924,12 @@ def stop_all() -> list[str]:
     """Stop every worker host listening in the runtime directory. Returns their projects."""
     close_all()
     projects = []
-    if not sockets_supported():
-        return projects
-    for path in sorted(runtime_dir().glob("*.sock")):
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        with connection:
-            try:
-                connection.connect(str(path))
-                connection.sendall(b'{"op":"status"}\n')
-                project = json.loads(_receive_line(connection, time.monotonic() + 10))["status"]["project"]
-            except (OSError, ValueError, KeyError, TypeError, TimeoutError):
-                continue
+    directory = runtime_dir()
+    for path in sorted([*directory.glob("*.sock"), *directory.glob("*.addr")]):
+        try:
+            project = _call_endpoint(path, {"op": "status"}, deadline=time.monotonic() + 10)["status"]["project"]
+        except (OSError, ValueError, UnicodeError, KeyError, TypeError, TimeoutError):
+            continue
         if stop(Path(project)):
             projects.append(project)
     return projects
@@ -859,32 +948,30 @@ def holder_note(project: Path) -> str:
             "to send queries through it.")
 
 
-def _require_sockets() -> None:
-    if not sockets_supported():
-        raise GhidraError("worker daemons need unix domain sockets, which this platform's Python lacks",
-                          code="invalid_request")
-
-
 def serve(project: Path, idle: float | None = None, *, warm: bool = True) -> int:
     """Run a worker daemon for the project in the foreground until it is stopped or idle."""
-    _require_sockets()
+    _adopt_log()
     ghidra._require_project(project)
     try:
         host = Host(project, owner="daemon", idle=idle)
     except HostExists:
         print(f"retrore: a worker already serves {project_key(project)}", file=sys.stderr)
         return 1
-    if host.socket_path is None:
+    if host.address is None:
         host.close()
-        raise GhidraError(f"the worker socket path for {project} is too long; set RETRORE_WORKER_DIR to a "
-                          "shorter directory", code="io_error")
+        if transport() == "unix":
+            raise GhidraError(f"the worker socket path for {project} is too long; set RETRORE_WORKER_DIR to a "
+                              "shorter directory", code="io_error")
+        raise GhidraError(f"the worker for {project} could not listen on a loopback port or write its endpoint "
+                          f"file in {runtime_dir()}", code="io_error")
 
     def finish(number: int, frame: object) -> None:
         threading.Thread(target=host.close, daemon=True).start()
 
-    for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(number, finish)
-    print(f"retrore worker {os.getpid()} serving {host.project} on {host.socket_path}", file=sys.stderr, flush=True)
+    for name in ("SIGTERM", "SIGHUP", "SIGINT", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), finish)
+    print(f"retrore worker {os.getpid()} serving {host.project} on {host.address}", file=sys.stderr, flush=True)
     if warm:
         try:
             host.warm()
@@ -904,13 +991,45 @@ def _remove_own_log(key: Path) -> None:
     """Remove the log that `start` sent this daemon's output to, once the daemon exits cleanly."""
     with contextlib.suppress(GhidraError, OSError, ValueError):
         log = _paths(key)["log"]
-        if os.path.samestat(os.fstat(sys.stderr.fileno()), os.stat(log)):
-            log.unlink()
+        if os.name != "nt":
+            if os.path.samestat(os.fstat(sys.stderr.fileno()), os.stat(log)):
+                log.unlink()
+            return
+        # Windows cannot remove a file while any process has it open, so a log that a newer daemon
+        # writes to stays. Close this daemon's own output first; _adopt_log opened it.
+        if os.environ.get(LOG_ENV) != str(log):
+            return
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(OSError, ValueError):
+                stream.flush()
+        _redirect_output(os.devnull)
+        log.unlink()
+
+
+def _adopt_log() -> None:
+    """On Windows, send this daemon's output to the log that `start` created for it.
+
+    `start` gives a Windows daemon no log handle of its own: a virtual environment's python.exe is a
+    launcher that keeps its standard handles open until the interpreter exits, so a log passed as
+    stdout could not be removed by the daemon.
+    """
+    if os.name == "nt" and os.environ.get(LOG_ENV):
+        with contextlib.suppress(OSError):
+            _redirect_output(os.environ[LOG_ENV], append=True)
+
+
+def _redirect_output(path: str, append: bool = False) -> None:
+    flags = os.O_WRONLY | (os.O_APPEND | os.O_CREAT if append else 0)
+    descriptor = os.open(path, flags)
+    try:
+        for target in (1, 2):
+            os.dup2(descriptor, target)
+    finally:
+        os.close(descriptor)
 
 
 def start(project: Path, idle: float | None = None, timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
     """Start a detached worker daemon for the project and wait until its Ghidra session is ready."""
-    _require_sockets()
     ghidra._require_project(project)
     key = project_key(project)
     record = status(key)
@@ -918,17 +1037,24 @@ def start(project: Path, idle: float | None = None, timeout: float | None = ghid
         return {**record, "started": False}
     log = _paths(key)["log"]
     # A new file, so a daemon that is still exiting cannot recognize it as its own log and remove it.
-    with contextlib.suppress(FileNotFoundError):
-        log.unlink()
+    with contextlib.suppress(FileNotFoundError, PermissionError):
+        log.unlink()  # Windows refuses while a daemon that is still exiting holds it
     package = str(Path(__file__).resolve().parents[1])
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (package, os.environ.get("PYTHONPATH"))))}
     environment.pop(TOKEN_ENV, None)
+    environment[LOG_ENV] = str(log)
     command = [sys.executable, "-m", "retrore", "worker", "serve", "--project", str(key)]
     if idle:
         command += ["--idle", f"{idle:g}"]
+    windows = os.name == "nt"
+    # On Windows the daemon gets its own hidden console, so the console that started it neither shows
+    # Ghidra's windows nor passes Ctrl+C on to it.
+    detach = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if windows
+              else {"start_new_session": True})
     with open(log, "w", encoding="utf-8") as output:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-                                   env=environment, start_new_session=True, cwd=str(runtime_dir()))
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL if windows else output, stderr=subprocess.STDOUT,
+                                   env=environment, cwd=str(runtime_dir()), **detach)
     deadline = None if not timeout else time.monotonic() + timeout
     while True:
         if process.poll() is not None:
@@ -942,7 +1068,10 @@ def start(project: Path, idle: float | None = None, timeout: float | None = ghid
             return {**record, "started": True, "log": str(log)}
         if deadline is not None and time.monotonic() >= deadline:
             stop(key)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
+            if windows:
+                ghidra._stop_group(process, True)
+            else:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
             raise GhidraError(f"the retrore worker did not become ready within {timeout:g} seconds", code="timeout")
         time.sleep(_POLL)

@@ -12,7 +12,7 @@ public class CheckSegmentReferences extends GhidraScript {
         var refs = currentProgram.getReferenceManager();
         var symbols = currentProgram.getSymbolTable();
         for (String check : getScriptArgs()) {
-            String[] parts = check.split(",");
+            String[] parts = check.split("/");
             Address instruction = address(parts[0]);
             require(getInstructionAt(instruction) != null, check, "instruction");
             String register = parts[1];

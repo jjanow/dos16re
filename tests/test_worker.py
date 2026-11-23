@@ -2,8 +2,10 @@
 
 import json
 import os
+import queue
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -16,9 +18,7 @@ from retrore import ghidra, worker
 from retrore.cli import main
 from retrore.errors import CONTRACT_VERSION
 from retrore.ghidra import GhidraError, cancellable
-from test_errors import _wait_dead
-
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="the fake launcher is a POSIX script")
+from test_errors import _kill_tree, _wait_dead
 
 PACKAGE_PATH = Path(ghidra.__file__).resolve().parents[1]
 
@@ -31,6 +31,9 @@ serve = "serve" in args
 with open(os.environ["FAKE_LAUNCHES"], "a") as launches:
     launches.write(("serve" if serve else "oneshot") + "\\n")
 if not serve:
+    with open(os.environ["FAKE_ONESHOTS"], "a") as oneshots:
+        home = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        oneshots.write(json.dumps({{"home": home, "java_home": os.environ.get("JAVA_HOME")}}) + "\\n")
     if "RetroreGaps.java" in args:
         report = {{"program": "image.bin", "ranges": [], "undefined_bytes": 0, "oneshot": True}}
     else:
@@ -88,22 +91,37 @@ class Fake:
     def __init__(self, tmp_path: Path, monkeypatch) -> None:
         support = tmp_path / "ghidra" / "support"
         support.mkdir(parents=True)
-        launcher = support / "analyzeHeadless"
-        launcher.write_text(_FAKE.format(python=sys.executable), encoding="utf-8")
-        launcher.chmod(0o755)
+        if os.name == "nt":
+            # cmd.exe runs the launcher, like Ghidra's analyzeHeadless.bat; %~dp0 is the launcher's directory.
+            (support / "fake_headless.py").write_text(_FAKE.format(python=sys.executable), encoding="utf-8")
+            (support / "analyzeHeadless.bat").write_bytes(
+                f'@"{sys.executable}" "%~dp0fake_headless.py" %*\r\n@exit /b %errorlevel%\r\n'.encode())
+        else:
+            launcher = support / "analyzeHeadless"
+            launcher.write_text(_FAKE.format(python=sys.executable), encoding="utf-8")
+            launcher.chmod(0o755)
         self.launch_log = tmp_path / "launches.txt"
+        self.oneshot_log = tmp_path / "oneshots.txt"
         self.pid_file = tmp_path / "worker.pid"
         self.project = tmp_path / "demo.gpr"
         self.project.write_text("", encoding="utf-8")
         self.monkeypatch = monkeypatch
         monkeypatch.setenv("GHIDRA_HOME", str(tmp_path / "ghidra"))
         monkeypatch.setenv("FAKE_LAUNCHES", str(self.launch_log))
+        monkeypatch.setenv("FAKE_ONESHOTS", str(self.oneshot_log))
         monkeypatch.setenv("FAKE_WORKER_PID", str(self.pid_file))
         monkeypatch.setattr(ghidra, "_KILL_GRACE", 1)
         monkeypatch.setattr(worker, "STOP_GRACE", 2)
 
     def behave(self, behavior: str) -> None:
         self.monkeypatch.setenv("FAKE_WORKER", behavior)
+
+    @property
+    def oneshots(self) -> list[dict]:
+        """The Ghidra installation and JAVA_HOME of each one-shot launch."""
+        if not self.oneshot_log.exists():
+            return []
+        return [json.loads(line) for line in self.oneshot_log.read_text().splitlines()]
 
     @property
     def launches(self) -> list[str]:
@@ -117,8 +135,13 @@ class Fake:
         return int(self.pid_file.read_text())
 
 
-@pytest.fixture
-def fake(tmp_path, monkeypatch):
+# Windows hosts listen on loopback TCP; POSIX hosts on unix sockets, and on TCP too when the tests force it.
+TRANSPORTS = ["tcp"] if os.name == "nt" else ["unix", "tcp"]
+
+
+@pytest.fixture(params=TRANSPORTS)
+def fake(request, tmp_path, monkeypatch):
+    monkeypatch.setenv(worker.TRANSPORT_ENV, request.param)
     fake = Fake(tmp_path, monkeypatch)
     yield fake
     worker.stop_all()
@@ -228,7 +251,7 @@ def test_idle_timeout_stops_the_worker(fake):
         pid = fake.worker_pid()
         assert host.closed.wait(15)
         _wait_dead(pid)
-        assert not worker._paths(worker.project_key(fake.project))["sock"].exists()
+        assert not worker._endpoint(worker._paths(worker.project_key(fake.project))).exists()
     finally:
         host.close()
 
@@ -245,7 +268,8 @@ def test_cli_queries_reuse_a_daemon_and_import_stops_it(fake, capsys):
     started = json.loads(capsys.readouterr().out)
     assert started["running"] and started["started"] and started["owner"] == "daemon"
     daemon, jvm = started["pid"], fake.worker_pid()
-    assert started["ghidra_pid"] == jvm
+    if os.name != "nt":  # On Windows the recorded process is cmd.exe running the launcher.
+        assert started["ghidra_pid"] == jvm
 
     for _ in range(2):
         assert main(["func", "c000", "--project", project, "--json"]) == 0
@@ -292,7 +316,8 @@ def test_stopping_a_daemon_cancels_its_request_and_cleans_up(fake):
     started = worker.start(fake.project)
     daemon, jvm = started["pid"], fake.worker_pid()
     runtime = worker.runtime_dir()
-    assert sorted(path.suffix for path in runtime.iterdir()) == [".lock", ".log", ".sock"]
+    endpoint = ".sock" if worker.transport() == "unix" else ".addr"
+    assert sorted(path.suffix for path in runtime.iterdir()) == sorted([".lock", ".log", endpoint])
     outcome = {}
 
     def slow_query() -> None:
@@ -336,10 +361,82 @@ def test_a_query_with_another_ghidra_restarts_the_daemons_worker(fake, tmp_path)
     assert fake.launches == ["serve", "serve"]
 
 
+def test_a_daemons_one_shot_fallback_uses_the_callers_setup(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("JAVA_HOME", str(tmp_path / "daemon-java"))
+    assert worker.start(fake.project)["started"]
+    other = tmp_path / "other-ghidra"
+    shutil.copytree(tmp_path / "ghidra", other)
+    caller = _environment(GHIDRA_HOME=str(other), JAVA_HOME=str(tmp_path / "caller-java"))
+    # The worker cannot answer this request, so the daemon runs it one-shot.
+    child = subprocess.run([sys.executable, "-m", "retrore", "func", "cccc", "--project", str(fake.project),
+                            "--json"], capture_output=True, text=True, env=caller, timeout=60)
+    assert json.loads(child.stdout)["oneshot"] is True, child.stderr
+    # The daemon restarted its worker with the caller's setup, then ran the fallback with it too.
+    assert fake.launches == ["serve", "serve", "oneshot"]
+    [oneshot] = fake.oneshots
+    assert Path(oneshot["home"]).resolve() == other.resolve()
+    assert oneshot["java_home"] == str(tmp_path / "caller-java")
+
+
 def test_workers_launch_with_the_callers_java(monkeypatch):
     monkeypatch.setenv("JAVA_HOME", "/opt/daemon-java")
     assert worker._environment({"java_home": "/opt/caller-java"}, "t")["JAVA_HOME"] == "/opt/caller-java"
     assert "JAVA_HOME" not in worker._environment({"java_home": None}, "t")
+
+
+@pytest.mark.parametrize("fake", ["tcp"], indirect=True)
+def test_tcp_hosts_answer_only_connections_with_their_token(hosted):
+    ghidra.query(hosted.project, {"command": "func", "address": "c000"})
+    key = worker.project_key(hosted.project)
+    record = json.loads(worker._paths(key)["addr"].read_text(encoding="utf-8"))
+    assert set(record) == {"port", "token", "pid"} and record["pid"] == os.getpid()
+    for message in ({"op": "stop"}, {"op": "stop", "token": "0" * 32}, {"op": "stop", "token": 7}, ["stop"]):
+        with socket.create_connection(("127.0.0.1", record["port"]), timeout=10) as connection:
+            connection.sendall((json.dumps(message) + "\n").encode("utf-8"))
+            assert connection.recv(100) == b"", message  # closed without an answer
+    status = worker._call(key, {"op": "status"}, deadline=time.monotonic() + 10)["status"]
+    assert status["socket"] == f"127.0.0.1:{record['port']}" and status["ghidra"] == "ready"
+
+
+def test_mcp_hosts_workers_that_cli_queries_reach(fake):
+    process = subprocess.Popen([sys.executable, "-m", "retrore", "mcp"], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, text=True, env=_environment())
+    lines = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(line) for line in process.stdout], daemon=True).start()
+
+    def call(identifier: int, arguments: dict) -> dict:
+        process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+                                        "params": {"name": "func", "arguments": arguments}}) + "\n")
+        process.stdin.flush()
+        response = json.loads(lines.get(timeout=60))
+        assert response["id"] == identifier and response["result"]["isError"] is False, response
+        return response["result"]["structuredContent"]
+
+    try:
+        for message in (
+            {"jsonrpc": "2.0", "id": 0, "method": "initialize",
+             "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        ):
+            process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+        assert json.loads(lines.get(timeout=60))["id"] == 0
+        jvm = call(1, {"project": str(fake.project), "address": "c000"})["pid"]
+        assert call(2, {"project": str(fake.project), "address": "c004"})["pid"] == jvm
+        # A CLI query on the same project goes through the server's worker.
+        child = subprocess.run([sys.executable, "-m", "retrore", "func", "c000", "--project", str(fake.project),
+                                "--json"], capture_output=True, text=True, env=_environment(), check=True,
+                               timeout=60)
+        assert json.loads(child.stdout)["pid"] == jvm
+        assert fake.launches == ["serve"]
+    finally:
+        process.stdin.close()
+        assert process.wait(timeout=60) == 0
+        process.stdout.close()
+    # The server stops its worker and removes its lock and endpoint when it exits.
+    _wait_dead(jvm)
+    assert list(worker.runtime_dir().iterdir()) == []
 
 
 def test_cli_queries_reach_a_hosting_process(hosted):
@@ -420,7 +517,7 @@ def test_real_worker_matches_one_shot_queries(tmp_path, monkeypatch, capsys):
         host_pid = record["pid"]
         # Stop the daemon's Ghidra the way an expired budget does, then give requests too little time to
         # reopen the project, so each one kills a worker that is still starting.
-        os.killpg(record["ghidra_pid"], signal.SIGTERM)
+        _kill_tree(record["ghidra_pid"], signal.SIGTERM)
         _wait_dead(record["ghidra_pid"])
         for budget in ("0.5", "2", "3.5"):
             main(["callers", "c004", "--project", str(project), "--timeout", budget, "--json"])

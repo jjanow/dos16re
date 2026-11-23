@@ -40,7 +40,9 @@ def _check_references(project, *checks):
         [
             str(_headless()), str(project.parent), project.name,
             "-process", "image.bin", "-noanalysis", "-readOnly",
-            "-scriptPath", str(script_path), "-postScript", "CheckSegmentReferences.java", *checks,
+            "-scriptPath", str(script_path), "-postScript", "CheckSegmentReferences.java",
+            # cmd.exe splits arguments at commas, so analyzeHeadless.bat would break up comma-separated checks.
+            *(check.replace(",", "/") for check in checks),
         ],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
     )

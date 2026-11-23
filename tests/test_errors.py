@@ -70,18 +70,48 @@ def _error(capsys):
     return report["error"]
 
 
+def _alive(pid):
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates the process on Windows, so ask the kernel instead.
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE, QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: still running
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        return ") Z " not in Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return True  # No /proc on this system; os.kill found the process.
+    except OSError:
+        return False  # It exited while being read.
+
+
+def _kill_tree(pid, sent=signal.SIGKILL if hasattr(signal, "SIGKILL") else None):
+    """Stop a process group the way retrore stops a headless run's group."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], check=False, capture_output=True)
+    else:
+        os.killpg(pid, sent)
+
+
 def _wait_dead(pid):
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        stat = Path(f"/proc/{pid}/stat")
-        if stat.exists() and ") Z " in stat.read_text():
+        if not _alive(pid):
             return
         time.sleep(0.1)
-    os.kill(pid, 9)
+    if os.name == "nt":
+        _kill_tree(pid)
+    else:
+        os.kill(pid, 9)
     pytest.fail(f"process {pid} survived")
 
 

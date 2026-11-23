@@ -80,11 +80,22 @@ def _project_parts(project: Path) -> tuple[str, str]:
     return str(project.parent), project.name.removesuffix(".gpr")
 
 
+def launch_environment(java_home: str | None) -> dict:
+    """This process's environment with JAVA_HOME replaced by java_home, or removed when it is None."""
+    environment = dict(os.environ)
+    environment.pop("JAVA_HOME", None)
+    if java_home:
+        environment["JAVA_HOME"] = java_home
+    return environment
+
+
 def _run(
     project: Path, options: list[str], script: str | None, *arguments: str, pre_script: str | None = None,
-    timeout: float | None = QUERY_TIMEOUT,
+    timeout: float | None = QUERY_TIMEOUT, setup: dict | None = None,
 ) -> dict:
-    launcher = _headless()
+    """Run analyzeHeadless once. setup is a worker.launch_setup() record of another process's launcher and
+    JAVA_HOME to use instead of this process's, for a worker host answering that process."""
+    launcher = setup["launcher"] if setup else _headless()
     scripts = files("retrore").joinpath("ghidra_scripts")
     label = script or pre_script
     with as_file(scripts) as script_dir, TemporaryDirectory() as temp:
@@ -94,7 +105,8 @@ def _run(
         if pre_script:
             script_options = ["-preScript", pre_script, *script_args, *script_options]
         command = [str(launcher), *_project_parts(project), *options, "-scriptPath", str(script_dir), *script_options]
-        returncode, output = _launch(command, timeout, label)
+        environment = launch_environment(setup.get("java_home")) if setup else None
+        returncode, output = _launch(command, timeout, label, environment)
         if result_file.is_file():
             try:
                 report = json.loads(result_file.read_text(encoding="utf-8"))
@@ -127,13 +139,14 @@ def _failure(label: str | None, returncode: int | None, output: str) -> GhidraEr
     return GhidraError(f"Ghidra {label} failed (exit status {returncode})\n{detail}", code=code)
 
 
-def _launch(command: list[str], timeout: float | None, label: str | None) -> tuple[int, str]:
+def _launch(command: list[str], timeout: float | None, label: str | None,
+            environment: dict | None = None) -> tuple[int, str]:
     """Run analyzeHeadless in its own process group and kill the whole group when the budget expires."""
     check_cancelled(label)
     windows = os.name == "nt"
     process = subprocess.Popen(
         command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace",
+        encoding="utf-8", errors="replace", env=environment,
         **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True}),
     )
     started = time.monotonic()
@@ -350,14 +363,14 @@ def _report(project: Path, mode: str, request: object, timeout: float | None) ->
     return _oneshot(project, mode, request, timeout) if report is None else report
 
 
-def _oneshot(project: Path, mode: str, request: object, timeout: float | None) -> dict:
-    """Run one query mode in its own analyzeHeadless launch."""
+def _oneshot(project: Path, mode: str, request: object, timeout: float | None, setup: dict | None = None) -> dict:
+    """Run one query mode in its own analyzeHeadless launch, with another process's setup if given."""
     if mode == "gaps":
-        return _query(project, "RetroreGaps.java", timeout=timeout)
+        return _query(project, "RetroreGaps.java", timeout=timeout, setup=setup)
     with TemporaryDirectory() as temp:
         input_file = Path(temp) / "input.json"
         input_file.write_text(json.dumps(request), encoding="utf-8")
-        return _query(project, "RetroreQuery.java", mode, str(input_file), timeout=timeout)
+        return _query(project, "RetroreQuery.java", mode, str(input_file), timeout=timeout, setup=setup)
 
 
 def _require_project(project: Path) -> None:
@@ -368,9 +381,10 @@ def _require_project(project: Path) -> None:
         )
 
 
-def _query(project: Path, script: str, *arguments: str, timeout: float | None = QUERY_TIMEOUT) -> dict:
+def _query(project: Path, script: str, *arguments: str, timeout: float | None = QUERY_TIMEOUT,
+           setup: dict | None = None) -> dict:
     _require_project(project)
     return _run(
         project, ["-process", "image.bin", "-noanalysis", "-readOnly"],
-        script, *arguments, timeout=timeout,
+        script, *arguments, timeout=timeout, setup=setup,
     )
