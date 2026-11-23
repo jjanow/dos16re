@@ -1253,6 +1253,12 @@ defined as data, or inside an instruction.
 Add `--classify-gaps` to attach static gap classification and runtime hit evidence to the undefined
 ranges that contain executed addresses.
 
+Add `--evidence --json` to include the export identity and byte evidence for each mapped address,
+including disassembly misses and the examples in classified gaps. Each `export_evidence` record
+contains one byte from the loader image, its original value before loader fixups, and the matching
+runtime, image, and available source file coordinates. The bytes describe the export. The debugger
+log supplies the observed address and hit count.
+
 ## Tests
 
 Install `pytest` with `.venv/bin/python -m pip install pytest`, then run tests with

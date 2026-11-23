@@ -5,10 +5,9 @@ from hashlib import sha256
 from pathlib import Path
 
 from .ghidra import GhidraError, query_batch
-from .image import M68K_FORMATS, ImageError, ImageUnit, image_units, read_map
+from .image import M68K_FORMATS, ImageError, ImageUnit, RuntimePlacementError, dos_runtime_units, image_units, read_map
 from .mz import Address
 from .search import SearchError, resolve_address
-from .trace import _runtime_units
 
 ADDRESS_SPACES = ("logical", "linear", "runtime", "image", "file")
 MAX_BYTES = 4096
@@ -26,8 +25,11 @@ class ExportEvidence:
         self.records = {record["name"]: record for record in self.program["units"]}
         self.format = self.program.get("format", "MZ")
         if self.format == "MZ":
-            self.runtime = {unit.name: start for start, unit in
-                            _runtime_units(self.units, runtime_base, overlay_segments or {})}
+            try:
+                placements = dos_runtime_units(self.units, runtime_base, overlay_segments or {})
+            except RuntimePlacementError as error:
+                raise EvidenceError(str(error)) from error
+            self.runtime = {unit.name: start for start, unit in placements}
         else:
             if runtime_base is not None or overlay_segments:
                 raise EvidenceError("runtime segment overrides require a DOS MZ export")

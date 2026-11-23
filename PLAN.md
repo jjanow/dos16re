@@ -14,13 +14,12 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `batch --evidence --export` added loader comparisons for indirect transfers,
-including recovered switch tables and the instructions that write candidate pointers.
-`annotations export --export` added anchor-byte evidence that transfer preserves as source
-provenance. The standalone suite passed 422 tests with 90 skipped. Focused Ghidra 12.2 checks
-covered synthetic DOS, Amiga, and C64 inputs, including changed bytes and targets.
+On 2026-11-23, `trace --evidence` linked mapped DOSBox-X hits, disassembly misses, and
+classified gap examples to the export identity, loader bytes, and available source offsets.
+The standalone suite passed 422 tests with 90 skipped. A Ghidra 12.2 integration test
+verified loader evidence on gap hits in a rebased synthetic DOS trace.
 
-Resume Phase 10 by attaching loader evidence to observed runtime addresses and static gap hits.
+Resume Phase 10 with export and replay of user-defined data types in annotations.
 
 ## Why
 
@@ -354,15 +353,16 @@ release. Continue with the analysis backlog below.
   `disasm` reads a bounded Ghidra range with resolved references and flags unresolved computed flow.
   `decomp --map-lines` maps C lines to contributing instruction ranges. Open: source offsets for
   older maps and formats with incomplete provenance, and generalized runtime placement.
-- **Partly implemented.** `batch --evidence` bundles selected results and their requests. It can
+- **Implemented.** `batch --evidence` bundles selected results and their requests. It can
   attach loader evidence to disassembly and the distinct instructions cited by returned decompiler
   fields. Both comparisons report address, initialized size, and byte mismatches, plus incomplete
   coverage when both sources provide equal byte counts. The decompiler comparison records each
   instruction's bytes and source spans and flags missing or truncated evidence. A disassembly
   range uninitialized in both sources reports an unavailable byte comparison. Indirect flow bundles
   compare instructions, loader-recovered tables and targets, initial candidate slots, and stored
-  pointer writers. Gap classification can include observed runtime hits. Open: shared evidence for
-  runtime observations.
+  pointer writers. `trace --evidence` attaches the export identity and a byte at each mapped DOSBox-X
+  address to the report, including disassembly misses and observed gap examples. The evidence
+  includes the original byte before loader fixups and source coordinates where available.
 - **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
   entry points. An optional loader export adds byte and source evidence at each anchor. Transfer
   preserves the source evidence. Replay previews conflicts and applies changes in one transaction.

@@ -886,7 +886,7 @@ def _trace(args: argparse.Namespace) -> None:
         raise TraceError(str(error)) from error
     report = import_trace(
         args.trace, args.export, runtime_base=args.runtime_base, overlay_segments=overlay_segments, project=args.project,
-        timeout=args.timeout, classify_gaps=args.classify_gaps,
+        timeout=args.timeout, classify_gaps=args.classify_gaps, evidence=args.evidence,
     )
     if args.json:
         print(json.dumps(report))
@@ -909,7 +909,7 @@ def _trace(args: argparse.Namespace) -> None:
         total = len(functions) + len(missed)
     for row in rows:
         print(f"  {row}")
-    if total > _PREVIEW_LIMIT or unmapped or report["ignored_lines"]:
+    if total > _PREVIEW_LIMIT or unmapped or report["ignored_lines"] or args.evidence:
         print("Use --json for the full trace report.")
 
 
@@ -1465,6 +1465,8 @@ def main(argv: list[str] | None = None) -> int:
     trace_parser.add_argument("--project", metavar="PROJECT", type=Path, help="compare with the analyzed Ghidra project")
     trace_parser.add_argument("--classify-gaps", action="store_true",
                               help="include static evidence for gaps observed in the trace (requires --project)")
+    trace_parser.add_argument("--evidence", action="store_true",
+                              help="include export bytes and source locations for mapped hits in JSON")
     trace_parser.add_argument(
         "--runtime-base", metavar="HEX", type=_hex_segment, help="runtime root load segment (defaults to the export base)",
     )

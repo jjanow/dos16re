@@ -4,11 +4,10 @@ import re
 from bisect import bisect_right
 from collections import Counter
 from dataclasses import asdict
-from hashlib import sha256
 from pathlib import Path
 
+from .evidence import EvidenceError, ExportEvidence
 from .ghidra import QUERY_TIMEOUT, trace_coverage
-from .image import ImageUnit, image_units, read_map
 from .mz import Address
 
 _TRACE_LINE = re.compile(r"^\s*(?:\d+\.\d+\s+)?([0-9a-fA-F]{4}):([0-9a-fA-F]{4,8})(?=\s|$)")
@@ -18,51 +17,21 @@ class TraceError(ValueError):
     """An invalid trace or runtime image placement."""
 
 
-def _runtime_units(
-    units: list[ImageUnit], root_segment: int | None, overlay_segments: dict[str, int],
-) -> list[tuple[int, ImageUnit]]:
-    if not units or units[0].name != "root":
-        raise TraceError("the first image unit must be root")
-    root = units[0]
-    overlays = {unit.name.casefold(): unit for unit in units[1:]}
-    placements = [(root.segment if root_segment is None else root_segment, root)]
-    placed = set()
-    for name, segment in overlay_segments.items():
-        key = name.casefold()
-        unit = overlays.get(key)
-        if unit is None:
-            raise TraceError(f"unknown overlay unit {name}")
-        if key in placed:
-            raise TraceError(f"runtime segment specified twice for {unit.name}")
-        placed.add(key)
-        placements.append((segment, unit))
-
-    ranges = []
-    for segment, unit in placements:
-        if type(segment) is not int or not 0 <= segment <= 0xFFFF or segment * 16 + unit.size > 0x100000:
-            raise TraceError(f"runtime placement for {unit.name} is outside the first MiB")
-        if unit.size:
-            ranges.append((segment * 16, unit))
-    ranges.sort(key=lambda item: item[0])
-    for (left_start, left), (right_start, right) in zip(ranges, ranges[1:]):
-        if left_start + left.size > right_start:
-            raise TraceError(f"runtime ranges overlap for {left.name} and {right.name}")
-    return ranges
-
-
 def import_trace(
     trace: Path, export: Path, *, runtime_base: int | None = None,
     overlay_segments: dict[str, int] | None = None, project: Path | None = None,
-    timeout: float | None = QUERY_TIMEOUT, classify_gaps: bool = False,
+    timeout: float | None = QUERY_TIMEOUT, classify_gaps: bool = False, evidence: bool = False,
 ) -> dict:
     if classify_gaps and project is None:
         raise TraceError("classifying gaps requires a Ghidra project")
-    image = export / "image.bin"
-    program = read_map(export)
-    if program.get("format", "MZ") != "MZ":
+    try:
+        image = ExportEvidence(export, runtime_base, overlay_segments)
+    except EvidenceError as error:
+        raise TraceError(str(error)) from error
+    if image.format != "MZ":
         raise TraceError("DOSBox-X traces require a DOS MZ image")
-    units = image_units(program, image.stat().st_size)
-    ranges = _runtime_units(units, runtime_base, overlay_segments or {})
+    ranges = [(image.runtime[unit.name], unit) for unit in image.units if unit.name in image.runtime]
+    ranges.sort(key=lambda placement: placement[0])
     starts = [start for start, _ in ranges]
     counts: Counter[int] = Counter()
     addresses: dict[int, str] = {}
@@ -82,6 +51,7 @@ def import_trace(
         raise TraceError("trace contains no 16-bit DOSBox-X instruction addresses")
 
     mapped, unmapped = [], []
+    anchors = {}
     for linear, count in sorted(counts.items()):
         hit = {"runtime_address": addresses[linear], "count": count}
         index = bisect_right(starts, linear) - 1
@@ -89,18 +59,40 @@ def import_trace(
             start, unit = ranges[index]
             offset = linear - start
             if offset < unit.size:
-                mapped.append({**hit, **unit.location(offset)})
+                location = unit.location(offset)
+                mapped.append({**hit, **location})
+                if evidence:
+                    position = unit.image_offset + offset
+                    original, _ = image.original
+                    anchors[location["linear"]] = {
+                        "address": image.location(unit, offset),
+                        "loaded": image.image[position:position + 1].hex(),
+                        "original": original[position:position + 1].hex(),
+                    }
                 continue
         unmapped.append(hit)
+    identity = image.identity() if project is not None or evidence else None
     analysis = None
     if project is not None:
         analysis = trace_coverage(project, {
-            "sha256": sha256(image.read_bytes()).hexdigest(),
-            "units": [asdict(unit) for unit in units],
+            "sha256": identity["image_sha256"],
+            "units": [asdict(unit) for unit in image.units],
             "hits": mapped,
             "classify_gaps": classify_gaps,
         }, timeout=timeout)
-    return {
+    report = {
         "instructions": counts.total(), "ignored_lines": ignored,
         "mapped": mapped, "unmapped": unmapped, "analysis": analysis,
     }
+    # Keep loader evidence out of the Ghidra coverage request.
+    if evidence:
+        report["export"] = identity
+        for hit in mapped:
+            hit["export_evidence"] = anchors[hit["linear"]]
+        if analysis is not None:
+            for hit in analysis["missed"]:
+                hit["export_evidence"] = anchors[hit["linear"]]
+            for gap in analysis.get("observed_gaps", ()):
+                for hit in gap["trace_evidence"]["examples"]:
+                    hit["export_evidence"] = anchors[hit["linear"]]
+    return report

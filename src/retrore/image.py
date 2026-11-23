@@ -38,6 +38,10 @@ class ImageError(CodedError):
     default_code = "export_invalid"
 
 
+class RuntimePlacementError(ValueError):
+    """An invalid DOS runtime image placement."""
+
+
 def check_map_version(program: object) -> int:
     """Return a map's major version. Maps without "version" predate versioning and read as version 1."""
     if not isinstance(program, dict):
@@ -71,6 +75,38 @@ class ImageUnit:
             segmented = Address(self.segment, offset) if offset <= 0xFFFF else Address(linear >> 4, linear & 0xF)
             address = str(segmented)
         return {"address": address, "unit_address": f"{self.name}:{offset:04x}", "linear": linear}
+
+
+def dos_runtime_units(
+    units: list[ImageUnit], root_segment: int | None, overlay_segments: dict[str, int],
+) -> list[tuple[int, ImageUnit]]:
+    if not units or units[0].name != "root":
+        raise RuntimePlacementError("the first image unit must be root")
+    root = units[0]
+    overlays = {unit.name.casefold(): unit for unit in units[1:]}
+    placements = [(root.segment if root_segment is None else root_segment, root)]
+    placed = set()
+    for name, segment in overlay_segments.items():
+        key = name.casefold()
+        unit = overlays.get(key)
+        if unit is None:
+            raise RuntimePlacementError(f"unknown overlay unit {name}")
+        if key in placed:
+            raise RuntimePlacementError(f"runtime segment specified twice for {unit.name}")
+        placed.add(key)
+        placements.append((segment, unit))
+
+    ranges = []
+    for segment, unit in placements:
+        if type(segment) is not int or not 0 <= segment <= 0xFFFF or segment * 16 + unit.size > 0x100000:
+            raise RuntimePlacementError(f"runtime placement for {unit.name} is outside the first MiB")
+        if unit.size:
+            ranges.append((segment * 16, unit))
+    ranges.sort(key=lambda item: item[0])
+    for (left_start, left), (right_start, right) in zip(ranges, ranges[1:]):
+        if left_start + left.size > right_start:
+            raise RuntimePlacementError(f"runtime ranges overlap for {left.name} and {right.name}")
+    return ranges
 
 
 def read_map(export: Path) -> dict:

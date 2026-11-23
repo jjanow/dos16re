@@ -1,5 +1,6 @@
 import json
 import os
+from hashlib import sha256
 from struct import pack_into
 
 import pytest
@@ -10,7 +11,8 @@ from retrore.cli import main
 def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):
     root = b"\xc3" + bytes(31)
     header = bytearray(32)
-    pack_into("<2s13H", header, 0, b"MZ", len(header) + len(root), 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 28, 0)
+    pack_into("<2s13H", header, 0, b"MZ", len(header) + len(root), 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 28, 0)
+    pack_into("<HH", header, 28, 30, 0)
     exe = tmp_path / "sample.exe"
     exe.write_bytes(header + root)
     overlay = tmp_path / "OV1.ovr"
@@ -23,8 +25,8 @@ def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):
     trace.write_text(
         "CPU log\n"
         "2000:0000  ret                            EAX:00000000\n"
-        "2000:0000001F\n"
         "2001:000F  nop                            EAX:00000000\n"
+        "2000:0000001F\n"
         "2.500000 3000:00000000  retf              CB         EAX:00000000\n"
         "3000:00000010\n"
         "1200:00000000\n"
@@ -39,7 +41,7 @@ def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):
         "instructions": 7, "ignored_lines": 2, "analysis": None,
         "mapped": [
             {"runtime_address": "2000:0000", "address": "1000:0000", "unit_address": "root:0000", "linear": 0x10000, "count": 1},
-            {"runtime_address": "2000:001f", "address": "1000:001f", "unit_address": "root:001f", "linear": 0x1001F, "count": 2},
+            {"runtime_address": "2001:000f", "address": "1000:001f", "unit_address": "root:001f", "linear": 0x1001F, "count": 2},
             {"runtime_address": "3000:0000", "address": "1200:0000", "unit_address": "OV1:0000", "linear": 0x12000, "count": 1},
         ],
         "unmapped": [
@@ -47,6 +49,24 @@ def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):
             {"runtime_address": "3000:0010", "count": 1},
             {"runtime_address": "f000:fffe", "count": 1},
         ],
+    }
+
+    assert main([*command, "--overlay-segment", "ov1=3000", "--evidence", "--json"]) == 0
+    sourced = json.loads(capsys.readouterr().out)
+    assert sourced["export"]["image_sha256"] == sha256((export / "image.bin").read_bytes()).hexdigest()
+    assert sourced["unmapped"] == report["unmapped"]
+    for hit, loaded, original, source, file_offset in zip(
+        sourced["mapped"], ("c3", "10", "cb"), ("c3", "00", "cb"), (exe, exe, overlay), (32, 63, 0), strict=True,
+    ):
+        proof = hit["export_evidence"]
+        assert (proof["loaded"], proof["original"]) == (loaded, original)
+        assert proof["address"]["unit_address"] == hit["unit_address"]
+        assert proof["address"]["file"] == {
+            "source": source.name, "offset": file_offset, "offset_kind": "file", "member": None,
+        }
+    assert sourced["mapped"][1]["runtime_address"] == "2001:000f"
+    assert sourced["mapped"][1]["export_evidence"]["address"]["runtime"] == {
+        "address": "2000:001f", "linear": 0x2001F,
     }
 
     assert main([*command, "--overlay-segment", "OV1=2001", "--json"]) == 1
@@ -68,12 +88,18 @@ def test_trace_attaches_execution_evidence_to_static_gaps(tmp_path, capsys):
     assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
     capsys.readouterr()
     trace = tmp_path / "logcpu.txt"
-    trace.write_text("1000:0000\n1000:000e\n1000:000e\n1000:000f\n", encoding="utf-8")
+    trace.write_text("2000:0000\n2000:000e\n2000:000e\n2000:000f\n", encoding="utf-8")
     assert main(["trace", str(trace), "--project", str(project), "--export", str(export), "--classify-gaps",
-                 "--json"]) == 0, capsys.readouterr().err
+                 "--runtime-base", "2000", "--evidence", "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)
     gap, = report["analysis"]["observed_gaps"]
     assert gap["class"] == "padding"
     evidence = gap["trace_evidence"]
     assert (evidence["kind"], evidence["addresses"], evidence["hits"]) == ("executed", 2, 3)
     assert [row["unit_address"] for row in evidence["examples"]] == ["root:000e", "root:000f"]
+    assert evidence["examples"] == report["analysis"]["missed"]
+    for index, example in enumerate(evidence["examples"], 1):
+        proof = example["export_evidence"]
+        assert proof == report["mapped"][index]["export_evidence"]
+        assert proof["loaded"] == proof["original"] == "00"
+        assert proof["address"]["file"]["offset"] == 45 + index
