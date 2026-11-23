@@ -12,15 +12,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22, finished Phase 8's open items and the Sharp X1 milestone in parallel branches:
-the query registry with bounded bulk lookups, inventories, call graphs, and routine context;
-headless time budgets, coded errors, and a benchmark; versioned maps and query contracts; and
-`retrore schema` with an MCP adapter. The X1 loader and Z180-based import were validated on the
-Phantasie I Program Disk. On merged main with Ghidra 12.2 and the X1 disks, 302 tests passed with 27 skipped.
-The standalone suite passed 282 tests with 47 skipped.
+On 2026-11-22, closed the remaining Phase 8 items. `context` pages its parameters, and `symbols --generated`
+matches Ghidra's generated `DAT_`/`LAB_`/`SUB_` names. `trace --project` takes `--timeout`. The MCP server
+gained `info` and `load` tools (the CLI's program options now live in `program_options()` and
+`build_program()`) and runs calls concurrently, queued per project and cancellable. Project lock
+failures report `project_locked`. `tools/bench.py` measures question scenarios, and a Pool of Radiance
+run showed that dependent steps, not batch size, dominate. With Ghidra 12.2 and the PoR inputs, 306 tests
+passed with 27 skipped. The standalone suite passed 286 with 47 skipped.
 
-Resume with Sharp X68000, or Phase 9 code and data recovery. The remaining Phase 8 items are small
-(listed below).
+The PoR run also exposed a Phase 1 bug: automatic overlay placement overlaps DGROUP's uninitialized
+data and stack (see Phase 1). Resume by fixing that, then build the persistent query worker
+(Phase 8 **Next**). After that come Sharp X68000 and Phase 9.
 
 ## Why
 
@@ -73,6 +75,14 @@ platforms used by the remaster projects, starting with AmigaDOS.
 **Validated.** PoR `START.EXE` and `GAME.OVR` load 35 distinct overlay units and resolve all 406 stubs.
 The documented stub `0085:0039` resolves to `GAME.OVR` file offset `0x21AED`. Phantasie I's LZEXE-packed
 `PHANTASI.EXE` loads alongside both flat overlays at distinct segments.
+
+**Open bug.** Automatic overlay placement starts right after the root's file image. It ignores the
+program's uninitialized data, its stack, and the header's minimum allocation. In PoR the root image ends at
+linear `0x20BF0` but the stack top is `24F2:4000` (`0x28F20`). `tpov_0016` and the units after it
+therefore cover DGROUP's uninitialized data: `DGROUP_4433`, one of the `LOADPIECES` flags, resolves
+to `tpov_0016:0003`. Place automatic units above the image end, the initial stack top, and
+`min_alloc` for unpacked headers. Then re-run the PoR and Phantasie opt-in validations, whose overlay
+segments will move.
 
 ### Phase 2: Ghidra import
 
@@ -228,13 +238,17 @@ The analysis backlog below applies to existing and future platforms.
 - **Implemented.** One query registry (`queries.py`) defines every Ghidra query's parameters,
   fields, and caps for validation, the CLI, and `batch`. Bounded `functions`, `symbols`, `inventory`,
   `callgraph`, `context`, `gaps`, and `coverage` queries run alone or in a batch with paging and
-  explicit truncation. Open: page `context` parameters and search Ghidra's generated names.
+  explicit truncation. `context` pages parameters too, and `symbols --generated` matches Ghidra's
+  generated `DAT_`, `LAB_`, and `SUB_` names.
 - **Implemented.** Headless runs have time budgets (`--timeout`) that stop the whole JVM process
   group. Failures carry stable error codes with hints and documented exit statuses.
-  `tools/bench.py` measures import and query latency, launch counts, and output size
-  ([results](docs/benchmarks.md)). Launch cost dominates and batching amortizes it, so a persistent
-  worker is not justified yet. Open: measure steps for representative reversing questions and
-  re-check on a large overlay project; add `--timeout` to `trace --project`.
+  `trace --project` has a budget too. `tools/bench.py` measures import and query latency, launch
+  counts, output size, and the steps that reversing questions take ([results](docs/benchmarks.md)).
+  On Pool of Radiance (36 units) a launch costs about 4.1 s and a batched query about 18 ms. Real
+  questions need two or three dependent steps, so even batched they take 8 to 12 s.
+- **Next.** A persistent query worker that keeps one project open across dependent steps, for the
+  CLI and the MCP server. Keep the request and result contract, time budgets, and cancellation, and
+  measure it against the PoR questions.
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
 - **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested
@@ -243,8 +257,9 @@ The analysis backlog below applies to existing and future platforms.
   `contract`. Unversioned fixture maps for several formats test compatibility with older exports.
 - **Implemented.** `retrore schema` emits a JSON Schema generated from the query registry, and
   `retrore mcp` is a standard-library MCP stdio server whose tools share the CLI's validation and
-  entry points. Open: `info` and `load` tools (needs the CLI's inline platform options factored out)
-  and concurrent or cancellable calls.
+  entry points. Its `info` and `load` tools pass their arguments through the CLI's own parser. Calls
+  run concurrently except on the same project, because Ghidra locks a project per session. A
+  cancelled call stops its headless run. Lock failures report `project_locked`.
 
 ### Phase 9: better code and data recovery
 
