@@ -24,7 +24,9 @@ def _import_program(tmp_path, capsys, exe, *options):
     assert main(["load", str(exe), "-o", str(export), "--json", *options]) == 0
     program = json.loads(capsys.readouterr().out)
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
-    assert json.loads(capsys.readouterr().out)["units"] == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["units"] == 1
+    program["import"] = report
     return project, program
 
 
@@ -255,14 +257,25 @@ def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
     if not directory:
         pytest.skip("set RETRORE_PH3_DIR to run the real-game test")
     exe = next(path for path in Path(directory).iterdir() if path.name.upper() == "MAIN.EXE")
-    project, _ = _import_program(tmp_path, capsys, exe)
+    project, program = _import_program(tmp_path, capsys, exe)
 
     # The save-game code reads and writes a word through the relocated FAR segment.
+    # 1000:125d, called from main, keeps DGROUP now that a misread jump table no longer joins
+    # main's context. int86 at 1000:5276 and 1000:2840 receive far pointers that every caller
+    # pushes as relocated FAR segment and offset.
     _check_references(
         project,
         "13b2:452a,ES,2820,1,2820:97f0,word,FAR2820_97f0",
         "13b2:467d,ES,2820,0,2820:97f0,word,FAR2820_97f0",
+        "1000:1274,ES,2820,0,2820:aa30,word,FAR2820_aa30",
+        "1000:52af,DS,2820,1,2820:b7f6,word,FAR2820_b7f6",
+        "1000:2851,ES,2820,0,2820:09fa,byte,FAR2820_09fa",
     )
+    # Before summaries and loss tracking, 247 of 380 functions entered with a known DS and the
+    # import added 1,903 data references.
+    analysis = program["import"]["segment_analysis"]
+    assert analysis["entry_known"]["DS"] >= 360
+    assert analysis["data_references"] >= 2500
 
 
 def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, monkeypatch):
