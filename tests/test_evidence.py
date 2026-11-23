@@ -43,18 +43,23 @@ def test_hunk_file_mapping_and_bss():
     assert bss["truncated"] and not bss["address"]["initialized"] and bss["loaded"] == ""
 
 
-def test_bundle_distinguishes_uninitialized_ranges_from_byte_conflicts(monkeypatch):
+def test_bundle_reports_byte_comparison_status_and_conflicts(monkeypatch):
     export = FIXTURES / "hunk"
-    addresses = ["h3:1", "h0:2", "h3:1", "h0:2"]
+    addresses = ["h3:1", "h0:2", "h3:1", "h0:2", "h0:2", "h0:2", "h0:6"]
     rows = [
         {"kind": "uninitialized"},
         {"kind": "data", "bytes": "ffffffff"},
         {"kind": "data", "bytes": "00000000"},
         {"kind": "uninitialized"},
+        {"kind": "data", "bytes": "00010020"},
+        {"kind": "data", "bytes": "00010020"},
+        {"kind": "data", "bytes": inspect_bytes(export, "h0:6", size=2)["loaded"]},
     ]
     results = [{"result": {"program": "demo"}}]
-    for address, row in zip(addresses, rows, strict=True):
+    for index, (address, row) in enumerate(zip(addresses, rows, strict=True)):
         start, = map_address(export, address)["matches"]
+        if index == 5:
+            start["linear"] += 0x10
         results.append({"result": {"start": start, "size": 4, "rows": [row]}})
     monkeypatch.setattr(evidence, "query_batch", lambda *args, **kwargs: {"results": results})
 
@@ -62,7 +67,13 @@ def test_bundle_distinguishes_uninitialized_ranges_from_byte_conflicts(monkeypat
     bundle = evidence.evidence_bundle(Path("demo.gpr"), requests, export=export)
 
     comparisons = [row["export_evidence"] for row in bundle["results"]]
-    assert [item["status"] for item in comparisons] == ["unavailable", "conflict", "conflict", "conflict"]
+    assert [item["status"] for item in comparisons] == [
+        "unavailable", "conflict", "conflict", "conflict", "consistent", "conflict", "conflict",
+    ]
+    assert [item.get("conflicts") for item in comparisons] == [
+        None, ["byte_mismatch"], ["initialized_size_mismatch"], ["initialized_size_mismatch"],
+        None, ["address_mismatch"], ["incomplete_range"],
+    ]
     assert comparisons[0]["reason"] == "range is uninitialized"
     assert comparisons[0]["bytes"]["loaded"] == ""
 

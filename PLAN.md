@@ -14,13 +14,12 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `batch --evidence` gained an explicit unavailable byte comparison for ranges
-that are uninitialized in both the Ghidra project and the export. A regression test covers
-the unavailable result, changed bytes, and initialization mismatches. The standalone suite
-passed 419 tests with 90 skipped. The focused decompilation and evidence suites passed all
-13 tests with Ghidra 12.2 and JDK 25.
+On 2026-11-23, `batch --evidence` gained conflict codes for loader comparisons of disassembly
+ranges. The regression test covers address, initialized size, and byte mismatches, incomplete
+coverage, and consistent and unavailable ranges. The standalone suite passed 419 tests with
+90 skipped.
 
-Resume with Phase 10's shared evidence categories, or use runtime observations to investigate
+Resume by extending Phase 10's evidence categories beyond disassembly, or use runtime observations to investigate
 Phantasie III's unresolved dispatch at `root:13721` in Phase 9.
 X1turbo validation still awaits the Gold Box release.
 
@@ -357,9 +356,10 @@ release. Continue with the analysis backlog below.
   `decomp --map-lines` maps C lines to contributing instruction ranges. Open: source offsets for
   older maps and formats with incomplete provenance, and generalized runtime placement.
 - **Partly implemented.** `batch --evidence` bundles selected results and their requests. It can
-  attach loader evidence to disassembly and flag byte conflicts. A range uninitialized in both the
-  export and Ghidra reports an unavailable byte comparison. Gap classification can include observed
-  runtime hits. Open: shared evidence categories across all analyses and annotations.
+  attach loader evidence to disassembly and report address, initialized size, and byte mismatches,
+  plus incomplete coverage when both sources provide equal byte counts. A range uninitialized in
+  both the export and Ghidra reports an unavailable byte comparison. Gap classification can
+  include observed runtime hits. Open: shared evidence categories across analyses and annotations.
 - **Partly implemented.** `annotations` exports names, global labels, signatures, comments, and
   entry points. Replay previews conflicts and applies changes in one transaction. Open: user data
   types, custom storage, and layout hints.

@@ -241,7 +241,17 @@ def evidence_bundle(project: Path, requests: list, *, export: Path | None = None
             row["export_evidence"] = {"status": "unavailable", "reason": "range is uninitialized",
                                       "bytes": observed}
             continue
-        same_bytes = observed["size"] == result["size"] and observed["loaded"] == project_bytes
-        row["export_evidence"] = {"status": "consistent" if same_address and same_bytes else "conflict",
-                                  "bytes": observed}
+        conflicts = []
+        if not same_address:
+            conflicts.append("address_mismatch")
+        if observed["size"] * 2 != len(project_bytes):
+            conflicts.append("initialized_size_mismatch")
+        else:
+            if observed["loaded"] != project_bytes:
+                conflicts.append("byte_mismatch")
+            if observed["size"] != result["size"]:
+                conflicts.append("incomplete_range")
+        row["export_evidence"] = {"status": "conflict" if conflicts else "consistent", "bytes": observed}
+        if conflicts:
+            row["export_evidence"]["conflicts"] = conflicts
     return bundle
