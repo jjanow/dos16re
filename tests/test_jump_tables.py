@@ -243,6 +243,29 @@ def test_ghidra_keeps_candidates_for_far_pointer_tables_and_variables(tmp_path, 
     assert ("root:0208", "DATA") in [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]]
 
 
+def test_ghidra_reports_tail_jumps_as_calls(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    image = bytearray(0x40)
+    image[:7] = bytes.fromhex("e8 0e 00 e8 13 00 c3")  # call 0x11; call 0x19; ret
+    image[0x11:0x19] = bytes.fromhex("b8 01 00 eb 03 90 90 90")  # mov ax,1; jmp 0x19 (a tail call)
+    image[0x19:0x1D] = bytes.fromhex("40 40 c3 90")          # inc ax; inc ax; ret
+    exe = tmp_path / "sample.exe"
+    exe.write_bytes(_mz(image, []))
+    export, project = tmp_path / "export", tmp_path / "tail"
+    assert main(["load", str(exe), "-o", str(export), "--base-segment", "2000"]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    assert main(["callees", "root:0011", "--project", str(project), "--json"]) == 0
+    callees = json.loads(capsys.readouterr().out)["callees"]
+    # Ghidra's shared-return analysis already turns a jump to another function's entry into a call.
+    assert [(ref["to"]["unit_address"], ref["type"]) for ref in callees] == [("root:0019", "UNCONDITIONAL_CALL")]
+    assert main(["callers", "root:0019", "--project", str(project), "--json"]) == 0
+    callers = {(ref["from"]["unit_address"], ref["type"]) for ref in json.loads(capsys.readouterr().out)["callers"]}
+    assert callers == {("root:0003", "UNCONDITIONAL_CALL"), ("root:0014", "UNCONDITIONAL_CALL")}
+
+
 def test_ghidra_classifies_gaps_and_seeds_routines_named_by_far_pointers(tmp_path, capsys):
     if not os.environ.get("GHIDRA_HOME"):
         pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
