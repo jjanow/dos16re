@@ -13,15 +13,18 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22 (third session), closed the POSIX worker follow-ups in Phase 8. `ghidra import` and
-`worker stop` now cancel a running worker query instead of waiting up to about 60 s and then
-reporting `project_locked`. Daemons follow each caller's Ghidra installation and
-`JAVA_HOME`, and leave no lock or log files after a clean exit. A cancellation or timeout during a
-worker request no longer passes through the one-shot fallback, because `GhidraError` is a
-`ValueError` and was caught as an unreadable response. With Ghidra 12.2 and the PoR and Phantasie I/III inputs, 330
-tests passed with 23 skipped. The standalone suite passed 305 with 48 skipped.
+On 2026-11-22 (fourth session), added the Sharp X68000 milestone. `info` and `load` read Human68k `HU`
+executables, including symbols and word relocations. The Ghidra importer adds the X68000 map and
+patches reached line-F DOS and FPACK calls into named stubs. It rewrites XC's stacked multiply and
+divide calls and rejoins XC's split routine entries. Validated on Phantasie IV's `P4.X`: 2,222 call
+sites, `_save` and `_rand` decompile as single routines. Phase 8: daemon fallbacks now use the
+caller's Ghidra, and workers and daemons run on Windows over a token-checked loopback TCP endpoint.
+Windows is only partly verified (see Phase 8). The full suite with Ghidra 12.2 passed 339 with 31
+skipped before the Windows merge. After it the standalone suite passed 340 with 51 skipped, and the
+worker, X68000, and segment tests passed with Ghidra (57 passed, 1 skipped).
 
-Resume with Sharp X68000, then Phase 9. Windows worker hosting remains untested.
+Resume with Phase 9. A Windows job for release CI is drafted on the unmerged `ci/windows-worker`
+branch; trigger CI only for a tagged release. Classic Macintosh is the next platform milestone.
 
 ## Why
 
@@ -255,9 +258,18 @@ The analysis backlog below applies to existing and future platforms.
 - **Implemented.** Stopping a worker host (`ghidra import`, `worker stop`, idle exit) cancels the
   request in progress with `cancelled` instead of waiting for it. Each request carries the caller's
   analyzeHeadless path and `JAVA_HOME`, and the host restarts its JVM when they change. One-shot
-  fallbacks inside a daemon still use the daemon's environment. Hosts remove
+  fallbacks inside a daemon use the requesting caller's launcher and `JAVA_HOME` too. Hosts remove
   their lock files, and daemons remove their logs on a clean exit.
-- **Open.** In-process worker hosting on Windows is untested, and Windows has no daemon.
+- **Implemented, partly verified on Windows.** Python on Windows has no unix sockets, so hosts there
+  listen on a loopback TCP port and write the port and a random token to an endpoint file in
+  `%LOCALAPPDATA%\retrore\workers`; every connection must present the token. Locks use
+  `msvcrt.locking`, the daemon runs detached without a console window, and it opens its own log so it
+  can remove it. The worker tests run on both transports on Linux. Ad-hoc Windows runs on 2026-11-22
+  (not repeated; CI runs only for tagged releases) passed the worker, MCP, and synthetic Ghidra tests
+  with Ghidra 12.2 before the final log-cleanup fix, which passed the standalone suite but was not run
+  with Ghidra on Windows. Open: a full Windows run of the final code, ideally in a Windows job on the
+  next tagged release; a crashed host's stale endpoint file costs a refused connect (about 2 s on
+  Windows) until a new host replaces it; daemon output before its log opens is lost on Windows.
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
 - **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested
