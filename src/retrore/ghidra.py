@@ -13,7 +13,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from .errors import CONTRACT_VERSION, CodedError, coded
-from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, X1_FORMAT, Z80_FORMATS, image_units, read_map
+from .image import (
+    FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, Z80_FORMATS, image_units, read_map,
+)
 from .queries import QueryError, echo, normalize_query
 
 
@@ -235,9 +237,11 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
     options = ["-import", str(image), "-loader", "BinaryLoader", "-processor"]
     if program.get("format") in M68K_FORMATS:
         image_units(program, image.stat().st_size)
+        # X68000 imports run the script again after analysis to patch line-F calls that analysis reached.
+        post_script = "RetroreM68kImport.java" if program["format"] == X68K_FORMAT else None
         return _run(
-            project, [*options, "68000:BE:32:MC68020"], None, str(manifest), pre_script="RetroreM68kImport.java",
-            timeout=timeout,
+            project, [*options, "68000:BE:32:MC68020"], post_script, str(manifest),
+            pre_script="RetroreM68kImport.java", timeout=timeout,
         )
     if program.get("format") in FLAT16_FORMATS:
         image_units(program, image.stat().st_size)

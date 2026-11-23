@@ -5,7 +5,7 @@ from pathlib import Path
 from .image import FLAT16_FORMATS, M68K_FORMATS, PC98_FORMAT, ImageError, image_units, read_map
 
 _STRING_ENCODINGS = {
-    "MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii", PC98_FORMAT: "cp932",
+    "MZ": "cp437", "HUNK": "latin-1", "PRG": "ascii", "X68K": "cp932", PC98_FORMAT: "cp932",
 } | dict.fromkeys(FLAT16_FORMATS, "ascii")
 
 

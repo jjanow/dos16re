@@ -12,6 +12,7 @@ from .atari8 import (
     ATR_MAGIC, DEFAULT_PORTB, XEX_MAGIC, Atari8Binary, Atari8Error, Atari8Source, AtrImage, Segment, build_atari8_image,
 )
 from .atari_st import PRG_MAGIC, PrgError, build_prg_image
+from .x68k import X_MAGIC, XError, build_x_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
@@ -22,7 +23,7 @@ from .ghidra import (
 )
 from .image import (
     APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MSX2_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT,
-    ImageError,
+    X68K_FORMAT, ImageError,
 )
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, MZExecutable, UnsupportedPacker
@@ -50,7 +51,7 @@ _PREVIEW_LIMIT = 10
 # Errors that commands report as coded error objects instead of tracebacks.
 HANDLED_ERRORS = (
     Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, GhidraError, HunkError, ImageError, MZError,
-    Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error, OSError,
+    Msx2Error, Pc88Error, Pc98Error, PrgError, SearchError, TraceError, X1Error, XError, OSError,
 )
 
 
@@ -826,7 +827,8 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     """Build the image and map selected by parsed info or load options, with a text summary."""
     data = args.program.read_bytes()
     hunk = data.startswith(HUNK_MAGIC)
-    m68k = hunk or data.startswith(PRG_MAGIC)
+    human68k = data.startswith(X_MAGIC)
+    m68k = hunk or human68k or data.startswith(PRG_MAGIC)
     extension = args.program.suffix.lower()
     atari8 = args.atari8 or args.atari8_raw or (
         not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or extension in DISK_SUFFIXES)
@@ -869,11 +871,11 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         if args.base_segment is not None or args.overlay:
             raise MZError("--base-segment and --overlay apply to DOS executables")
         base_address = DEFAULT_M68K_BASE if args.base_address is None else args.base_address
-        loader = build_hunk_image if hunk else build_prg_image
+        loader = build_hunk_image if hunk else build_x_image if human68k else build_prg_image
         image, program_map = loader(data, args.program.name, base_address)
     else:
         if args.base_address is not None:
-            raise MZError("--base-address applies to Amiga, Atari ST, and 8-bit programs")
+            raise MZError("--base-address applies to Amiga, Atari ST, X68000, and 8-bit programs")
         executable = MZExecutable.parse(data)
         base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
         loaded = executable.load(base_segment)
@@ -887,6 +889,11 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         lines.append(f"Amiga Hunk  entry h0:0000 ({base_address:06x})  {len(program_map['units'])} hunks")
     elif program_map["format"] == "PRG":
         lines.append(f"Atari ST GEMDOS  entry text:0000 ({base_address:06x})")
+        lines.append("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
+    elif program_map["format"] == X68K_FORMAT:
+        entry = program_map["entry"]
+        symbols = sum(len(unit["symbols"]) for unit in program_map["units"])
+        lines.append(f"X68000 Human68k  entry {entry['unit_address']} ({entry['linear']:06x})  {symbols} symbols")
         lines.append("  ".join(f"{unit['name'].upper()} {unit['size']} bytes" for unit in program_map["units"]))
     elif program_map["format"] == PC98_FORMAT:
         entry = program_map["entry"]
@@ -940,7 +947,7 @@ def program_options() -> argparse.ArgumentParser:
     )
     base.add_argument(
         "--base-address", type=_hex_address, metavar="HEX",
-        help=f"Amiga/Atari ST base (default {DEFAULT_M68K_BASE:06x}) or 8-bit program load address",
+        help=f"Amiga/Atari ST/X68000 base (default {DEFAULT_M68K_BASE:06x}) or 8-bit program load address",
     )
     command.add_argument(
         "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
