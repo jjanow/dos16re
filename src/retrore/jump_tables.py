@@ -321,3 +321,92 @@ def _recover_at(decoder: Cs, code: bytes, jump: int, flat_overlay: bool) -> Jump
             if targets and any(target < table for target in targets):
                 return JumpTable(guard, jump, table, value.default, targets, kind, value.bound)
     return None
+
+
+@dataclass(frozen=True)
+class M68kJumpTable:
+    """A 68k switch through a table of relocated 32-bit code addresses; offsets are relative to the unit."""
+
+    guard: int
+    jump: int
+    table: int
+    default: int
+    targets: tuple[int, ...]
+
+
+def _word(code: bytes, offset: int) -> int:
+    return int.from_bytes(code[offset:offset + 2], "big") if 0 <= offset <= len(code) - 2 else -1
+
+
+def _signed16(value: int) -> int:
+    return value - 0x10000 if value & 0x8000 else value
+
+
+def recover_m68k_jump_tables(code: bytes, base: int, relocations: Iterable[int]) -> list[M68kJumpTable]:
+    """Find compiler switches of the form used by Sharp XC and similar 68k C compilers.
+
+        cmpi.l #N,dK; bhi default; asl.l #2,dK; lea table(pc),aM; movea.l (aM,dK.l),aN; jmp (aN)
+
+    `code` is one code unit loaded at linear address `base`; `relocations` are unit offsets of relocated
+    longs. Every table entry must be relocated and point at an even offset inside the unit.
+    """
+    relocated = set(relocations)
+    tables = []
+    for jump in range(8, len(code) - 1, 2):
+        opcode = _word(code, jump)
+        if opcode & 0xFFF8 != 0x4ED0:
+            continue
+        target_register = opcode & 7
+        load, extension = _word(code, jump - 4), _word(code, jump - 2)
+        if load & 0xFFF8 != 0x2070 | target_register << 9:
+            continue
+        table_register = load & 7
+        if extension & 0x8FFF != 0x0800:  # Data register index, long size, no scale or displacement.
+            continue
+        index = extension >> 12 & 7
+        if _word(code, jump - 8) != 0x41FA | table_register << 9:
+            continue
+        table = jump - 6 + _signed16(_word(code, jump - 6))
+        if _word(code, jump - 10) not in (0xE580 | index, 0xE588 | index):  # asl.l / lsl.l #2
+            continue
+        short = _word(code, jump - 12)
+        if short >> 8 in (0x62, 0x64) and short & 0xFF not in (0, 0xFF):  # bhi.b / bcc.b
+            branch, displacement = jump - 12, (short & 0xFF) - (0x100 if short & 0x80 else 0)
+        elif _word(code, jump - 14) in (0x6200, 0x6400):  # bhi.w / bcc.w
+            branch, displacement = jump - 14, _signed16(short)
+        else:
+            continue
+        condition = _word(code, branch) >> 8
+        compare = branch - 6
+        if _word(code, compare) != 0x0C80 | index:
+            continue
+        limit = int.from_bytes(code[compare + 2:compare + 6], "big")
+        count = limit + (condition == 0x62)
+        if not 1 <= count <= _MAX_CASES or table < 0 or table + 4 * count > len(code):
+            continue
+        entries = [table + 4 * case for case in range(count)]
+        if not relocated.issuperset(entries):
+            continue
+        targets = tuple(int.from_bytes(code[entry:entry + 4], "big") - base for entry in entries)
+        default = branch + 2 + displacement
+        if all(0 <= target < len(code) and not target % 2 for target in (*targets, default)):
+            tables.append(M68kJumpTable(compare, jump, table, default, targets))
+    return tables
+
+
+def m68k_jump_table_records(image: bytes, unit: dict) -> list[dict]:
+    """Map records for the switches in one exported 68k code unit."""
+    start, base = unit["image_offset"], unit["linear"]
+
+    def record(offset: int) -> dict:
+        return {"unit_address": f"{unit['name']}:{offset:04x}", "linear": base + offset}
+
+    width4 = (relocation["offset"] for relocation in unit["relocations"] if relocation.get("width", 4) == 4)
+    return [
+        {
+            "unit": unit["name"], "kind": "jump", "bound": "compare", "address": record(table.jump),
+            "guard": record(table.guard), "table": record(table.table), "default": record(table.default),
+            "targets": [record(target) for target in table.targets],
+        }
+        for table in recover_m68k_jump_tables(image[start:start + unit["size"]], base, width4)
+    ]

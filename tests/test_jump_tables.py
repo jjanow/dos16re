@@ -6,7 +6,7 @@ from struct import pack_into
 import pytest
 
 from retrore.cli import main
-from retrore.jump_tables import JumpTable, recover_jump_tables
+from retrore.jump_tables import JumpTable, M68kJumpTable, recover_jump_tables, recover_m68k_jump_tables
 from retrore.mz import Address, LoadedMZ
 from retrore.overlays import Overlay, build_image
 
@@ -158,6 +158,25 @@ def test_assigns_root_switches_to_the_nearest_relocated_code_segment():
     assert (record["kind"], record["bound"], record["default"]["offset"]) == ("jump", "compare", 0x0E)
 
 
+@pytest.mark.parametrize(("branch", "expected"), [
+    ("62 12", M68kJumpTable(0, 18, 28, 26, (20, 22, 24))),          # bhi.b
+    ("62 00 00 14", M68kJumpTable(0, 20, 30, 28, (22, 24, 26))),    # bhi.w
+])
+def test_recovers_m68k_switch_through_relocated_pointers(branch, expected):
+    code = bytearray.fromhex(
+        f"0c 80 00 00 00 02 {branch}"  # cmpi.l #2,d0; bhi default
+        " e5 80 41 fa 00 10"           # asl.l #2,d0; lea table(pc),a0
+        " 20 70 08 00 4e d0"           # movea.l (a0,d0.l),a0; jmp (a0)
+        " 4e 75 4e 75 4e 75 4e 75"     # three cases and the default
+    )
+    for target in expected.targets:
+        code += (0x10000 + target).to_bytes(4, "big")
+    relocations = [expected.table + 4 * case for case in range(3)]
+    assert recover_m68k_jump_tables(bytes(code), 0x10000, relocations) == [expected]
+    # Without a relocation on every entry the table is not proved.
+    assert recover_m68k_jump_tables(bytes(code), 0x10000, relocations[:2]) == []
+
+
 @pytest.fixture
 def phantasie_iii_export(tmp_path, capsys):
     directory = os.environ.get("RETRORE_PH3_DIR")
@@ -191,3 +210,31 @@ def test_phantasie_iii_switches_in_every_code_segment(phantasie_iii_export, caps
     assert {"from": "root:124bc", "type": "COMPUTED_CALL"} in [
         {"from": caller["from"]["unit_address"], "type": caller["type"]} for caller in report["callers"]
     ]
+
+
+def test_phantasie_iv_x68k_switches(tmp_path, capsys):
+    directory = os.environ.get("RETRORE_PH4_X68K_DIR")
+    if not directory:
+        pytest.skip("set RETRORE_PH4_X68K_DIR to run the real-game test")
+    program_file = next(path for path in Path(directory).iterdir() if path.name.upper() == "P4.X")
+    export = tmp_path / "export"
+    assert main(["load", str(program_file), "-o", str(export), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    tables = {table["address"]["unit_address"]: table for table in program["jump_tables"]}
+    # Every XC switch (cmpi.l; bhi; asl.l #2; lea (pc); movea.l; jmp (a0)) has a relocated table.
+    assert len(tables) == 41
+    switch = tables["text:13014"]
+    assert switch["table"]["unit_address"] == "text:13114"
+    assert [target["unit_address"] for target in switch["targets"]][:2] == ["text:13016", "text:1305a"]
+
+    if not os.environ.get("GHIDRA_HOME"):
+        return
+    project = tmp_path / "p4"
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["switches"] == 41
+    # Ghidra's own switch analysis leaves this one unresolved; the recovered table adds its cases.
+    assert main(["xrefs", "text:1305a", "--project", str(project), "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert any(
+        ref["from"]["unit_address"] == "text:13014" and ref["type"] == "COMPUTED_JUMP" for ref in report["incoming"]
+    )

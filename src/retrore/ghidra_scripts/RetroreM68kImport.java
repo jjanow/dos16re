@@ -179,6 +179,7 @@ public class RetroreM68kImport extends HeadlessScript {
         if (!memory.contains(entry) || !memory.getBlock(entry).isExecute()) {
             throw new IllegalArgumentException("Entry point is outside executable memory");
         }
+        int switches = map.has("jump_tables") ? recoverSwitches(map.getAsJsonArray("jump_tables")) : 0;
         currentProgram.getSymbolTable().addExternalEntryPoint(entry);
         disassemble(entry);
         createFunction(entry, null);
@@ -188,11 +189,55 @@ public class RetroreM68kImport extends HeadlessScript {
         report.put("format", format);
         report.put("units", units.size());
         report.put("relocations", relocations);
+        if (map.has("jump_tables")) {
+            report.put("switches", switches);
+        }
         if (x68k) {
             patchLineF();
             report.put("line_f", lineFReport());
         }
         return report;
+    }
+
+    /** Reserve each switch table's pointers, then add the computed jumps and disassemble the cases. */
+    private int recoverSwitches(JsonArray switches) throws Exception {
+        var listing = currentProgram.getListing();
+        var references = currentProgram.getReferenceManager();
+        for (var item : switches) {
+            var record = item.getAsJsonObject();
+            var table = address(record.getAsJsonObject("table").get("linear").getAsLong());
+            int count = record.getAsJsonArray("targets").size();
+            for (int index = 0; index < count; index++) {
+                var entry = table.addNoWrap(4L * index);
+                if (listing.getUndefinedDataAt(entry) != null && listing.getUndefinedDataAt(entry.addNoWrap(3)) != null) {
+                    listing.createData(entry, PointerDataType.dataType);
+                }
+            }
+        }
+        int recovered = 0;
+        for (var item : switches) {
+            monitor.checkCancelled();
+            var record = item.getAsJsonObject();
+            var jump = address(record.getAsJsonObject("address").get("linear").getAsLong());
+            var table = address(record.getAsJsonObject("table").get("linear").getAsLong());
+            disassemble(address(record.getAsJsonObject("guard").get("linear").getAsLong()));
+            var instruction = listing.getInstructionAt(jump);
+            if (instruction == null || !instruction.getFlowType().isJump() || !instruction.getFlowType().isComputed()) {
+                continue;
+            }
+            int index = 0;
+            for (var target : record.getAsJsonArray("targets")) {
+                var destination = address(target.getAsJsonObject().get("linear").getAsLong());
+                references.addMemoryReference(table.addNoWrap(4L * index++), destination, RefType.DATA,
+                    SourceType.ANALYSIS, 0);
+                instruction.addMnemonicReference(destination, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+            }
+            for (Address destination : instruction.getFlows()) {
+                disassemble(destination);
+            }
+            recovered++;
+        }
+        return recovered;
     }
 
     private void addMemoryMap(JsonArray regions, AddressSet loaded) throws Exception {
