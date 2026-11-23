@@ -991,8 +991,15 @@ The `data_types.types` list gives the category and name of each definition. The 
 Typed signatures use category-qualified type names. Preview reports type changes in
 `data_type_changes`. A different definition at the same path blocks the whole apply. Replay
 requires the same Ghidra language and compiler specification, and adds definitions before applying
-signatures. Version 1 documents still replay with textual signatures. Custom variable storage and
-data layout assignments remain separate work.
+signatures. Version 1 documents still replay with textual signatures.
+
+Version 3 also carries manually defined signatures that use Ghidra's custom variable storage.
+The `custom_storage` field records the return and parameter locations, local variables and
+their first-use offsets, signature flags, and stack purge size. Storage uses Ghidra's native
+address spaces, including ordered register pieces and signed stack offsets. The bundled archive
+supplies the variable types. Preview reports incompatible signatures and conflicting locals.
+Reuse version 3 documents against the original program layout so absolute storage addresses
+and local first-use offsets still refer to the same locations.
 
 With `--export OUT`, each annotation includes an `export_evidence` comparison of the byte at its
 anchor. The comparison includes loader source spans and fixups where available, and the document
@@ -1016,7 +1023,8 @@ without establishing that the two routines have identical behavior.
 names, signatures, and comments at same-body function entries, records the source and match method
 for each, and lists skipped entries. Source anchor evidence and the export identity travel with the
 source in `provenance`. If a typed signature transfers, its data type archive travels with the
-document. Use `annotations import` to review it against the destination.
+document. Custom-storage signatures appear among the skipped entries because they depend on the
+original layout. Use `annotations import` to review it against the destination.
 
 ### Persistent query workers
 

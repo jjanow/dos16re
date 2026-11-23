@@ -26,10 +26,19 @@ import ghidra.program.model.data.Pointer;
 import ghidra.program.model.data.StandAloneDataTypeManager;
 import ghidra.program.model.data.TypeDef;
 import ghidra.program.model.listing.CommentType;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Function.FunctionUpdateType;
 import ghidra.program.model.listing.FunctionSignature;
+import ghidra.program.model.listing.LocalVariableImpl;
+import ghidra.program.model.listing.ParameterImpl;
+import ghidra.program.model.listing.ReturnParameterImpl;
+import ghidra.program.model.listing.Variable;
+import ghidra.program.model.listing.VariableStorage;
+import ghidra.program.model.listing.VariableUtilities;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.program.model.symbol.SymbolUtilities;
+import ghidra.util.exception.InvalidInputException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -46,7 +55,7 @@ import java.util.Set;
 
 public class RetroreAnnotations extends GhidraScript {
     private record Item(String unit, long offset, String kind, String value, String commentType,
-            String callingConvention, Prototype prototype) {}
+            String callingConvention, Prototype prototype, CustomStorage customStorage) {}
     private record TypePath(String category, String name) {
         static TypePath of(DataType type) {
             return new TypePath(type.getCategoryPath().getPath(), type.getName());
@@ -63,6 +72,30 @@ public class RetroreAnnotations extends GhidraScript {
                 Arrays.stream(signature.getArguments()).map(param ->
                     new Argument(param.getName(), TypePath.of(param.getDataType()))).toList(),
                 signature.hasVarArgs(), signature.hasNoReturn());
+        }
+    }
+    private record StoredVariable(String name, TypePath type, String storage, int firstUse, String comment,
+            SourceType source) {
+        static StoredVariable of(Variable variable) {
+            return new StoredVariable(variable.getName(), TypePath.of(variable.getDataType()),
+                variable.getVariableStorage().getSerializationString(), variable.getFirstUseOffset(),
+                variable.getComment(), variable.getSource());
+        }
+    }
+    private record CustomStorage(TypePath returnType, String returnStorage, List<StoredVariable> parameters,
+            List<StoredVariable> locals, boolean varargs, boolean noreturn, int stackPurge) {
+        static CustomStorage of(Function function) {
+            return new CustomStorage(TypePath.of(function.getReturnType()),
+                function.getReturn().getVariableStorage().getSerializationString(),
+                Arrays.stream(function.getParameters()).map(StoredVariable::of).toList(),
+                Arrays.stream(function.getLocalVariables()).map(StoredVariable::of).toList(),
+                function.hasVarArgs(), function.hasNoReturn(), function.getStackPurgeSize());
+        }
+
+        boolean matchesSignature(CustomStorage actual) {
+            return returnType.equals(actual.returnType) && returnStorage.equals(actual.returnStorage)
+                && parameters.equals(actual.parameters) && varargs == actual.varargs
+                && noreturn == actual.noreturn && stackPurge == actual.stackPurge;
         }
     }
     private record TypeArchive(String format, List<TypePath> types, String archive) {}
@@ -98,7 +131,7 @@ public class RetroreAnnotations extends GhidraScript {
     private Item item(Address address, String kind, String value, String detail) {
         var block = currentProgram.getMemory().getBlock(address);
         return block == null ? null : new Item(block.getName(), address.subtract(block.getStart()), kind, value,
-            kind.equals("comment") ? detail : null, kind.equals("signature") ? detail : null, null);
+            kind.equals("comment") ? detail : null, kind.equals("signature") ? detail : null, null, null);
     }
 
     private Map<String, Object> exportAnnotations() throws Exception {
@@ -107,6 +140,7 @@ public class RetroreAnnotations extends GhidraScript {
         var items = new ArrayList<Item>();
         var types = new ArrayList<DataType>();
         var manager = currentProgram.getDataTypeManager();
+        boolean customStorage = false;
         for (var type : namedDefinitions(manager)) {
             if (manager.getLocalSourceArchive().equals(type.getSourceArchive())) {
                 types.add(type);
@@ -132,13 +166,25 @@ public class RetroreAnnotations extends GhidraScript {
         }
         for (var function : listing.getFunctions(true)) {
             monitor.checkCancelled();
-            if (function.getSignatureSource() != SourceType.USER_DEFINED || function.hasCustomVariableStorage()) {
+            if (function.getSignatureSource() != SourceType.USER_DEFINED ||
+                    (function.hasCustomVariableStorage() && function.isThunk())) {
                 continue;
             }
             var signature = function.getSignature();
             var item = item(function.getEntryPoint(), "signature", signature.getPrototypeString(false),
                 function.getCallingConventionName());
-            if (item != null) {
+            if (item == null) {
+                continue;
+            }
+            if (function.hasCustomVariableStorage()) {
+                types.add(function.getReturnType());
+                for (var variable : function.getAllVariables()) {
+                    types.add(variable.getDataType());
+                }
+                item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
+                    item.callingConvention(), null, CustomStorage.of(function));
+                customStorage = true;
+            } else {
                 var signatureTypes = new ArrayList<DataType>();
                 signatureTypes.add(signature.getReturnType());
                 for (var parameter : signature.getArguments()) {
@@ -147,10 +193,10 @@ public class RetroreAnnotations extends GhidraScript {
                 if (signatureTypes.stream().anyMatch(RetroreAnnotations::usesNamedDefinition)) {
                     types.addAll(signatureTypes);
                     item = new Item(item.unit(), item.offset(), item.kind(), item.value(), null,
-                        item.callingConvention(), Prototype.of(signature));
+                        item.callingConvention(), Prototype.of(signature), null);
                 }
-                items.add(item);
             }
+            items.add(item);
         }
         var memory = currentProgram.getMemory();
         var addresses = listing.getCommentAddressIterator(memory, true);
@@ -175,7 +221,7 @@ public class RetroreAnnotations extends GhidraScript {
             .thenComparing(Item::commentType, Comparator.nullsFirst(Comparator.naturalOrder()))
             .thenComparing(Item::value, Comparator.nullsFirst(Comparator.naturalOrder())));
         var report = new LinkedHashMap<String, Object>();
-        report.put("version", types.isEmpty() ? 1 : 2);
+        report.put("version", customStorage ? 3 : types.isEmpty() ? 1 : 2);
         report.put("language", language());
         report.put("sha256", currentProgram.getExecutableSHA256());
         report.put("annotations", items);
@@ -236,7 +282,7 @@ public class RetroreAnnotations extends GhidraScript {
         }
     }
 
-    private StandAloneDataTypeManager readTypes(JsonObject document) throws Exception {
+    private StandAloneDataTypeManager readTypes(JsonObject document, int version) throws Exception {
         var bundle = document.getAsJsonObject("data_types");
         if (!ARCHIVE_FORMAT.equals(string(bundle, "format"))) {
             throw new IllegalArgumentException("unsupported annotation data type archive format");
@@ -254,7 +300,7 @@ public class RetroreAnnotations extends GhidraScript {
                     throw new IllegalArgumentException("annotation data type archive architecture differs from the Ghidra program");
                 }
                 var paths = namedDefinitions(archive).stream().map(TypePath::of).toList();
-                if (paths.isEmpty() || !GSON.toJsonTree(paths).equals(bundle.get("types"))) {
+                if ((version == 2 && paths.isEmpty()) || !GSON.toJsonTree(paths).equals(bundle.get("types"))) {
                     throw new IllegalArgumentException("annotation data type paths differ from the archive");
                 }
                 return stageTypes(archive);
@@ -322,10 +368,10 @@ public class RetroreAnnotations extends GhidraScript {
             throw new IllegalArgumentException("annotation executable SHA-256 differs from the Ghidra program");
         }
         int version = document.get("version").getAsBigDecimal().intValueExact();
-        if ((version != 1 && version != 2) || document.has("data_types") != (version == 2)) {
-            throw new IllegalArgumentException("expected a version 1 or 2 annotation document");
+        if (version < 1 || version > 3 || document.has("data_types") != (version >= 2)) {
+            throw new IllegalArgumentException("expected a version 1, 2, or 3 annotation document");
         }
-        try (var staged = version == 2 ? readTypes(document) : null) {
+        try (var staged = version >= 2 ? readTypes(document, version) : null) {
             return replay(document, apply, version, staged);
         }
     }
@@ -375,12 +421,24 @@ public class RetroreAnnotations extends GhidraScript {
                 }
                 prototype = GSON.fromJson(row.get("prototype"), Prototype.class);
             }
+            CustomStorage customStorage = null;
+            if (row.has("custom_storage")) {
+                if (version != 3 || !kind.equals("signature") || prototype != null ||
+                        !row.get("custom_storage").isJsonObject()) {
+                    throw new IllegalArgumentException("custom storage requires a version 3 signature annotation");
+                }
+                customStorage = GSON.fromJson(row.get("custom_storage"), CustomStorage.class);
+                if (!GSON.toJsonTree(customStorage).equals(row.get("custom_storage")) ||
+                        customStorage.parameters() == null || customStorage.locals() == null) {
+                    throw new IllegalArgumentException("invalid custom storage record");
+                }
+            }
             var item = new Item(string(row, "unit"), offset, kind,
                 kind.equals("entry_point") ? null : string(row, "value"),
                 kind.equals("comment") ? string(row, "comment_type") : null,
-                kind.equals("signature") ? string(row, "calling_convention") : null, prototype);
+                kind.equals("signature") ? string(row, "calling_convention") : null, prototype, customStorage);
             var key = new Item(item.unit(), item.offset(), item.kind(),
-                kind.equals("label") ? item.value() : null, item.commentType(), null, null);
+                kind.equals("label") ? item.value() : null, item.commentType(), null, null, null);
             if (!keys.add(key)) {
                 throw new IllegalArgumentException("duplicate annotation at " + item.unit() + "+" + item.offset());
             }
@@ -472,6 +530,14 @@ public class RetroreAnnotations extends GhidraScript {
             if (function == null) {
                 return new Change(item, address, "conflict", "no function starts at this address");
             }
+            if (item.customStorage() != null) {
+                try {
+                    var update = customUpdate(item, function, staged);
+                    return new Change(item, address, update.unchanged() ? "unchanged" : "add", "");
+                } catch (InvalidInputException error) {
+                    return new Change(item, address, "conflict", error.getMessage());
+                }
+            }
             if (function.hasCustomVariableStorage()) {
                 return new Change(item, address, "conflict", "the function has custom variable storage");
             }
@@ -521,12 +587,133 @@ public class RetroreAnnotations extends GhidraScript {
         if (TypePath.of(DataType.DEFAULT).equals(path)) {
             return DataType.DEFAULT;
         }
-        var type = path == null ? null : path.find(staged);
+        var type = path == null || path.category() == null || path.name() == null ? null : path.find(staged);
         if (type == null) {
-            throw new IllegalArgumentException("signature references a data type missing from the annotation archive: " + path);
+            throw new IllegalArgumentException("annotation references a data type missing from the archive: " + path);
         }
         var existing = path.find(destination);
         return existing != null && equivalentType(existing, type) ? existing : type;
+    }
+
+    private record CustomUpdate(boolean updateSignature, Variable returnValue, List<Variable> parameters,
+            Map<StoredVariable, Variable> newLocals, Set<StoredVariable> originalLocals) {
+        boolean unchanged() {
+            return !updateSignature && newLocals.isEmpty();
+        }
+    }
+
+    private CustomUpdate customUpdate(Item item, Function function, DataTypeManager staged)
+            throws InvalidInputException {
+        if (function.isThunk()) {
+            throw new InvalidInputException("custom storage belongs to the thunk target");
+        }
+        var storage = item.customStorage();
+        boolean updateSignature = !matchesCustomSignature(item, function);
+        if (updateSignature && function.getSignatureSource() == SourceType.USER_DEFINED) {
+            throw new InvalidInputException("a different manual function signature or storage already exists");
+        }
+
+        var manager = currentProgram.getDataTypeManager();
+        var returnValue = new ReturnParameterImpl(signatureType(storage.returnType(), staged, manager),
+            variableStorage(storage.returnStorage()), true, currentProgram);
+        var originalLocals = new HashSet<StoredVariable>();
+        var names = new HashSet<String>();
+        var variables = new ArrayList<Variable>();
+        for (var local : function.getLocalVariables()) {
+            originalLocals.add(StoredVariable.of(local));
+            names.add(local.getName());
+            variables.add(local);
+        }
+        for (var symbol : currentProgram.getSymbolTable().getSymbols(function)) {
+            if (symbol.getSymbolType() != SymbolType.PARAMETER && symbol.getSymbolType() != SymbolType.LOCAL_VAR &&
+                    symbol.getSource() != SourceType.DEFAULT) {
+                names.add(symbol.getName());
+            }
+        }
+        var parameters = new ArrayList<Variable>();
+        for (var saved : storage.parameters()) {
+            var parameter = readVariable(saved, staged, parameters.size());
+            checkVariable(parameter, names, variables);
+            parameters.add(parameter);
+        }
+        var newLocals = new LinkedHashMap<StoredVariable, Variable>();
+        var savedLocals = new HashSet<StoredVariable>();
+        for (var saved : storage.locals()) {
+            if (!savedLocals.add(saved)) {
+                throw new InvalidInputException("duplicate custom local variable");
+            }
+            var local = readVariable(saved, staged, -1);
+            if (!originalLocals.contains(saved)) {
+                checkVariable(local, names, variables);
+                newLocals.put(saved, local);
+            }
+        }
+        return new CustomUpdate(updateSignature, returnValue, parameters, newLocals, originalLocals);
+    }
+
+    private static boolean matchesCustomSignature(Item item, Function function) {
+        return function.hasCustomVariableStorage() && function.getSignatureSource() == SourceType.USER_DEFINED &&
+            item.callingConvention().equals(function.getCallingConventionName()) &&
+            item.customStorage().matchesSignature(CustomStorage.of(function));
+    }
+
+    private VariableStorage variableStorage(String encoded) throws InvalidInputException {
+        var storage = VariableStorage.deserialize(currentProgram, encoded);
+        if (storage.isBadStorage() || !storage.getSerializationString().equals(encoded)) {
+            throw new InvalidInputException("invalid custom variable storage: " + encoded);
+        }
+        return storage;
+    }
+
+    private Variable readVariable(StoredVariable saved, DataTypeManager staged, int ordinal)
+            throws InvalidInputException {
+        if (saved == null || saved.name() == null || saved.source() == null ||
+                (ordinal >= 0 && saved.firstUse() != 0)) {
+            throw new InvalidInputException("invalid custom variable record");
+        }
+        var type = signatureType(saved.type(), staged, currentProgram.getDataTypeManager());
+        var storage = variableStorage(saved.storage());
+        if (ordinal < 0 && storage.hasStackStorage() && saved.firstUse() != 0) {
+            throw new InvalidInputException("a stack local must start at the function entry");
+        }
+        return ordinal >= 0
+            ? new ParameterImpl(saved.name(), ordinal, type, storage, true, currentProgram, saved.source())
+            : new LocalVariableImpl(saved.name(), saved.firstUse(), type, storage, true, currentProgram, saved.source());
+    }
+
+    private static void checkVariable(Variable variable, Set<String> names, List<Variable> variables)
+            throws InvalidInputException {
+        SymbolUtilities.validateName(variable.getName());
+        if (!names.add(variable.getName())) {
+            throw new InvalidInputException("a different variable or symbol is already named " + variable.getName());
+        }
+        VariableUtilities.checkVariableConflict(variables, variable, variable.getVariableStorage(), null);
+        variables.add(variable);
+    }
+
+    private void addCustomSignature(Item item, Function function, DataTypeManager staged) throws Exception {
+        var storage = item.customStorage();
+        var update = customUpdate(item, function, staged);
+        if (update.updateSignature()) {
+            function.updateFunction(item.callingConvention(), update.returnValue(), update.parameters(),
+                FunctionUpdateType.CUSTOM_STORAGE, false, SourceType.USER_DEFINED);
+            for (int i = 0; i < storage.parameters().size(); i++) {
+                function.getParameter(i).setComment(storage.parameters().get(i).comment());
+            }
+            function.setVarArgs(storage.varargs());
+            function.setNoReturn(storage.noreturn());
+            function.setStackPurgeSize(storage.stackPurge());
+        }
+        for (var entry : update.newLocals().entrySet()) {
+            monitor.checkCancelled();
+            var local = entry.getValue();
+            function.addLocalVariable(local, local.getSource()).setComment(entry.getKey().comment());
+        }
+        var installedLocals = CustomStorage.of(function).locals();
+        if (!matchesCustomSignature(item, function) || !installedLocals.containsAll(storage.locals()) ||
+                !installedLocals.containsAll(update.originalLocals())) {
+            throw new InvalidInputException("could not reproduce custom storage at " + function.getEntryPoint());
+        }
     }
 
     private void add(Item item, Address address, DataTypeManager staged) throws Exception {
@@ -538,6 +725,10 @@ public class RetroreAnnotations extends GhidraScript {
             case "comment" -> listing.setComment(address, CommentType.valueOf(item.commentType()), item.value());
             case "entry_point" -> symbols.addExternalEntryPoint(address);
             case "signature" -> {
+                if (item.customStorage() != null) {
+                    addCustomSignature(item, listing.getFunctionAt(address), staged);
+                    break;
+                }
                 var command = new ApplyFunctionSignatureCmd(address, parseSignature(item, address, staged),
                     SourceType.USER_DEFINED, false, FunctionRenameOption.NO_CHANGE);
                 if (!command.applyTo(currentProgram, monitor)) {

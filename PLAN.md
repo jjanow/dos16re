@@ -14,13 +14,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, annotation documents gained Ghidra data type export and replay. Version 2
-bundles a native archive and uses category-qualified types for signatures. Preview reports
-definition conflicts and apply installs types and annotations together. The standalone
-suite passed 422 tests with 91 skipped. Ghidra 12.2 verified legacy replay and a synthetic
-round trip with bitfields, recursive pointers, and a conflict that blocked the entire apply.
+On 2026-11-23, version 3 annotation documents gained export and replay of custom return,
+parameter, and local variable storage. Replay preserves variable types, locations, comments,
+and stack purge size. The standalone suite passed 422 tests with 92 skipped. Ghidra 12.2
+verified legacy and typed replay, custom-storage round trips, and a local conflict that blocked
+the whole apply.
 
-Resume Phase 10 with export and replay of custom function variable storage.
+Resume Phase 10 with replay of data layout hints.
 
 ## Why
 
@@ -369,8 +369,9 @@ release. Continue with the analysis backlog below.
   preserves the source evidence. Replay previews conflicts and applies changes in one transaction.
   Version 2 bundles program-local structures, unions, enums, typedefs, function definitions, and
   required dependencies as a Ghidra data type archive. It previews definitions by category and
-  name and installs them before replaying signatures that use them. Version 1 remains supported.
-  Open: custom function variable storage and layout hints.
+  name and installs them before replaying signatures that use them. Version 3 also replays custom
+  return, parameter, and local storage, with stack purge size and local first-use offsets.
+  Version 1 remains supported. Data layout hints and remapping custom storage across layouts are open.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay

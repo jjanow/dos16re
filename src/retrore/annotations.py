@@ -20,11 +20,11 @@ def _read_json(path: Path) -> dict:
 
 def _read_annotations(path: Path) -> dict:
     content = _read_json(path)
-    if (type(content.get("version")) is not int or content["version"] not in (1, 2)
+    if (type(content.get("version")) is not int or content["version"] not in (1, 2, 3)
             or not isinstance(content.get("annotations"), list)
-            or ("data_types" in content) != (content["version"] == 2)
-            or (content["version"] == 2 and not isinstance(content["data_types"], dict))):
-        raise ghidra.GhidraError("expected a version 1 or 2 annotation document")
+            or ("data_types" in content) != (content["version"] >= 2)
+            or (content["version"] >= 2 and not isinstance(content["data_types"], dict))):
+        raise ghidra.GhidraError("expected a version 1, 2, or 3 annotation document")
     return content
 
 
@@ -90,7 +90,9 @@ def transfer_annotations(document: Path, comparison: Path) -> dict:
         for item in source["annotations"]:
             key = item["unit"], item["offset"]
             match = matches.get(key)
-            if item["kind"] not in ("function_name", "signature", "comment"):
+            if "custom_storage" in item:
+                reason = "custom_variable_storage_requires_original_layout"
+            elif item["kind"] not in ("function_name", "signature", "comment"):
                 reason = "unsupported_annotation_kind"
             elif match is None:
                 reason = "no_function_entry_match_on_page"
