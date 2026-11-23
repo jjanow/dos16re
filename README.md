@@ -108,7 +108,46 @@ Use `retrore COMMAND --help` to check supported arguments and cite the addresses
 and tool evidence behind your findings.
 ```
 
-An MCP adapter is on the [analysis roadmap](PLAN.md#phase-8-faster-queries-and-reproducible-releases).
+Agents that work better with typed tools can use the [agent adapter](#agent-adapter) instead.
+
+### Agent adapter
+
+`retrore schema --json` prints a JSON Schema (draft 2020-12) of the query contract, generated from
+the query registry. `$defs` holds one request schema per query command (`decomp_request`,
+`xrefs_request`, …), `request` (any one of them, discriminated by `command`), `batch` (a nonempty
+array of requests), `error`, and `error_report` (the `--json` error object). The top-level
+`contract` and `commands` keys give the contract version and a summary of each command. Plain
+`retrore schema` lists the commands. The schema expresses every check except the combined cap of
+256 `functions` lookups, which it records as `x-retrore-max-total-items`.
+
+```sh
+.venv/bin/retrore schema --json > retrore-schema.json
+```
+
+`retrore mcp` serves the same queries to [MCP](https://modelcontextprotocol.io) clients over stdio.
+It offers one tool per query command, `batch`, and `where_is`. Query tools take the request
+parameters as arguments, plus `project` and an optional `timeout` in seconds. `batch` takes `project`
+and `requests`, the same array `retrore batch` reads. `where_is` takes `export` and one of `bytes`,
+`string`, or `constant`, with an optional `width`. A call runs through the same validation and
+functions as the CLI. Its `structuredContent` and text content hold the JSON that `--json` prints.
+An error result has `isError: true` and carries the `--json` error object with `code`, `message`,
+and `hint`. A batch whose rows fail still succeeds and reports `error` in those rows. The `gaps` tool
+always uses the paged form, like `retrore gaps --limit N`. Exporting and importing programs stays
+with `retrore load` and `retrore ghidra import`.
+
+Add the server to Claude Code with `claude mcp add retrore -- retrore mcp`, or put this entry in an
+MCP client's configuration, such as a project's `.mcp.json`. Use the absolute path to
+`.venv/bin/retrore` if it is not on `PATH`, and set `GHIDRA_HOME` in the client's environment.
+
+```json
+{"mcpServers": {"retrore": {"command": "retrore", "args": ["mcp"]}}}
+```
+
+The server supports clients that open with `initialize` (MCP 2025-11-25 and earlier) and clients
+that send the protocol version with each request (MCP 2026-07-28). Some tool-calling APIs reject
+`oneOf`, `anyOf`, and `allOf` at the top level of a tool's input schema. The tool schemas therefore
+state those constraints in their descriptions, and retrore still enforces them. Each call launches
+Ghidra once and blocks the server until it returns, so prefer `batch` for several queries.
 
 ## DOS loader
 
@@ -611,7 +650,8 @@ stream. A batch launches Ghidra once, so it costs about the same as one single q
 
 The `retrore.queries` module defines every query command, its parameters with JSON Schema types,
 ranges, and defaults, its selectable fields, and its caps. `query_definitions()` returns them as
-plain data. Validation, the CLI, and `batch` use the same definitions.
+plain data. Validation, the CLI, `batch`, `retrore schema`, and the
+[agent adapter](#agent-adapter) use the same definitions.
 
 ### Bulk lookups, inventories, and call graphs
 

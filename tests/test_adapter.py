@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import retrore
 from retrore.cli import main
 from retrore.errors import CONTRACT_VERSION, HINTS
 from retrore.mcp import tools
@@ -17,7 +18,8 @@ from retrore.schema import DIALECT, query_schema
 from test_c64 import _prg
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src"
+# The server subprocess imports the same retrore as the tests: the checkout's src or an installed wheel.
+PACKAGE_PATH = Path(retrore.__file__).resolve().parents[1]
 
 # Keywords the schema may use. The validator below implements every assertion keyword in this set.
 _ASSERTIONS = {
@@ -283,8 +285,7 @@ def test_tool_schemas_follow_the_registry():
 
 
 def _environment(**extra: str) -> dict:
-    environment = {**os.environ, "PYTHONPATH": str(SOURCE), **extra}
-    return environment
+    return {**os.environ, "PYTHONPATH": str(PACKAGE_PATH), **extra}
 
 
 def _session(messages: list, *, timeout: float = 60, **environment: str) -> dict:
