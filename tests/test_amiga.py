@@ -66,9 +66,9 @@ def test_amiga_export_and_search(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["count"] == 0
 
     assert main(["call", "h0:0", "--export", str(out), "--json"]) == 1
-    assert "requires a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]
+    assert "requires a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]["message"]
     assert main(["trace", str(tmp_path / "log"), "--export", str(out), "--json"]) == 1
-    assert "require a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]
+    assert "require a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 @pytest.mark.parametrize("record", [0x3F7, 0x3FC])

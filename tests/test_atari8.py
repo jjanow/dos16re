@@ -116,7 +116,7 @@ def test_portb_maps_rom_and_xe_ram(tmp_path, capsys):
     source.write_bytes(b"\x60")
     assert main(["info", str(source), "--atari8-raw", "--base-address", "e000",
                  "--entry", "e000", "--json"]) == 1
-    assert "os_rom_high" in json.loads(capsys.readouterr().err)["error"]
+    assert "os_rom_high" in json.loads(capsys.readouterr().err)["error"]["message"]
     assert main(["info", str(source), "--atari8-raw", "--base-address", "e000", "--atari8-portb", "fe",
                  "--entry", "e000", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["entry"]["linear"] == 0xE000

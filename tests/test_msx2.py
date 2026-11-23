@@ -59,7 +59,7 @@ def test_standalone_msx_com_and_raw(tmp_path, capsys):
     assert main(["info", str(raw), "--msx2", "--base-address", "ffff", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["entry"] is None
     assert main(["info", str(raw), "--msx2", "--base-address", "10000", "--json"]) == 1
-    assert "16-bit address space" in json.loads(capsys.readouterr().err)["error"]
+    assert "16-bit address space" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_ghidra_msx2_cross_unit_call(tmp_path, capsys):

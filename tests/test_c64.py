@@ -101,7 +101,7 @@ def test_c64_override_disambiguates_gemdos_signature(tmp_path, capsys):
     source = tmp_path / "demo.prg"
     source.write_bytes(_prg(0x1A60, b"\x60"))
     assert main(["info", str(source), "--json"]) == 1
-    assert "GEMDOS" in json.loads(capsys.readouterr().err)["error"]
+    assert "GEMDOS" in json.loads(capsys.readouterr().err)["error"]["message"]
     assert main(["info", str(source), "--c64", "--entry", "1a60", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["entry"]["linear"] == 0x1A60
 
@@ -118,7 +118,7 @@ def test_c64_rejects_corrupt_sector_chains(block, link, message, tmp_path, capsy
     source.write_bytes(image)
     out = tmp_path / "out"
     assert main(["load", str(source), "--disk-file", "demo", "-o", str(out), "--json"]) == 1
-    assert message in json.loads(capsys.readouterr().err)["error"]
+    assert message in json.loads(capsys.readouterr().err)["error"]["message"]
     assert not out.exists()
 
 

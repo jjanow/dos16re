@@ -166,7 +166,7 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, mo
     assert len(launches) == 1
     batch = json.loads(captured.out)["results"]
     assert [{name: row[name] for name in ("command", "address")} for row in batch] == requests
-    assert "no analyzed function" in batch[1]["error"]
+    assert "no analyzed function" in batch[1]["error"]["message"]
     assert batch[0]["result"] == result
     assert batch[2]["result"]["unit_address"] == "OV1:0000"
 
@@ -228,7 +228,7 @@ def test_recovers_far_prototype_and_reports_undefined_bytes(tmp_path, capsys, mo
     assert json.loads(capsys.readouterr().out) == pages[0]
 
     assert main(["func", "root:e", "--project", str(project), "--json"]) == 1
-    assert "no analyzed function" in json.loads(capsys.readouterr().err)["error"]
+    assert "no analyzed function" in json.loads(capsys.readouterr().err)["error"]["message"]
 
     assert main(["gaps", "--project", str(project) + ".gpr", "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)

@@ -56,7 +56,7 @@ def test_pc98_hdm_sector_span_crosses_heads(tmp_path, capsys):
         {"offset": 1024, "file_offset": 8 * 1024, "size": 1024},
     ]
     assert main(["info", str(disk), "--pc98", "--pc98-sector", "76:1:8+2@1000", "--json"]) == 1
-    assert "beyond the disk" in json.loads(capsys.readouterr().err)["error"]
+    assert "beyond the disk" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_pc98_raw_units_entries_and_bounds(tmp_path, capsys):
@@ -74,14 +74,14 @@ def test_pc98_raw_units_entries_and_bounds(tmp_path, capsys):
     trace = tmp_path / "LOGCPU.TXT"
     trace.write_text("1000:0010\n", encoding="ascii")
     assert main(["trace", str(trace), "--export", str(export), "--json"]) == 1
-    assert "require a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]
+    assert "require a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]["message"]
     for flags, expected in (
         (["--pc98-unit", f"{secondary}@1001"], "overlap"),
         (["--pc98-unit", f"{secondary}@a000"], "conventional RAM"),
         (["--pc98-entry", "3000:0000"], "outside the loaded image"),
     ):
         assert main(["info", str(root), *options, *flags, "--json"]) == 1
-        assert expected in json.loads(capsys.readouterr().err)["error"]
+        assert expected in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_ghidra_pc98_far_jump_and_vram(tmp_path, capsys):

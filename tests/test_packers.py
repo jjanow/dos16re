@@ -89,7 +89,13 @@ def test_unsupported_packer_reports_json(tmp_path, capsys):
     ))
     assert main(["info", str(program), "--json"]) == 1
     error = json.loads(capsys.readouterr().err)
-    assert error == {"packer": "PKLITE", "error": "unsupported DOS executable packer (PKLITE)"}
+    assert error == {
+        "contract": 1, "packer": "PKLITE",
+        "error": {
+            "code": "unsupported_packer", "message": "unsupported DOS executable packer (PKLITE)",
+            "hint": "Unpack the program with an external tool, then load the unpacked file.",
+        },
+    }
 
 
 def test_unknown_lzexe_variant_is_not_loaded_as_plain_mz():

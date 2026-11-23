@@ -39,7 +39,7 @@ def test_cli_calls_non_aligned_entry_and_reads_back_state(tmp_path, capsys):
     ]
 
     assert main(["call", "root:ffff", "--export", str(output), "--json"]) == 1
-    error = json.loads(capsys.readouterr().err)["error"]
+    error = json.loads(capsys.readouterr().err)["error"]["message"]
     assert "offset outside unit" in error
 
 

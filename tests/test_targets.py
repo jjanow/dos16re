@@ -269,7 +269,7 @@ def test_phantasie_c64_program_loads(phantasie_c64_disk, tmp_path, capsys):
     outdoors, = json.loads(capsys.readouterr().out)["units"]
     assert (outdoors["linear"], outdoors["file_size"]) == (0x0801, 29202)
     assert main(["info", disk, "--disk-file", "TOWNR", "--disk-file", "OUTDOORS", "--json"]) == 1
-    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]
+    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_ghidra_analyzes_phantasie_c64(phantasie_c64_disk, tmp_path, capsys):
@@ -328,7 +328,7 @@ def test_phantasie3_apple2_alternative_loads(phantasie3_apple2_disk, tmp_path, c
         assert (helper["disk_file"], helper["linear"], helper["file_size"]) == (member, 0x1828, 472)
     assert (tmp_path / "IMPTEXT" / "image.bin").read_bytes() != (tmp_path / "IMPREVERSE" / "image.bin").read_bytes()
     assert main(["info", disk, "--disk-file", "IMPTEXT", "--disk-file", "IMPREVERSE", "--json"]) == 1
-    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]
+    assert "overlaps another unit" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_ghidra_analyzes_phantasie3_apple2(phantasie3_apple2_disk, tmp_path, capsys):

@@ -46,7 +46,7 @@ def test_searches_each_exported_unit_without_crossing_its_boundary(tmp_path, cap
     assert output[-1] == "Use --json for all matches."
 
     assert main([*search, "--bytes", "", "--json"]) == 1
-    assert "at least one byte" in json.loads(capsys.readouterr().err)["error"]
+    assert "at least one byte" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_reports_matches_past_the_first_64_kib_of_the_root_unit(tmp_path, capsys):

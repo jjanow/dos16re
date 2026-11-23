@@ -39,7 +39,8 @@ public class RetroreImport extends HeadlessScript {
     }
 
     private void loadMap(JsonObject map) throws Exception {
-        if (map.get("version").getAsInt() != 1) {
+        // Maps written before versioning have no "version" and read as version 1.
+        if (map.has("version") && map.get("version").getAsInt() != 1) {
             throw new IllegalArgumentException("unsupported retrore map version");
         }
         space = (SegmentedAddressSpace) currentProgram.getAddressFactory().getDefaultAddressSpace();
