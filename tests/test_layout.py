@@ -135,3 +135,39 @@ def test_layout_recovers_a_record_array(record_project, tmp_path, capsys):
     inventory = _json(capsys, "inventory", "root", "--compact", "--project", str(project))
     assert {"address": "root:0200", "type": "record[6]"}.items() <= next(
         row for row in inventory["data"] if row["address"] == "root:0200").items()
+
+
+@pytest.fixture(scope="module")
+def phantasie_iv_project(tmp_path_factory):
+    directory = os.environ.get("RETRORE_PH4_X68K_DIR")
+    if not directory or not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set RETRORE_PH4_X68K_DIR and GHIDRA_HOME to run the real-game Ghidra test")
+    program = next(path for path in Path(directory).iterdir() if path.name.upper() == "P4.X")
+    output = tmp_path_factory.mktemp("p4")
+    assert main(["load", str(program), "-o", str(output / "export")]) == 0
+    assert main(["ghidra", "import", str(output / "export"), str(output / "project")]) == 0
+    return output / "project"
+
+
+def test_phantasie_iv_character_records(phantasie_iv_project, capsys):
+    # _gmb (bss:2ebd6) runs to _pmb: ten 190-byte records. _save reads fields 0x22 (88fbe), 0x23, 0xb4 (89050),
+    # 0xb5, and 0xba of each record, indexed through `muls.l` by 0xbe (rewritten from __CLMUL).
+    project = str(phantasie_iv_project)
+    report = _json(capsys, "layout", "88f9c", "--compact", "--project", project)
+    layout = report["layout"]
+    assert (layout["kind"], layout["element_size"], layout["count"]) == ("record_array", 190, 10)
+    assert layout["size_source"] == "next symbol _pmb" and report["size"] == 1900
+    assert layout["count_source"].endswith(" INT_SLESS 10 at text:75be")
+    assert {0x22, 0x23, 0xB4, 0xB5, 0xBA} <= {field["offset"] for field in layout["fields"]}
+    stride = report["strides"][0]
+    assert stride["stride"] == 190 and "text:1754 INT_MULT by 0xbe" in stride["evidence"] + [
+        note for row in report["accesses"] for index in row["index"] for note in index["evidence"]]
+    save = {(row["address"], row["offset"]) for row in report["accesses"] if row["function"] == "_save"}
+    assert {("text:1766", 0x22), ("text:1794", 0x23)} <= save
+    assert not report["conflicts"]
+
+    # A second table in _save: six 8-byte entries at 4f66e indexed by `asl.l #3`, bounded by `cmp.l #6`.
+    report = _json(capsys, "layout", "4f66e", "--compact", "--project", project)
+    layout = report["layout"]
+    assert (layout["element_size"], layout["count"]) == (8, 6)
+    assert layout["count_source"].endswith(" INT_SLESS 6 at text:1740")
