@@ -550,10 +550,69 @@ EOF
 Pass a UTF-8 JSON file as the positional argument or pipe the array on stdin. Each request contains
 a `command` and an `address`. Optional fields match the individual commands. Use the arrays `fields`
 and `ref_types`, the integers `limit`, `offset`, `context`, and `slice`, the boolean `compact`, and
-the string `direction` where supported. The JSON response contains a `results` array in request order. Each
-row echoes those two fields and includes either `result`, with the individual command's JSON, or
-`error`. The CLI writes the whole batch report to stdout and exits with status 1 if any query fails.
-An invalid request array or a headless launch failure uses the command's error stream.
+the string `direction` where supported. The JSON response contains `contract` and a `results` array in
+request order. Each row echoes those two fields and includes either `result`, with the individual command's
+JSON, or an `error` object with `code`, `message`, and `hint`. The CLI writes the whole batch report to
+stdout and exits with status 1 if any query fails. An invalid request array or a headless launch failure
+uses the command's error stream. A batch launches Ghidra once, so it costs about the same as one single
+query. See [benchmarks](docs/benchmarks.md).
+
+### Errors, exit statuses, and time budgets
+
+`ghidra import`, `decomp`, `gaps`, `batch`, `xrefs`, `callers`, `callees`, and `func` accept
+`--timeout SECONDS`. Imports default to 3600 seconds and queries to 600. `0` disables the limit.
+When the budget runs out, retrore stops the whole `analyzeHeadless` process group, JVM included.
+It sends SIGTERM first so Ghidra can release the project lock, then SIGKILL after 10 seconds. The
+Python functions in `retrore.ghidra` take the same `timeout` keyword.
+
+With `--json`, a failed command prints this object to stderr:
+
+```json
+{"contract": 1, "error": {"code": "no_function", "message": "no analyzed function contains c00a", "hint": "..."}}
+```
+
+| Exit status | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | The command failed and printed an error, or a batch finished with at least one failed query |
+| 2 | Invalid command-line usage, reported by argparse in plain text even with `--json` |
+
+`code` is stable, and scripts should branch on it. `message` and `hint` are for people and may change.
+
+| Code | Meaning |
+|---|---|
+| `ghidra_not_found` | `GHIDRA_HOME` does not contain `support/analyzeHeadless` |
+| `project_not_found` | The `--project` path has no `.gpr` file |
+| `export_invalid` | `map.json` or `image.bin` is missing or invalid |
+| `unsupported_map_version` | `map.json` comes from a newer retrore |
+| `timeout` | The headless run exceeded `--timeout` |
+| `headless_failed` | `analyzeHeadless` exited without a result; the message ends with the log tail |
+| `script_error` | A retrore Ghidra script reported an unclassified failure |
+| `invalid_request` | The query or batch request failed validation |
+| `address_not_found` | The address is malformed for the project or outside the loaded image |
+| `no_function` | No analyzed function or instruction contains the address |
+| `project_mismatch` | A trace was compared with a project imported from a different image |
+| `query_failed` | Ghidra could not answer the query, for example when decompilation fails |
+| `unsupported_packer` | The DOS executable uses a packer retrore cannot unpack; `packer` names it |
+| `input_invalid` | The input program or options are invalid for the selected platform |
+| `io_error` | A file could not be read or written |
+
+Batch rows use the same `error` object, with the query codes `address_not_found`, `no_function`, and
+`query_failed`.
+
+### Versions and compatibility
+
+`map.json` carries an integer major `version`, currently 1. Readers treat a map without `version`
+as version 1. They reject a larger version with `unsupported_map_version` and other invalid
+values with `export_invalid`. New optional fields do not change the version, and readers ignore
+fields they do not know. A change that older readers would misread, such as a changed meaning or
+a removed field, increments `version`. The checked-in [unversioned fixtures](tests/fixtures/maps) cover
+the DOS, Amiga, C64, MSX2, and PC-98 exporters, and the tests check that current code still reads them.
+
+Ghidra query JSON carries a top-level `contract` integer, currently 1. It is present on single queries
+(even with `--fields`), `gaps`, batch reports, and error objects. It is not present inside batch row
+results. Adding fields, query commands, or error codes keeps the contract number. Renaming or removing
+a field, or changing its type or meaning, increments it.
 
 ## Emulator harness
 
