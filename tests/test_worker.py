@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -342,9 +343,35 @@ def test_real_worker_matches_one_shot_queries(tmp_path, monkeypatch, capsys):
         assert worker.STARTS == starts + 1
         record = worker.status(project)
         assert record["requests"] == len(requests) + 3 and record["fallbacks"] == 0
+        # A timeout or cancellation kills the process group; the next request reopens the project at once.
+        host = worker._local_host(worker.project_key(project), create=False)
+        host.worker.kill()
+        assert ghidra.query(project, requests[0]) == expected[2]
+        assert worker.STARTS == starts + 2
+        record = worker.status(project)
+        assert record["fallbacks"] == 0
         # Re-importing stops the worker first instead of failing on the project lock.
         with pytest.raises(GhidraError) as caught:
             ghidra.import_program(export, project)
         assert caught.value.code == "headless_failed" and "conflicting program file" in str(caught.value)
         _wait_dead(record["ghidra_pid"])
         assert worker.status(project) is None
+
+    # A daemon whose worker is killed by a budget that expires while it opens the project recovers too.
+    assert main(["worker", "start", "--project", str(project), "--json"]) == 0
+    capsys.readouterr()
+    try:
+        record = worker.status(project)
+        host_pid = record["pid"]
+        # Stop the daemon's Ghidra the way an expired budget does, then give requests too little time to
+        # reopen the project, so each one kills a worker that is still starting.
+        os.killpg(record["ghidra_pid"], signal.SIGTERM)
+        _wait_dead(record["ghidra_pid"])
+        for budget in ("0.5", "2", "3.5"):
+            main(["callers", "c004", "--project", str(project), "--timeout", budget, "--json"])
+            capsys.readouterr()
+        assert main(["callers", "c004", "--project", str(project), "--json"]) == 0
+        assert json.loads(capsys.readouterr().out) == expected[3]
+        assert worker.status(project)["pid"] == host_pid
+    finally:
+        worker.stop(project)

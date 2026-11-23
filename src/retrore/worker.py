@@ -250,7 +250,9 @@ class Worker:
             raise WorkerCrash("the worker answered a different request")
         if "crash" in response:
             raise WorkerCrash(str(response["crash"]))
-        return response.get("report")
+        if not isinstance(response.get("report"), dict):
+            raise WorkerCrash("the worker sent a response without a report")
+        return response["report"]
 
     def _read_line(self, budget: _Budget, *, hello: bool = False) -> str:
         """Read one line from the JVM, stopping it when the budget runs out or the request is cancelled."""
