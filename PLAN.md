@@ -13,17 +13,21 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22 (fourth session), added the Sharp X68000 milestone. `info` and `load` read Human68k `HU`
-executables, including symbols and word relocations. The Ghidra importer adds the X68000 map and
-patches reached line-F DOS and FPACK calls into named stubs. It rewrites XC's stacked multiply and
-divide calls and rejoins XC's split routine entries. Validated on Phantasie IV's `P4.X`: 2,222 call
-sites, `_save` and `_rand` decompile as single routines. Phase 8: daemon fallbacks now use the
-caller's Ghidra, and workers and daemons run on Windows over a token-checked loopback TCP endpoint.
-Windows is only partly verified (see Phase 8). The full suite with Ghidra 12.2 passed 339 with 31
-skipped before the Windows merge. After it the standalone suite passed 340 with 51 skipped, and the
-worker, X68000, and segment tests passed with Ghidra (57 passed, 1 skipped).
+On 2026-11-22–23 (fifth session), Phase 9 landed in four parallel parts, merged on `main`:
+- **Segments:** cross-call segment summaries and `LES`/`LDS` far pointers, with `segment_losses` in `func`.
+- **Indirect flow:** more switch patterns, including XC 68k, plus the `indirect` query with candidate
+  targets and evidence, and `gaps --classify` with gap seeding.
+- **Conventions:** DOS calling conventions and `int 21h` service stubs. On X68000, DOS prototypes,
+  FPACK call fixups, and IOCS names.
+- **Data:** platform string, pointer, relocation, and symbol searches without Ghidra, and the `layout`
+  query.
 
-Resume with Phase 9. Release CI has no Windows job yet; trigger CI only for a tagged release. Classic Macintosh is the next platform milestone.
+The merge exposed one interaction: unreached caller chains lost pushed far pointers. Segment analysis
+now seeds unreached functions callers first. The Phase 8 Windows items are closed (see Phase 8). Full
+local suite with Ghidra 12.2 and 15 game directories: 442 passed, 1 skipped.
+
+Resume with the Phase 9 open items below, or start Classic Macintosh. CI runs for tagged releases, and
+by hand (`gh workflow run release-ci.yml`) only when a change needs a check that can't run locally.
 
 ## Why
 
@@ -259,16 +263,14 @@ The analysis backlog below applies to existing and future platforms.
   analyzeHeadless path and `JAVA_HOME`, and the host restarts its JVM when they change. One-shot
   fallbacks inside a daemon use the requesting caller's launcher and `JAVA_HOME` too. Hosts remove
   their lock files, and daemons remove their logs on a clean exit.
-- **Implemented, partly verified on Windows.** Python on Windows has no unix sockets, so hosts there
-  listen on a loopback TCP port and write the port and a random token to an endpoint file in
-  `%LOCALAPPDATA%\retrore\workers`; every connection must present the token. Locks use
-  `msvcrt.locking`, the daemon runs detached without a console window, and it opens its own log so it
-  can remove it. The worker tests run on both transports on Linux. Ad-hoc Windows runs on 2026-11-22
-  (not repeated; CI runs only for tagged releases) passed the worker, MCP, and synthetic Ghidra tests
-  with Ghidra 12.2 before the final log-cleanup fix, which passed the standalone suite but was not run
-  with Ghidra on Windows. Open: a full Windows run of the final code, ideally in a Windows job on the
-  next tagged release; a crashed host's stale endpoint file costs a refused connect (about 2 s on
-  Windows) until a new host replaces it; daemon output before its log opens is lost on Windows.
+- **Implemented and verified on Windows.** Python on Windows has no unix sockets, so hosts there
+  listen on a loopback TCP port and write the port, a random token, and their process ID to an endpoint
+  file in `%LOCALAPPDATA%\retrore\workers`; every connection must present the token. Clients skip
+  a file whose host process has exited, so a crashed host no longer costs a refused connect. Locks use
+  `msvcrt.locking`. The daemon runs detached without a console window and sends its output to its log
+  before importing anything, so startup errors reach `worker start`. The worker tests run on both
+  transports on Linux. The release workflow has a Windows job (worker, MCP, and synthetic Ghidra tests
+  with Ghidra 12.2) and a manual trigger. A manual run on 2026-11-23 passed it on the final code (run 45121304418).
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
 - **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested
@@ -386,14 +388,14 @@ underlying analysis uses each machine's conventions and available emulator or tr
 
 | Capability | DOS | Amiga, Atari ST, and X68000 | C64, Apple II, Atari 8-bit, MSX2, PC-88, and X1 | PC-98 |
 |---|---|---|---|---|
-| Load, export, and byte search | Implemented | Implemented | Implemented | Implemented |
+| Load, export, byte, string, pointer, relocation, and symbol search | Implemented | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
 | Batch Ghidra address queries | Implemented | Implemented | Implemented | Implemented |
 | Bulk lookups, inventories, call graphs, and routine context | Implemented | Implemented | Implemented | Implemented |
 | Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
 | Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
 | Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
-| Calling conventions, runtime signatures, and indirect control flow | Selected patterns implemented | Human68k DOS and FPACK call stubs and XC arithmetic on X68000; extend for relevant targets | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
+| Calling conventions, runtime signatures, and indirect control flow | Stack conventions, `int 21h` services, switch patterns, and indirect-call candidates | X68000: DOS prototypes, IOCS names, FPACK fixups, XC arithmetic and switches; extend for Amiga and Atari ST | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
 | Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned | Planned |
 
 For each new capability, use shared synthetic contract checks where possible and add fixtures for
