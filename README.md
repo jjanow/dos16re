@@ -158,10 +158,13 @@ state those constraints in their descriptions, and retrore still enforces them.
 
 Tool calls run on up to four worker threads and may finish out of order. Ghidra locks a project
 while a headless session has it open, so calls on the same project wait for each other; calls on
-other projects and the `where_is`, `info`, and `load` tools run alongside them. Each query call
-launches Ghidra once, so prefer `batch` for several queries on one project. A client that sends
-`notifications/cancelled` for a call in progress stops its headless run, process group included, and
-gets no response for that call. A cancelled call that is still waiting for its project never starts.
+other projects and the `where_is`, `info`, and `load` tools run alongside them. The server keeps a
+[persistent worker](#persistent-query-workers) per project: the first call on a project starts Ghidra
+in a few seconds, and later calls take milliseconds. `batch` still saves round trips for independent
+queries. A client that sends `notifications/cancelled` for a call in progress stops the project's
+Ghidra process group and gets no response for that call; the next call starts a new worker. A
+cancelled call that is still waiting for its project never starts. `retrore mcp --no-worker` launches
+Ghidra once per call instead.
 
 ## DOS loader
 
@@ -665,6 +668,43 @@ any query fails. An invalid request array or a headless launch failure uses the 
 stream. A batch launches Ghidra once, so it costs about the same as one single query. See
 [benchmarks](docs/benchmarks.md).
 
+### Persistent query workers
+
+Every query launches `analyzeHeadless`, which takes 3–4 seconds before a query that itself needs
+milliseconds. A worker keeps the project open in one headless session and answers later queries
+without that launch. Results, error objects, time budgets, and cancellation stay the same.
+
+```sh
+.venv/bin/retrore worker start --project out/pool-project
+.venv/bin/retrore callers root:b1bf --project out/pool-project --compact --json
+.venv/bin/retrore decomp root:2197 --project out/pool-project --json
+.venv/bin/retrore worker status --project out/pool-project --json
+.venv/bin/retrore worker stop --project out/pool-project
+```
+
+`worker start` runs a background daemon for the project and returns once Ghidra has opened it.
+While it runs, every query command on that project (`decomp`, `gaps`, `batch`, the address and
+registry queries, and `trace --project`), from any shell, goes through it. A query command takes about
+0.1 seconds then, mostly Python startup. The daemon exits after 15 minutes without queries;
+`--idle SECONDS` or `RETRORE_WORKER_IDLE` changes that. `worker stop --all` stops every worker of
+the current user. `worker serve` runs the daemon in the foreground.
+
+`retrore mcp` hosts its own workers the same way, and query commands in other shells use them too.
+`retrore ghidra import` stops a project's worker before it writes the project. Set `RETRORE_WORKER=0`
+to launch Ghidra for every query. Ghidra locks a project per session, so with workers disabled a query
+on a project that a worker holds fails with `project_locked`, and the message names the worker.
+
+When a time budget runs out or a client cancels a request, retrore stops the worker's process group
+and reports `timeout` or `cancelled` as before; the next query starts a new worker, and the budget
+covers that start. If the worker cannot answer a request the way a one-shot run would, retrore
+runs that request in its own launch. If a worker fails to start for a reason other than the project
+lock, retrore uses one-shot launches for the next minute.
+
+Daemons listen on a unix socket named after the project path in `$XDG_RUNTIME_DIR/retrore`, or in
+`RETRORE_WORKER_DIR` when set, a directory only the current user can write. The worker connects
+back to retrore on a loopback port and proves itself with a one-time token. Windows has no daemon;
+`retrore mcp` still keeps workers in its own process there.
+
 The `retrore.queries` module defines every query command, its parameters with JSON Schema types,
 ranges, and defaults, its selectable fields, and its caps. `query_definitions()` returns them as
 plain data. Validation, the CLI, `batch`, `retrore schema`, and the
@@ -740,7 +780,8 @@ Imports default to 3600 seconds and single queries to 600. A batch defaults to
 the budget to its `--project` comparison.
 When the budget runs out, retrore stops the whole `analyzeHeadless` process group, JVM included.
 It sends SIGTERM first so Ghidra can release the project lock, then SIGKILL after 10 seconds. The
-Python functions in `retrore.ghidra` take the same `timeout` keyword.
+Python functions in `retrore.ghidra` take the same `timeout` keyword. Queries through a
+[worker](#persistent-query-workers) follow the same budget, including the worker's start.
 
 With `--json`, a failed command prints this object to stderr:
 
@@ -764,7 +805,7 @@ With `--json`, a failed command prints this object to stderr:
 | `unsupported_map_version` | `map.json` comes from a newer retrore |
 | `timeout` | The headless run exceeded `--timeout` |
 | `headless_failed` | `analyzeHeadless` exited without a result; the message ends with the log tail |
-| `project_locked` | Another Ghidra session holds the project lock |
+| `project_locked` | Another Ghidra session holds the project lock; a retrore worker holding it is named in the message |
 | `cancelled` | An MCP client cancelled the call (the server sends no response for it) |
 | `script_error` | A retrore Ghidra script reported an unclassified failure |
 | `invalid_request` | The query or batch request failed validation |

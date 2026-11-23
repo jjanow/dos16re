@@ -783,6 +783,38 @@ def _schema(args: argparse.Namespace) -> None:
     print("Use --json for the request, batch, and error schemas.")
 
 
+def _worker(args: argparse.Namespace) -> int:
+    from . import worker
+    if args.worker_command == "serve":
+        return worker.serve(args.project, args.idle)
+    if args.worker_command == "stop":
+        if args.all == bool(args.project):
+            raise GhidraError("pass --project PROJECT or --all")
+        projects = worker.stop_all() if args.all else ([str(worker.project_key(args.project))]
+                                                       if worker.stop(args.project) else [])
+        report = {"contract": CONTRACT_VERSION, "stopped": projects}
+        if args.json:
+            print(json.dumps(report))
+        else:
+            print(f"Stopped {len(projects)} worker{'s' if len(projects) != 1 else ''}"
+                  + "".join(f"\n{project}" for project in projects))
+        return 0
+    if args.worker_command == "start":
+        record = worker.start(args.project, args.idle, args.timeout)
+    else:
+        record = worker.status(args.project)
+    report = {"contract": CONTRACT_VERSION, "running": record is not None, **(record or {})}
+    if args.json:
+        print(json.dumps(report))
+    elif record is None:
+        print(f"No worker for {worker.project_key(args.project)}")
+    else:
+        verb = "Started" if record.get("started") else "Running"
+        print(f"{verb} worker {record['pid']} ({record['owner']}) for {record['project']}; "
+              f"Ghidra {record['ghidra']}, {record['requests']} requests, idle timeout {record['idle_timeout']:g} s")
+    return 0
+
+
 def _seconds(value: str) -> float:
     try:
         return check_timeout(float(value))
@@ -1082,6 +1114,26 @@ def main(argv: list[str] | None = None) -> int:
     schema_parser.add_argument("--json", action="store_true", help="print the JSON Schema document")
     mcp_parser = commands.add_parser("mcp", help="serve queries to MCP clients over stdio")
     mcp_parser.add_argument("--json", action="store_true", help="accepted for consistency; output is always JSON-RPC")
+    mcp_parser.add_argument("--no-worker", action="store_true",
+                            help="launch Ghidra for every call instead of keeping a worker per project")
+    worker_parser = commands.add_parser("worker", help="keep a Ghidra project open for consecutive queries")
+    worker_commands = worker_parser.add_subparsers(dest="worker_command", required=True)
+    worker_start = worker_commands.add_parser("start", help="start a background worker for a project")
+    worker_stop = worker_commands.add_parser("stop", help="stop a project's worker")
+    worker_status = worker_commands.add_parser("status", help="report a project's worker")
+    worker_serve = worker_commands.add_parser("serve", help="run a worker in the foreground")
+    for command in (worker_start, worker_status, worker_serve):
+        command.add_argument("--project", metavar="PROJECT", type=Path, required=True)
+    worker_stop.add_argument("--project", metavar="PROJECT", type=Path)
+    worker_stop.add_argument("--all", action="store_true", help="stop every worker of this user")
+    for command in (worker_start, worker_serve):
+        command.add_argument("--idle", type=_seconds, metavar="SECONDS",
+                             help="stop after SECONDS without queries (default: RETRORE_WORKER_IDLE or 900)")
+    worker_start.add_argument("--timeout", type=_seconds, default=QUERY_TIMEOUT, metavar="SECONDS",
+                              help=f"wait at most SECONDS for Ghidra to open the project (default: {QUERY_TIMEOUT}; "
+                                   "0 waits indefinitely)")
+    for command in (worker_start, worker_stop, worker_status, worker_serve):
+        command.add_argument("--json", action="store_true", help="print JSON")
     search_parser = commands.add_parser("where-is", help="find a byte pattern across exported units")
     search_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     pattern = search_parser.add_mutually_exclusive_group(required=True)
@@ -1132,8 +1184,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "mcp":
         from .mcp import serve  # The adapter imports this module.
-        return serve()
+        return serve(use_worker=not args.no_worker)
     try:
+        if args.command == "worker":
+            return _worker(args)
         if args.command == "batch":
             return _batch(args)
         if args.command == "ghidra":
