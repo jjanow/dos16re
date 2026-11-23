@@ -98,16 +98,31 @@ def _run(
                 report = json.loads(result_file.read_text(encoding="utf-8"))
             except (UnicodeError, ValueError) as error:
                 raise GhidraError(f"Ghidra {label} wrote an unreadable result: {error}", code="script_error") from error
-            if isinstance(report, dict) and "error" in report:
-                record = coded(report["error"])
-                raise GhidraError(record["message"], code=record["code"])
+            report = _checked(report, label)
             if not returncode:
                 return report
-        lines = output.splitlines()
-        errors = [line for line in lines if "ERROR" in line or "Exception" in line]
-        detail = "\n".join((errors or lines)[-8:])
-        code = "project_locked" if "LockException" in output else "headless_failed"
-        raise GhidraError(f"Ghidra {label} failed (exit status {returncode})\n{detail}", code=code)
+        error = _failure(label, returncode, output)
+        if error.code == "project_locked":
+            from . import worker
+            error.args = (str(error) + worker.holder_note(project),)
+        raise error
+
+
+def _checked(report: object, label: str | None) -> object:
+    """Raise the error object a script reported instead of a result."""
+    if isinstance(report, dict) and "error" in report:
+        record = coded(report["error"])
+        raise GhidraError(record["message"], code=record["code"])
+    return report
+
+
+def _failure(label: str | None, returncode: int | None, output: str) -> GhidraError:
+    """The error for a headless run that exited without a result, from its log output."""
+    lines = output.splitlines()
+    errors = [line for line in lines if "ERROR" in line or "Exception" in line]
+    detail = "\n".join((errors or lines)[-8:])
+    code = "project_locked" if "LockException" in output else "headless_failed"
+    return GhidraError(f"Ghidra {label} failed (exit status {returncode})\n{detail}", code=code)
 
 
 def _launch(command: list[str], timeout: float | None, label: str | None) -> tuple[int, str]:
@@ -169,6 +184,16 @@ def _forward_termination() -> dict:
 
 
 def _kill_group(process: subprocess.Popen, windows: bool) -> None:
+    _stop_group(process, windows)
+    try:
+        process.communicate(timeout=_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+
+
+def _stop_group(process: subprocess.Popen, windows: bool) -> None:
+    """Terminate a process group started with _launch's flags, then kill whatever outlives the grace period."""
     if windows:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], check=False, capture_output=True)
     else:
@@ -185,11 +210,6 @@ def _kill_group(process: subprocess.Popen, windows: bool) -> None:
                 time.sleep(0.1)
             if not _group_alive(process):
                 break
-    try:
-        process.communicate(timeout=_KILL_GRACE)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
 
 
 def _group_alive(process: subprocess.Popen) -> bool:
@@ -205,6 +225,8 @@ def _group_alive(process: subprocess.Popen) -> bool:
 
 def import_program(export: Path, project: Path, *, timeout: float | None = IMPORT_TIMEOUT) -> dict:
     export = export.resolve()
+    from . import worker
+    worker.stop(project)  # A worker's read-only session would lock the project and serve the old program.
     manifest = export / "map.json"
     image = export / "image.bin"
     if not manifest.is_file() or not image.is_file():
@@ -294,7 +316,7 @@ def query_batch(project: Path, requests: object, *, timeout: float | None = None
 
 
 def analysis_gaps(project: Path, *, timeout: float | None = QUERY_TIMEOUT) -> dict:
-    return {"contract": CONTRACT_VERSION, **_query(project, "RetroreGaps.java", timeout=timeout)}
+    return {"contract": CONTRACT_VERSION, **_report(project, "gaps", None, timeout)}
 
 
 def trace_coverage(project: Path, coverage: dict, *, timeout: float | None = QUERY_TIMEOUT) -> dict:
@@ -302,10 +324,7 @@ def trace_coverage(project: Path, coverage: dict, *, timeout: float | None = QUE
 
 
 def _query_json(project: Path, mode: str, request: object, *, timeout: float | None = QUERY_TIMEOUT) -> dict:
-    with TemporaryDirectory() as temp:
-        input_file = Path(temp) / "input.json"
-        input_file.write_text(json.dumps(request), encoding="utf-8")
-        report = _query(project, "RetroreQuery.java", mode, str(input_file), timeout=timeout)
+    report = _report(project, mode, request, timeout)
     if mode == "trace":
         return report
     if mode == "batch":
@@ -315,12 +334,38 @@ def _query_json(project: Path, mode: str, request: object, *, timeout: float | N
     return {"contract": CONTRACT_VERSION, **report}
 
 
-def _query(project: Path, script: str, *arguments: str, timeout: float | None = QUERY_TIMEOUT) -> dict:
+def _report(project: Path, mode: str, request: object, timeout: float | None) -> dict:
+    """Run a RetroreQuery.java mode, or RetroreGaps.java for mode `gaps`, and return the script's report.
+
+    The project's persistent worker answers when one is running or this process hosts workers;
+    otherwise analyzeHeadless runs once for the request.
+    """
+    from . import worker
+    _require_project(project)
+    report = worker.route(project, mode, request, timeout)
+    return _oneshot(project, mode, request, timeout) if report is None else report
+
+
+def _oneshot(project: Path, mode: str, request: object, timeout: float | None) -> dict:
+    """Run one query mode in its own analyzeHeadless launch."""
+    if mode == "gaps":
+        return _query(project, "RetroreGaps.java", timeout=timeout)
+    with TemporaryDirectory() as temp:
+        input_file = Path(temp) / "input.json"
+        input_file.write_text(json.dumps(request), encoding="utf-8")
+        return _query(project, "RetroreQuery.java", mode, str(input_file), timeout=timeout)
+
+
+def _require_project(project: Path) -> None:
     project_dir, project_name = _project_parts(project)
     if not Path(project_dir, project_name + ".gpr").is_file():
         raise GhidraError(
             f"Ghidra project not found at {Path(project_dir, project_name + '.gpr')}", code="project_not_found",
         )
+
+
+def _query(project: Path, script: str, *arguments: str, timeout: float | None = QUERY_TIMEOUT) -> dict:
+    _require_project(project)
     return _run(
         project, ["-process", "image.bin", "-noanalysis", "-readOnly"],
         script, *arguments, timeout=timeout,

@@ -103,18 +103,25 @@ public class RetroreQuery extends GhidraScript {
 
     private DecompInterface decompiler;
 
+    private static final com.google.gson.Gson GSON = new GsonBuilder()
+        .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES).serializeNulls().create();
+
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
+        if (args[0].equals("serve")) {
+            try {
+                serve(Integer.parseInt(args[1]));
+            } finally {
+                if (decompiler != null) {
+                    decompiler.dispose();
+                }
+            }
+            return;
+        }
         Map<String, Object> report;
         try {
-            var input = JsonParser.parseString(Files.readString(Path.of(args[1])));
-            report = switch (args[0]) {
-                case "trace" -> trace(input.getAsJsonObject());
-                case "batch" -> batch(input.getAsJsonArray());
-                case "single" -> query(input.getAsJsonObject());
-                default -> throw new IllegalArgumentException("unknown query mode " + args[0]);
-            };
+            report = answer(args[0], JsonParser.parseString(Files.readString(Path.of(args[1]))));
         } catch (IllegalArgumentException | AddressOutOfBoundsException | AddressOverflowException error) {
             report = Map.of("error", errorObject(error));
         } finally {
@@ -122,9 +129,75 @@ public class RetroreQuery extends GhidraScript {
                 decompiler.dispose();
             }
         }
-        var gson = new GsonBuilder().setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
-            .serializeNulls().create();
-        Files.writeString(Path.of(args[2]), gson.toJson(report));
+        Files.writeString(Path.of(args[2]), GSON.toJson(report));
+    }
+
+    private Map<String, Object> answer(String mode, com.google.gson.JsonElement input) throws Exception {
+        return switch (mode) {
+            case "trace" -> trace(input.getAsJsonObject());
+            case "batch" -> batch(input.getAsJsonArray());
+            case "single" -> query(input.getAsJsonObject());
+            default -> throw new IllegalArgumentException("unknown query mode " + mode);
+        };
+    }
+
+    /**
+     * Answer newline-delimited JSON requests from the retrore worker manager until it closes the connection.
+     *
+     * The manager listens on a loopback port and passes the port as an argument and a one-time token in the
+     * RETRORE_WORKER_TOKEN environment variable. Each request is {"id", "mode", "input"}; each response is
+     * {"id", "report"} with the same report the one-shot modes write, or {"id", "crash"} when the request
+     * failed in a way the one-shot modes would report as a failed headless run.
+     */
+    private void serve(int port) throws Exception {
+        try (var socket = new java.net.Socket(java.net.InetAddress.getLoopbackAddress(), port);
+                var reader = new java.io.BufferedReader(new java.io.InputStreamReader(
+                    socket.getInputStream(), java.nio.charset.StandardCharsets.UTF_8));
+                var writer = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
+                    socket.getOutputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+            var hello = new LinkedHashMap<String, Object>();
+            hello.put("token", Objects.requireNonNullElse(System.getenv("RETRORE_WORKER_TOKEN"), ""));
+            hello.put("program", currentProgram.getName());
+            writer.write(GSON.toJson(hello));
+            writer.newLine();
+            writer.flush();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                var request = JsonParser.parseString(line).getAsJsonObject();
+                String mode = request.get("mode").getAsString();
+                if (mode.equals("shutdown")) {
+                    break;
+                }
+                var response = new LinkedHashMap<String, Object>();
+                response.put("id", request.get("id").getAsLong());
+                try {
+                    Object report;
+                    try {
+                        report = mode.equals("gaps") ? gapsScript() : answer(mode, request.get("input"));
+                    } catch (IllegalArgumentException | AddressOutOfBoundsException | AddressOverflowException error) {
+                        report = Map.of("error", errorObject(error));
+                    }
+                    response.put("report", report);
+                } catch (Exception | LinkageError | AssertionError error) {
+                    printerr("retrore worker request failed: " + error);
+                    response.put("crash", Objects.toString(error.getMessage(), error.getClass().getName()));
+                }
+                writer.write(GSON.toJson(response));
+                writer.newLine();
+                writer.flush();
+            }
+        }
+    }
+
+    /** Run RetroreGaps.java in this session and return its report unchanged. */
+    private com.google.gson.JsonElement gapsScript() throws Exception {
+        var file = Files.createTempFile("retrore-gaps", ".json");
+        try {
+            runScript("RetroreGaps.java", new String[] {file.toString()});
+            return JsonParser.parseString(Files.readString(file));
+        } finally {
+            Files.deleteIfExists(file);
+        }
     }
 
     private Map<String, Object> batch(JsonArray requests) throws Exception {

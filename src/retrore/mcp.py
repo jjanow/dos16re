@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import copy
 import json
+import signal
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +20,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import IO
 
+from . import worker
 from .cli import HANDLED_ERRORS, _export_image, build_program, error_report, program_options
 from .errors import CONTRACT_VERSION
 from .ghidra import QUERY_TIMEOUT, GhidraError, cancellable, check_cancelled, check_timeout, query, query_batch
@@ -51,7 +53,8 @@ _CACHE_TTL_MS = 3_600_000
 INSTRUCTIONS = (
     "retrore answers questions about retro executables analyzed in a headless Ghidra project. Pass the "
     "project path (the .gpr file or its path without the suffix) to each query tool, and prefer the batch "
-    "tool for several queries: each call launches Ghidra once, and calls on one project run one at a time. "
+    "tool for independent queries. The server keeps each project open in Ghidra between calls, so the first "
+    "call on a project takes a few seconds and later calls are fast; calls on one project run one at a time. "
     "Results and error objects match the CLI's --json output under query contract "
     f"{CONTRACT_VERSION}; branch on error.code. Inspect and export programs with the info and load tools, "
     "then create the project with the CLI: `retrore ghidra import EXPORT PROJECT`."
@@ -491,12 +494,41 @@ def _is_tool_call(message: object) -> bool:
 
 
 def serve(stdin: IO[bytes] | None = None, stdout: IO[str] | None = None,
-          workers: int = MAX_CONCURRENT_CALLS) -> int:
+          workers: int = MAX_CONCURRENT_CALLS, *, use_worker: bool = True) -> int:
     """Serve newline-delimited JSON-RPC on stdio until stdin closes and calls in progress finish.
 
     Tool calls run on worker threads and may answer out of order; other messages are answered in order.
     A call cancelled with notifications/cancelled stops its headless Ghidra run and sends no response.
+    With use_worker, each project's queries go to one persistent Ghidra worker that stays open between
+    calls (see retrore.worker); it stops after the idle timeout and when the server exits.
     """
+    with contextlib.ExitStack() as stack:
+        if use_worker:
+            stack.enter_context(worker.hosting("mcp"))
+            stack.enter_context(_exit_on_termination())
+        return _serve(stdin, stdout, workers)
+
+
+@contextlib.contextmanager
+def _exit_on_termination():
+    """Turn SIGTERM and SIGHUP into SystemExit so the server stops its workers before exiting."""
+    previous = {}
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGHUP"):
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            if signal.getsignal(number) is signal.SIG_DFL:
+                previous[number] = signal.signal(number, _exit_on_signal)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def _exit_on_signal(number: int, frame: object) -> None:
+    raise SystemExit(128 + number)
+
+
+def _serve(stdin: IO[bytes] | None, stdout: IO[str] | None, workers: int) -> int:
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout
     server = Server()
