@@ -195,7 +195,9 @@ def test_dos_bulk_queries(dos_project, capsys, monkeypatch):
     assert (unknown["query"], unknown["error"]["code"]) == ("nope", "no_function")
     assert unknown["error"]["message"] == "no analyzed function named nope"
     assert lookup["pagination"]["functions"] == {"offset": 0, "total": 5, "returned": 5, "next_offset": None}
-    assert narrow["functions"] == [{"query": "root:15", "prototype": "undefined __stdcall16far FUN_1000_0015()"}]
+    # The retf 2 and the [bp+6] read give the far routine one word argument.
+    assert narrow["functions"] == [
+        {"query": "root:15", "prototype": "undefined __stdcall16far FUN_1000_0015(undefined2 param_1)"}]
     assert narrow["pagination"]["functions"]["next_offset"] == 2
 
     assert [symbol["name"] for symbol in prefixed["symbols"]] == [
