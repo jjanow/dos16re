@@ -26,7 +26,9 @@ from .errors import CONTRACT_VERSION
 from .ghidra import QUERY_TIMEOUT, GhidraError, cancellable, check_cancelled, check_timeout, query, query_batch
 from .queries import query_definitions
 from .schema import DIALECT, query_schema
-from .search import WIDTHS, find_bytes, search_pattern
+from .search import (
+    ENCODINGS, WIDTHS, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols, search_pattern,
+)
 
 MODERN_VERSIONS = ("2026-07-28",)
 LEGACY_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -139,7 +141,11 @@ def _where_is_tool() -> dict:
         "name": "where_is",
         "title": "retrore where-is",
         "description": "Find a byte pattern across the file-backed units of an export from `retrore load`. Give "
-                       "exactly one of bytes, string, or constant. Matches can overlap.",
+                       "exactly one of bytes, string, constant, or pointer. Matches can overlap. Strings are tried "
+                       "in every text encoding of the export's platform (PETSCII and screen codes on the C64, "
+                       "high-bit ASCII on the Apple II, ATASCII and screen codes on Atari 8-bit, Shift-JIS on "
+                       "Japanese machines). A pointer search finds stored DOS near and far pointers, 68k longs, "
+                       "or 6502 and Z80 words holding an address, and marks relocation-backed hits.",
         "inputSchema": {
             "$schema": DIALECT,
             "type": "object",
@@ -150,6 +156,64 @@ def _where_is_tool() -> dict:
                 "constant": {"type": ["integer", "string"],
                              "description": "integer, or decimal or 0x-prefixed string, in the image's byte order"},
                 "width": {"enum": list(WIDTHS), "description": "constant width in bytes (default 2)"},
+                "pointer": {"type": "string", "minLength": 1,
+                            "description": "find stored pointers to this unit:offset, seg:off, or hex address"},
+                "pointer_kinds": {"type": "array", "minItems": 1, "items": {"enum": ["far", "near", "absolute"]},
+                                  "description": "only these pointer kinds (DOS: far, near; others: absolute)"},
+                "encoding": {"enum": list(ENCODINGS),
+                             "description": "string encoding (default: every encoding of the export's platform)"},
+                "ignore_case": {"type": "boolean", "description": "match strings in either letter case"},
+            },
+            "required": ["export"],
+            "additionalProperties": False,
+        },
+    }
+
+
+_EXPORT = {"type": "string", "minLength": 1, "description": "directory from retrore load"}
+_ADDRESS_TEXT = {"type": "string", "minLength": 1, "description": "unit:offset, seg:off, or hexadecimal address"}
+
+
+def _relocations_tool() -> dict:
+    return {
+        "name": "relocations",
+        "title": "retrore relocs",
+        "description": "List loader relocations in an export from `retrore load`, as `retrore relocs --json` "
+                       "does. DOS relocations patch segment words; 68k relocations patch longs. Filter by unit, "
+                       "site range (at and size), or target (DOS: same segment; 68k: value in [target, +size)).",
+        "inputSchema": {
+            "$schema": DIALECT,
+            "type": "object",
+            "properties": {
+                "export": _EXPORT, "unit": {"type": "string", "minLength": 1, "description": "unit name"},
+                "at": _ADDRESS_TEXT, "target": _ADDRESS_TEXT,
+                "size": {"type": "integer", "minimum": 1, "description": "range size in bytes for at and target"},
+                "limit": {"type": "integer", "minimum": 1, "description": "maximum relocations"},
+                "offset": {"type": "integer", "minimum": 0, "description": "skip this many after filtering"},
+            },
+            "required": ["export"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _lookup_tool() -> dict:
+    return {
+        "name": "lookup",
+        "title": "retrore lookup",
+        "description": "Look up names from an export's map.json without Ghidra, as `retrore lookup --json` does: "
+                       "unit symbols, entry points, overlay entries and stubs, runtime signatures, hardware "
+                       "labels, and memory regions. Give a name (exact, or * and ? pattern) or an address to get "
+                       "the nearest symbol at or below it.",
+        "inputSchema": {
+            "$schema": DIALECT,
+            "type": "object",
+            "properties": {
+                "export": _EXPORT,
+                "name": {"type": "string", "minLength": 1, "description": "exact name or * and ? pattern"},
+                "address": _ADDRESS_TEXT,
+                "ignore_case": {"type": "boolean", "description": "match names ignoring case"},
+                "limit": {"type": "integer", "minimum": 1, "description": "maximum symbols for a name search"},
             },
             "required": ["export"],
             "additionalProperties": False,
@@ -264,12 +328,13 @@ def _call_program(command: str, arguments: dict) -> dict:
 def tools() -> list[dict]:
     """Return every tool definition in a stable order."""
     definitions = query_definitions()
-    reserved = {"batch", "where_is", *_PROGRAM_TOOLS} & definitions.keys()
+    reserved = {"batch", "where_is", "relocations", "lookup", *_PROGRAM_TOOLS} & definitions.keys()
     if reserved:
         raise RuntimeError(f"query names collide with adapter tools: {', '.join(sorted(reserved))}")
     document = query_schema()
     return [*(_query_tool(command, definition, document) for command, definition in definitions.items()),
-            _batch_tool(document), _where_is_tool(), *map(_program_tool, _PROGRAM_TOOLS)]
+            _batch_tool(document), _where_is_tool(), _relocations_tool(), _lookup_tool(),
+            *map(_program_tool, _PROGRAM_TOOLS)]
 
 
 def _project(arguments: dict) -> Path:
@@ -328,16 +393,61 @@ def _call_batch(arguments: dict) -> dict:
         return query_batch(project, arguments.get("requests"), timeout=timeout)
 
 
-def _call_where_is(arguments: dict) -> dict:
-    unknown = arguments.keys() - {"export", "bytes", "string", "constant", "width"}
+def _export_arguments(tool: str, arguments: dict, allowed: set[str]) -> Path:
+    unknown = arguments.keys() - {"export", *allowed}
     if unknown:
-        raise InvalidArguments(f"unsupported options for where_is: {', '.join(sorted(unknown))}")
+        raise InvalidArguments(f"unsupported options for {tool}: {', '.join(sorted(unknown))}")
     export = arguments.get("export")
     if not isinstance(export, str) or not export:
         raise InvalidArguments("export must be a nonempty path string")
+    return Path(export)
+
+
+def _optional(arguments: dict, name: str, kind: type) -> object:
+    value = arguments.get(name)
+    if value is not None and (type(value) is not kind or (kind is str and not value)):
+        raise InvalidArguments(f"{name} must be a {'nonempty string' if kind is str else kind.__name__}")
+    return value
+
+
+def _call_where_is(arguments: dict) -> dict:
+    export = _export_arguments("where_is", arguments, {
+        "bytes", "string", "constant", "width", "pointer", "pointer_kinds", "encoding", "ignore_case"})
+    if ("encoding" in arguments or arguments.get("ignore_case")) and "string" not in arguments:
+        raise InvalidArguments("encoding and ignore_case require string")
+    if "pointer_kinds" in arguments and "pointer" not in arguments:
+        raise InvalidArguments("pointer_kinds requires pointer")
+    if "pointer" in arguments:
+        if any(name in arguments for name in ("bytes", "string", "constant", "width")):
+            raise InvalidArguments("specify exactly one of bytes, string, constant, or pointer")
+        kinds = arguments.get("pointer_kinds")
+        if kinds is not None and (not isinstance(kinds, list) or not kinds
+                                  or any(not isinstance(kind, str) for kind in kinds)):
+            raise InvalidArguments("pointer_kinds must be a nonempty list of far, near, or absolute")
+        return find_pointers(export, _optional(arguments, "pointer", str), kinds=tuple(kinds) if kinds else None)
+    if "string" in arguments and not any(name in arguments for name in ("bytes", "constant", "width")):
+        return find_text(export, arguments["string"], encoding=_optional(arguments, "encoding", str),
+                         ignore_case=bool(_optional(arguments, "ignore_case", bool)))
     pattern, width = search_pattern(hex_bytes=arguments.get("bytes"), string=arguments.get("string"),
                                     constant=arguments.get("constant"), width=arguments.get("width"))
-    return find_bytes(Path(export), pattern, width=width)
+    return find_bytes(export, pattern, width=width)
+
+
+def _call_relocations(arguments: dict) -> dict:
+    export = _export_arguments("relocations", arguments, {"unit", "at", "target", "size", "limit", "offset"})
+    return find_relocations(
+        export, unit=_optional(arguments, "unit", str), at=_optional(arguments, "at", str),
+        target=_optional(arguments, "target", str), size=_optional(arguments, "size", int),
+        limit=_optional(arguments, "limit", int), offset=_optional(arguments, "offset", int) or 0,
+    )
+
+
+def _call_lookup(arguments: dict) -> dict:
+    export = _export_arguments("lookup", arguments, {"name", "address", "ignore_case", "limit"})
+    return lookup_symbols(
+        export, name=_optional(arguments, "name", str), address=_optional(arguments, "address", str),
+        ignore_case=bool(_optional(arguments, "ignore_case", bool)), limit=_optional(arguments, "limit", int),
+    )
 
 
 def call_tool(name: str, arguments: dict) -> dict:
@@ -346,6 +456,10 @@ def call_tool(name: str, arguments: dict) -> dict:
         run = _call_batch
     elif name == "where_is":
         run = _call_where_is
+    elif name == "relocations":
+        run = _call_relocations
+    elif name == "lookup":
+        run = _call_lookup
     elif name in _PROGRAM_TOOLS:
         def run(arguments: dict) -> dict:
             return _call_program(name, arguments)

@@ -35,7 +35,11 @@ from .pc88 import (
 from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build_pc98_image
 from .queries import QUERIES, option_names
 from .schema import DIALECT, query_schema
-from .search import WIDTHS, SearchError, find_bytes, search_pattern
+from .layout import apply_layout, layout_lines
+from .search import (
+    ENCODINGS, WIDTHS, SearchError, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols,
+    search_pattern,
+)
 from .trace import TraceError, import_trace
 from .x1 import DISK_SUFFIXES as X1_DISK_SUFFIXES
 from .x1 import MEMORY_VIEWS as X1_VIEWS
@@ -591,7 +595,7 @@ def _batch(args: argparse.Namespace) -> int:
     return int(bool(errors))
 
 
-_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage")
+_REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "layout")
 
 
 def _add_query_parser(commands: argparse._SubParsersAction, command: str) -> argparse.ArgumentParser:
@@ -651,10 +655,15 @@ def _print_continue(report: dict) -> None:
 
 
 def _registry_query(args: argparse.Namespace) -> int:
-    report = query(args.project, _registry_request(args), timeout=args.timeout)
+    if args.command == "layout" and args.apply:
+        report = apply_layout(args.project, _registry_request(args), timeout=args.timeout)
+    else:
+        report = query(args.project, _registry_request(args), timeout=args.timeout)
     command = args.command
     if args.json:
         print(json.dumps(report))
+    elif command == "layout":
+        print("\n".join(layout_lines(report)))
     elif command == "functions":
         _print_page(report, "functions", [
             f"{row['query']}: {row['error']['message']}" if "error" in row else f"{_location(row['entry'])}  {row['prototype']}"
@@ -722,16 +731,81 @@ def _paged_gaps(args: argparse.Namespace) -> None:
 
 
 def _where_is(args: argparse.Namespace) -> None:
-    pattern, width = search_pattern(hex_bytes=args.bytes, string=args.string, constant=args.constant, width=args.width)
-    report = find_bytes(args.export, pattern, width=width, limit=None if args.json else _PREVIEW_LIMIT)
+    limit = None if args.json else _PREVIEW_LIMIT
+    if (args.encoding or args.ignore_case) and args.string is None:
+        raise SearchError("--encoding and --ignore-case require --string")
+    if args.pointer_kind and args.pointer is None:
+        raise SearchError("--pointer-kind requires --pointer")
+    if args.width is not None and args.constant is None:
+        raise SearchError("--width requires --constant")
+    if args.pointer is not None:
+        report = find_pointers(args.export, args.pointer, kinds=tuple(args.pointer_kind or ()) or None, limit=limit)
+    elif args.string is not None:
+        report = find_text(args.export, args.string, encoding=args.encoding, ignore_case=args.ignore_case,
+                           limit=limit)
+    else:
+        pattern, width = search_pattern(hex_bytes=args.bytes, constant=args.constant, width=args.width)
+        report = find_bytes(args.export, pattern, width=width, limit=limit)
     if args.json:
         print(json.dumps(report))
         return
-    print(f"{report['count']} matches")
+    if args.pointer is not None:
+        counts = ", ".join(f"{count} {kind}" for kind, count in report["counts"].items())
+        print(f"{report['count']} pointers to {report['target']['address']} ({counts}; "
+              f"{report['relocated']} relocated)")
+    else:
+        print(f"{report['count']} matches")
     for match in report["matches"]:
-        print(f"{match['unit_address']}  {match['address']}")
+        detail = ""
+        if "kind" in match:
+            backed = {True: "  relocated", False: "", None: ""}[match["relocated"]]
+            detail = f"  {match['kind']} {match['value']}{backed}"
+        elif "encoding" in match:
+            detail = f"  {match['encoding']}"
+        print(f"{match['unit_address']}  {match['address']}{detail}")
     if report["count"] > _PREVIEW_LIMIT:
         print("Use --json for all matches.")
+
+
+def _relocs(args: argparse.Namespace) -> None:
+    report = find_relocations(args.export, unit=args.unit, at=args.at, target=args.target, size=args.size,
+                              limit=args.limit if args.json or args.limit else _PREVIEW_LIMIT, offset=args.offset or 0)
+    if args.json:
+        print(json.dumps(report))
+        return
+    if not report["has_relocations"]:
+        print("This format has no loader relocations.")
+        return
+    print(f"{report['count']} relocations")
+    for row in report["relocations"]:
+        target = row.get("segment_unit") or (row.get("target") or {}).get("unit_address") or ""
+        print(f"{row['unit_address']}  {row['address']}  -> {row['value']}  {target}".rstrip())
+    if report["pagination"]["next_offset"] is not None:
+        print("Use --json, --limit, and --offset for more.")
+
+
+def _lookup(args: argparse.Namespace) -> None:
+    report = lookup_symbols(args.export, name=args.name, address=args.address, ignore_case=args.ignore_case,
+                            limit=None if args.json else _PREVIEW_LIMIT)
+    if args.json:
+        print(json.dumps(report))
+        return
+    if args.name is not None:
+        print(f"{report['count']} symbols")
+        for row in report["symbols"]:
+            print(f"{row['unit_address'] or row['address']}  {row['name']}  {row['kind']}")
+        if report["count"] > _PREVIEW_LIMIT:
+            print("Use --json for all symbols.")
+        return
+    nearest = report["nearest"]
+    where = report["address"]["unit_address"] or report["address"]["address"]
+    if nearest is None:
+        print(f"{where}  no symbol at or below")
+    else:
+        distance = f"+0x{nearest['distance']:x}" if nearest["distance"] else ""
+        print(f"{where}  {nearest['name']}{distance}  ({nearest['kind']})")
+    if report["containing"]:
+        print("in " + ", ".join(report["containing"]))
 
 
 def _trace(args: argparse.Namespace) -> None:
@@ -1116,6 +1190,9 @@ def main(argv: list[str] | None = None) -> int:
             query_parser.add_argument("--direction", choices=("incoming", "outgoing", "both"), help="select reference direction")
     for name in _REGISTRY_COMMANDS:
         _add_query_parser(commands, name)
+    commands.choices["layout"].add_argument(
+        "--apply", action="store_true",
+        help="apply the proposed structure or array in Ghidra (saves the project; default: preview only)")
 
     schema_parser = commands.add_parser("schema", help="print the JSON Schema of query requests and errors")
     schema_parser.add_argument("--json", action="store_true", help="print the JSON Schema document")
@@ -1148,6 +1225,28 @@ def main(argv: list[str] | None = None) -> int:
     pattern.add_argument("--string", metavar="TEXT", help="literal string in the image's supported encoding")
     pattern.add_argument("--constant", metavar="N", help="decimal or 0x-prefixed integer in the image's byte order")
     search_parser.add_argument("--width", type=int, choices=WIDTHS, help="constant width in bytes (default 2)")
+    pattern.add_argument("--pointer", metavar="ADDR",
+                         help="stored pointers to ADDR: DOS near and far, 68k longs, 6502 and Z80 words")
+    search_parser.add_argument("--pointer-kind", action="append", choices=("far", "near", "absolute"),
+                               help="only these pointer kinds (repeatable)")
+    search_parser.add_argument("--encoding", choices=list(ENCODINGS),
+                               help="string encoding (default: every encoding of the export's platform)")
+    search_parser.add_argument("--ignore-case", action="store_true", help="match strings in either letter case")
+    relocs_parser = commands.add_parser("relocs", help="list loader relocations in an export")
+    relocs_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
+    relocs_parser.add_argument("--unit", metavar="NAME", help="only relocations in this unit")
+    relocs_parser.add_argument("--at", metavar="ADDR", help="only relocations at ADDR (and --size bytes after it)")
+    relocs_parser.add_argument("--target", metavar="ADDR",
+                               help="only relocations pointing to ADDR (DOS: to its segment; 68k: --size bytes)")
+    relocs_parser.add_argument("--size", type=int, metavar="N", help="range size in bytes for --at and --target")
+    relocs_parser.add_argument("--limit", type=int, metavar="N", help="maximum relocations")
+    relocs_parser.add_argument("--offset", type=int, metavar="N", help="skip N relocations after filtering")
+    lookup_parser = commands.add_parser("lookup", help="find map symbols by name, or the nearest one to an address")
+    lookup_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
+    lookup_target = lookup_parser.add_mutually_exclusive_group(required=True)
+    lookup_target.add_argument("--name", metavar="PATTERN", help="exact name or * and ? pattern")
+    lookup_target.add_argument("--address", metavar="ADDR", help="report the nearest symbol at or below ADDR")
+    lookup_parser.add_argument("--ignore-case", action="store_true", help="match names ignoring case")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
     call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
@@ -1173,7 +1272,8 @@ def main(argv: list[str] | None = None) -> int:
     trace_parser.add_argument(
         "--overlay-segment", metavar="UNIT=HEX", action="append", default=[], help="map an overlay at its runtime segment",
     )
-    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser):
+    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser,
+                    relocs_parser, lookup_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries),
                     *map(commands.choices.get, _REGISTRY_COMMANDS), trace_parser):
@@ -1231,6 +1331,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "where-is":
             _where_is(args)
+            return 0
+        if args.command == "relocs":
+            _relocs(args)
+            return 0
+        if args.command == "lookup":
+            _lookup(args)
             return 0
         if args.command == "trace":
             _trace(args)

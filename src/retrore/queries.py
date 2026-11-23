@@ -183,6 +183,24 @@ QUERIES = {
         "fields_scope": "record",
         "echo": ["unit"],
     },
+    "layout": {
+        "description": "infer an array, record, or string layout of a global from the instructions that access it",
+        "parameters": {
+            "address": {**_address("start of the global: unit:offset, seg:off, or flat address"), "required": True},
+            "size": _integer(1, 0x100000, "bytes to cover (default: defined data, else up to the next named "
+                                          "symbol, else 256)"),
+            "stride": _integer(1, 0x10000, "element size to use instead of the most common observed stride"),
+            "max_functions": _integer(1, 256, "decompile at most this many referencing functions", 64),
+            "name": {"type": "string", "pattern": "[A-Za-z_][A-Za-z0-9_]{0,63}",
+                     "description": "name for the proposed structure"},
+            **_paging(1000, 100, "accesses"),
+            "compact": _COMPACT,
+        },
+        "fields": ["address", "size", "functions", "accesses", "strides", "bounds", "layout", "conflicts",
+                   "proposal"],
+        "fields_scope": "result",
+        "echo": ["address"],
+    },
 }
 
 # Messages kept from the original validator.
