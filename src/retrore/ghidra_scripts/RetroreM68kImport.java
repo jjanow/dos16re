@@ -12,6 +12,8 @@ import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.data.ByteDataType;
+import ghidra.program.model.data.DWordDataType;
 import ghidra.program.model.data.IntegerDataType;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.WordDataType;
@@ -116,7 +118,7 @@ public class RetroreM68kImport extends HeadlessScript {
                 address(unit.get("linear").getAsLong()), bytes, unit.get("image_offset").getAsLong(), size, false);
             boolean code = unit.get("kind").getAsString().equals("code");
             block.setExecute(code);
-            block.setWrite(!code);
+            block.setWrite(unit.has("writable") ? unit.get("writable").getAsBoolean() : !code);
             loaded.add(block.getStart(), block.getEnd());
         }
 
@@ -158,17 +160,28 @@ public class RetroreM68kImport extends HeadlessScript {
             }
         }
 
+        boolean genesis = format.equals("GENESIS");
         boolean x68k = format.equals("X68K");
-        if (x68k) {
+        if (x68k || genesis) {
             addMemoryMap(map.getAsJsonArray("memory_map"), loaded);
             for (var element : map.getAsJsonArray("hardware_labels")) {
                 var label = element.getAsJsonObject();
                 var at = address(label.get("linear").getAsLong());
                 if (memory.contains(at)) {
+                    if (label.has("width")) {
+                        createData(at, switch (label.get("width").getAsInt()) {
+                            case 1 -> ByteDataType.dataType;
+                            case 2 -> WordDataType.dataType;
+                            case 4 -> DWordDataType.dataType;
+                            default -> throw new IllegalArgumentException("Unsupported hardware register width");
+                        });
+                    }
                     currentProgram.getSymbolTable().createLabel(at, label.get("name").getAsString(),
                         SourceType.IMPORTED);
                 }
             }
+        }
+        if (x68k) {
             readCallNames(map);
             // XC enters each routine with a bra to a trailing link and a bra back. Discovered non-returning
             // analysis misreads that split as a call that never returns and drops the code after its callers.
@@ -191,23 +204,27 @@ public class RetroreM68kImport extends HeadlessScript {
             }
         }
 
-        var entry = address(map.getAsJsonObject("entry").get("linear").getAsLong());
-        if (!memory.contains(entry) || !memory.getBlock(entry).isExecute()) {
-            throw new IllegalArgumentException("Entry point is outside executable memory");
-        }
         int switches = map.has("jump_tables") ? recoverSwitches(map.getAsJsonArray("jump_tables")) : 0;
         if (format.equals("MAC68K")) {
             seedMacintosh(map);
         }
-        currentProgram.getSymbolTable().addExternalEntryPoint(entry);
-        disassemble(entry);
-        createFunction(entry, null);
 
         var report = new LinkedHashMap<String, Object>();
         report.put("program", currentProgram.getName());
         report.put("format", format);
         report.put("units", units.size());
         report.put("relocations", relocations);
+        if (genesis) {
+            seedGenesisVectors(map.getAsJsonArray("vectors"));
+            var entries = map.getAsJsonArray("entries");
+            for (var item : entries) {
+                seedEntry(item.getAsJsonObject());
+            }
+            report.put("entries", entries.size());
+            report.put("memory_view", map.get("memory_view").getAsString());
+        } else {
+            seedEntry(map.getAsJsonObject("entry"));
+        }
         if (map.has("jump_tables")) {
             report.put("switches", switches);
         }
@@ -216,6 +233,30 @@ public class RetroreM68kImport extends HeadlessScript {
             report.put("line_f", lineFReport());
         }
         return report;
+    }
+
+    private void seedEntry(JsonObject record) throws Exception {
+        var entry = address(record.get("linear").getAsLong());
+        var block = currentProgram.getMemory().getBlock(entry);
+        if (block == null || !block.isExecute()) {
+            throw new IllegalArgumentException("Entry point is outside executable memory");
+        }
+        currentProgram.getSymbolTable().addExternalEntryPoint(entry);
+        disassemble(entry);
+        createFunction(entry, null);
+    }
+
+    private void seedGenesisVectors(JsonArray vectors) throws Exception {
+        var references = currentProgram.getReferenceManager();
+        for (var item : vectors) {
+            var vector = item.getAsJsonObject();
+            var at = address(vector.get("linear").getAsLong());
+            createData(at, DWordDataType.dataType);
+            if (vector.has("target")) {
+                var target = address(vector.get("target").getAsLong());
+                references.addMemoryReference(at, target, RefType.DATA, SourceType.IMPORTED, 0);
+            }
+        }
     }
 
     private void seedMacintosh(JsonObject map) throws Exception {

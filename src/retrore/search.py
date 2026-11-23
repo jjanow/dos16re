@@ -7,8 +7,8 @@ from bisect import bisect_right
 from pathlib import Path
 
 from .image import (
-    APPLE2_FORMAT, ATARI8_FORMAT, C64_FORMAT, FLAT16_FORMATS, M68K_FORMATS, MAC68K_FORMAT, MOS6502_FORMATS, MSX2_FORMAT,
-    NES_FORMAT,
+    APPLE2_FORMAT, ATARI8_FORMAT, C64_FORMAT, FLAT16_FORMATS, GENESIS_FORMAT, M68K_FORMATS, MAC68K_FORMAT,
+    MOS6502_FORMATS, MSX2_FORMAT, NES_FORMAT,
     PC88_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError, ImageUnit, image_units, read_map,
 )
 
@@ -107,6 +107,7 @@ PLATFORM_ENCODINGS = {
     PC98_FORMAT: ("shift-jis",),
     X68K_FORMAT: ("shift-jis",),
     MAC68K_FORMAT: ("mac-roman",),
+    GENESIS_FORMAT: ("ascii", "shift-jis"),
     "HUNK": ("latin-1",),
     "PRG": ("ascii",),
     C64_FORMAT: ("petscii", "petscii-shifted", "c64-screen", "c64-screen-shifted"),
@@ -520,7 +521,7 @@ def find_relocations(
         rows.append({**owner.location(position - owner.image_offset), **extra})
     page = rows[offset:] if limit is None else rows[offset:offset + limit]
     return {
-        "has_relocations": image_format == "MZ" or image_format in M68K_FORMATS,
+        "has_relocations": image_format == "MZ" or (image_format in M68K_FORMATS and image_format != GENESIS_FORMAT),
         "count": len(rows), "relocations": page,
         "pagination": {"offset": offset, "total": len(rows), "returned": len(page),
                        "next_offset": offset + len(page) if offset + len(page) < len(rows) else None},

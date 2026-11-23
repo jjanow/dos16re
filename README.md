@@ -3,7 +3,7 @@
 Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
 NEC PC-88 and PC-98 programs, Sharp X1 programs, Sharp X68000 Human68k executables, Classic
-Macintosh 68k applications, and NES / Famicom cartridges.
+Macintosh 68k applications, NES / Famicom cartridges, and Sega Genesis / Mega Drive cartridges.
 Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
 are optional validation targets for particular executable formats and compiler patterns.
 
@@ -624,6 +624,31 @@ separate export and project for each MMC3 bank configuration. Cross-window refer
 the selected banks. Runtime mapper changes, CHR mapping, and CPU RAM and PPU register mirror
 aliasing remain open.
 
+## Sega Genesis / Mega Drive loader
+
+`info` and `load` recognize raw, big-endian linear cartridges of up to 4 MiB by their Sega header.
+Use `--genesis` to select the loader explicitly. The export preserves the complete ROM and
+its file offsets in the `vectors`, `header`, and `rom` units. The map records cartridge titles,
+ROM bounds, both checksums, the initial supervisor stack pointer, and the 68000 vector table.
+Ghidra seeds the mapped vector targets and labels video, audio, controller, and Z80 registers.
+Repeat `--entry HEX` to add analysis entry points. [Sega software development manual](https://gendev.spritesmind.net/files/md/tech/Genesis%20Software%20Development%20Manual%20%5BVersion%202.0%5D%20%5B1991-07-09%5D.pdf)
+
+```sh
+.venv/bin/retrore info GAME.md --json
+.venv/bin/retrore load GAME.md -o out/genesis --json
+.venv/bin/retrore ghidra import out/genesis out/genesis-project
+.venv/bin/retrore decomp rom:0000 --project out/genesis-project --json
+.venv/bin/retrore address-map vectors:0078 --export out/genesis --json
+```
+
+The memory map includes work RAM, Z80 RAM, the main I/O registers, and declared parallel
+cartridge SRAM outside the linear ROM. Use `--genesis-sram START:END` for an inclusive hex
+range when the header omits it. Even/even or odd/odd endpoints select one byte lane.
+Even/odd endpoints select both lanes. For example, the U.S./Europe `Countdown to Doomsday`
+cartridge uses `--genesis-sram 200001:203fff` for its 8 KiB of odd-lane SRAM.
+The map describes canonical address ranges. Cartridge mappers, ROM and device mirrors,
+interleaved copier dumps, EEPROM protocols, and runtime analysis remain open.
+
 ## Ghidra
 
 Set `GHIDRA_HOME` to your Ghidra installation directory, which contains `support/analyzeHeadless`, and use a JDK
@@ -745,7 +770,7 @@ within a unit's file-backed span. `--string` tries every text encoding the platf
 - Apple II: high-bit ASCII, then plain ASCII.
 - Atari 8-bit: ATASCII and screen codes.
 - PC-98 and X68000: Shift-JIS.
-- MSX, PC-88, and X1: ASCII, then Shift-JIS.
+- MSX, PC-88, X1, and Genesis / Mega Drive: ASCII, then Shift-JIS.
 - Amiga: Latin-1. Atari ST: ASCII. Classic Macintosh: MacRoman.
 
 `--ignore-case` matches either letter case. When several encodings were tried, or with
@@ -1221,7 +1246,9 @@ X68000 `P4.X`, extracted from Disk 1. Set `RETRORE_POR_MAC_DIR` to the directory
 `Pool of Radiance v1.1.rsrc` and `RETRORE_SOTSB_MAC_DIR` to the directory containing
 `Secret of the Silver Blade.img`. Set `RETRORE_POR_NES_DIR` and `RETRORE_POR_FAMICOM_DIR` to
 directories containing one Pool of Radiance `.nes` cartridge image each, for the U.S. and Japanese
-releases respectively. The Ghidra tests use `GHIDRA_HOME` and include synthetic programs for all
+releases respectively. Set `RETRORE_CTD_GENESIS_DIR` to the directory containing one raw
+U.S./Europe `Buck Rogers: Countdown to Doomsday` Genesis cartridge image. The Ghidra tests use
+`GHIDRA_HOME` and include synthetic programs for all
 supported platforms. Tests skip when their input variables are unset.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
 runs the synthetic suites with the headless tests enabled. [Release workflow](.github/workflows/release-ci.yml)

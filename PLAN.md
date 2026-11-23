@@ -3,9 +3,10 @@
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
 binaries, Atari 8-bit executables, MSX2 programs, NEC PC-88 and PC-98 programs, Sharp X1 disks, Sharp X68000
-Human68k executables, Classic Macintosh 68k applications, and NES / Famicom cartridges. It handles
-formats and compiler patterns shared across 1980s and early 1990s games and uses those games to
-validate support. It gives Ghidra's decompiler and agents driving it one whole-program image to work on.
+Human68k executables, Classic Macintosh 68k applications, NES / Famicom cartridges, and Sega
+Genesis / Mega Drive cartridges. It handles formats and compiler patterns shared across 1980s and
+early 1990s games and uses those games to validate support. It gives Ghidra's decompiler and agents
+driving it one whole-program image to work on.
 
 The primary goal is to help LLMs reverse 16-bit binaries faster and with fewer tokens. Prioritize the
 work Ghidra leaves to the analyst: recovering the runtime layout, resolving segmented and indirect
@@ -13,14 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, NES / Famicom gained iNES and NES 2.0 loading, NROM mirroring, selectable MMC3 PRG
-banks, and Ghidra hardware labels and vector entries. Both Pool of Radiance releases validated
-the bank views, file offsets, and startup and interrupt analysis.
+On 2026-11-23, Sega Genesis / Mega Drive gained linear ROM loading, cartridge and vector metadata,
+a configurable SRAM window, and Ghidra entry points and hardware symbols. The U.S./Europe
+`Countdown to Doomsday` cartridge validated source offsets, startup calls, VBlank decompilation,
+and video and SRAM references.
 
-The standalone suite passed 416 tests with 87 skipped. All 503 tests passed across the Ghidra 12.2
-and opt-in suites with Python 3.14 and JDK 25.
+The standalone suite passed 418 tests with 89 skipped. All 507 tests passed with the Ghidra 12.2
+and opt-in suites enabled, using Python 3.14 and JDK 25.
 
-Resume with the Sega Genesis / Mega Drive loader or the remaining Phase 9 and Phase 10 items.
+Resume with unresolved indirect transfers in Phase 9 or shared evidence categories in Phase 10.
 X1turbo validation still awaits the Gold Box release.
 
 ## Why
@@ -194,6 +196,7 @@ across separated overlay units.
 | Phantasie I (Sharp X1) | D88 Program and Player Disks | IPL header boot, logical-sector second stage, cross-unit transfer and 16-bit I/O port references |
 | Phantasie IV (Sharp X68000) | Human68k `HU` executable with XC symbols | Relocations and symbols, line-F DOS and FPACK calls, XC arithmetic and split entries, save routine decompilation |
 | Pool of Radiance (NES and Famicom) | U.S. and Japanese NES 2.0 cartridges | MMC3 bank placement and file provenance, hardware vectors, Ghidra startup and IRQ analysis |
+| Buck Rogers: Countdown to Doomsday (Genesis) | U.S./Europe linear Mega Drive ROM, odd-lane cartridge SRAM | ROM and vector provenance, startup and VBlank analysis, video and SRAM references |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
@@ -204,6 +207,7 @@ The opt-in PC-88 and PC-98 tests use `RETRORE_PH3_PC88_DIR` and `RETRORE_PH3_PC9
 The opt-in X1 tests use `RETRORE_PH1_X1_DIR`. The opt-in X68000 tests use `RETRORE_PH4_X68K_DIR`.
 The opt-in Macintosh tests use `RETRORE_POR_MAC_DIR` and `RETRORE_SOTSB_MAC_DIR`.
 The opt-in NES / Famicom tests use `RETRORE_POR_NES_DIR` and `RETRORE_POR_FAMICOM_DIR`.
+The opt-in Genesis tests use `RETRORE_CTD_GENESIS_DIR`.
 Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
@@ -217,10 +221,9 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
-Sharp X1, Sharp X68000, Classic Macintosh, and Nintendo NES / Famicom milestones are complete for
-the validated releases. X1turbo validation waits for a copy of the Gold Box release.
-Sega Genesis / Mega Drive is the next platform milestone.
-The analysis backlog below applies to existing and future platforms.
+Sharp X1, Sharp X68000, Classic Macintosh, Nintendo NES / Famicom, and Sega Genesis / Mega Drive
+milestones are complete for the validated releases. X1turbo validation waits for a copy of the Gold Box
+release. Continue with the analysis backlog below.
 
 ## Analysis backlog
 
@@ -396,7 +399,7 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga, Atari ST, X68000, and Macintosh | C64, Apple II, Atari 8-bit, MSX2, PC-88, X1, and NES | PC-98 |
+| Capability | DOS | Amiga, Atari ST, X68000, Macintosh, and Genesis | C64, Apple II, Atari 8-bit, MSX2, PC-88, X1, and NES | PC-98 |
 |---|---|---|---|---|
 | Load, export, byte, string, pointer, relocation, and symbol search | Implemented | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
@@ -404,7 +407,7 @@ underlying analysis uses each machine's conventions and available emulator or tr
 | Bulk lookups, inventories, call graphs, and routine context | Implemented | Implemented | Implemented | Implemented |
 | Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
 | Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
-| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations, including a fixed Macintosh A5 world | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
+| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations, a fixed Macintosh A5 world, and a linear Genesis cartridge view | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
 | Calling conventions, runtime signatures, and indirect control flow | Stack conventions, `int 21h` services, switch patterns, and indirect-call candidates | X68000 DOS and FPACK, Amiga and Atari ST switch recovery, and Macintosh A5 jump targets and named Toolbox traps | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
 | Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned | Planned |
 
@@ -605,3 +608,19 @@ source offsets in each cartridge. Synthetic analysis verifies a cross-bank call 
 
 Open work includes more mappers, CHR banking, analysis of runtime bank changes and RAM and I/O
 mirrors, and an NES trace and emulation backend.
+
+### Sega Genesis / Mega Drive
+
+**Implemented for raw linear cartridges.** The loader preserves ROM bytes and source offsets
+and records the cartridge header, initial supervisor stack pointer, and vector table. It maps canonical
+work RAM, Z80 RAM, and I/O, with supported parallel SRAM declared by the header or set by
+`--genesis-sram`. Ghidra seeds mapped vector targets and labels and types common hardware registers.
+
+**Validated on Ghidra 12.2.** The 1 MiB U.S./Europe `Countdown to Doomsday` ROM starts at
+`$000200` and has HBlank and VBlank entries at `$0F1B64` and `$00DE8C`. The reset routine calls
+`$019CCA`, where a read resolves to the odd-lane cartridge SRAM at `$200001` using the explicit
+range. Ghidra resolves VDP writes in the startup code and decompiles the VBlank handler.
+
+Open work includes banked cartridges, SRAM that shares the ROM address range, ROM and device
+mirrors, 24-bit address aliases in Ghidra, interleaved copier dumps, EEPROM protocols, and Genesis
+trace and emulation backends.

@@ -20,14 +20,15 @@ from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
 from .evidence import ADDRESS_SPACES, MAX_BYTES, EvidenceError, evidence_bundle, inspect_bytes, map_address
+from .genesis import GenesisError, build_genesis_image, is_genesis
 from .ghidra import (
     BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, check_timeout, decompile,
     import_program, query, query_address, query_batch,
 )
 from .hfs import HfsError
 from .image import (
-    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, MAC68K_FORMAT, MSX2_FORMAT, NES_FORMAT, PC88_FORMAT,
-    PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError,
+    APPLE2_FORMAT, ATARI8_FORMAT, DEFAULT_M68K_BASE, FLAT16_FORMATS, GENESIS_FORMAT, MAC68K_FORMAT, MSX2_FORMAT,
+    NES_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError,
 )
 from .macintosh import MacintoshError, build_macintosh_image, is_macintosh
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
@@ -60,7 +61,7 @@ _PREVIEW_LIMIT = 10
 
 # Errors that commands report as coded error objects instead of tracebacks.
 HANDLED_ERRORS = (
-    Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, EvidenceError, GhidraError, HfsError, HunkError,
+    Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, EvidenceError, GenesisError, GhidraError, HfsError, HunkError,
     ImageError, MacintoshError, MZError, Msx2Error, NesError, Pc88Error, Pc98Error, PrgError, SearchError, TraceError,
     X1Error, XError, OSError,
 )
@@ -89,6 +90,13 @@ def _hex_address(value: str) -> int:
         return int(value, 16)
     except ValueError:
         raise argparse.ArgumentTypeError("expected a hexadecimal address") from None
+
+
+def _genesis_sram(value: str) -> tuple[int, int]:
+    start, separator, end = value.partition(":")
+    if not separator:
+        raise argparse.ArgumentTypeError("expected an inclusive hexadecimal SRAM range START:END")
+    return _hex_address(start), _hex_address(end)
 
 
 def _overlay(value: str) -> tuple[Path, int | None]:
@@ -977,9 +985,15 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     human68k = data.startswith(X_MAGIC)
     m68k = hunk or human68k or data.startswith(PRG_MAGIC)
     extension = args.program.suffix.lower()
+    genesis = args.genesis or (
+        not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or args.atari8 or args.atari8_raw
+             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or args.x1 or args.nes or m68k
+             or data.startswith((b"MZ", NES_MAGIC)) or extension in DISK_SUFFIXES)
+        and is_genesis(data)
+    )
     nes = args.nes or (
         not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or args.atari8 or args.atari8_raw
-             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or args.x1)
+             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or args.x1 or genesis)
         and (data.startswith(NES_MAGIC) or extension == ".nes")
     )
     macintosh = args.macintosh or (
@@ -1002,6 +1016,8 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         raise X1Error("X1 options require --x1")
     if not nes and any(value is not None for value in (args.nes_prg_mode, args.nes_r6, args.nes_r7)):
         raise NesError("NES PRG options require an NES cartridge")
+    if not genesis and args.genesis_sram is not None:
+        raise GenesisError("--genesis-sram requires a Genesis / Mega Drive cartridge")
     if args.x1:
         image, program_map = _x1_image(args, data)
     elif args.pc98:
@@ -1012,6 +1028,13 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         image, program_map = _msx2_image(args, data)
     elif args.msx2_unit or args.msx2_copy:
         raise Msx2Error("--msx2-unit and --msx2-copy require --msx2")
+    elif genesis:
+        if args.base_segment is not None or args.base_address is not None or args.overlay or args.disk_file:
+            raise GenesisError("Genesis ROMs use a fixed address and accept no base, overlay, or disk member options")
+        if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
+                or args.atari8_unit or args.atari8_portb is not None):
+            raise GenesisError("C64, Apple II, and Atari 8-bit options require their respective platforms")
+        image, program_map = build_genesis_image(data, args.program.name, entries=args.entry, sram=args.genesis_sram)
     elif nes:
         if args.base_segment is not None or args.base_address is not None or args.overlay or args.disk_file:
             raise NesError("NES cartridges use mapper windows and accept no base, overlay, or disk member options")
@@ -1076,6 +1099,8 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         entry = program_map["entry"]
         lines.append(f"Classic Macintosh 68k  entry {entry['unit_address']} ({entry['linear']:06x})"
                      f"  {len(program_map['a5_jumps'])} jump-table entries")
+    elif program_map["format"] == GENESIS_FORMAT:
+        lines.append(f"Genesis / Mega Drive  {len(image)} ROM bytes  {len(program_map['entries'])} entry points")
     elif program_map["format"] == PC98_FORMAT:
         entry = program_map["entry"]
         lines.append(f"PC-98  entry {entry['segment']:04x}:{entry['offset']:04x}  {len(program_map['units'])} units")
@@ -1143,6 +1168,7 @@ def program_options() -> argparse.ArgumentParser:
     platform.add_argument("--atari8", action="store_true", help="interpret the input as an Atari 8-bit program")
     platform.add_argument("--atari8-raw", action="store_true", help="load raw Atari 8-bit bytes at --base-address")
     platform.add_argument("--nes", action="store_true", help="interpret the input as an NES / Famicom cartridge")
+    platform.add_argument("--genesis", action="store_true", help="interpret the input as a Genesis / Mega Drive ROM")
     platform.add_argument("--msx2", action="store_true", help="interpret the input as an MSX-DOS .COM, raw file, or FAT12 disk")
     platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
     platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
@@ -1185,6 +1211,8 @@ def program_options() -> argparse.ArgumentParser:
     command.add_argument("--nes-prg-mode", type=int, metavar="0|1", help="MMC3 PRG mode (default 0)")
     command.add_argument("--nes-r6", type=_hex_address, metavar="HEX", help="MMC3 R6 PRG bank (default 0)")
     command.add_argument("--nes-r7", type=_hex_address, metavar="HEX", help="MMC3 R7 PRG bank (default 1)")
+    command.add_argument("--genesis-sram", type=_genesis_sram, metavar="START:END",
+                         help="override the Genesis cartridge SRAM with an inclusive hexadecimal bus range")
     command.add_argument(
         "--msx2-unit", type=_unit_path, action="append", default=[], metavar="FILE@HEX",
         help="load an additional MSX2 file at its runtime address",
@@ -1245,7 +1273,7 @@ def program_options() -> argparse.ArgumentParser:
     command.add_argument("--x1-view", choices=X1_VIEWS, help="select RAM or the IPL ROM for reads below 8000")
     command.add_argument(
         "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
-        help="seed 8-bit machine-code analysis at this address (repeatable)",
+        help="seed 8-bit or Genesis machine-code analysis at this address (repeatable)",
     )
     return command
 
