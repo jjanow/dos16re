@@ -2,7 +2,7 @@
 
 A reverse-engineering toolkit for retro executables, starting with 16-bit real-mode DOS programs (MZ executables,
 packers and overlay systems), AmigaDOS Hunk executables, Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II
-binaries, Atari 8-bit executables, MSX2 programs, and NEC PC-88 and PC-98 programs. It handles formats and compiler
+binaries, Atari 8-bit executables, MSX2 programs, NEC PC-88 and PC-98 programs, and Sharp X1 disks. It handles formats and compiler
 patterns shared across 1980s and early 1990s games and uses those games to validate support. It gives
 Ghidra's decompiler and agents driving it one whole-program image to work on.
 
@@ -12,12 +12,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-22, added the README compatibility table for Python, Ghidra, and the JDK. Checked the
-wheel-test configuration against the release workflow. The standalone suite on Python 3.14 passed
-141 tests with 38 skipped. With Ghidra 12.2 and OpenJDK 25, 152 tests passed with 27 skipped.
+On 2026-11-22, finished Phase 8's open items and the Sharp X1 milestone in parallel branches:
+the query registry with bounded bulk lookups, inventories, call graphs, and routine context;
+headless time budgets, coded errors, and a benchmark; versioned maps and query contracts; and
+`retrore schema` with an MCP adapter. The X1 loader and Z180-based import were validated on the
+Phantasie I Program Disk. On merged main with Ghidra 12.2 and the X1 disks, 302 tests passed with 27 skipped.
+The standalone suite passed 282 tests with 47 skipped.
 
-Resume Phase 8 with bounded bulk function and symbol lookups. The typed tool adapter remains open.
-Sharp X1 / X1turbo is the next platform.
+Resume with Sharp X68000, or Phase 9 code and data recovery. The remaining Phase 8 items are small
+(listed below).
 
 ## Why
 
@@ -181,6 +184,7 @@ across separated overlay units.
 | Phantasie III (MSX2) | FAT12 Scenario Disk, MSX-DOS `.COM` and `.OVR` files | Resident code copy, alternative overlays, Z80 decompilation and cross-unit transfers |
 | Phantasie III (NEC PC-88) | D88 Program and Utility Disks | IPL, alternative Z80 payloads, cross-unit transfers and hardware port references |
 | Phantasie III (NEC PC-98) | D88 Program and Utility Disks | Real-mode IPL, alternative payloads, cross-unit far jumps and segment context |
+| Phantasie I (Sharp X1) | D88 Program and Player Disks | IPL header boot, logical-sector second stage, cross-unit transfer and 16-bit I/O port references |
 
 The opt-in DOS tests use `RETRORE_POR_DIR`, `RETRORE_PH1_DIR`, and `RETRORE_PH3_DIR`.
 The opt-in Amiga tests use `RETRORE_PH1_AMIGA_DIR` and `RETRORE_PH3_AMIGA_DIR`. The opt-in Atari ST
@@ -188,6 +192,7 @@ tests use `RETRORE_PH2_ST_DIR`. The opt-in C64 tests use `RETRORE_PH1_C64_DIR`. 
 `RETRORE_PH1_APPLE2_DIR` and `RETRORE_PH3_APPLE2_DIR`. The opt-in Atari 8-bit tests use
 `RETRORE_PH1_ATARI8_DIR` and `RETRORE_PH2_ATARI8_DIR`. The opt-in MSX2 tests use `RETRORE_PH3_MSX2_DIR`.
 The opt-in PC-88 and PC-98 tests use `RETRORE_PH3_PC88_DIR` and `RETRORE_PH3_PC98_DIR`.
+The opt-in X1 tests use `RETRORE_PH1_X1_DIR`.
 Headless tests also use `GHIDRA_HOME`.
 Tests skip when their inputs are unset. The default suite uses synthetic files.
 
@@ -200,8 +205,9 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 ## Order of work
 
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
-The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, and NEC PC-98
-milestones are complete for the validated releases. Sharp X1 / X1turbo is the next platform milestone.
+The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98, and
+Sharp X1 milestones are complete for the validated releases. X1turbo validation waits for a copy of
+the Gold Box release. Sharp X68000 is the next platform milestone.
 The analysis backlog below applies to existing and future platforms.
 
 ## Analysis backlog
@@ -219,19 +225,26 @@ The analysis backlog below applies to existing and future platforms.
 - **Implemented.** Single and batch `decomp` queries return address-linked C excerpts and bounded
   backward p-code slices for calls, branches, and memory accesses. The results identify the containing
   function and the instruction addresses that support the excerpt and slice.
-- Add bounded bulk function and symbol lookups, unit-scoped inventories, limited call-graph walks,
-  and contextual results that combine a routine's prototype, calls, and referenced data. Allow bulk
-  queries for coverage and analysis gaps when a workflow needs them.
-- Add time budgets and actionable error codes for headless operations. Benchmark cold and warm
-  query latency, launch counts, output size, and steps required to answer representative reversing
-  questions. Consider a persistent project worker or cache if batching leaves material overhead.
+- **Implemented.** One query registry (`queries.py`) defines every Ghidra query's parameters,
+  fields, and caps for validation, the CLI, and `batch`. Bounded `functions`, `symbols`, `inventory`,
+  `callgraph`, `context`, `gaps`, and `coverage` queries run alone or in a batch with paging and
+  explicit truncation. Open: page `context` parameters and search Ghidra's generated names.
+- **Implemented.** Headless runs have time budgets (`--timeout`) that stop the whole JVM process
+  group. Failures carry stable error codes with hints and documented exit statuses.
+  `tools/bench.py` measures import and query latency, launch counts, and output size
+  ([results](docs/benchmarks.md)). Launch cost dominates and batching amortizes it, so a persistent
+  worker is not justified yet. Open: measure steps for representative reversing questions and
+  re-check on a large overlay project; add `--timeout` to `trace --project`.
 - **Implemented.** The README's [synthetic walkthrough](README.md#try-a-synthetic-program) generates
   a C64 PRG and runs inspection, export, headless import, and batch queries.
 - **Documented.** The README's [compatibility table](README.md#compatibility) records locally tested
   Python, Ghidra, and JDK combinations and the release CI configuration. Update it as verification changes.
-- Version exported maps and query contracts and test compatibility with older exports.
-- Provide a discoverable request schema and a thin tool adapter for agents that benefit from
-  typed inputs. Keep the CLI and the adapter on the same query contract.
+- **Implemented.** `map.json` `version` is enforced (missing reads as 1) and query results carry
+  `contract`. Unversioned fixture maps for several formats test compatibility with older exports.
+- **Implemented.** `retrore schema` emits a JSON Schema generated from the query registry, and
+  `retrore mcp` is a standard-library MCP stdio server whose tools share the CLI's validation and
+  entry points. Open: `info` and `load` tools (needs the CLI's inline platform options factored out)
+  and concurrent or cancellable calls.
 
 ### Phase 9: better code and data recovery
 
@@ -300,11 +313,12 @@ records, result limits, and failure behavior should be shared. Provide equivalen
 capabilities for layout reconstruction, code and data recovery, and dynamic validation. The
 underlying analysis uses each machine's conventions and available emulator or trace backend.
 
-| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, MSX2, and PC-88 | PC-98 |
+| Capability | DOS | Amiga and Atari ST | C64, Apple II, Atari 8-bit, MSX2, PC-88, and X1 | PC-98 |
 |---|---|---|---|---|
 | Load, export, and byte search | Implemented | Implemented | Implemented | Implemented |
 | Ghidra import, decompile, references, and function queries | Implemented | Implemented | Implemented | Implemented |
 | Batch Ghidra address queries | Implemented | Implemented | Implemented | Implemented |
+| Bulk lookups, inventories, call graphs, and routine context | Implemented | Implemented | Implemented | Implemented |
 | Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
 | Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
 | Runtime layout | MZ relocation and supported overlays | Resident sections and relocations | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
@@ -444,3 +458,21 @@ The Phantasie III Program and Utility Disks both start at `1fc0:0000` and load a
 The startup routines there lead to `0412:0006` on the Program Disk and `03ca:000f` on the Utility
 Disk. The Phantasie IV HDM boot sector also imported into Ghidra. Future loader work includes FAT12
 member selection for PC-98 DOS floppies and additional machine-specific ROM and graphics views.
+
+### Sharp X1
+
+**Implemented and validated on Ghidra 12.2.** `info` and `load` read the IPL boot entry from D88/D77
+disks or caller-selected spans by logical sector or cylinder, head, and sector ID. They also accept raw
+files at explicit addresses. Explicit resident copies can share the Z80 address space. The map records
+the IPL header, sector payload offsets, and the selected RAM or IPL ROM view below `$8000`. X1 devices
+and VRAM are in the 16-bit I/O space. The importer uses Ghidra's Z180 variant so `OUT (C),r` ports
+resolve through `BC`. It maps the I/O space and labels the FDC, palette, PCG, CRTC, PPI, PSG, IPL
+ROM switch, CTC, and VRAM ranges. The Z180 variant does not decode undocumented Z80 instructions.
+
+The Phantasie I Program Disk boots `PHANTASIE 1` from LSN `$370` at `$BF80` and runs `$C000`. The
+routine at `$C3D8` reads `$70` sectors from LSN `$80` to `$0100`, and `$C465` passes control there.
+Ghidra recovered that transfer, decompiled the loader and the second stage's main routine at `$3D7F`,
+and resolved the CRTC write at `$C04F`, the PPI control write at `$C05B`, and the second stage's FDC
+control write at `$011D`. The Player Disk has no IPL entry, and neither disk has a filesystem. Future
+loader work includes X1turbo bank memory and devices, filesystem member selection, and runtime-computed
+disk loads.
