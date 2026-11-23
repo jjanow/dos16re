@@ -214,8 +214,10 @@ public class RetroreImport extends HeadlessScript {
             Address table = address(record.getAsJsonObject("table"));
             disassemble(address(record.getAsJsonObject("guard")));
             var instruction = listing.getInstructionAt(jump);
-            if (instruction == null || !instruction.getFlowType().isJump() ||
-                    !instruction.getFlowType().isComputed()) {
+            // Call tables ("kind": "call") dispatch to subroutines; older maps hold only jump tables.
+            boolean call = record.has("kind") && record.get("kind").getAsString().equals("call");
+            if (instruction == null || !instruction.getFlowType().isComputed() ||
+                    (call ? !instruction.getFlowType().isCall() : !instruction.getFlowType().isJump())) {
                 continue;
             }
             instruction.addOperandReference(0, table, RefType.READ, SourceType.ANALYSIS);
@@ -224,10 +226,14 @@ public class RetroreImport extends HeadlessScript {
                 Address destination = address(target.getAsJsonObject());
                 Address word = table.addNoWrap(2L * index++);
                 references.addMemoryReference(word, destination, RefType.DATA, SourceType.ANALYSIS, 0);
-                instruction.addMnemonicReference(destination, RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
+                instruction.addMnemonicReference(destination,
+                    call ? RefType.COMPUTED_CALL : RefType.COMPUTED_JUMP, SourceType.ANALYSIS);
             }
             for (Address destination : instruction.getFlows()) {
                 disassemble(destination);
+                if (call && getFunctionAt(destination) == null) {
+                    createFunction(destination, null);
+                }
             }
         }
     }
