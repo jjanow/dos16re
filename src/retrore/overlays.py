@@ -212,8 +212,8 @@ def _jump_table_record(unit: str, segment: int, table) -> dict:
         "guard": address_record(Address(segment, table.guard)),
         "table": address_record(Address(segment, table.table)),
     }
-    if table.default is not None:
-        record["default"] = address_record(Address(segment, table.default))
+    # Always present so version-1 readers find it; null for mask- and byte-bounded tables.
+    record["default"] = None if table.default is None else address_record(Address(segment, table.default))
     record["targets"] = [address_record(Address(segment, offset)) for offset in table.targets]
     return record
 

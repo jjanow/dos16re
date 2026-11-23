@@ -21,7 +21,7 @@ additional setup for project import, decompilation, and cross-reference queries.
 
 ### Compatibility
 
-The package requires Python 3.12 or newer. The table records the Linux setups used for local
+The package requires Python 3.12 or newer. The table records the setups used for local
 verification and configured for release CI.
 
 | Check | Python | Ghidra | JDK |
@@ -29,8 +29,11 @@ verification and configured for release CI.
 | Local standalone suite | 3.14 | — | — |
 | Local suite with headless tests enabled | 3.14 | 12.2 | OpenJDK 25 |
 | Release CI configuration for the installed wheel | 3.12 | 12.2 | Temurin 25 |
+| Release CI Windows job: worker, MCP, and synthetic Ghidra tests | 3.12 | 12.2 | Temurin 25 |
 
-See the [release workflow](.github/workflows/release-ci.yml) for the exact CI setup.
+See the [release workflow](.github/workflows/release-ci.yml) for the exact CI setup. It runs for each
+published release and can be started by hand to verify changes, such as Windows worker hosting, that
+can't be tested locally.
 
 ### Try a synthetic program
 
@@ -554,10 +557,19 @@ program. The original bytes stay in `image.bin`.
 - XC enters routines through `bra` to a trailing `link` and `bra` back. The importer rejoins the
   pieces that analysis splits off, so each routine decompiles as one function.
 
-The decompiler doesn't show DOS call arguments, because Human68k pushes mixed word and long
-arguments. Read them from the listing. The other stacked FPACK calls (remainder, float, and double
-helpers) write their result over the first stacked argument, which the decompiler doesn't track.
-[Human68k DOS and FPACK call numbers, from XEiJ's include files](https://stdkmd.net/xeij/)
+- DOS stubs carry prototypes for about 80 calls, with each word or long argument at its stack
+  offset, so the decompiler shows calls such as `DOS::_WRITE(handle,buffer,length)`. Calls whose
+  arguments depend on a mode word (`_IOCTRL`, `_CONCTRL`, and others) declare only the fixed leading
+  arguments.
+- The other stacked FPACK calls (remainder, conversions, float and double arithmetic, and compares)
+  write their result over the first stacked argument. Call fixups model each one, so the decompiler shows
+  `uVar2 % param_1` or `(dVar2 + dVar1) / 2.0`. Compares set the condition codes.
+- `trap #15` calls whose number is loaded into D0 just before the trap become calls to
+  `IOCS::_CRTMOD`-style stubs, with the name in the comment.
+- The importer recognizes XC switch tables (`cmpi.l`, `bhi`, `asl.l #2`, a PC-relative `lea`, and an
+  indexed `movea.l` / `jmp (a0)`) and adds their targets.
+
+[Human68k DOS, IOCS, and FPACK call numbers, from XEiJ's include files](https://stdkmd.net/xeij/)
 
 ## Ghidra
 
@@ -575,7 +587,12 @@ Pass the project path with or without its `.gpr` extension.
 For DOS, the importer creates one memory block per unit, names overlay entries and stubs, and runs
 Ghidra's auto-analysis.
 The importer marks recovered table words as data, adds computed jump references, and disassembles each case
-so auto-analysis can discover the routines they call.
+so auto-analysis can discover the routines they call. Recognized switches compare the index against a
+bound (`ja`, `jae`, `jbe`, or `jb` over a default jump, optionally after a `sub` bias) or mask it
+(`and bx,N`), use word or zero-extended byte indexes, and jump or call through a CS-relative word table.
+A root switch is read against the nearest code segment at or below it among the load segment, the entry
+segment, and relocated segment words. `map.json` `jump_tables` records give the `kind` (`jump` or `call`)
+and `bound` (`compare`, `mask`, or `byte`). `default` is `null` for tables without a default case.
 
 After analysis, the importer recognizes `push cs` followed by a direct near `call` when the callee's return
 instructions agree on a far return and stack cleanup. It applies the far calling convention to the callee.
@@ -588,9 +605,33 @@ startup DGROUP assignment, relocation-backed segment words, and register transfe
 operands in the loaded image. The listing uses names like `DGROUP_4433` and `FAR2820_97f0`. Names use the
 relocated segment. Ghidra 12.2 may still print some ES-relative accesses as numeric offsets in decompiled C.
 
-The analysis assumes DS and SS are preserved across ordinary calls. It uses the startup DGROUP as the
-default for functions reached only through unresolved control flow and drops values when incoming paths
-disagree. A resolved direct write invalidates any overlapping relocation-backed segment word.
+Segment values carry across calls. Each function gets a summary of the segment registers it preserves,
+sets to a known value, or copies from another register, and of the argument words it removes on return.
+Calls apply the summary, and a callee starts with the segment values all its analyzed callers agree on.
+The analysis follows the stack and `[BP+n]` slots, so `LES` and `LDS` resolve from relocation-backed far
+pointers in memory or from a far pointer every caller passes as the same argument. Indexed operands such
+as `[BX+n]` resolve when the registers hold known values. Without a definite summary, DS and SS are
+assumed preserved across a call. Functions reached only through unresolved control flow start with the
+startup DGROUP. Values are dropped when incoming paths disagree. A jump into the middle of another
+function does not pass its segment values to that function, so a shared error or exit tail can't erase
+the caller's DS. The import report's `segment_analysis` counts these jumps. A resolved direct write
+invalidates any overlapping relocation-backed segment word.
+
+When a segment register is unknown, the analysis records where and why it was lost (`join`, `call`,
+`unknown_call`, `interrupt`, `load`, `pop`, `write`, or `entry`). `func` reports this as `segment_losses`.
+
+A later pass handles indirect calls and jumps that Ghidra left unresolved. It reads the table or variable
+through the known DS or CS and keeps candidate targets: initial far pointers whose segment word is
+relocated, and offset and segment pairs stored into the slot. Each candidate lists its evidence and
+the writer's address. Candidates get a data reference from their slot but don't join control flow. A gap whose entry a
+relocated pointer names, that starts with `push bp; mov bp,sp`, and that decodes cleanly becomes a
+function.
+
+The last pass recovers calling conventions for functions without a signature. It uses `ret n` /
+`retf n` immediates, `add sp,n` or `pop` after calls, and argument reads through `[BP+n]` or
+`SS:[BX+n]`. Arguments loaded with `les` or `lds` become one far pointer. Each argument gets an explicit stack
+offset. `int 21h` sites with AH loaded in the same straight-line code become calls to stubs such as
+`DOS::SeekFile` in a `dos_services` block. The carry flag reads as `extraout_CF` after the call.
 Re-export images made by older versions to include the relocation metadata.
 
 ```sh
@@ -608,6 +649,12 @@ Re-export images made by older versions to include the relocation metadata.
 data, or padding. Text output shows the total and the first ten ranges. JSON includes all ranges with
 inclusive `unit:offset` endpoints, the starting linear address, and byte counts.
 
+`gaps --classify` scores each range as `code`, `data`, `padding`, or `unknown`. It reports `code_score`,
+`data_score`, `conflict` when both readings have support, a suggested `entry`, and `evidence` rows.
+Evidence includes references into the range and relocated pointers. A pointer counts toward code only
+when a far call or jump targets its segment. Other evidence is relocated words, a `push bp; mov bp,sp`
+or `link a6` prologue, a clean linear decode, text, and zero fill.
+
 ## Program queries
 
 ```sh
@@ -618,6 +665,10 @@ inclusive `unit:offset` endpoints, the starting linear address, and byte counts.
 .venv/bin/retrore where-is --export out/phantasie --bytes 'b8 00 4c'
 .venv/bin/retrore where-is --export out/phantasie --string 'Mystic'
 .venv/bin/retrore where-is --export out/phantasie --constant 0x1234 --width 2 --json
+.venv/bin/retrore where-is --export out/phantasie --pointer 1000:0eae --json
+.venv/bin/retrore relocs --export out/phantasie --unit root --limit 20
+.venv/bin/retrore lookup --export out/pool --name 'stub_tpov_0085_*'
+.venv/bin/retrore lookup --export out/pool --address 1085:0039
 ```
 
 `xrefs` reports incoming and outgoing references Ghidra recorded at the exact address, including code and
@@ -627,18 +678,79 @@ reference type, operand index, and enclosing functions when available.
 
 `func` reports the function entry, inclusive body ranges, total body size in bytes, and callers. For DOS
 it gives Ghidra's DS, ES, and SS values at the requested address. Unknown values appear as `?` in text
-and `null` in JSON.
+and `null` in JSON. `segment_losses` gives, for each unknown register, the address and reason where its
+value was lost, such as `{"ES": {"address": ..., "reason": "call", "detail": "1000:b79c changes ES"}}`.
 
 `where-is` searches relocated, file-backed bytes in the export. Matches can overlap and must fit
-within a unit's file-backed span. `--string` uses DOS CP437, Amiga Latin-1, PC-98 and X68000 CP932, or ASCII
-on the other platforms. Use
-`--bytes` to search for Atari ST text containing bytes above `0x7f`.
+within a unit's file-backed span. `--string` tries every text encoding the platform uses unless
+`--encoding` picks one:
+
+- DOS: CP437.
+- C64: PETSCII and screen codes, in both character sets.
+- Apple II: high-bit ASCII, then plain ASCII.
+- Atari 8-bit: ATASCII and screen codes.
+- PC-98 and X68000: Shift-JIS.
+- MSX, PC-88, and X1: ASCII, then Shift-JIS.
+- Amiga: Latin-1. Atari ST: ASCII.
+
+`--ignore-case` matches either letter case. When several encodings were tried, or with
+`--ignore-case`, each match reports its `encoding` and `bytes`. Use `--bytes` to search for Atari ST
+text containing bytes above `0x7f`.
+
+`--pointer ADDR` finds stored pointers to an address:
+
+- DOS: far pointers in any equivalent `segment:offset` form, and near pointers, which are noisy.
+- 68k: aligned big-endian longs.
+- 6502 and Z80: little-endian words.
+
+Each match reports whether a loader relocation backs it (`relocated`, `null` where the format has none).
+`--pointer-kind` keeps only `far`, `near`, or `absolute` matches.
+
+`relocs` lists loader relocations from the export, filtered by `--unit`, by site (`--at` and `--size`),
+or by `--target`. DOS targets match on segment, and 68k targets on the value range. Results are paged
+with `--limit` and `--offset`. `lookup` finds symbols, unit entries, overlay entries and stubs,
+runtime signature matches, hardware labels, and memory regions. `--name` takes an exact name or a `*`
+and `?` pattern. `--address` gives the nearest symbol at or below the address, the next symbol, and the
+containing unit or region. None of these commands needs Ghidra.
 `--constant` accepts a decimal or `0x`-prefixed integer and encodes it in the platform's byte order
 at the specified width (1, 2, 4, or 8 bytes, default 2).
 
 Text output previews up to ten references or matches. Use `--json` for the full results with
 `unit:offset` and linear addresses where available. Ghidra queries also report the address as
 displayed by the analyzed project.
+
+### Indirect control flow and data layouts
+
+```sh
+.venv/bin/retrore indirect --project out/pool-project --status candidate --json
+.venv/bin/retrore layout 2820:e820 --project out/ph3-project
+.venv/bin/retrore layout 2820:e820 --project out/ph3-project --name Character --apply
+```
+
+`indirect` lists each indirect call and jump as `resolved` (with its `targets`), `candidate`, or
+`unresolved` (with a `reason`). Candidate sites give the `table`, the segment used to read it,
+`candidates` with their evidence (`relocated`, `initial`, `stored`, `function_entry`, `prologue`,
+`decodes`, `seeded`) and writer addresses, and why the scan `stop`ped (`sentinel`, `next_variable`,
+`uninitialized`, and others). Filter by `--unit`, `--at`, or `--status`.
+
+`layout` infers the shape of a global from the code that reads and writes it. It decompiles every function
+that references the range or uses an instruction constant inside it. Each access becomes a constant offset
+plus scaled index terms, taken from multiplies, shifts, pointer arithmetic, and loop variables that step by a
+constant. The result lists the following:
+
+- each access, with its width and offset;
+- `strides`, each with the instruction that implies it (for example `root:1f8c INT_MULT by 0x106`);
+- count `bounds`, from loop compares;
+- record fields, with their widths and read and write counts;
+- `conflicts`, such as two widths at one offset;
+- a `layout` kind (`record_array`, `array`, `string`, or `record`);
+- a C-style `proposal`.
+
+Loops that copy or clear whole records are counted apart from field accesses. The size defaults to
+the defined data, or up to the next named symbol. `--stride` overrides the inferred element size.
+`--apply` (CLI only) stops the project's worker, creates the proposed structure or array, and saves the
+project. It refuses a type that would cover instructions, and it replaces data already defined in the
+range. Without `--apply` the query is read-only, as in `batch` and the MCP server.
 
 ### Limit Ghidra address query results
 
@@ -762,8 +874,11 @@ back to retrore on a loopback port and proves itself with a one-time token. A da
 socket and lock file when it exits, and its log too when it exits cleanly. A daemon that fails
 keeps its log, and when it fails to start, the `worker start` error quotes the log's last lines. On Windows, daemons and
 `retrore mcp` listen on a loopback TCP port instead. The port and a random token that every connection
-must present are kept in a file in `%LOCALAPPDATA%\retrore\workers` (or `RETRORE_WORKER_DIR`). Windows
-support is tested on Linux with the TCP transport forced, and only partly on Windows (see PLAN.md).
+must present are kept in a file in `%LOCALAPPDATA%\retrore\workers` (or `RETRORE_WORKER_DIR`), with
+the host's process ID. Clients skip a file whose host has exited instead of waiting for a refused
+connection. A Windows daemon sends its output to its log before importing anything, so startup
+errors reach the `worker start` error too. Windows support is tested on Linux with the TCP transport
+forced, and on Windows by the release CI job.
 
 The `retrore.queries` module defines every query command, its parameters with JSON Schema types,
 ranges, and defaults, its selectable fields, and its caps. `query_definitions()` returns them as
