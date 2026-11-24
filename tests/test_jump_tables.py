@@ -494,22 +494,29 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
     assert candidate["target"] == "root:11914" and "relocated" in candidate["evidence"]
     assert dispatch["status"] == "unresolved" and dispatch["reason"] == "no_valid_entries"
 
-    # Replay the four FTST successors validated with the software floating-point emulator.
+    # Replay the FCOM/FCOMP and FTST successors validated with the software floating-point emulator.
     runtime_base = 0x0824
-    target_offsets = (0x136BC, 0x13699, 0x136AE, 0x136B5)
-    trace = tmp_path / "ftst.json"
+    dispatch_targets = {
+        0x1366D: (0x13672, 0x13699, 0x136AE, 0x136B5, 0x136BC, 0x136C2, 0x136C9, 0x136D0),
+        0x13721: (0x136BC, 0x13699, 0x136AE, 0x136B5),
+    }
+    trace = tmp_path / "float_dispatch.json"
     trace.write_text(json.dumps({"version": 1, "events": [
-        {"kind": "edge", "from": runtime_base * 16 + 0x13721, "to": runtime_base * 16 + offset, "flow": "jump"}
-        for offset in target_offsets
+        {"kind": "edge", "from": runtime_base * 16 + site, "to": runtime_base * 16 + target, "flow": "jump"}
+        for site, targets in dispatch_targets.items() for target in targets
     ]}), encoding="utf-8")
     assert main(["trace", str(trace), "--export", str(export), "--runtime-base", f"{runtime_base:x}",
                  "--project", str(project), "--apply", "--json"]) == 0, capsys.readouterr().err
     applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
-    targets = {f"root:{offset:x}" for offset in target_offsets}
-    assert {row["to"]["unit_address"] for row in applied if row["kind"] == "flow"} == targets
-    assert main(["indirect", "--at", "root:13721", "--project", str(project), "--compact", "--json"]) == 0
-    recovered, = json.loads(capsys.readouterr().out)["sites"]
-    assert recovered["status"] == "resolved" and set(recovered["targets"]) == targets
+    assert any(row["address"]["unit_address"] == "root:1366d" for row in applied if row["kind"] == "instruction")
+    assert {(row["from"]["unit_address"], row["to"]["unit_address"]) for row in applied if row["kind"] == "flow"} == {
+        (f"root:{site:x}", f"root:{target:x}") for site, targets in dispatch_targets.items() for target in targets
+    }
+    for site, targets in dispatch_targets.items():
+        assert main(["indirect", "--at", f"root:{site:x}", "--project", str(project), "--compact", "--json"]) == 0
+        recovered, = json.loads(capsys.readouterr().out)["sites"]
+        assert recovered["status"] == "resolved"
+        assert set(recovered["targets"]) == {f"root:{target:x}" for target in targets}
 
 
 def test_phantasie_iv_x68k_switches(tmp_path, capsys):

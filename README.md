@@ -1549,6 +1549,10 @@ where DOS loaded the root. Applied computed edges are visible in `indirect` and 
 Each edge records a successor observed in the capture. Checking the index range requires
 inputs that exercise the dispatch.
 
+In Phantasie III's DOS software floating-point runtime, the opt-in Ghidra test replays
+eight FCOM/FCOMP successors and four FTST successors. The comparison trace covered all
+16 pairs of operand classes across memory and register forms of FCOM and FCOMP.
+
 ```sh
 .venv/bin/retrore trace capture.json --export out/program --project out/project --json
 .venv/bin/retrore trace capture.json --export out/program --project out/project --apply --json

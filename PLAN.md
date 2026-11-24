@@ -14,17 +14,18 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, traced Phantasie III's software floating-point test at `root:13721`. Ten
-controlled inputs exercised indexes 0 through 3. Ghidra 12.2 applied 16 instruction starts and
-four computed jumps to the import with all four LINK overlays, and `indirect` reported the
-four successors. The standalone suite passed 513 tests with 127 skipped. All three opt-in
-Phantasie III checks passed with Ghidra 12.2 and the full overlay layout.
+On 2026-11-24, traced Phantasie III's FCOM/FCOMP dispatch at `root:1366d`. The 400 probes
+covered all 16 slots and eight successors. Ghidra 12.2 applied 65 instruction starts and
+eight computed jumps in the import with all four LINK overlays. A second preview found
+zero remaining gaps in the capture. The opt-in test replays the comparison and FTST edges.
+The standalone suite passed 513 tests with 127 skipped. All three opt-in Phantasie III
+DOS checks passed with Ghidra 12.2.
 
-Resume Phase 9 with the adjacent two-operand comparison dispatch at `root:1366d`. Check
-whether the runtime's operand classification can also supply static bounds for the two
-tables. Static LINK validation still needs a shipped executable that omits the directory
-counts or places a member's first listed segment after the window start. Use captured
-placements for Microsoft MOVE runtime views as more formats are verified.
+Resume Phase 9 by checking the operand-class bounds through arithmetic and stack-record
+copies before using them for static table recovery. Static LINK validation still needs a
+shipped executable that omits the directory counts or places a member's first listed segment
+after the window start. Use captured placements for Microsoft MOVE runtime views as more
+formats are verified.
 
 ## Why
 
@@ -331,7 +332,14 @@ release. Continue with the analysis backlog below.
   `root:136ae`. Signed infinities reached index 3 and `root:136b5`. The loader's local index
   analysis allows 256 values. The structured trace supplied the four observed successors
   to `trace --apply`, and replay reported no remaining gaps in the capture.
-  Open work includes proving these bounds statically and recovering genuinely unknown segment values.
+  FCOM and FCOMP share the dispatch at `root:1366d`, with a 16-word table at `root:120de`.
+  The memory and register forms each covered every pair of classes. The index is
+  `4 * class(SI) + class(DI)` when the two bytes are in 0 through 3. FTST uses
+  `class(SI)`. The single-, double-, and extended-precision input converters write
+  class values 0 through 3 at `root:12d47`, `root:12f6d`, and `root:134f3` respectively.
+  Both dispatch sites read the class from an operand record without a local range check.
+  A static bound still needs proof that arithmetic results and record copies preserve
+  that range. Open work also includes recovering genuinely unknown segment values.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry
