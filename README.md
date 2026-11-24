@@ -247,9 +247,11 @@ VROOMM skips empty code descriptors and handles the reserved fixup bit used by T
 A flagged VROOMM function-pointer fixup resolves two adjacent `MOV reg,imm16` / `PUSH reg` pairs
 using the same register to a unique resident stub. LINK directories can be recovered from count
 fields or adjacent relocation-backed arrays corroborated by member fixups. Verified members share
-one runtime window, including any padding before their first routine. Inspect `diagnostics` in JSON
-for unmatched trailers, unresolved VROOMM function-pointer offsets, and unidentified or ambiguous
-LINK directories.
+one runtime window, including any padding before their first routine. A member's minimum allocation
+can account for trailing segments omitted from the file. Only file-backed segment starts appear in
+`segment_offsets`, and fixups to omitted segments keep their relocated runtime addresses. Inspect
+`diagnostics` in JSON for unmatched trailers, unresolved VROOMM function-pointer offsets, and
+unidentified or ambiguous LINK directories.
 
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the
@@ -1594,6 +1596,7 @@ Phase 12 has optional checks against original tool outputs and releases.
 | `RETRORE_DOS_LINK_LAYOUT_DIR` | LINK 3.65 `LIVE365.EXE` with a 16-byte uninitialized CODE segment before a page-aligned routine in member 2. The test also checks a copy with the directory counts cleared. |
 | `RETRORE_VROOMM_DIR` | The TLINK 4.0 three-overlay `VROOMM.EXE` probe |
 | `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
+| `RETRORE_DOS_NATIVE_OVERLAY_DIR` | LINK 3.65 and 5.01.21 `TAIL365.EXE`, `TAIL501.EXE`, `BSS365.EXE`, and `BSS501.EXE` plus TLINK 3.01 and 4.0 `INSEG.EXE` and `INSEG4.EXE`. See the [build steps](#trailing-link-segments-and-flagged-tlink-pointers). |
 | `RETRORE_BORLAND_COMPILERS_DIR` | Original `TCC.EXE` from [Turbo C++ 1.01](https://altd.embarcadero.com/download/museum/tcpp101.zip) and `BCC.EXE` from [Borland C++ 2.0](https://winworldpc.com/product/borland-c/20) |
 | `RETRORE_PKLITE_TESTEXE_DIR` | The `compress` directory with `t10fr` and `h10fr` EXE and UNC pairs from [testexe](https://github.com/camoto-project/testexe) |
 | `RETRORE_PKLITE_SFX_DIR` | The [PKZIP 2.04g installer](https://www.hpcalc.org/details/3882) as `pk204g.exe` and its [Deark](https://github.com/jsummers/deark) reference produced by `deark -m pklite -o pk204g-unpacked pk204g.exe` |
@@ -1670,6 +1673,126 @@ lp2 run+(one)+(padded),pad240,pad240/map,pascal+math;
 lp1 run+(one)+(padded),pad245,pad245/map,pascal+math;
 pad240
 pad245
+```
+
+### Trailing LINK segments and flagged TLINK pointers
+
+Use Microsoft C 5.1 and MASM 5.10 for the LINK probes. Save these files with DOS line endings.
+`RUN.C` calls each overlay twice, and the process exits with status zero if both return the expected
+values.
+
+```c
+/* RUN.C */
+extern int ovl1(void), ovlb(void);
+int main(void) { return !(ovl1() == 1 && ovlb() == 7 && ovl1() == 1 && ovlb() == 7); }
+```
+
+```c
+/* OVL1.C */
+int ovl1(void) { return 1; }
+```
+
+```asm
+; TAIL.ASM
+public _ovlb
+two2 segment para public 'CODE'
+assume cs:two2
+_ovlb proc far
+ifdef BSS_TAIL
+    mov ax,seg last_code
+endif
+    mov dx,seg _ovlb
+ifdef BSS_TAIL
+    sub ax,dx
+    cmp ax,10h
+    jne fail
+endif
+    mov ax,cs
+    cmp ax,dx
+    mov ax,0
+    jne done
+    mov ax,7
+done:
+    ret
+ifdef BSS_TAIL
+fail:
+    xor ax,ax
+    ret
+endif
+_ovlb endp
+two2 ends
+last_code segment page public 'CODE'
+ifdef BSS_TAIL
+    db 10h dup (?)
+endif
+last_code ends
+end
+```
+
+Run with LINK 3.65 named `LINK365.EXE` and 5.01.21 named `LINK501.EXE`.
+
+```bat
+cl /AM /c run.c ovl1.c
+masm tail,tail;
+masm /DBSS_TAIL tail,tailbss;
+link365 run+(ovl1)+(tail),tail365,tail365/map,mlibcr; > tail365.log
+link365 run+(ovl1)+(tailbss),bss365,bss365/map,mlibcr; > bss365.log
+link501 run+(ovl1)+(tail),tail501,tail501/map,mlibcr; > tail501.log
+link501 run+(ovl1)+(tailbss),bss501,bss501/map,mlibcr; > bss501.log
+```
+
+For the TLINK probes, use Turbo C++ 1.01 and MASM 5.10. Save the two C translation units separately
+so the resident check compares the received pointer with the linker's own reference.
+
+```c
+/* MAIN.C */
+extern int ovla(void);
+int main(void) { return ovla() == 7 ? 0 : 1; }
+```
+
+```c
+/* CHECK.C */
+extern int ovlb(void);
+int check(int (*fn)(void)) { return fn == ovlb ? fn() : 1; }
+```
+
+```asm
+; INSEG.ASM
+extrn _check:far
+external_refs segment para public 'CODE'
+assume cs:external_refs
+public _ovla
+_ovla proc far
+    push bp
+    mov bp,sp
+    mov ax,seg _ovlb
+    push ax
+    db 0b8h
+    dw _ovlb-_ovla
+    push ax
+    call _check
+    mov sp,bp
+    pop bp
+    ret
+_ovla endp
+public _ovlb
+_ovlb proc far
+    mov ax,7
+    ret
+_ovlb endp
+external_refs ends
+end
+```
+
+The `dw` emits the function's offset without an OMF offset relocation. TLINK flags the segment
+fixup so the overlay manager can substitute the resident stub at runtime. Use `TLINK.EXE` 3.01
+and `TLINK4.EXE` 4.0. Both programs exit with status zero when the pointer comparison and call succeed.
+
+```bat
+tcc -mm -Y -c main.c check.c
+masm inseg,inseg;
+tlink /m c0m+main+check+/o+inseg+/o-,inseg,inseg,overlay+emu+mathm+cm
+tlink4 /m c0m+main+check+/o+inseg+/o-,inseg4,inseg4,overlay+emu+mathm+cm
 ```
 
 The roadmap tracks upcoming work. [PLAN.md](PLAN.md)

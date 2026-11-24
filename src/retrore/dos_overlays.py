@@ -1,6 +1,7 @@
 """Read embedded Microsoft LINK and Borland VROOMM overlay members."""
 
 from collections import defaultdict
+from dataclasses import dataclass
 from struct import Struct
 
 from .mz import Address, MZError, MZExecutable, read_mz_header, read_mz_relocations
@@ -15,8 +16,15 @@ _FB_DESCRIPTOR_SIZE = 0x20
 _FB_STUB = Struct("<BBHB")
 _LINK_MAX_SEGMENTS = 256
 
-type _LinkMembers = dict[int, tuple[int, bytes, tuple[Address, ...]]]
 type _LinkDirectory = tuple[int, dict[int, tuple[int, ...]]]
+
+
+@dataclass(frozen=True)
+class _LinkMember:
+    file_offset: int
+    image: bytes
+    relocations: tuple[Address, ...]
+    min_alloc_paragraphs: int
 
 
 def _align(value: int, alignment: int) -> int:
@@ -50,7 +58,7 @@ def embedded_overlays(data: bytes, executable: MZExecutable, source: str,
     return overlays, diagnostics
 
 
-def _link_directory_at(image: bytes, selectors: range, members: _LinkMembers) -> _LinkDirectory | None:
+def _link_directory_at(image: bytes, selectors: range, members: dict[int, _LinkMember]) -> _LinkDirectory | None:
     numbers = image[selectors.stop:selectors.stop + len(selectors)]
     if len(numbers) != len(selectors) or numbers[0] != 0 or set(numbers) != {0, *members}:
         return None
@@ -61,14 +69,28 @@ def _link_directory_at(image: bytes, selectors: range, members: _LinkMembers) ->
     # LINK reserves one OVERLAY_AREA for all members. A member's first code segment can follow
     # the start of that window if its segment alignment requires padding.
     runtime = min(min(values) for values in segments.values())
+    initialized = {}
     for number, values in segments.items():
-        size = len(members[number][1])
-        if runtime * 16 + size > len(image) or (max(values) - runtime) * 16 >= size:
+        member = members[number]
+        size = len(member.image)
+        end = runtime * 16 + size
+        backed = tuple(sorted(value for value in values if value * 16 < end))
+        if end > len(image) or not backed:
             return None
-    return runtime, {number: tuple(sorted(values)) for number, values in segments.items()}
+        if len(backed) != len(values):
+            # When LINK omits a trailing empty or uninitialized segment from the file,
+            # its member header measures minimum allocation from the load module origin.
+            # A zero-length segment can start at the allocation end.
+            allocation_end = (size // 16 + member.min_alloc_paragraphs) * 16
+            if max(values) * 16 > min(allocation_end, len(image)):
+                return None
+        initialized[number] = backed
+    return runtime, initialized
 
 
-def _link_directory(executable: MZExecutable, members: _LinkMembers) -> tuple[_LinkDirectory | None, str | None]:
+def _link_directory(
+    executable: MZExecutable, members: dict[int, _LinkMember],
+) -> tuple[_LinkDirectory | None, str | None]:
     """Find the resident selector words and matching overlay-number bytes."""
     image = executable.image
     positions = {site.linear for site in executable.relocations}
@@ -101,9 +123,9 @@ def _link_directory(executable: MZExecutable, members: _LinkMembers) -> tuple[_L
             if directory is None:
                 continue
             runtime, _ = directory
-            if any(relocations for _, _, relocations in members.values()) and all(
-                0 <= address.linear - runtime * 16 <= len(code) - _WORD.size
-                for _, code, relocations in members.values() for address in relocations
+            if any(member.relocations for member in members.values()) and all(
+                0 <= address.linear - runtime * 16 <= len(member.image) - _WORD.size
+                for member in members.values() for address in member.relocations
             ):
                 candidates.append(directory)
     if len(candidates) != 1:
@@ -114,7 +136,7 @@ def _link_directory(executable: MZExecutable, members: _LinkMembers) -> tuple[_L
 
 def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
                base: int) -> tuple[list[LinkedOverlay], list[dict], int]:
-    members: _LinkMembers = {}
+    members: dict[int, _LinkMember] = {}
     while True:
         content = memoryview(data)[start:]
         try:
@@ -126,31 +148,32 @@ def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
         if number == 0 or number in members or header.header_size == header.file_size:
             raise MZError(f"invalid or duplicate Microsoft LINK overlay {number} at file offset {start:#x}")
         file_offset, end = start + header.header_size, start + header.file_size
-        members[number] = (file_offset, data[file_offset:end], relocations)
+        members[number] = _LinkMember(file_offset, data[file_offset:end], relocations,
+                                      header.min_alloc_paragraphs)
         locations = _link_offsets(data, end)
         if not locations:
             break
         start = locations[0]
 
     directory, reason = _link_directory(executable, members)
-    runtime, segments_by_member = directory if directory is not None else (None, {})
+    runtime, backed_by_member = directory if directory is not None else (None, {})
     overlays = []
-    for number, (file_offset, image, relocations) in members.items():
+    for number, member in members.items():
         name = f"link_{number:04x}"
-        segments = segments_by_member.get(number, ())
+        backed = backed_by_member.get(number, ())
         fixups = []
         entries = ()
         if runtime is not None:
-            entries = tuple((segment - runtime) * 16 for segment in segments)
-            for address in relocations:
+            entries = tuple((segment - runtime) * 16 for segment in backed)
+            for address in member.relocations:
                 offset = address.linear - runtime * 16
-                if not 0 <= offset <= len(image) - 2:
+                if not 0 <= offset <= len(member.image) - 2:
                     raise MZError(f"Microsoft LINK overlay {number} relocation {address} lies outside its own image")
-                value, = _WORD.unpack_from(image, offset)
-                fixups.append(LinkedFixup(offset, value - runtime, name) if value in segments else
+                value, = _WORD.unpack_from(member.image, offset)
+                fixups.append(LinkedFixup(offset, value - runtime, name) if value in backed else
                               LinkedFixup(offset, value))
         runtime_segment = None if runtime is None else base + runtime
-        overlays.append(LinkedOverlay(source, name, image, file_offset, "MS_LINK", number,
+        overlays.append(LinkedOverlay(source, name, member.image, member.file_offset, "MS_LINK", number,
                                       runtime_segment, entries, fixups=tuple(fixups)))
     diagnostics = [{"code": "overlay_layout_partial", "message": reason}] if reason else []
     return overlays, diagnostics, end

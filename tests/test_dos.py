@@ -10,11 +10,11 @@ from retrore.dos import load_dos_flat, load_dos_mz
 from retrore.mz import Address, MZError, read_mz_header
 
 
-def _mz(image, *, relocations=(), member=0, cs=0, ip=0, extra=b""):
+def _mz(image, *, relocations=(), member=0, cs=0, ip=0, extra=b"", min_alloc=0):
     header_size = (28 + len(extra) + 4 * len(relocations) + 15) & -16
     size = header_size + len(image)
     header = pack("<2s13H", b"MZ", size % 512, (size + 511) // 512, len(relocations),
-                  header_size // 16, 0, 0xFFFF, 0, 0x100, 0, ip, cs, 28 + len(extra), member)
+                  header_size // 16, min_alloc, 0xFFFF, 0, 0x100, 0, ip, cs, 28 + len(extra), member)
     table = b"".join(pack("<HH", offset, segment) for offset, segment in relocations)
     return (header + extra + table).ljust(header_size, b"\0") + image
 
@@ -48,6 +48,30 @@ def _split_link_directory(*, counted=False, duplicate=False, outside_window=Fals
     second_code = bytes(0x20) + bytes.fromhex("b80400cb").ljust(16, b"\0") + bytes.fromhex("b80100cb")
     second = _mz(second_code, relocations=[(1, 6 if outside_window else 4), (1, 5)], member=7)
     return resident + _align(first) + second
+
+
+@pytest.mark.parametrize("counted", [False, True])
+def test_link_allocation_bounds_trailing_segment_without_file_bytes(counted):
+    root = bytearray(0xC0)
+    if counted:
+        pack_into("<2H", root, 0x5C, 4, 3)
+    pack_into("<4H4B", root, 0x60, 0, 2, 2, 9, 0, 1, 2, 2)
+    resident = _align(_mz(root, relocations=[(site, 0) for site in range(0x60, 0x68, 2)]))
+    first = _align(_mz(b"\xcb", member=1))
+    code = bytes.fromhex("b80900 ba0200 cb").ljust(0x1D, b"\0")
+
+    second = _mz(code, relocations=[(1, 2), (4, 2)], member=2, min_alloc=8)
+    loaded, (_, overlay) = load_dos_mz(resident + first + second, 0x1000, "link.exe")
+    assert loaded.diagnostics == ()
+    assert (overlay.runtime_segment, overlay.entries, overlay.image) == (0x1002, (0,), code)
+    tail, internal = overlay.fixups
+    assert (tail.offset, tail.value, tail.target_unit) == (1, 9, None)
+    assert (internal.offset, internal.value, internal.target_unit) == (4, 0, overlay.name)
+
+    second = _mz(code, relocations=[(1, 2), (4, 2)], member=2, min_alloc=7)
+    loaded, (_, overlay) = load_dos_mz(resident + first + second, 0x1000, "link.exe")
+    assert [report["code"] for report in loaded.diagnostics] == ["overlay_layout_partial"]
+    assert overlay.runtime_segment is None
 
 
 def _vroomm(code=bytes.fromhex("b80000cb"), *, fixups=(1,), entries=(0,), empty_descriptor=False):
@@ -438,6 +462,49 @@ def test_original_link_2x_padded_member(filename, count_offset, selector_count, 
     assert match["file"]["offset"] == 0x5210
 
 
+@pytest.mark.parametrize("version", ["365", "501"])
+@pytest.mark.parametrize("with_bss", [False, True])
+def test_original_link_trailing_segment(version, with_bss, tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_DOS_NATIVE_OVERLAY_DIR")):
+        pytest.skip("set RETRORE_DOS_NATIVE_OVERLAY_DIR to the original LINK and TLINK probes")
+    source = Path(directory) / f"{'BSS' if with_bss else 'TAIL'}{version}.EXE"
+    out = tmp_path / "link"
+    program = _command(capsys, "load", source, "-o", out)
+    _, first, second = program["units"]
+    assert "diagnostics" not in program
+    assert first["runtime_linear"] == second["runtime_linear"] == 0x10B00
+    assert second["segment_offsets"] == [0]
+    assert (second["size"], second["file_offset"]) == (0x1D if with_bss else 0x10, 0x1C00)
+    assert second["relocation_count"] == (2 if with_bss else 1)
+    loaded = pack("<BH", 0xBA, second["segment"])
+    original = bytes.fromhex("bab000")
+    if with_bss:
+        loaded = bytes.fromhex("b8c010") + loaded
+        original = bytes.fromhex("b8c000") + original
+    proof = _command(capsys, "bytes", "link_0002:0", "--export", out, "--size", len(original))
+    assert proof["original"] == original.hex()
+    assert proof["loaded"] == loaded.hex()
+
+
+@pytest.mark.parametrize("filename", ["INSEG.EXE", "INSEG4.EXE"])
+def test_original_tlink_flagged_function_pointer(filename, tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_DOS_NATIVE_OVERLAY_DIR")):
+        pytest.skip("set RETRORE_DOS_NATIVE_OVERLAY_DIR to the original LINK and TLINK probes")
+    out = tmp_path / "borland"
+    program = _command(capsys, "load", Path(directory) / filename, "-o", out)
+    _, overlay = program["units"]
+    assert "diagnostics" not in program
+    stub, = (row["address"] for row in program["stubs"] if row["target"]["offset"] == 0x14)
+    assert stub["offset"] == 0x20
+    proof = _command(capsys, "bytes", f"{overlay['name']}:3", "--export", out, "--size", 8)
+    assert proof["original"] == "b8890050b8140050"
+    assert proof["loaded"] == pack("<BHBBHB", 0xB8, stub["segment"], 0x50, 0xB8, 0x20, 0x50).hex()
+    assert {(row["kind"], row["before"], row["after"]) for row in proof["evidence"]} == {
+        ("relocation", "8900", pack("<H", stub["segment"]).hex()),
+        ("overlay_fixup", "1400", "2000"),
+    }
+
+
 def test_original_dos_overlay_probe_outputs_when_available(tmp_path, capsys):
     if not (directory := os.environ.get("RETRORE_DOS_OVERLAY_PROBE_DIR")):
         pytest.skip("set RETRORE_DOS_OVERLAY_PROBE_DIR to the PADDED.EXE, VROOMM.EXE and VROOM86.EXE probe outputs")
@@ -471,7 +538,7 @@ def test_original_dos_overlay_probe_outputs_when_available(tmp_path, capsys):
         assert proof["loaded"] == loaded.hex()
 
         # Exercise the original overlay bytes with the flag set and the offset changed
-        # from the resident stub to the function entry. TLINK emits the stub offset directly.
+        # from the resident stub to the function entry. TLINK emits stub offsets for these probes.
         flagged = bytearray(binary.read_bytes())
         site = proof["address"]["file"]["offset"]
         encoded_segment, = unpack_from("<H", flagged, site + 1)

@@ -14,15 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, LINK 2.40 and 2.45 probes built with Microsoft Pascal 3.20 switched between two
-overlays and checked the padded member's relocation in DOSBox. The VROOMM loader now accepts the
-empty descriptors and unused fixup bit found in Borland's shipped compilers. Both compilers
-built a probe in DOSBox, and retrore exported 122 overlays from each. The standalone suite passed
-508 tests with 117 skipped. The DOS and Amiga suite with native inputs and Ghidra 12.2 passed 59
-tests with one skipped.
+On 2026-11-23, LINK 3.65 and 5.01.21 probes showed that trailing empty and uninitialized segments
+can appear in the directory beyond the member's file bytes. The loader now uses the member's
+minimum allocation to validate those selectors. TLINK 3.01 and 4.0 emitted the pointer-offset flag
+for a same-segment assembly pointer. All six probes ran successfully in DOSBox. Ghidra 12.2
+imported the 29-byte LINK member in its runtime view. The standalone suite passed 510 tests with
+123 skipped. The opt-in DOS and Amiga suite passed 67 tests with one skipped.
 
-Continue native validation when a LINK executable omits the counts or starts a member's first listed
-segment past the window start, or when a TLINK executable sets the pointer-offset flag.
+Continue native validation with a shipped LINK executable that omits the directory counts or places
+a member's first listed segment after the window start. The LINK 3.65 and 5.01.21 alignment probes
+still list each member's first segment at the window start.
 
 ## Why
 
@@ -421,7 +422,8 @@ release. Continue with the analysis backlog below.
   decoding handles encoded match distances and the ADD variant's big-endian relocation offsets.
   Microsoft LINK and Borland VROOMM overlays retain their source offsets and recovered fixups.
   LINK recovers the shared runtime window from counted directories and adjacent arrays with matching
-  member fixups. VROOMM skips header-only descriptors for empty code segments and resolves flagged
+  member fixups. It validates trailing segments using the member allocation and exports file-backed
+  segment starts. VROOMM skips header-only descriptors for empty code segments and resolves flagged
   pointer pushes to verified resident stubs. Partial layouts and unmapped trailers appear as diagnostics.
 - **Implemented.** Amiga Hunk overlay trees retain each node and its ancestry, active segment indices,
   table entries, and source offsets. The loader supports additional narrow absolute and PC-relative
@@ -449,11 +451,18 @@ opt-in LINK 3.65 test checks the padding, relocation, and source offset with the
 and with its count words cleared. Ghidra 12.2 kept the full padded member in the runtime view and
 decompiled `link_0002:0100` to a routine returning 7. [Microsoft LINK overlay placement](https://www.infania.net/misc/kbarchive/kb/032/Q32003/index.html)
 
+LINK 3.65 and 5.01.21 also list a page-aligned trailing selector at `0xC00` when member 2 ends
+on disk before that address. The probe with an empty trailing segment has 16 file bytes. The
+probe with a 16-byte uninitialized segment has 29 file bytes and compares the relocated segment
+with CS in DOSBox. Retrore keeps the two initialized payload sizes and retains the native runtime
+address for the trailing segment's fixup. Ghidra's runtime view replaces only the member's file bytes.
+
 Turbo C++ 1.01 with TLINK 3.01 and Borland C++ 2.0 with TLINK 4.0 emitted resident stub offsets
-for the far-pointer probes. Setting the flag and substituting the function's overlay offset on
-copies of those binaries verified the runtime rewrite in DOSBox. The runtime pointer check passed
-for same-register `MOV`/`PUSH` pairs and failed for flagged immediate pushes and pairs using
-different registers. The loader reports these unsupported flagged offsets as unresolved.
+for the C far-pointer probes. Both linkers set the pointer-offset flag for an assembly probe that
+passes the in-segment function offset as a constant and relocates the segment immediate. The DOSBox
+probe compares the pointer with the resident stub and calls through it. Modified probes tested the
+manager's instruction checks. The pointer comparison failed with flagged immediate pushes and
+with `MOV`/`PUSH` pairs using different registers. Retrore reports those flagged offsets as unresolved.
 
 **Validated with shipped Borland executables.** Turbo C++ 1.01 `TCC.EXE` and Borland C++ 2.0
 `BCC.EXE` each export 122 nonempty overlays. `TCC.EXE` has 4 empty descriptors, 894 stubs, and
