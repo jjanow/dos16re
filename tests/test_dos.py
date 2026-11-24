@@ -7,7 +7,7 @@ import pytest
 
 from retrore.cli import main
 from retrore.dos import load_dos_flat, load_dos_mz
-from retrore.mz import Address, MZError
+from retrore.mz import Address, MZError, read_mz_header
 
 
 def _mz(image, *, relocations=(), member=0, cs=0, ip=0, extra=b""):
@@ -166,10 +166,7 @@ def test_vroomm_restores_stub_call_fixup_and_source(tmp_path, capsys):
 
 @pytest.mark.parametrize(("encoded", "restored"), [
     ("b8090050b8000050", "b8021050b8250050"),
-    ("b8090050bb000053", "b8021050bb250053"),
-    ("680900680000", "680210682500"),
-    ("680900bb000053", "680210bb250053"),
-    ("b8090050680000", "b8021050682500"),
+    ("bb090053bb000053", "bb021053bb250053"),
 ])
 def test_vroomm_restores_flagged_far_pointer_pushes(encoded, restored, tmp_path, capsys):
     source, out = tmp_path / "vroomm.exe", tmp_path / "out"
@@ -183,9 +180,13 @@ def test_vroomm_restores_flagged_far_pointer_pushes(encoded, restored, tmp_path,
 
 @pytest.mark.parametrize(("code", "fixups", "entries"), [
     ("b8090050bb000050cb", (1,), (8, 0)),
-    ("6809006812009090cb", (1,), (8, 0)),
-    ("6809006800009090cb", (1,), (0, 0)),
-    ("6809006800009090cb", (1, 4), (8, 0)),
+    ("b8090050bb000053cb", (1,), (8, 0)),
+    ("6809006800009090cb", (1,), (8, 0)),
+    ("680900bb00005390cb", (1,), (8, 0)),
+    ("b809005068000090cb", (1,), (8, 0)),
+    ("b8090050b8120050cb", (1,), (8, 0)),
+    ("b8090050b8000050cb", (1,), (0, 0)),
+    ("b8090050b8000050cb", (1, 5), (8, 0)),
 ])
 def test_vroomm_reports_function_offsets_without_a_unique_valid_rewrite(code, fixups, entries):
     resident, (overlay,) = load_dos_mz(_vroomm(bytes.fromhex(code), fixups=fixups, entries=entries),
@@ -355,6 +356,36 @@ def test_original_pklite_add_output_when_available():
     )
 
 
+@pytest.mark.parametrize("clear_counts", [False, True])
+def test_original_link_member_with_leading_padding(clear_counts, tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_DOS_LINK_LAYOUT_DIR")):
+        pytest.skip("set RETRORE_DOS_LINK_LAYOUT_DIR to the LINK 3.65 LIVE365.EXE probe")
+    source = Path(directory) / "LIVE365.EXE"
+    original = source.read_bytes()
+    count_site = read_mz_header(original).header_size + 0x1260
+    assert unpack_from("<2H", original, count_site) == (4, 3)
+    if clear_counts:
+        source = tmp_path / "WITHOUT.EXE"
+        source.write_bytes(original[:count_site] + bytes(4) + original[count_site + 4:])
+
+    out = tmp_path / "link"
+    program = _command(capsys, "load", source, "-o", out)
+    _, first, second = program["units"]
+    assert "diagnostics" not in program
+    assert first["runtime_linear"] == second["runtime_linear"] == 0x10B00
+    assert second["segment_offsets"] == [0, 0x100]
+    assert second["size"] == 0x107
+    padding = _command(capsys, "bytes", "link_0002:0", "--export", out, "--size", "256")
+    assert padding["original"] == padding["loaded"] == bytes(256).hex()
+    proof = _command(capsys, "bytes", "link_0002:100", "--export", out, "--size", 7)
+    assert proof["original"] == "bac000b80700cb"
+    assert proof["loaded"] == (pack("<BH", 0xBA, second["segment"] + 0x10) + bytes.fromhex("b80700cb")).hex()
+    mapping = _command(capsys, "address-map", "10c00", "--from", "runtime", "--state", "link_0002", "--export", out)
+    match, = mapping["matches"]
+    assert match["unit"] == "link_0002"
+    assert match["file"]["offset"] == 0x1D00
+
+
 def test_original_dos_overlay_probe_outputs_when_available(tmp_path, capsys):
     if not (directory := os.environ.get("RETRORE_DOS_OVERLAY_PROBE_DIR")):
         pytest.skip("set RETRORE_DOS_OVERLAY_PROBE_DIR to the PADDED.EXE, VROOMM.EXE and VROOM86.EXE probe outputs")
@@ -385,6 +416,29 @@ def test_original_dos_overlay_probe_outputs_when_available(tmp_path, capsys):
         loaded = bytearray.fromhex(encoded)
         pack_into("<H", loaded, 1, stub["segment"])
         assert unpack_from("<H", loaded, offset_site)[0] == stub["offset"]
+        assert proof["loaded"] == loaded.hex()
+
+        # Exercise the original overlay bytes with the flag set and the offset changed
+        # from the resident stub to the function entry. TLINK emits the stub offset directly.
+        flagged = bytearray(binary.read_bytes())
+        site = proof["address"]["file"]["offset"]
+        encoded_segment, = unpack_from("<H", flagged, site + 1)
+        assert not encoded_segment & 7
+        pack_into("<H", flagged, site + 1, encoded_segment | 1)
+        pack_into("<H", flagged, site + offset_site, target["entries"][0])
+        modified = tmp_path / f"flagged-{filename}"
+        modified.write_bytes(flagged)
+        export = tmp_path / f"flagged-{binary.stem}"
+        program = _command(capsys, "load", modified, "-o", export)
+        if filename == "VROOMM.EXE":
+            diagnostic, = program["diagnostics"]
+            assert diagnostic["code"] == "overlay_fixups_partial"
+            assert "1 unresolved function-pointer offset" in diagnostic["message"]
+            pack_into("<H", loaded, offset_site, target["entries"][0])
+        else:
+            assert "diagnostics" not in program
+        proof = _command(capsys, "bytes", f"{caller['name']}:3", "--export", export, "--size", len(loaded))
+        assert proof["original"] == flagged[site:site + len(loaded)].hex()
         assert proof["loaded"] == loaded.hex()
 
 

@@ -250,26 +250,17 @@ def _read_vroomm(data: bytes, start: int, executable: MZExecutable,
     return overlays, diagnostics, end
 
 
-def _push_word_end(code: bytes, offset: int) -> int | None:
-    """Return the end of a word push whose immediate starts at offset."""
-    if not 0 < offset <= len(code) - _WORD.size:
-        return None
-    opcode = code[offset - 1]
-    end = offset + _WORD.size
-    if opcode == 0x68:
-        return end
-    if 0xB8 <= opcode <= 0xBF and opcode != 0xBC and end < len(code) and code[end] == opcode - 0x68:
-        return end + 1
-    return None
-
-
 def _function_ref_fixup(code: bytes, offset: int, descriptor: Descriptor | None) -> LinkedFixup | None:
-    # The fixup flag marks the segment push. Match both halves of the far pointer before
-    # replacing its offset with the resident stub offset in the analysis image.
-    segment_end = _push_word_end(code, offset)
-    if descriptor is None or segment_end is None or _push_word_end(code, segment_end + 1) is None:
+    # The overlay manager matches two adjacent MOV-immediate/PUSH pairs using the same register.
+    # The flag marks the immediate that holds the segment.
+    if descriptor is None or not 0 < offset <= len(code) - 7:
         return None
-    offset_site = segment_end + 1
+    move = code[offset - 1]
+    push = 0x50 + (move - 0xB8)
+    if (not 0xB8 <= move <= 0xBF or move == 0xBC or code[offset + 2] != push
+            or code[offset + 3] != move or code[offset + 6] != push):
+        return None
+    offset_site = offset + 4
     target, = _WORD.unpack_from(code, offset_site)
     matches = [index for index, entry in enumerate(descriptor.entries) if entry == target]
     if len(matches) != 1:

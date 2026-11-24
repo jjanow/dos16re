@@ -14,15 +14,14 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, Phase 12 validated PKLITE's XOR and ADD paths, the PKLITE COM decoder pointers,
-and original LINK and TLINK overlay outputs. DeluxePaint I exposed two Amiga loader assumptions.
-The parser now accepts nonzero reserved table words and retains exact-end symbols without
-seeding code there. Ghidra 12.2 imported 282 hunks and decompiled an overlay entry. The standalone
-suite passed 505 tests with 111 skipped, and the focused DOS and Amiga run passed all 51 tests
-with Ghidra and native inputs enabled.
+On 2026-11-23, LINK 3.65 and 5.01.21 probes switched between two overlays in DOSBox, including a
+member with 256 bytes of leading padding. A copy with its counts cleared verified the LINK fallback.
+TLINK 3.01 and 4.0 runtime checks narrowed flagged VROOMM pointer rewrites to adjacent
+`MOV`/`PUSH` pairs using the same register. The standalone suite passed 506 tests with 113 skipped.
+The focused DOS and Amiga suite passed 54 tests with native inputs and Ghidra 12.2.
 
-Resume native validation with LINK members whose first segment follows the shared window start,
-LINK directories without count words, and VROOMM outputs that flag pointer offsets for rewriting.
+Resume with untouched LINK outputs whose directory omits the counts or whose first listed segment
+for a member follows the window start, and untouched TLINK outputs that set the pointer-offset flag.
 
 ## Why
 
@@ -438,11 +437,19 @@ release. Continue with the analysis backlog below.
 **Validated with original tools.** PKLITE 1.15 registered small and large XOR outputs match their
 unpacked references. The PKZIP 2.04g installer exercises the ADD decoder and matches Deark on
 its image, entry, stack, and 24 relocations. The PKLITE 2.01 COM probe still decodes after its
-copyright fields are cleared. LINK 3.65 and 5.01.21 counted-directory probes agree with their
-linker maps, including a page-aligned shared window and padding between segments in the LINK 3.65
-member. Turbo C++ 1.01 and TLINK 3.01 produced immediate and `MOV`/`PUSH` far-pointer arguments
-that resolve to resident stubs. Both probes ran in DOSBox. Leading member padding, LINK directories
-without counts, and VROOMM pointer-offset rewrites still have synthetic coverage.
+copyright fields are cleared. LINK 3.05, 3.65, and 5.01.21 probes produced counted directories.
+In the runnable LINK 3.65 and 5.01.21 probes, the shared window begins at image offset `0xB00`.
+Member 2 begins with an uninitialized segment, and its first routine is page-aligned at `0xC00`.
+Both probes returned the expected values on alternating calls to the two members in DOSBox. The
+opt-in LINK 3.65 test checks the padding, relocation, and source offset with the native directory
+and with its count words cleared. Ghidra 12.2 kept the full padded member in the runtime view and
+decompiled `link_0002:0100` to a routine returning 7. [Microsoft LINK overlay placement](https://www.infania.net/misc/kbarchive/kb/032/Q32003/index.html)
+
+Turbo C++ 1.01 with TLINK 3.01 and Borland C++ 2.0 with TLINK 4.0 emitted resident stub offsets
+for the far-pointer probes. Setting the flag and substituting the function's overlay offset on
+copies of those binaries verified the runtime rewrite in DOSBox. The runtime pointer check passed
+for same-register `MOV`/`PUSH` pairs and failed for flagged immediate pushes and pairs using
+different registers. The loader reports these unsupported flagged offsets as unresolved.
 
 **Validated with an original Amiga release.** The 1986 DeluxePaint I executable has eight overlay
 nodes, including two children of `ov1_6`, and 66 table entries. Ghidra 12.2 imported 6,360

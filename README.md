@@ -243,11 +243,12 @@ default to offset `0000` and enter at the first input byte unless `--dos-entry` 
 
 Embedded Borland VROOMM banks and Microsoft LINK members are discovered from the executable.
 The loader exports native file offsets, applies verified fixups, and rewrites resolved VROOMM stubs.
-A VROOMM function-pointer fixup can resolve adjacent word pushes to a unique resident stub, including
-immediate pushes and `MOV`/`PUSH` pairs. LINK directories can be recovered from count fields or adjacent
-relocation-backed arrays corroborated by member fixups. Verified members share one runtime window,
-including any padding before their first code segment. Inspect `diagnostics` in JSON for unmatched
-trailers, unresolved VROOMM function-pointer offsets, and unidentified or ambiguous LINK directories.
+A flagged VROOMM function-pointer fixup resolves two adjacent `MOV reg,imm16` / `PUSH reg` pairs
+using the same register to a unique resident stub. LINK directories can be recovered from count
+fields or adjacent relocation-backed arrays corroborated by member fixups. Verified members share
+one runtime window, including any padding before their first routine. Inspect `diagnostics` in JSON
+for unmatched trailers, unresolved VROOMM function-pointer offsets, and unidentified or ambiguous
+LINK directories.
 
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the
@@ -1588,6 +1589,7 @@ Phase 12 has optional checks against original tool outputs and releases.
 | Environment variable | Inputs |
 |---|---|
 | `RETRORE_DOS_LOADER_DIR` | Microsoft LINK 3.65 `TEST2.EXE`, PKLITE 2.01 `PACK201.EXE` and `COM201.COM`, and their unpacked `PACK.EXE` and `testcom.com` counterparts |
+| `RETRORE_DOS_LINK_LAYOUT_DIR` | LINK 3.65 `LIVE365.EXE` with a 16-byte uninitialized CODE segment before a page-aligned routine in member 2. The test also checks a copy with the directory counts cleared. |
 | `RETRORE_VROOMM_DIR` | The TLINK 4.0 three-overlay `VROOMM.EXE` probe |
 | `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
 | `RETRORE_PKLITE_TESTEXE_DIR` | The `compress` directory with `t10fr` and `h10fr` EXE and UNC pairs from [testexe](https://github.com/camoto-project/testexe) |
