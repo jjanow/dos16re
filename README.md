@@ -214,9 +214,11 @@ offset lookup to that source.
 ## DOS loader
 
 The loader restores the original load module from EXEPACK, LZEXE 0.90, 0.91, and 0.91e, and supported
-PKLITE streams. PKLITE support covers standard small and large streams, recognized early extra
-compression variants, and recognized COM stubs. The loader applies segment relocations and records
-the original initial `CS:IP` and `SS:SP`. Unrecognized packed variants produce a coded error.
+PKLITE streams. PKLITE support covers standard small and large streams, recognized XOR- and
+ADD-scrambled EXE stubs, and v1.20 streams with encoded match distances and big-endian relocation
+offsets. The COM loader can follow recognized copier and decoder pointers when the copyright area
+is erased. The loader applies segment relocations and records the original initial `CS:IP` and
+`SS:SP`. Unrecognized packed variants produce a coded error.
 
 ```sh
 .venv/bin/retrore info PROGRAM.EXE
@@ -241,9 +243,11 @@ default to offset `0000` and enter at the first input byte unless `--dos-entry` 
 
 Embedded Borland VROOMM banks and Microsoft LINK members are discovered from the executable.
 The loader exports native file offsets, applies verified fixups, and rewrites resolved VROOMM stubs.
-A verified Microsoft segment directory produces a runtime state for each member even when the
-members reuse the same address. Inspect `diagnostics` in JSON for unmatched trailers, unresolved
-VROOMM function-pointer offsets, and LINK variants with an unidentified segment directory.
+A VROOMM function-pointer fixup can resolve adjacent word pushes to a unique resident stub, including
+immediate pushes and `MOV`/`PUSH` pairs. LINK directories can be recovered from count fields or adjacent
+relocation-backed arrays corroborated by member fixups. Verified members share one runtime window,
+including any padding before their first code segment. Inspect `diagnostics` in JSON for unmatched
+trailers, unresolved VROOMM function-pointer offsets, and unidentified or ambiguous LINK directories.
 
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the

@@ -14,15 +14,14 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, Phase 12 added DOS COM, raw and PKLITE loads, embedded LINK and VROOMM overlays,
-hierarchical Amiga overlays, and more Hunk fixups and debug records. Load manifests now carry
-bank and overlay states through address mapping, traces, and Ghidra. Disk and container catalogs
-share member selectors and source layout records. Microsoft LINK 3.65, Borland TLINK 4.0, and
-PKLITE 2.01 produced the DOS validation inputs. The standalone suite passed 487 tests with 106
-skipped. Ghidra 12.2 verified state views, public symbols, source lines, and Amiga overlay imports.
+On 2026-11-23, Phase 12 added PKLITE decoder variants, Microsoft LINK directory recovery with
+padded members, and VROOMM function-pointer fixups for additional word-push encodings. Synthetic
+DOS fixtures check decoded bytes, relocation targets, and source offsets. The standalone suite
+passed 504 tests with 106 skipped. The focused Ghidra 12.2 run passed 28 with two skipped and
+verified the LINK member's runtime placement.
 
-Resume with an original Amiga overlay release and additional native linker and packer variants
-as inputs become available. The remaining format-specific gaps are listed in Phase 12.
+Resume with native DOS tool outputs for the new cases and an original hierarchical Amiga overlay
+release. Both validation tasks are deferred.
 
 ## Why
 
@@ -417,10 +416,12 @@ release. Continue with the analysis backlog below.
 ### Phase 12: loader depth on supported platforms
 
 - **Implemented.** DOS COM and raw loads record the input byte range and initial segment registers.
-  PKLITE decodes recognized standard and early extra-compression streams and COM stubs. Microsoft
-  LINK and Borland VROOMM overlays retain their source offsets and recovered fixups. Validated
-  LINK directories supply a shared runtime window. VROOMM restores calls through verified resident
-  stubs. Partial layouts and unmapped trailers appear as diagnostics.
+  PKLITE recognizes additional XOR- and ADD-scrambled EXE stubs and COM decoder pointers. V1.20
+  decoding handles encoded match distances and the ADD variant's big-endian relocation offsets.
+  Microsoft LINK and Borland VROOMM overlays retain their source offsets and recovered fixups.
+  LINK recovers the shared runtime window from counted directories and adjacent arrays with matching
+  member fixups. VROOMM resolves flagged pointer pushes to verified resident stubs. Partial layouts
+  and unmapped trailers appear as diagnostics.
 - **Implemented.** Amiga Hunk overlay trees retain each node and its ancestry, active segment indices,
   table entries, and source offsets. The loader supports additional narrow absolute and PC-relative
   fixups, recognized LINE records, and the THOR 1.2 manager signature. DOS exports accept LINK and
@@ -433,10 +434,10 @@ release. Continue with the analysis backlog below.
   Exports preserve selection order, layout decisions, and member and file offsets. Synthetic tests
   cover these workflows. Original-tool outputs and releases use optional `RETRORE_*_DIR` inputs.
 
-Open validation includes additional PKLITE stubs and Microsoft LINK directory arrangements, VROOMM
-function-pointer fixup patterns beyond the recognized sequence, and an original hierarchical Amiga
-release. Amiga overlay trees establish coexistence. Captured placements supply physical scatter-load
-addresses for a run.
+Native DOS validation remains open for the new PKLITE stub paths, LINK directory arrangements, and
+VROOMM pointer-push encodings. Amiga validation still needs an original hierarchical overlay release.
+Amiga overlay trees establish coexistence. Captured placements supply physical scatter-load addresses
+for a run.
 
 ## Platform capability parity
 

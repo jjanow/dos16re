@@ -3,7 +3,7 @@
 from collections import defaultdict
 from struct import Struct
 
-from .mz import MZError, MZExecutable, read_mz_header, read_mz_relocations
+from .mz import Address, MZError, MZExecutable, read_mz_header, read_mz_relocations
 from .overlays import Descriptor, LinkedFixup, LinkedOverlay
 
 _WORD = Struct("<H")
@@ -12,6 +12,10 @@ _FB_HEADER = Struct("<4sIII")
 _FB_SEGMENT = Struct("<4H")
 _FB_DESCRIPTOR = Struct("<BBHI3H")
 _FB_STUB = Struct("<BBHB")
+_LINK_MAX_SEGMENTS = 256
+
+type _LinkMembers = dict[int, tuple[int, bytes, tuple[Address, ...]]]
+type _LinkDirectory = tuple[int, dict[int, tuple[int, ...]]]
 
 
 def _align(value: int, alignment: int) -> int:
@@ -45,39 +49,71 @@ def embedded_overlays(data: bytes, executable: MZExecutable, source: str,
     return overlays, diagnostics
 
 
-def _link_directory(executable: MZExecutable, members: dict[int, tuple]) -> tuple[dict[int, tuple[int, ...]], str | None]:
-    """Find the relocation-backed segment and overlay-number arrays from LINK 3.65."""
+def _link_directory_at(image: bytes, selectors: range, members: _LinkMembers) -> _LinkDirectory | None:
+    numbers = image[selectors.stop:selectors.stop + len(selectors)]
+    if len(numbers) != len(selectors) or numbers[0] != 0 or set(numbers) != {0, *members}:
+        return None
+    segments = defaultdict(set)
+    for number, position in zip(numbers, selectors, strict=True):
+        if number:
+            segments[number].add(_WORD.unpack_from(image, position)[0])
+    # LINK reserves one OVERLAY_AREA for all members. A member's first code segment can follow
+    # the start of that window if its segment alignment requires padding.
+    runtime = min(min(values) for values in segments.values())
+    for number, values in segments.items():
+        size = len(members[number][1])
+        if runtime * 16 + size > len(image) or (max(values) - runtime) * 16 >= size:
+            return None
+    return runtime, {number: tuple(sorted(values)) for number, values in segments.items()}
+
+
+def _link_directory(executable: MZExecutable, members: _LinkMembers) -> tuple[_LinkDirectory | None, str | None]:
+    """Find the resident selector words and matching overlay-number bytes."""
     image = executable.image
     positions = {site.linear for site in executable.relocations}
     candidates = []
-    for start in sorted(position - 4 for position in positions if position >= 4):
-        count, count_overlays = _PAIR.unpack_from(image, start)
-        if not 2 <= count <= 256 or not 2 <= count_overlays <= 256 or start + 4 + count * 3 > len(image):
+    overlay_count = max(members) + 1
+    for start in sorted(positions):
+        if start < _PAIR.size:
             continue
-        selectors = range(start + 4, start + 4 + 2 * count, 2)
-        if any(position not in positions for position in selectors):
+        count, count_overlays = _PAIR.unpack_from(image, start - _PAIR.size)
+        if not len(members) < count <= _LINK_MAX_SEGMENTS or count_overlays != overlay_count:
             continue
-        numbers = image[selectors.stop:selectors.stop + count]
-        if numbers[0] != 0 or count_overlays != max(numbers) + 1 or set(numbers) != {0, *members}:
-            continue
-        segments = defaultdict(list)
-        for number, position in zip(numbers, selectors, strict=True):
-            if number:
-                segments[number].append(_WORD.unpack_from(image, position)[0])
-        if any(max(values) * 16 >= len(image) or (max(values) - min(values)) * 16 >= len(members[number][1])
-               or min(values) * 16 + len(members[number][1]) > len(image)
-               for number, values in segments.items()):
-            continue
-        candidates.append({number: tuple(sorted(set(values))) for number, values in segments.items()})
+        selectors = range(start, start + _WORD.size * count, _WORD.size)
+        if all(position in positions for position in selectors):
+            directory = _link_directory_at(image, selectors, members)
+            if directory is not None:
+                candidates.append(directory)
+
+    if not candidates:
+        # Some layouts expose the adjacent arrays without the LINK 3.65 count words. Require
+        # a complete run of relocated selector words and independent support from member fixups.
+        # See https://github.com/fenugrec/overlazy for the paired arrays in Microsoft C 5.1 output.
+        for start in sorted(position for position in positions if position - _WORD.size not in positions):
+            end = start
+            while end in positions and end - start <= _WORD.size * _LINK_MAX_SEGMENTS:
+                end += _WORD.size
+            selectors = range(start, end, _WORD.size)
+            if not len(members) < len(selectors) <= _LINK_MAX_SEGMENTS:
+                continue
+            directory = _link_directory_at(image, selectors, members)
+            if directory is None:
+                continue
+            runtime, _ = directory
+            if any(relocations for _, _, relocations in members.values()) and all(
+                0 <= address.linear - runtime * 16 <= len(code) - _WORD.size
+                for _, code, relocations in members.values() for address in relocations
+            ):
+                candidates.append(directory)
     if len(candidates) != 1:
         reason = "could not locate" if not candidates else "found multiple candidates for"
-        return {}, f"{reason} the Microsoft LINK segment directory; overlay relocations and runtime addresses are unavailable"
+        return None, f"{reason} the Microsoft LINK segment directory; overlay relocations and runtime addresses are unavailable"
     return candidates[0], None
 
 
 def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
                base: int) -> tuple[list[LinkedOverlay], list[dict], int]:
-    members = {}
+    members: _LinkMembers = {}
     while True:
         content = memoryview(data)[start:]
         try:
@@ -96,13 +132,15 @@ def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
         start = locations[0]
 
     directory, reason = _link_directory(executable, members)
+    runtime, segments_by_member = directory if directory is not None else (None, {})
     overlays = []
     for number, (file_offset, image, relocations) in members.items():
         name = f"link_{number:04x}"
-        segments = directory.get(number, ())
-        runtime = segments[0] if segments else None
+        segments = segments_by_member.get(number, ())
         fixups = []
+        entries = ()
         if runtime is not None:
+            entries = tuple((segment - runtime) * 16 for segment in segments)
             for address in relocations:
                 offset = address.linear - runtime * 16
                 if not 0 <= offset <= len(image) - 2:
@@ -111,7 +149,6 @@ def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
                 fixups.append(LinkedFixup(offset, value - runtime, name) if value in segments else
                               LinkedFixup(offset, value))
         runtime_segment = None if runtime is None else base + runtime
-        entries = tuple((segment - runtime) * 16 for segment in segments)
         overlays.append(LinkedOverlay(source, name, image, file_offset, "MS_LINK", number,
                                       runtime_segment, entries, fixups=tuple(fixups)))
     diagnostics = [{"code": "overlay_layout_partial", "message": reason}] if reason else []
@@ -179,7 +216,11 @@ def _read_vroomm(data: bytes, start: int, executable: MZExecutable,
         fixups = []
         unresolved = 0
         unknown_flags = 0
-        for offset, in _WORD.iter_unpack(data[code_end:descriptor.end]):
+        offsets = tuple(offset for offset, in _WORD.iter_unpack(data[code_end:descriptor.end]))
+        segment_bytes = {byte for offset in offsets for byte in (offset, offset + 1)}
+        if len(segment_bytes) != len(offsets) * _WORD.size:
+            raise MZError(f"Borland VROOMM segment {descriptor.segment:04x} has overlapping fixups")
+        for offset in offsets:
             if offset + 2 > len(code):
                 raise MZError(f"Borland VROOMM fixup lies outside segment {descriptor.segment:04x}")
             value, = _WORD.unpack_from(code, offset)
@@ -190,11 +231,11 @@ def _read_vroomm(data: bytes, start: int, executable: MZExecutable,
             if flags & ~1:
                 unknown_flags += 1
             if flags & 1:
-                stub = _function_ref_stub(code, offset, descriptors.get(index))
-                if stub is None:
+                pointer = _function_ref_fixup(code, offset, descriptors.get(index))
+                if pointer is None or not segment_bytes.isdisjoint(range(pointer.offset, pointer.offset + _WORD.size)):
                     unresolved += 1
                 else:
-                    fixups.append(LinkedFixup(offset + 4, stub, segment=False))
+                    fixups.append(pointer)
         if unresolved:
             diagnostics.append({"code": "overlay_fixups_partial", "message":
                                 f"Borland VROOMM segment {descriptor.segment:04x} has "
@@ -209,14 +250,28 @@ def _read_vroomm(data: bytes, start: int, executable: MZExecutable,
     return overlays, diagnostics, end
 
 
-def _function_ref_stub(code: bytes, offset: int, descriptor: Descriptor | None) -> int | None:
-    # Borland emits MOV reg, segment / PUSH reg / MOV reg, offset / PUSH reg.
-    if descriptor is None or not 0 < offset <= len(code) - 7:
+def _push_word_end(code: bytes, offset: int) -> int | None:
+    """Return the end of a word push whose immediate starts at offset."""
+    if not 0 < offset <= len(code) - _WORD.size:
         return None
-    mov, push = code[offset - 1], code[offset + 2]
-    if not (0xB8 <= mov <= 0xBF and push == mov - 0x68 and
-            code[offset + 3] == mov and code[offset + 6] == push):
+    opcode = code[offset - 1]
+    end = offset + _WORD.size
+    if opcode == 0x68:
+        return end
+    if 0xB8 <= opcode <= 0xBF and opcode != 0xBC and end < len(code) and code[end] == opcode - 0x68:
+        return end + 1
+    return None
+
+
+def _function_ref_fixup(code: bytes, offset: int, descriptor: Descriptor | None) -> LinkedFixup | None:
+    # The fixup flag marks the segment push. Match both halves of the far pointer before
+    # replacing its offset with the resident stub offset in the analysis image.
+    segment_end = _push_word_end(code, offset)
+    if descriptor is None or segment_end is None or _push_word_end(code, segment_end + 1) is None:
         return None
-    target, = _WORD.unpack_from(code, offset + 4)
+    offset_site = segment_end + 1
+    target, = _WORD.unpack_from(code, offset_site)
     matches = [index for index, entry in enumerate(descriptor.entries) if entry == target]
-    return 32 + _FB_STUB.size * matches[0] if len(matches) == 1 else None
+    if len(matches) != 1:
+        return None
+    return LinkedFixup(offset_site, 32 + _FB_STUB.size * matches[0], segment=False)
