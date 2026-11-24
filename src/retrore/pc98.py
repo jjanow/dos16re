@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .d88 import D88Disk, D88Sector
 from .image import PC98_FORMAT, PC98_RAM_END
+from .members import Member
 from .mz import Address
 from .overlays import address_record
 
@@ -41,6 +42,7 @@ class HdmDisk:
             "format": "HDM", "media_type": "2HD", "cylinders": self._CYLINDERS, "heads": self._HEADS,
             "sectors_per_track": self._RECORDS, "sector_size": self._SECTOR_SIZE,
         }
+        self.member = Member("disk:1", "Disk 1", "disk", size=len(data), container_offset=0, details=self.metadata)
 
     def read_sectors(self, cylinder: int, head: int, record: int, count: int = 1) -> tuple[D88Sector, ...]:
         if not (0 <= cylinder < self._CYLINDERS and 0 <= head < self._HEADS
@@ -98,6 +100,9 @@ def build_pc98_image(
             cylinder, head, record = source.chs
             unit["disk_span"] = {"cylinder": cylinder, "head": head, "record": record, "count": len(source.sectors)}
             unit["file_offset"] = source.sectors[0].file_offset
+            if disk is not None:
+                unit["member_id"] = disk.member.id
+                unit["file_offset_kind"] = "container"
             if len(source.sectors) > 1:
                 offset = 0
                 spans = []

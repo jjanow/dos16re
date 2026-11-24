@@ -1,10 +1,12 @@
 """Read Atari DOS binary loads and ATR disks into a static XL/XE CPU view."""
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from itertools import groupby
 from struct import unpack_from
 
 from .image import ATARI8_FORMAT, MOS6502_ADDRESS_LIMIT, SourceSpan, slice_source_spans
+from .members import Member, select_member
 
 ATR_MAGIC = b"\x96\x02"
 XEX_MAGIC = b"\xff\xff"
@@ -117,13 +119,25 @@ class AtrImage:
             address += _BOOT_SECTOR_SIZE
         return Atari8Binary(tuple(segments), "boot", init_addresses=(init,), boot_entry=segments[0].address + 6)
 
+    def boot_member(self) -> Member:
+        _, count, address, init = unpack_from("<BBHH", self._sector(1))
+        count = count or 256
+        return Member("boot:1", "Boot sectors", "boot", count <= self.sector_count,
+                      size=count * _BOOT_SECTOR_SIZE, container_offset=_ATR_HEADER,
+                      details={"sectors": count, "load_address": address, "init_address": init})
+
+    @property
+    def has_directory(self) -> bool:
+        return self.sector_count >= 368 and self._sector(360)[0] == 2
+
     def read_file(self, name: str) -> bytes:
         return self.read_file_with_spans(name)[0]
 
     def read_file_with_spans(self, name: str) -> tuple[bytes, tuple[SourceSpan, ...]]:
-        if self.sector_count < 368 or self._sector(360)[0] != 2:
-            raise Atari8Error("ATR has no supported Atari DOS 2.x directory")
-        matches = []
+        _, contents, spans = self.extract_file(name)
+        return contents, spans
+
+    def _catalog(self) -> Iterator[tuple[Member, tuple[int, int, int]]]:
         for index in range(64):
             offset, slot = divmod(index, 8)
             directory = self._sector(361 + offset)
@@ -137,14 +151,21 @@ class AtrImage:
             stem = bytes(entry[5:13]).decode("ascii", errors="replace").rstrip()
             suffix = bytes(entry[13:16]).decode("ascii", errors="replace").rstrip()
             filename = f"{stem}.{suffix}" if suffix else stem
-            if filename.upper() == name.upper():
-                count, start = unpack_from("<HH", entry, 1)
-                matches.append((index, count, start))
-        if len(matches) != 1:
-            reason = "ambiguous" if matches else "not found"
-            raise Atari8Error(f"ATR disk member {name!r} {reason}")
+            count, start = unpack_from("<HH", entry, 1)
+            at, _ = self._sector_location(361 + offset)
+            yield Member(f"file:{index + 1}", filename, "file", container_offset=_ATR_HEADER + at + slot * 16,
+                         details={"sectors": count, "start_sector": start}), (index, count, start)
 
-        index, count, number = matches[0]
+    def list_members(self) -> list[Member]:
+        files = [member for member, _ in self._catalog()] if self.has_directory else []
+        return [self.boot_member(), *files]
+
+    def extract_file(self, selector: str) -> tuple[Member, bytes, tuple[SourceSpan, ...]]:
+        if not self.has_directory:
+            raise Atari8Error("ATR has no supported Atari DOS 2.x directory")
+        member, (index, count, number) = select_member(self._catalog(), selector, "ATR disk member", Atari8Error)
+
+        name = member.name
         contents = bytearray()
         spans = []
         seen = set()
@@ -165,7 +186,7 @@ class AtrImage:
             number = (sector[-3] & 3) << 8 | sector[-2]
         if len(seen) != count:
             raise Atari8Error(f"ATR disk member {name!r} has a mismatched sector count")
-        return bytes(contents), tuple(spans)
+        return member, bytes(contents), tuple(spans)
 
 
 @dataclass(frozen=True)
@@ -175,6 +196,7 @@ class Atari8Source:
     binary: Atari8Binary
     disk_file: str | None = None
     container_spans: tuple[SourceSpan, ...] = ()
+    member_id: str | None = None
 
 
 def memory_map(portb: int) -> list[dict]:
@@ -258,6 +280,8 @@ def build_atari8_image(
             "segments": segments, "run_address": binary.run_address, "init_addresses": binary.init_addresses,
             "boot_entry": binary.boot_entry, "unmapped_writes": unmapped_writes,
         })
+        if source.member_id is not None:
+            source_records[-1]["member_id"] = source.member_id
 
     ranges = []
     for index, addresses in groupby(range(MOS6502_ADDRESS_LIMIT), key=owners.__getitem__):
@@ -279,6 +303,10 @@ def build_atari8_image(
             "name": name, "kind": "ram", "linear": start, "size": size, "image_offset": start - origin,
             "file_size": size, "source": source.source, "disk_file": source.disk_file,
         }
+        if source.member_id is not None:
+            unit["member_id"] = source.member_id
+        if source.binary.kind == "boot":
+            unit["file_offset_kind"] = "container"
         spans = []
         for _, addresses in groupby(range(start, start + size), key=lambda address: file_offsets[address] - address):
             first = next(addresses)

@@ -44,7 +44,7 @@ def detect_packer(header: MZHeader, extra_header: bytes, image: bytes) -> str | 
         if extra_header.startswith((b"LZ09", b"LZ90", b"LZ91")):
             return "unknown LZEXE variant"
     if cs == -16 and header.initial_ip == 0x100 and header.relocation_count <= 2:
-        if extra_header[2:].startswith(b"PKLITE") or _PKLITE_ENTRY.match(stub):
+        if extra_header[2:8].lower() == b"pklite" or _PKLITE_ENTRY.match(stub):
             return "PKLITE"
     return None
 

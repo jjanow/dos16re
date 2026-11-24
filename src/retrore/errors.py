@@ -27,6 +27,8 @@ HINTS = {
     "project_mismatch": "Re-import the current export, or pass the export the project was built from.",
     "query_failed": "The query failed inside Ghidra. Read the message for details.",
     "unsupported_packer": "Unpack the program with an external tool, then load the unpacked file.",
+    "load_manifest_invalid": "Check the states, unit names, and runtime address ranges against the export.",
+    "toolchain_invalid": "Check that the linker listing or signature catalog matches the selected program.",
     "input_invalid": "Check the input file and options against the README section for its platform.",
     "io_error": "Check that the path exists and is readable or writable.",
 }

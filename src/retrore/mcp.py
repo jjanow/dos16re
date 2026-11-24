@@ -23,8 +23,9 @@ from typing import IO
 from . import worker
 from .cli import (
     HANDLED_ERRORS, _export_image, _hex_segment, _overlay_segments, _runtime_loads, build_program, error_report,
-    program_options,
+    member_options, program_options,
 )
+from .containers import inspect_members
 from .errors import CONTRACT_VERSION
 from .evidence import ADDRESS_SPACES, FILE_OFFSET_KINDS, MAX_BYTES, inspect_bytes, map_address
 from .ghidra import QUERY_TIMEOUT, GhidraError, cancellable, check_cancelled, check_timeout, query, query_batch
@@ -236,14 +237,16 @@ def _lookup_tool() -> dict:
 _EXPORT_EVIDENCE = {
     "bytes": ("Read initialized bytes before and after loader edits", {
         "size": {"type": "integer", "minimum": 1, "maximum": MAX_BYTES, "default": 32},
-        "source_file": {"type": "string", "minLength": 1, "description": "Original unpacked DOS MZ file"},
+        "source_file": {"type": "string", "minLength": 1, "description": "Original unpacked DOS file"},
     }),
     "address_map": ("Map a location across the address spaces of an export", {
         "space": {"type": "string", "enum": list(ADDRESS_SPACES), "default": "logical"},
         "source": {"type": "string", "minLength": 1},
         "member": {"type": "string", "minLength": 1},
         "offset_kind": {"type": "string", "enum": list(FILE_OFFSET_KINDS)},
-        "source_file": {"type": "string", "minLength": 1, "description": "Original unpacked DOS MZ file"},
+        "state": {"type": "string", "minLength": 1},
+        "all_states": {"type": "boolean"},
+        "source_file": {"type": "string", "minLength": 1, "description": "Original unpacked DOS file"},
         "runtime_base": {"type": "string", "pattern": "^[a-fA-F0-9]{1,4}$"},
         "overlay_segments": {"type": "array", "items": {"type": "string"},
                              "description": "DOS overlay placements as UNIT=HEX"},
@@ -273,11 +276,14 @@ _PROGRAM_TOOLS = {
             "and any selected disk members, overlays, units, or sectors, and return the program map.",
     "load": "Export a program image, as `retrore load --json` does: write image.bin and map.json to a new "
             "output directory and return the program map. Existing files are never overwritten.",
+    "members": "List a disk or container catalog, as `retrore members --json` does, with selectors accepted "
+               "by the info and load tools.",
 }
 
 
 def _program_parser(command: str) -> _ToolParser:
-    parser = _ToolParser(prog=f"retrore {command}", parents=[program_options()], add_help=False)
+    options = member_options() if command == "members" else program_options()
+    parser = _ToolParser(prog=f"retrore {command}", parents=[options], add_help=False)
     if command == "load":
         parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT",
                             help="new or empty directory for image.bin and map.json")
@@ -358,6 +364,8 @@ def _program_argv(command: str, arguments: dict) -> list[str]:
 
 def _call_program(command: str, arguments: dict) -> dict:
     args = _program_parser(command).parse_args(_program_argv(command, arguments))
+    if command == "members":
+        return inspect_members(args.program, args.format, args.apple2_disk_order)
     args.command = command
     image, program_map, _ = build_program(args)
     if command == "load":
@@ -517,7 +525,9 @@ def _call_evidence(name: str, arguments: dict) -> dict:
                        source=_optional(arguments, "source", str), member=_optional(arguments, "member", str),
                        runtime_base=base, overlay_segments=_overlay_segments(segments),
                        runtime_loads=_runtime_loads(loads), source_file=source_file,
-                       offset_kind=_optional(arguments, "offset_kind", str))
+                       offset_kind=_optional(arguments, "offset_kind", str),
+                       state=_optional(arguments, "state", str),
+                       all_states=_optional(arguments, "all_states", bool) or False)
 
 
 def call_tool(name: str, arguments: dict) -> dict:

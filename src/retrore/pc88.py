@@ -22,14 +22,15 @@ def disk_source(
     for sector in disk.read_sectors(cylinder, head, record, count):
         spans.append(SourceSpan(len(payload), sector.file_offset, len(sector.data)))
         payload.extend(sector.data)
-    return Z80Source(name, filename, address, bytes(payload), file_spans=tuple(spans))
+    return Z80Source(name, filename, address, bytes(payload), file_spans=tuple(spans), member_id=disk.member.id)
 
 
 def boot_source(disk: D88Disk, filename: str) -> Z80Source:
     sector, = disk.read_sectors(0, 0, 1)
     if len(sector.data) != 256 or sector.size_code != 1:
         raise Pc88Error("PC-88 boot requires a 256-byte sector at 0:0:1")
-    return Z80Source("root", filename, BOOT_ADDRESS, sector.data, file_offset=sector.file_offset)
+    return Z80Source("root", filename, BOOT_ADDRESS, sector.data, file_offset=sector.file_offset,
+                     member_id=disk.member.id)
 
 
 def copy_source(sources: list[Z80Source], address: int, size: int, destination: int) -> Z80Source:

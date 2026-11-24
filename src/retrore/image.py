@@ -95,6 +95,23 @@ class ImageUnit:
         return {"address": address, "unit_address": f"{self.name}:{offset:04x}", "linear": linear}
 
 
+@dataclass(frozen=True)
+class RuntimeSpan:
+    linear: int
+    unit: ImageUnit
+    offset: int
+    size: int
+
+    @property
+    def end(self) -> int:
+        return self.linear + self.size
+
+
+def runtime_spans(units: list[ImageUnit], placements: dict[str, int]) -> list[RuntimeSpan]:
+    return sorted((RuntimeSpan(placements[unit.name], unit, 0, unit.size)
+                   for unit in units if unit.name in placements and unit.size), key=lambda span: span.linear)
+
+
 def dos_runtime_units(
     units: list[ImageUnit], root_segment: int | None, overlay_segments: dict[str, int],
 ) -> list[tuple[int, ImageUnit]]:
@@ -140,7 +157,7 @@ def explicit_runtime_units(
         if key in overrides:
             raise RuntimePlacementError(f"runtime placement specified twice for {name}")
         overrides[key] = start
-    limit = _FLAT_LIMITS.get(image_format, 0x100000)
+    limit = runtime_limit(image_format)
     ranges = []
     for unit in units:
         start = overrides.get(unit.name.casefold(), unit.linear)
@@ -155,6 +172,10 @@ def explicit_runtime_units(
         if start + unit.size > next_start:
             raise RuntimePlacementError(f"runtime ranges overlap for {unit.name} and {next_unit.name}")
     return {unit.name: start for start, unit in ranges}
+
+
+def runtime_limit(image_format: str) -> int:
+    return _FLAT_LIMITS.get(image_format, 0x100000)
 
 
 def read_map(export: Path) -> dict:

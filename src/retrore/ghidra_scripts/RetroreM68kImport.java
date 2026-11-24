@@ -9,6 +9,7 @@ import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.util.headless.HeadlessScript;
+import ghidra.program.database.sourcemap.SourceFile;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
@@ -40,6 +41,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -123,6 +125,7 @@ public class RetroreM68kImport extends HeadlessScript {
         }
 
         int relocations = 0;
+        int sourceLines = 0;
         for (var item : units) {
             monitor.checkCancelled();
             var unit = item.getAsJsonObject();
@@ -137,14 +140,28 @@ public class RetroreM68kImport extends HeadlessScript {
                 var site = start.addNoWrap(fixup.get("offset").getAsLong());
                 long value = fixup.get("value").getAsLong();
                 int width = fixup.has("width") ? fixup.get("width").getAsInt() : 4;
-                byte[] original = ByteBuffer.allocate(4).putInt(fixup.get("original").getAsInt()).array();
-                if (width == 2) {
-                    original = new byte[] {original[2], original[3]};
-                }
-                currentProgram.getRelocationTable().add(site, Relocation.Status.APPLIED, relocationType,
+                byte[] word = ByteBuffer.allocate(4).putInt(fixup.get("original").getAsInt()).array();
+                byte[] original = Arrays.copyOfRange(word, 4 - width, 4);
+                int type = fixup.has("record") ? fixup.get("record").getAsInt() : relocationType;
+                currentProgram.getRelocationTable().add(site, Relocation.Status.APPLIED, type,
                     new long[] {value}, original, null);
                 relocations++;
-                if (width == 4 && !block.isExecute() && memory.contains(address(value)) &&
+                if (fixup.has("target_linear") && !block.isExecute()) {
+                    var target = address(fixup.get("target_linear").getAsLong());
+                    if (memory.contains(target)) {
+                        if (listing.getUndefinedDataAt(site) != null &&
+                                listing.getUndefinedDataAt(site.addNoWrap(width - 1)) != null) {
+                            listing.createData(site, switch (width) {
+                                case 1 -> ByteDataType.dataType;
+                                case 2 -> WordDataType.dataType;
+                                case 4 -> DWordDataType.dataType;
+                                default -> throw new IllegalArgumentException("Unsupported Hunk relocation width");
+                            });
+                        }
+                        currentProgram.getReferenceManager().addMemoryReference(site, target, RefType.DATA,
+                            SourceType.IMPORTED, 0);
+                    }
+                } else if (width == 4 && !block.isExecute() && memory.contains(address(value)) &&
                         listing.getUndefinedDataAt(site) != null &&
                         listing.getUndefinedDataAt(site.addNoWrap(3)) != null) {
                     listing.createData(site, PointerDataType.dataType);
@@ -157,6 +174,9 @@ public class RetroreM68kImport extends HeadlessScript {
                 if (!name.isEmpty() && offset >= 0 && offset < block.getSize()) {
                     currentProgram.getSymbolTable().createLabel(start.addNoWrap(offset), name, SourceType.IMPORTED);
                 }
+            }
+            if (unit.has("source_lines")) {
+                sourceLines += addSourceLines(start, unit.getAsJsonArray("source_lines"));
             }
         }
 
@@ -225,6 +245,20 @@ public class RetroreM68kImport extends HeadlessScript {
         } else {
             seedEntry(map.getAsJsonObject("entry"));
         }
+        if (sourceLines != 0) {
+            report.put("source_lines", sourceLines);
+        }
+        if (map.has("overlay_tree")) {
+            var entries = map.getAsJsonObject("overlay_tree").getAsJsonArray("entries");
+            Set<Long> seeded = new HashSet<>();
+            for (var item : entries) {
+                var entry = item.getAsJsonObject();
+                if (entry.get("entry_point").getAsBoolean() && seeded.add(entry.get("linear").getAsLong())) {
+                    seedEntry(entry);
+                }
+            }
+            report.put("overlay_entries", seeded.size());
+        }
         if (map.has("jump_tables")) {
             report.put("switches", switches);
         }
@@ -233,6 +267,29 @@ public class RetroreM68kImport extends HeadlessScript {
             report.put("line_f", lineFReport());
         }
         return report;
+    }
+
+    private int addSourceLines(Address start, JsonArray lines) throws Exception {
+        var sourceMap = currentProgram.getSourceFileManager();
+        Map<String, SourceFile> files = new HashMap<>();
+        int mapped = 0;
+        for (var element : lines) {
+            monitor.checkCancelled();
+            var line = element.getAsJsonObject();
+            String name = line.get("file").getAsString();
+            var location = start.addNoWrap(line.get("offset").getAsLong());
+            int number = line.get("line").getAsInt();
+            try {
+                var file = files.computeIfAbsent(name, path -> new SourceFile(path.startsWith("/") ? path : "/" + path));
+                sourceMap.addSourceFile(file);
+                sourceMap.addSourceMapEntry(file, number, location, 0);
+                mapped++;
+            } catch (IllegalArgumentException error) {
+                // A toolchain may record an Amiga path that cannot be represented as a Ghidra source file.
+                currentProgram.getListing().setComment(location, CodeUnit.EOL_COMMENT, name + ":" + number);
+            }
+        }
+        return mapped;
     }
 
     private void seedEntry(JsonObject record) throws Exception {

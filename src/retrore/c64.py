@@ -7,6 +7,7 @@ from itertools import accumulate
 from struct import unpack_from
 
 from .image import C64_FORMAT, MOS6502_ADDRESS_LIMIT, SourceSpan, slice_source_spans
+from .members import Member, select_member
 
 DEFAULT_BANK = 7
 _SECTOR_SIZE = 256
@@ -50,22 +51,38 @@ class D64Image:
         return self.read_prg_with_spans(name)[0]
 
     def read_prg_with_spans(self, name: str) -> tuple[bytes, tuple[SourceSpan, ...]]:
-        if not name.isascii() or not 1 <= len(name) <= 16:
+        _, contents, spans = self.extract_prg(name)
+        return contents, spans
+
+    def _catalog(self) -> Iterator[tuple[Member, tuple[int, int]]]:
+        types = ("DEL", "SEQ", "PRG", "USR", "REL")
+        for offset, block in self._chain(18, 1):
+            for slot in range(0, _SECTOR_SIZE, 32):
+                flag = block[slot + 2]
+                if not flag:
+                    continue
+                kind = flag & 7
+                name = bytes(block[slot + 5:slot + 21]).rstrip(b"\xa0").decode("ascii", errors="replace")
+                at = offset + slot + 2
+                track, sector = block[slot + 3:slot + 5]
+                blocks = unpack_from("<H", block, slot + 30)[0]
+                yield Member(f"file:{at:x}", name, "file", flag & 0x87 == 0x82, container_offset=at,
+                             details={"type": types[kind] if kind < len(types) else str(kind),
+                                      "closed": bool(flag & 0x80), "blocks": blocks,
+                                      "track": track, "sector": sector}), (track, sector)
+
+    def list_members(self) -> list[Member]:
+        return [member for member, _ in self._catalog()]
+
+    def extract_prg(self, selector: str) -> tuple[Member, bytes, tuple[SourceSpan, ...]]:
+        if not selector.lower().startswith("id:") and (not selector.isascii() or not 1 <= len(selector) <= 16):
             raise C64Error("expected a D64 filename of 1 to 16 ASCII characters")
-        encoded = name.upper().encode("ascii").ljust(16, b"\xa0")
-        matches = []
-        for _, block in self._chain(18, 1):
-            for offset in range(0, _SECTOR_SIZE, 32):
-                file_type = block[offset + 2]
-                if file_type & 0x87 == 0x82 and block[offset + 5:offset + 21] == encoded:
-                    matches.append(tuple(block[offset + 3:offset + 5]))
-        if len(matches) != 1:
-            reason = "ambiguous" if matches else "not found"
-            raise C64Error(f"D64 PRG {name!r} {reason}")
+        entries = (entry for entry in self._catalog() if entry[0].selectable)
+        member, location = select_member(entries, selector, "D64 PRG", C64Error)
 
         contents = bytearray()
         spans = []
-        for offset, block in self._chain(*matches[0]):
+        for offset, block in self._chain(*location):
             next_track, link = block[:2]
             if next_track == 0 and link == 0:
                 raise C64Error("invalid final D64 file sector length")
@@ -73,7 +90,7 @@ class D64Image:
             if end > 2:
                 spans.append(SourceSpan(len(contents), offset + 2, end - 2))
             contents.extend(block[2:end])
-        return bytes(contents), tuple(spans)
+        return member, bytes(contents), tuple(spans)
 
 
 @dataclass(frozen=True)
@@ -84,6 +101,7 @@ class PrgUnit:
     address: int | None = None
     disk_file: str | None = None
     container_spans: tuple[SourceSpan, ...] = ()
+    member_id: str | None = None
 
 
 def memory_map(bank: int) -> list[dict]:
@@ -175,6 +193,8 @@ def build_c64_image(
             "image_offset": address - origin, "file_offset": 2, "file_size": len(payload),
             "load_address": file_address, "source": unit.source, "disk_file": unit.disk_file,
         })
+        if unit.member_id is not None:
+            records[-1]["member_id"] = unit.member_id
         if unit.container_spans:
             records[-1]["container_spans"] = [asdict(span) for span in slice_source_spans(
                 unit.container_spans, 2, len(payload),

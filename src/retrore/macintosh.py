@@ -6,6 +6,7 @@ from struct import Struct, pack_into, unpack_from
 from .errors import CodedError
 from .hfs import HfsDisk, is_hfs_disk
 from .image import DEFAULT_M68K_BASE, MAC68K_FORMAT, MAP_VERSION, M68K_ADDRESS_LIMIT
+from .members import Member, record_container
 
 _FORK_HEADER = Struct(">4I")
 _APPLE_FORKS = {b"\0\x05\x16\0": "applesingle", b"\0\x05\x16\x07": "appledouble"}
@@ -124,6 +125,24 @@ def _parse_resources(fork: bytes) -> dict[tuple[bytes, int], _Resource]:
     return resources
 
 
+def _application_member(program: str, offset: int, size: int) -> Member:
+    return Member("application", program, "resource_fork", size=size, container_offset=offset)
+
+
+def list_macintosh_members(data: bytes, program: str) -> tuple[str, list[Member]]:
+    if is_hfs_disk(data):
+        disk = HfsDisk(data)
+        return disk.container, disk.list_members()
+    fork, offset, wrapper = _resource_fork(data)
+    members = [_application_member(program, offset, len(fork))]
+    for resource in _parse_resources(fork).values():
+        kind = resource.type.decode("mac_roman")
+        members.append(Member(f"resource:{resource.type.hex()}:{resource.id}", resource.name or f"{kind} {resource.id}",
+                              "resource", False, resource.size, offset + resource.offset,
+                              {"type": kind, "resource_id": resource.id}))
+    return wrapper, members
+
+
 def _source_spans(
     spans: tuple[tuple[int, int, int], ...], offset: int, size: int, unit_offset: int = 0,
 ) -> list[dict]:
@@ -203,13 +222,19 @@ def build_macintosh_image(
     """Place all classic CODE segments and the A5 world in a fixed analysis address space."""
     if not 0 <= base < M68K_ADDRESS_LIMIT or base % 2:
         raise MacintoshError("Macintosh base address must be even and within the 24-bit address space")
-    if is_hfs_disk(data) or disk_file is not None:
+    selection_mode = "explicit" if disk_file is not None else "default"
+    if is_hfs_disk(data):
         disk = HfsDisk(data)
         member = disk.read_resource_fork(disk_file)
         fork, spans, wrapper, disk_file = member.data, member.spans, disk.container, member.name
+        selected = member.member
     else:
         fork, offset, wrapper = _resource_fork(data)
+        selected = _application_member(program, offset, len(fork))
+        if disk_file is not None and disk_file.casefold() != selected.selector:
+            raise MacintoshError("select the complete Macintosh resource fork with --member id:application")
         spans = ((0, offset, len(fork)),)
+        disk_file = None
     resources = _parse_resources(fork)
     code0 = resources.get((_CODE, 0))
     if code0 is None or code0.size < _CODE0_HEADER.size:
@@ -247,7 +272,9 @@ def build_macintosh_image(
             if len(placement) > 1:
                 unit["file_spans"] = placement
             if disk_file is not None:
-                unit.update(disk_file=disk_file, file_offset_kind="container")
+                unit["disk_file"] = disk_file
+            if wrapper != "resource_fork":
+                unit["file_offset_kind"] = "container"
         if resource is not None:
             unit.update(resource_type=resource.type.decode("mac_roman"), resource_id=resource.id)
             if resource.name is not None:
@@ -298,7 +325,9 @@ def build_macintosh_image(
             span for destination, offset, size in copies for span in _source_spans(spans, offset, size, destination)
         ])
         if disk_file is not None:
-            globals_.update(disk_file=disk_file, file_offset_kind="container")
+            globals_["disk_file"] = disk_file
+        if wrapper != "resource_fork":
+            globals_["file_offset_kind"] = "container"
         data_reloc = resources.get((b"DREL", 0))
         if data_reloc is not None:
             _apply_think_relocations(image, fork, data_reloc, globals_, below, a5, string_unit["linear"])
@@ -341,6 +370,10 @@ def build_macintosh_image(
     }
     if disk_file is not None:
         program_map["disk_file"] = disk_file
+    record_container(program_map, wrapper, [selected], decisions={"selection": selection_mode})
+    for unit in units:
+        if unit.get("source") == program:
+            unit["member_id"] = selected.id
     pending = [resource for key, resource in resources.items()
                if resource.type in (b"CREL", b"DREL", b"DATA", b"STRS", b"ZERO") and key not in applied]
     if pending:

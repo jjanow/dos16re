@@ -17,7 +17,7 @@ from retrore.errors import CONTRACT_VERSION, HINTS
 from retrore.mcp import tools
 from retrore.queries import QUERIES, QueryError, validate_query
 from retrore.schema import DIALECT, query_schema
-from test_c64 import _prg
+from test_c64 import _disk, _prg
 from test_errors import _FAKE, _wait_dead
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -269,7 +269,8 @@ def test_batch_schema_rejects_invalid_arrays():
 def test_tool_schemas_follow_the_registry():
     document = query_schema()
     listed = {tool["name"]: tool for tool in tools()}
-    assert list(listed) == [*QUERIES, "batch", "where_is", "relocations", "lookup", "bytes", "address_map", "info", "load"]
+    assert list(listed) == [*QUERIES, "batch", "where_is", "relocations", "lookup", "bytes", "address_map", "info", "load",
+                            "members"]
     for command in QUERIES:
         request, schema = document["$defs"][f"{command}_request"], listed[command]["inputSchema"]
         assert schema["$schema"] == DIALECT and schema["type"] == "object"
@@ -535,6 +536,20 @@ def test_mcp_info_and_load_match_the_cli(tmp_path, capsys):
         assert result["isError"] is True, identifier
         error = result["structuredContent"]["error"]
         assert (error["code"], error["message"][:len(message)]) == (code, message), identifier
+
+
+def test_mcp_members_and_selection_match_cli(tmp_path, capsys):
+    program = tmp_path / "test.d64"
+    program.write_bytes(_disk(_prg(0x2000, b"\x60" + bytes(256))))
+    assert main(["members", str(program), "--json"]) == 0
+    catalog = json.loads(capsys.readouterr().out)
+    member, = catalog["members"]
+    responses = _session([
+        *_initialize(), _call(1, "members", {"program": str(program)}),
+        _call(2, "info", {"program": str(program), "member": [member["selector"]]}),
+    ])
+    assert responses[1]["result"]["structuredContent"] == catalog
+    assert responses[2]["result"]["structuredContent"]["container_layout"]["members"] == [member]
 
 
 def _read_response(process: subprocess.Popen, seconds: float = 30) -> dict:

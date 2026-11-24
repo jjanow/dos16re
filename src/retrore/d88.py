@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from itertools import groupby
 from struct import unpack_from
 
+from .members import Member
+
 _SHORT_HEADER_SIZE = 0x2A0
 _SHORT_TRACK_COUNT = 160
 _TRACK_COUNT = 164
@@ -27,8 +29,8 @@ class D88Sector:
 class D88Disk:
     """One disk from a possibly concatenated D88 image."""
 
-    def __init__(self, data: bytes, index: int = 1):
-        self._data = data
+    @staticmethod
+    def list_members(data: bytes) -> list[Member]:
         disks = []
         offset = 0
         while offset < len(data):
@@ -37,11 +39,26 @@ class D88Disk:
             size, = unpack_from("<I", data, offset + 0x1C)
             if not _SHORT_HEADER_SIZE <= size <= len(data) - offset:
                 raise D88Error("invalid D88 disk size")
-            disks.append((offset, size))
+            index = len(disks) + 1
+            media = data[offset + 0x1B]
+            label = data[offset:offset + 0x11].split(b"\0", 1)[0].decode("cp932", errors="replace")
+            disks.append(Member(f"disk:{index}", label or f"Disk {index}", "disk", size=size,
+                                container_offset=offset, details={
+                                    "index": index, "label": label, "media_type": _MEDIA_TYPES.get(media, f"0x{media:02x}"),
+                                    "write_protected": bool(data[offset + 0x1A]),
+                                }))
             offset += size
+        if not disks:
+            raise D88Error("empty D88 container")
+        return disks
+
+    def __init__(self, data: bytes, index: int = 1):
+        self._data = data
+        disks = self.list_members(data)
         if not 1 <= index <= len(disks):
             raise D88Error(f"D88 disk index {index} is out of range ({len(disks)} disks)")
-        self._offset, size = disks[index - 1]
+        self.member = disks[index - 1]
+        self._offset, size = self.member.container_offset, self.member.size
         table_start = self._offset + 0x20
         tracks = unpack_from(f"<{_SHORT_TRACK_COUNT}I", data, table_start)
         if size != _SHORT_HEADER_SIZE and _SHORT_HEADER_SIZE not in tracks:
@@ -60,11 +77,7 @@ class D88Disk:
         media = data[self._offset + 0x1B]
         self._heads = 1 if media in (0x30, 0x40) else 2
         self.metadata = {
-            "format": "D88", "index": index, "image_count": len(disks),
-            "label": data[self._offset:self._offset + 0x11].split(b"\0", 1)[0].decode("cp932", errors="replace"),
-            "media_type": _MEDIA_TYPES.get(media, f"0x{media:02x}"),
-            "write_protected": bool(data[self._offset + 0x1A]),
-            "track_count": len(starts),
+            "format": "D88", "image_count": len(disks), **self.member.details, "track_count": len(starts),
         }
 
     def _track(self, index: int) -> list[D88Sector]:

@@ -85,6 +85,11 @@ class Emulator:
                 self._units[name] = (segment, size)
             stack = program_map.get("stack") if image_format == PC98_FORMAT else program_map["stack"]
             self._stack = Address(0x9000, 0xFFFE) if stack is None else _map_address(stack)
+            self._initial_segments = program_map.get("initial_segments", {})
+            if (not isinstance(self._initial_segments, dict)
+                    or any(name not in ("ds", "es") or not _word(value)
+                           for name, value in self._initial_segments.items())):
+                raise ValueError("invalid initial data segments")
             self._stubs = {
                 _map_address(stub["address"]).linear: _map_address(stub["target"])
                 for stub in program_map.get("stubs", ())
@@ -144,7 +149,7 @@ class Emulator:
         if type(limit) is not int or not 0 < limit < maxsize:
             raise EmulatorError("instruction limit must be a positive supported integer")
         start = self.resolve(address)
-        initial = {"ss": self._stack.segment, "sp": self._stack.offset, "flags": 2}
+        initial = {"ss": self._stack.segment, "sp": self._stack.offset, "flags": 2, **self._initial_segments}
         for name, value in (regs or {}).items():
             register = name.lower()
             if register not in _SETTABLE:

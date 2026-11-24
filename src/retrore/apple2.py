@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from struct import unpack_from
 
 from .image import APPLE2_FORMAT, MOS6502_ADDRESS_LIMIT, SourceSpan, slice_source_spans
+from .members import Member, select_member
 
 DEFAULT_LC = 0xC082
 DISK_SUFFIXES = (".dsk", ".do", ".po", ".d13")
@@ -129,20 +130,38 @@ class SectorImage:
                     yield _filename(entry[:24]), entry
 
     def read_binary(self, name: str) -> Binary:
+        return self.extract_binary(name)[1]
+
+    def _catalog(self) -> Iterator[tuple[Member, memoryview]]:
         dos = self.filesystem == "DOS 3.3"
         catalog = self._dos_catalog() if dos else self._rdos_catalog()
-        matches = [entry for member, entry in catalog if member.upper() == name.upper()]
-        if len(matches) != 1:
-            reason = "ambiguous" if matches else "not found"
-            raise Apple2Error(f"Apple II disk member {name!r} {reason}")
-        entry = matches[0]
-        if dos:
-            if entry[2] & 0x7F != 4:
-                raise Apple2Error(f"Apple DOS disk member {name!r} is not a binary (type B)")
-            return self._read_dos_binary(entry, name)
-        if entry[24] & 0x7F != ord("B"):
-            raise Apple2Error(f"RDOS disk member {name!r} is not a binary (type B)")
-        return self._read_rdos_binary(entry, name)
+        for index, (name, entry) in enumerate(catalog, 1):
+            if dos:
+                kind = entry[2] & 0x7F
+                binary = kind == 4
+                size = None
+                details = {"type": {0: "T", 1: "I", 2: "A", 4: "B", 8: "S"}.get(kind, f"0x{kind:02x}"),
+                           "sectors": unpack_from("<H", entry, 33)[0]}
+            else:
+                kind = entry[24] & 0x7F
+                binary = kind == ord("B")
+                address, size, start = unpack_from("<HHH", entry, 26)
+                details = {"type": chr(kind), "sectors": entry[25], "start_sector": start}
+                if binary:
+                    details["load_address"] = address
+            yield Member(f"file:{index}", name, "file", binary, size=size, details=details), entry
+
+    def list_members(self) -> list[Member]:
+        return [member for member, _ in self._catalog()]
+
+    def extract_binary(self, selector: str) -> tuple[Member, Binary]:
+        member, entry = select_member(self._catalog(), selector, "Apple II disk member", Apple2Error)
+        dos = self.filesystem == "DOS 3.3"
+        if not member.selectable:
+            name = "Apple DOS" if dos else "RDOS"
+            raise Apple2Error(f"{name} disk member {member.name!r} is not a binary (type B)")
+        read = self._read_dos_binary if dos else self._read_rdos_binary
+        return member, read(entry, member.name)
 
     def _read_dos_binary(self, entry: memoryview, name: str) -> Binary:
         sectors = {}
@@ -190,6 +209,7 @@ class Apple2Unit:
     binary: Binary
     address: int | None = None
     disk_file: str | None = None
+    member_id: str | None = None
 
 
 def memory_map(lc: int) -> list[dict]:
@@ -260,6 +280,8 @@ def build_apple2_image(
             "load_address": unit.binary.load_address, "source": unit.source, "disk_file": unit.disk_file,
             "writable": address < 0xC000 or bool(lc & 1),
         })
+        if unit.member_id is not None:
+            records[-1]["member_id"] = unit.member_id
         if unit.binary.container_spans:
             records[-1]["container_spans"] = [asdict(span) for span in unit.binary.container_spans]
         previous_end = end

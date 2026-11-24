@@ -37,6 +37,28 @@ class Descriptor:
         return self.file_offset + self.code_size + self.fixup_size
 
 
+@dataclass(frozen=True)
+class LinkedFixup:
+    offset: int
+    value: int
+    target_unit: str | None = None
+    segment: bool = True
+
+
+@dataclass(frozen=True)
+class LinkedOverlay:
+    source: str
+    name: str
+    image: bytes
+    file_offset: int
+    format: str
+    number: int
+    runtime_segment: int | None = None
+    entries: tuple[int, ...] = ()
+    descriptor: Descriptor | None = None
+    fixups: tuple[LinkedFixup, ...] = ()
+
+
 def address_record(address: Address) -> dict[str, int]:
     return {"segment": address.segment, "offset": address.offset, "linear": address.linear}
 
@@ -105,12 +127,15 @@ class _Unit:
     segment: int | None
     descriptor: Descriptor | None = None
     fixups: tuple[int, ...] = ()
+    linked: LinkedOverlay | None = None
 
 
-def _read_units(root: bytes, overlays: list[Overlay]) -> list[_Unit]:
+def _read_units(root: bytes, overlays: list[Overlay | LinkedOverlay]) -> list[_Unit]:
     units = []
     for overlay in overlays:
-        if overlay.image.startswith((b"FBOV", b"TPOV")):
+        if isinstance(overlay, LinkedOverlay):
+            units.append(_Unit(overlay.name, overlay.source, overlay.image, None, overlay.descriptor, linked=overlay))
+        elif overlay.image.startswith((b"FBOV", b"TPOV")):
             if overlay.segment is not None:
                 raise MZError("Turbo Pascal units use automatic segment placement")
             for unit in _directory(root, overlay.image):
@@ -236,7 +261,9 @@ def _add_jump_tables(image: bytes, program_map: dict) -> None:
     for unit in units:
         is_root = unit["name"] == "root"
         end = unit["image_offset"] + unit["size"]
-        segments = _root_code_segments(image, program_map) if is_root else [unit["segment"]]
+        segments = _root_code_segments(image, program_map) if is_root else [unit["segment"], *(
+            unit["segment"] + offset // 16 for offset in unit.get("segment_offsets", ()) if offset
+        )]
         found = {}
         # A site belongs to the nearest code segment at or below it whose table validates.
         for segment in segments:
@@ -256,7 +283,8 @@ def _add_jump_tables(image: bytes, program_map: dict) -> None:
 def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
     _add_jump_tables(image, program_map)
     units = program_map["units"]
-    compiler = detect_compiler(root, pascal_overlays=any("file_offset" in unit for unit in units[1:]))
+    compiler = detect_compiler(root, pascal_overlays=any("file_offset" in unit and "overlay_format" not in unit
+                                                        for unit in units[1:]))
     program_map["compiler"] = None
     program_map["runtime_signatures"] = signatures = []
     if compiler is None:
@@ -281,7 +309,7 @@ def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
             })
 
 
-def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[bytes, dict]:
+def build_image(root: LoadedMZ, program: str, overlays: list[Overlay | LinkedOverlay]) -> tuple[bytes, dict]:
     origin = root.base_segment * 16
     root_record = _unit_record("root", root.base_segment, origin, len(root.image))
     program_map = {
@@ -291,10 +319,20 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
         "memory_end": root.memory_end,
     }
     fixup_positions = {fixup.linear for fixup in root.relocations}
+    if root.diagnostics:
+        program_map["diagnostics"] = list(root.diagnostics)
+    if root.toolchain:
+        program_map["toolchain"] = root.toolchain
     if root.packer:
         program_map["packer"] = root.packer
     if root.file_offset is not None:
         root_record["file_offset"] = root.file_offset
+    if root.dos_format != "MZ":
+        program_map["dos_format"] = root.dos_format
+        program_map["load_offset"] = root.load_offset
+        program_map["initial_segments"] = {"ds": root.base_segment, "es": root.base_segment}
+        root_record["file_spans"] = [] if root.packer else [{"offset": root.load_offset, "file_offset": 0,
+                                                           "size": len(root.image) - root.load_offset}]
     root_fixups = [fixup.linear for fixup in root.relocations]
     if root_fixups != sorted(fixup_positions):
         program_map["root_relocation_order"] = root_fixups
@@ -307,20 +345,42 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
     units = _read_units(root.image, overlays)
     root_end = origin + max(len(root.image), 1)
     segments = _place_units(root_end, root.memory_end, units)
+    linked_segments = {unit.name: segment for unit, segment in zip(units, segments) if unit.linked is not None}
     image = bytearray(root.image)
     stub_targets = {}
     stub_records = []
     call_records = []
+    overlay_edits = []
     for unit, segment in zip(units, segments):
         record = _unit_record(unit.name, segment, origin, len(unit.data))
         record["source"] = unit.source
         code_start = record["image_offset"]
         data = bytearray(unit.data)
+        linked = unit.linked
+        if linked is not None:
+            record.update(overlay_format=linked.format, overlay_number=linked.number,
+                          file_offset=linked.file_offset, entries=list(linked.entries),
+                          relocation_count=sum(fixup.segment for fixup in linked.fixups))
+            if linked.runtime_segment is not None:
+                record["runtime_linear"] = linked.runtime_segment * 16
+            if linked.format == "MS_LINK":
+                record["segment_offsets"] = list(linked.entries)
+            for fixup in linked.fixups:
+                position = code_start + fixup.offset
+                old = data[fixup.offset:fixup.offset + 2].hex()
+                value = fixup.value
+                if fixup.segment:
+                    value += root.base_segment if fixup.target_unit is None else linked_segments[fixup.target_unit]
+                    fixup_positions.add(position)
+                overlay_edits.append({"image_offset": position, "original": old,
+                                      "kind": "relocation" if fixup.segment else "overlay_fixup"})
+                _WORD.pack_into(data, fixup.offset, value & 0xFFFF)
         descriptor = unit.descriptor
         if descriptor is not None:
             record["file_offset"] = descriptor.file_offset
             record["entries"] = sorted(set(descriptor.entries))
-            record["relocation_count"] = len(unit.fixups)
+            if linked is None:
+                record["relocation_count"] = len(unit.fixups)
             for fixup in unit.fixups:
                 old_segment, = _WORD.unpack_from(data, fixup)
                 _WORD.pack_into(data, fixup, (old_segment + root.base_segment) & 0xFFFF)
@@ -367,6 +427,8 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay]) -> tuple[
         program_map["calls"] = call_records
     if fixup_positions:
         program_map["relocations"] = sorted(fixup_positions)
+    if overlay_edits:
+        program_map["overlay_edits"] = overlay_edits
     relocated = bytes(image)
     _add_analysis(root, relocated, program_map)
     return relocated, program_map

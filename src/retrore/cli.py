@@ -16,7 +16,9 @@ from .atari_st import PRG_MAGIC, PrgError, build_prg_image
 from .x68k import X_MAGIC, XError, build_x_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .compare import DEFAULT_LIMIT as DEFAULT_COMPARE_LIMIT, compare_projects
+from .containers import CONTAINER_FORMATS, MACINTOSH_SUFFIXES, apple2_disk_order, inspect_members
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
+from .dos import load_dos_flat, load_dos_mz
 from .dynamic import RoutineBackend, RoutineRequest
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
@@ -33,8 +35,9 @@ from .image import (
     NES_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError,
 )
 from .macintosh import MacintoshError, build_macintosh_image, is_macintosh
+from .members import MemberError, disk_index, record_container
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
-from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, MZExecutable, UnsupportedPacker
+from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, UnsupportedPacker
 from .nes import NES_MAGIC, NesError, build_nes_image
 from .overlays import Overlay, build_image
 from .pc88 import (
@@ -45,11 +48,13 @@ from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build
 from .queries import QUERIES, option_names
 from .schema import DIALECT, query_schema
 from .layout import apply_layout, layout_lines
+from .load_manifest import LoadManifestError, add_native_load_manifest, apply_load_manifest
 from .search import (
     ENCODINGS, POINTER_KINDS, WIDTHS, SearchError, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols,
     search_pattern,
 )
 from .trace import TraceError, import_trace
+from .toolchain import ToolchainError, import_linker_map, import_signatures
 from .x1 import DISK_SUFFIXES as X1_DISK_SUFFIXES
 from .x1 import MEMORY_VIEWS as X1_VIEWS
 from .x1 import X1Error, build_x1_image
@@ -65,7 +70,7 @@ _PREVIEW_LIMIT = 10
 HANDLED_ERRORS = (
     Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, EvidenceError, FixtureError, GenesisError, GhidraError,
     HfsError, HunkError, ImageError, MacintoshError, MZError, Msx2Error, NesError, Pc88Error, Pc98Error, PrgError,
-    SearchError, TraceError, X1Error, XError, OSError,
+    LoadManifestError, MemberError, SearchError, ToolchainError, TraceError, X1Error, XError, OSError,
 )
 
 
@@ -158,24 +163,35 @@ def _segmented_address(value: str) -> Address:
     return Address(_hex_segment(segment), _hex_segment(offset))
 
 
+def _member_unit(index: int, selector: str, name: str) -> str:
+    if index == 0:
+        return "root"
+    return f"member_{index + 1}" if selector.lower().startswith("id:") else name
+
+
 def _c64_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     if args.base_segment is not None or args.overlay:
         raise C64Error("--base-segment and --overlay apply to DOS executables")
     source = args.program.name
+    selected = []
     if args.disk_file:
         disk = D64Image(data)
         units = []
-        for index, name in enumerate(args.disk_file):
-            contents, spans = disk.read_prg_with_spans(name)
-            units.append(PrgUnit("root" if index == 0 else name, source, contents,
-                                 args.base_address if index == 0 else None, name.upper(), spans))
+        for index, selector in enumerate(args.disk_file):
+            member, contents, spans = disk.extract_prg(selector)
+            selected.append(member)
+            units.append(PrgUnit(_member_unit(index, selector, selector), source, contents,
+                                 args.base_address if index == 0 else None, member.name.upper(), spans, member.id))
     elif args.program.suffix.lower() == ".d64":
-        raise C64Error("select a D64 program with --disk-file NAME")
+        raise C64Error("select a D64 program with --member NAME. Use retrore members to list the disk")
     else:
         units = [PrgUnit("root", source, data, args.base_address)]
     units.extend(PrgUnit(path.stem, path.name, path.read_bytes(), address) for path, address in args.c64_unit)
     bank = DEFAULT_BANK if args.c64_bank is None else args.c64_bank
-    return build_c64_image(units, source, bank=bank, entries=args.entry)
+    image, program = build_c64_image(units, source, bank=bank, entries=args.entry)
+    if selected:
+        record_container(program, "d64", selected, decisions={"selection": "explicit"})
+    return image, program
 
 
 def _apple2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
@@ -185,22 +201,22 @@ def _apple2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         raise Apple2Error("C64 options require a Commodore 64 program")
     source = args.program.name
     disk = None
+    selected = []
     if args.apple2_raw:
         if args.disk_file or args.apple2_disk_order:
             raise Apple2Error("--apple2-raw cannot be used with Apple II disk options")
         units = [Apple2Unit("root", source, Binary(data, None), args.base_address)]
     elif args.disk_file or args.program.suffix.lower() in DISK_SUFFIXES or args.apple2_disk_order:
         if not args.disk_file:
-            raise Apple2Error("select an Apple II disk binary with --disk-file NAME")
-        order = args.apple2_disk_order
-        if order is None and args.program.suffix.lower() == ".po":
-            order = "prodos"
+            raise Apple2Error("select an Apple II disk binary with --member NAME. Use retrore members to list the disk")
+        order = apple2_disk_order(args.program.suffix.lower(), args.apple2_disk_order)
         disk = SectorImage(data, order=order)
-        units = [
-            Apple2Unit("root" if index == 0 else name, source, disk.read_binary(name),
-                       args.base_address if index == 0 else None, name.upper())
-            for index, name in enumerate(args.disk_file)
-        ]
+        units = []
+        for index, selector in enumerate(args.disk_file):
+            member, binary = disk.extract_binary(selector)
+            selected.append(member)
+            units.append(Apple2Unit(_member_unit(index, selector, selector), source, binary,
+                                    args.base_address if index == 0 else None, member.name.upper(), member.id))
     else:
         units = [Apple2Unit("root", source, Binary.from_dos(data, source), args.base_address)]
 
@@ -212,6 +228,7 @@ def _apple2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     image, program = build_apple2_image(units, source, lc=lc, entries=args.entry)
     if disk is not None:
         program["disk"] = {"filesystem": disk.filesystem, "sector_order": disk.order}
+        record_container(program, "apple2", selected, decisions={"selection": "explicit", **program["disk"]})
     return image, program
 
 
@@ -225,6 +242,7 @@ def _atari8_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     source = args.program.name
     is_disk = args.program.suffix.lower() == ".atr" or data.startswith(ATR_MAGIC)
     disk = None
+    selected = []
     if args.atari8_raw:
         if args.disk_file or args.base_address is None:
             raise Atari8Error("--atari8-raw needs --base-address and accepts a standalone file")
@@ -233,14 +251,19 @@ def _atari8_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         raise Atari8Error("--base-address requires --atari8-raw for Atari 8-bit programs")
     elif is_disk or args.disk_file:
         disk = AtrImage(data)
-        if args.disk_file:
-            sources = []
-            for index, name in enumerate(args.disk_file):
-                contents, spans = disk.read_file_with_spans(name)
-                sources.append(Atari8Source("root" if index == 0 else name.upper(), source,
-                                            Atari8Binary.from_xex(contents, name), name.upper(), spans))
-        else:
-            sources = [Atari8Source("root", source, disk.boot_binary())]
+        boot = disk.boot_member()
+        sources = []
+        for index, selector in enumerate(args.disk_file or [boot.selector]):
+            if selector.casefold() == boot.selector:
+                selected.append(boot)
+                sources.append(Atari8Source(_member_unit(index, selector, boot.name), source, disk.boot_binary(),
+                                            member_id=boot.id))
+            else:
+                member, contents, spans = disk.extract_file(selector)
+                name = member.name.upper()
+                selected.append(member)
+                sources.append(Atari8Source(_member_unit(index, selector, name), source,
+                                            Atari8Binary.from_xex(contents, name), name, spans, member.id))
     else:
         sources = [Atari8Source("root", source, Atari8Binary.from_xex(data, source))]
     for path, address in args.atari8_unit:
@@ -252,6 +275,8 @@ def _atari8_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     image, program = build_atari8_image(sources, source, portb=portb, entries=args.entry)
     if disk is not None:
         program["disk"] = {"sector_size": disk.sector_size, "sector_count": disk.sector_count}
+        record_container(program, "atr", selected,
+                         decisions={"selection": "explicit" if args.disk_file else "default", **program["disk"]})
     return image, program
 
 
@@ -265,9 +290,10 @@ def _msx2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     name = args.program.name
     entries = args.entry
     sources = []
+    selected = []
     if disk:
         if not args.disk_file:
-            raise Msx2Error("select an MSX-DOS disk member with --disk-file NAME[@HEX]")
+            raise Msx2Error("select an MSX-DOS disk member with --member NAME[@HEX]. Use retrore members to list the disk")
         filesystem = MsxDosDisk(data)
         for index, spec in enumerate(args.disk_file):
             member, separator, suffix = spec.rpartition("@")
@@ -282,16 +308,18 @@ def _msx2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
                 if address is not None:
                     raise Msx2Error("specify the root member address once with @HEX or --base-address")
                 address = args.base_address
-            com = member.lower().endswith(".com")
+            catalog_entry, contents, spans = filesystem.extract_file(member)
+            selected.append(catalog_entry)
+            com = catalog_entry.name.lower().endswith(".com")
             if address is None:
                 if index != 0 or not com:
                     raise Msx2Error(f"specify an MSX2 load address for {member!r} with @HEX")
                 address = COM_ADDRESS
             if index == 0 and com and not entries:
                 entries = [address]
-            contents, spans = filesystem.read_file_with_spans(member)
-            sources.append(Msx2Source("root" if index == 0 else member.upper(), name, address,
-                                      contents, member.upper(), container_spans=spans))
+            member_name = catalog_entry.name.upper()
+            sources.append(Msx2Source(_member_unit(index, member, member_name), name, address,
+                                      contents, member_name, container_spans=spans, member_id=catalog_entry.id))
     else:
         com = args.program.suffix.lower() == ".com"
         address = args.base_address
@@ -314,14 +342,16 @@ def _msx2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
             raise Msx2Error(f"MSX2 copy {address:x}:{size:x} is outside the root file")
         copies.append(root.copy(f"copy_{destination:04x}", destination, offset, size))
     sources[1:1] = copies
-    return build_msx2_image(sources, name, entries, disk=disk)
+    image, program = build_msx2_image(sources, name, entries, disk=disk)
+    if disk:
+        record_container(program, "fat12", selected, decisions={"selection": "explicit", **program["disk"]})
+    return image, program
 
 
 def _pc88_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     if args.base_segment is not None or args.overlay:
         raise Pc88Error("--base-segment and --overlay apply to DOS executables")
-    if args.disk_file:
-        raise Pc88Error("select PC-88 disk sectors with --pc88-sector, or omit it for the boot sector")
+    index = disk_index(args.disk_file, args.pc88_disk, "--pc88-sector")
     if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
             or args.apple2_disk_order or args.atari8_unit or args.atari8_portb is not None
             or args.msx2_unit or args.msx2_copy):
@@ -330,10 +360,10 @@ def _pc88_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     disk = None
     entries = args.entry
     low = args.pc88_low
-    if args.program.suffix.lower() in PC88_DISK_SUFFIXES or args.pc88_sector or args.pc88_disk is not None:
+    if args.program.suffix.lower() in PC88_DISK_SUFFIXES or args.pc88_sector or index is not None:
         if args.base_address is not None:
             raise Pc88Error("set disk load addresses with --pc88-sector C:H:R[+COUNT]@HEX")
-        disk = D88Disk(data, args.pc88_disk if args.pc88_disk is not None else 1)
+        disk = D88Disk(data, 1 if index is None else index)
         if args.pc88_sector:
             sources = [
                 disk_source(disk, filename, "root" if index == 0 else f"sector_{cylinder}_{head}_{record}_{address:04x}",
@@ -354,14 +384,19 @@ def _pc88_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         if address is None:
             raise Pc88Error(f"specify a PC-88 load address for {path.name!r} with @HEX")
         sources.append(Z80Source(path.stem, path.name, address, path.read_bytes()))
-    return build_pc88_image(sources, filename, entries, low or "ram", args.pc88_high or "ram", disk)
+    image, program = build_pc88_image(sources, filename, entries, low or "ram", args.pc88_high or "ram", disk)
+    if disk is not None:
+        record_container(program, "d88", [disk.member], decisions={
+            "selection": "explicit" if index is not None else "default",
+            "boot": not args.pc88_sector, "sectors": [_sector_decision(*spec) for spec in args.pc88_sector],
+        })
+    return image, program
 
 
 def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     if args.base_segment is not None or args.overlay:
         raise X1Error("--base-segment and --overlay apply to DOS executables")
-    if args.disk_file:
-        raise X1Error("select X1 disk sectors with --x1-sector or --x1-lsn, or omit them for the IPL")
+    index = disk_index(args.disk_file, args.x1_disk, "--x1-sector or --x1-lsn")
     if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
             or args.apple2_disk_order or args.atari8_unit or args.atari8_portb is not None
             or args.msx2_unit or args.msx2_copy):
@@ -370,10 +405,11 @@ def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     disk = header = None
     entries = args.entry
     sources = []
-    if args.program.suffix.lower() in X1_DISK_SUFFIXES or args.x1_sector or args.x1_disk is not None or args.x1_ipl:
+    sectors = []
+    if args.program.suffix.lower() in X1_DISK_SUFFIXES or args.x1_sector or index is not None or args.x1_ipl:
         if args.base_address is not None:
             raise X1Error("set disk load addresses with --x1-sector C:H:R[+COUNT]@HEX or --x1-lsn LSN[+COUNT]@HEX")
-        disk = D88Disk(data, args.x1_disk if args.x1_disk is not None else 1)
+        disk = D88Disk(data, 1 if index is None else index)
         if args.x1_ipl or not args.x1_sector:
             boot, header = x1_boot_source(disk, filename)
             sources.append(boot)
@@ -383,12 +419,14 @@ def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
                 cylinder, head, record, count, address = selection
                 name = f"sector_{cylinder}_{head}_{record}_{address:04x}"
                 source = x1_disk_source(disk, filename, name, address, cylinder, head, record, count)
+                sectors.append(_sector_decision(cylinder, head, record, count, address))
             else:
                 lsn, count, address = selection
                 source = x1_lsn_source(disk, filename, f"lsn_{lsn:04x}_{address:04x}", address, lsn, count)
+                sectors.append({"logical_sector": lsn, "count": count, "linear": address})
             sources.append(source if sources else Z80Source(
                 "root", source.source, source.address, source.data,
-                file_offset=source.file_offset, file_spans=source.file_spans))
+                file_offset=source.file_offset, file_spans=source.file_spans, member_id=source.member_id))
     elif args.base_address is None:
         raise X1Error("--base-address is required for raw X1 files")
     else:
@@ -399,24 +437,37 @@ def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         if address is None:
             raise X1Error(f"specify an X1 load address for {path.name!r} with @HEX")
         sources.append(Z80Source(path.stem, path.name, address, path.read_bytes()))
-    return build_x1_image(sources, filename, entries, args.x1_view or "ram", disk, header)
+    image, program = build_x1_image(sources, filename, entries, args.x1_view or "ram", disk, header)
+    if disk is not None:
+        record_container(program, "d88", [disk.member], decisions={
+            "selection": "explicit" if index is not None else "default", "boot": header is not None,
+            "sectors": sectors,
+        })
+    return image, program
+
+
+def _sector_decision(cylinder: int, head: int, record: int, count: int, linear: int) -> dict:
+    return {"cylinder": cylinder, "head": head, "record": record, "count": count, "linear": linear}
 
 
 def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
-    if (args.base_address is not None or args.overlay or args.disk_file or args.entry
+    if (args.base_address is not None or args.overlay or args.entry
             or args.c64_unit or args.c64_bank is not None
             or args.apple2_unit or args.apple2_lc is not None or args.apple2_disk_order
             or args.atari8_unit or args.atari8_portb is not None or args.msx2_unit or args.msx2_copy):
         raise Pc98Error("use PC-98 load and entry options with --pc98")
     filename = args.program.name
     extension = args.program.suffix.lower()
+    index = disk_index(args.disk_file, args.pc98_disk, "--pc98-sector")
     disk = None
     if extension == HDM_SUFFIX:
         if args.pc98_disk is not None:
             raise Pc98Error("--pc98-disk applies to D88/D77 containers")
+        if index not in (None, 1):
+            raise Pc98Error("an HDM image contains only one disk (id:disk:1)")
         disk = HdmDisk(data)
-    elif extension in D88_SUFFIXES or args.pc98_sector or args.pc98_disk is not None:
-        disk = D88Disk(data, args.pc98_disk if args.pc98_disk is not None else 1)
+    elif extension in D88_SUFFIXES or args.pc98_sector or index is not None:
+        disk = D88Disk(data, 1 if index is None else index)
 
     if disk is not None:
         if args.base_segment is not None:
@@ -435,7 +486,13 @@ def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         if segment is None:
             raise Pc98Error("specify a PC-98 unit load segment with FILE@SEG")
         sources.append(Pc98Source(path.stem, path.name, segment, path.read_bytes()))
-    return build_pc98_image(sources, filename, args.pc98_entry, disk)
+    image, program = build_pc98_image(sources, filename, args.pc98_entry, disk)
+    if disk is not None:
+        record_container(program, disk.metadata["format"].lower(), [disk.member], decisions={
+            "selection": "explicit" if index is not None else "default", "boot": not args.pc98_sector,
+            "sectors": [_sector_decision(c, h, r, count, seg * 16) for c, h, r, count, seg in selections],
+        })
+    return image, program
 
 
 def _export_image(output: Path, image: bytes, program_map: dict) -> None:
@@ -929,7 +986,7 @@ def _trace(args: argparse.Namespace) -> None:
     report = import_trace(
         args.trace, args.export, runtime_base=args.runtime_base, overlay_segments=overlay_segments, project=args.project,
         timeout=args.timeout, classify_gaps=args.classify_gaps, evidence=args.evidence,
-        runtime_loads=runtime_loads, apply=args.apply, program=args.program,
+        runtime_loads=runtime_loads, apply=args.apply, program=args.program, state=args.state,
     )
     if args.json:
         print(json.dumps(report))
@@ -1051,6 +1108,8 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     human68k = data.startswith(X_MAGIC)
     m68k = hunk or human68k or data.startswith(PRG_MAGIC)
     extension = args.program.suffix.lower()
+    if not args.dos_raw and (args.dos_offset is not None or args.dos_entry is not None):
+        raise MZError("--dos-offset and --dos-entry require --dos-raw")
     genesis = args.genesis or (
         not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or args.atari8 or args.atari8_raw
              or args.macintosh or args.msx2 or args.pc88 or args.pc98 or args.x1 or args.nes or m68k
@@ -1065,13 +1124,21 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     macintosh = args.macintosh or (
         not (m68k or data.startswith(b"MZ") or args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order
              or args.atari8 or args.atari8_raw)
-        and (extension in (".rsrc", ".dc42", ".macbin", ".as", ".ad") or is_macintosh(data))
+        and (extension in MACINTOSH_SUFFIXES or is_macintosh(data))
     )
     atari8 = args.atari8 or args.atari8_raw or (
         not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or extension in DISK_SUFFIXES)
         and (extension in (".atr", ".xex") or
              extension not in (".d64", ".prg") and data.startswith((ATR_MAGIC, XEX_MAGIC)))
     )
+    dos_com = args.dos_com or (
+        extension == ".com" and not (
+            args.dos_raw or m68k or data.startswith(b"MZ") or args.c64 or args.apple2 or args.apple2_raw
+            or args.apple2_disk_order or args.msx2 or args.pc88 or args.pc98 or args.x1
+            or atari8 or nes or genesis or macintosh
+        )
+    )
+    dos_flat = dos_com or args.dos_raw
     if not args.pc88 and (args.pc88_disk is not None or args.pc88_sector or args.pc88_copy or args.pc88_unit
                          or args.pc88_low or args.pc88_high):
         raise Pc88Error("PC-88 options require --pc88")
@@ -1084,7 +1151,19 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         raise NesError("NES PRG options require an NES cartridge")
     if not genesis and args.genesis_sram is not None:
         raise GenesisError("--genesis-sram requires a Genesis / Mega Drive cartridge")
-    if args.x1:
+    if dos_flat:
+        if args.base_address is not None or args.disk_file or args.entry:
+            raise MZError("DOS flat loads use --base-segment, --dos-offset and --dos-entry")
+        if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
+                or args.apple2_disk_order or args.atari8_unit or args.atari8_portb is not None
+                or args.msx2_unit or args.msx2_copy or args.nes_prg_mode or args.nes_r6 is not None
+                or args.nes_r7 is not None or args.genesis_sram is not None):
+            raise MZError("DOS flat loads require DOS placement options")
+        base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
+        loaded = load_dos_flat(data, base_segment, com=dos_com, offset=args.dos_offset, entry=args.dos_entry)
+        overlays = [Overlay(path.name, path.stem, path.read_bytes(), segment) for path, segment in args.overlay]
+        image, program_map = build_image(loaded, args.program.name, overlays)
+    elif args.x1:
         image, program_map = _x1_image(args, data)
     elif args.pc98:
         image, program_map = _pc98_image(args, data)
@@ -1114,7 +1193,7 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         if args.base_segment is not None or args.overlay:
             raise MacintoshError("--base-segment and --overlay apply to DOS executables")
         if len(args.disk_file) > 1:
-            raise MacintoshError("select one Macintosh application with --disk-file NAME")
+            raise MacintoshError("select one Macintosh application with --member NAME")
         base_address = DEFAULT_M68K_BASE if args.base_address is None else args.base_address
         image, program_map = build_macintosh_image(
             data, args.program.name, base_address, disk_file=next(iter(args.disk_file), None),
@@ -1142,14 +1221,21 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
     else:
         if args.base_address is not None:
             raise MZError("--base-address applies to 68k and 8-bit programs")
-        executable = MZExecutable.parse(data)
         base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
-        loaded = executable.load(base_segment)
-        overlays = [
+        loaded, overlays = load_dos_mz(data, base_segment, args.program.name)
+        overlays.extend([
             Overlay(path.name, path.stem, path.read_bytes(), segment)
             for path, segment in args.overlay
-        ]
+        ])
         image, program_map = build_image(loaded, args.program.name, overlays)
+    if args.load_manifest:
+        image = apply_load_manifest(args.load_manifest, image, program_map)
+    else:
+        add_native_load_manifest(program_map, len(image))
+    for path in args.linker_map:
+        import_linker_map(path, program_map)
+    for path in args.signatures:
+        import_signatures(path, image, program_map)
     lines = []
     if program_map["format"] == "HUNK":
         lines.append(f"Amiga Hunk  entry h0:0000 ({base_address:06x})  {len(program_map['units'])} hunks")
@@ -1195,7 +1281,7 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
             lines.append(f"  {unit['name']}  {unit['linear']:04x}  {unit['size']} bytes")
     else:
         packer = f" ({loaded.packer})" if loaded.packer else ""
-        lines.append(f"MZ{packer}  entry {loaded.entry}  stack {loaded.stack}")
+        lines.append(f"{program_map.get('dos_format', 'MZ')}{packer}  entry {loaded.entry}  stack {loaded.stack}")
         lines.append(f"root  {loaded.base_segment:04x}:0000  {len(loaded.image)} bytes")
         compiler = program_map["compiler"]
         if compiler:
@@ -1205,6 +1291,10 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
             unit_count = len(program_map["units"]) - 1
             stub_count = len(program_map.get("stubs", []))
             lines.append(f"{unit_count} overlay units, {stub_count} stubs")
+    if diagnostics := program_map.get("diagnostics"):
+        lines.extend(f"  {row['message']}" for row in diagnostics[:3])
+        if len(diagnostics) > 3:
+            lines.append("  Use --json for all diagnostics.")
     return image, program_map, lines
 
 
@@ -1212,6 +1302,11 @@ def program_options() -> argparse.ArgumentParser:
     """Return a parent parser with the program argument and the options shared by info and load."""
     command = argparse.ArgumentParser(add_help=False)
     command.add_argument("program", type=Path, metavar="PROGRAM")
+    command.add_argument("--load-manifest", type=Path, metavar="FILE", help="define runtime states and transitions")
+    command.add_argument("--linker-map", action="append", type=Path, default=[], metavar="FILE",
+                         help="import public symbols and source lines from a DOS LINK/TLINK map")
+    command.add_argument("--signatures", action="append", type=Path, default=[], metavar="FILE",
+                         help="match a JSON catalog of masked routine signatures")
     base = command.add_mutually_exclusive_group()
     base.add_argument(
         "--base-segment",
@@ -1228,6 +1323,10 @@ def program_options() -> argparse.ArgumentParser:
         help="add a Turbo Pascal overlay bank or raw overlay (optionally at hex SEG)",
     )
     platform = command.add_mutually_exclusive_group()
+    platform.add_argument("--dos-com", action="store_true", help="load a DOS .COM program at offset 0100")
+    platform.add_argument("--dos-raw", action="store_true", help="load raw DOS real-mode bytes")
+    command.add_argument("--dos-offset", type=_hex_segment, metavar="HEX", help="raw DOS load offset")
+    command.add_argument("--dos-entry", type=_hex_segment, metavar="HEX", help="raw DOS entry offset")
     platform.add_argument("--c64", action="store_true", help="interpret the input as a Commodore 64 program")
     platform.add_argument("--apple2", action="store_true", help="interpret the input as an Apple II program")
     platform.add_argument("--apple2-raw", action="store_true", help="load raw Apple II bytes at --base-address")
@@ -1244,7 +1343,11 @@ def program_options() -> argparse.ArgumentParser:
     )
     command.add_argument(
         "--disk-file", action="append", default=[], metavar="NAME[@HEX]",
-        help="select a disk member (first is root, repeat for additional files, @HEX applies to MSX2)",
+        help="alias of --member",
+    )
+    command.add_argument(
+        "--member", dest="disk_file", action="append", metavar="NAME|ID",
+        help="select a container member by name or catalog selector (repeatable for additional files, @HEX for MSX2)",
     )
     command.add_argument(
         "--c64-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
@@ -1344,6 +1447,15 @@ def program_options() -> argparse.ArgumentParser:
     return command
 
 
+def member_options() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("program", type=Path, metavar="INPUT")
+    parser.add_argument("--format", choices=CONTAINER_FORMATS, help="override container detection")
+    parser.add_argument("--apple2-disk-order", choices=("dos", "prodos", "physical"),
+                        help="override Apple II sector ordering")
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="retrore", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1351,6 +1463,8 @@ def main(argv: list[str] | None = None) -> int:
     load_parser = commands.add_parser("load", parents=[program_parent], help="export a program image")
     load_parser.add_argument("-o", "--output", type=Path, required=True, metavar="OUT")
     info_parser = commands.add_parser("info", parents=[program_parent], help="summarize a program image")
+    members_parser = commands.add_parser("members", parents=[member_options()], help="list a disk or container catalog")
+    members_parser.add_argument("--json", action="store_true", help="print JSON")
     for command in (load_parser, info_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
 
@@ -1359,6 +1473,7 @@ def main(argv: list[str] | None = None) -> int:
     import_parser = ghidra_commands.add_parser("import", help="import and analyze an exported image")
     import_parser.add_argument("export", metavar="OUT", type=Path)
     import_parser.add_argument("project", metavar="PROJECT", type=Path)
+    import_parser.add_argument("--load-views", action="store_true", help="import manifest states in overlay address spaces")
     decomp_parser = commands.add_parser("decomp", help="decompile a function in a Ghidra project")
     decomp_parser.add_argument("address", metavar="ADDR")
     decomp_parser.add_argument("--project", metavar="PROJECT", type=Path, required=True)
@@ -1506,8 +1621,11 @@ def main(argv: list[str] | None = None) -> int:
     map_parser.add_argument("address", metavar="ADDR", help="hexadecimal address or offset")
     map_parser.add_argument("--from", dest="space", choices=ADDRESS_SPACES, default="logical")
     map_parser.add_argument("--source", help="match a source filename when mapping a file offset")
-    map_parser.add_argument("--member", help="match a disk member when mapping a file offset")
+    map_parser.add_argument("--member", help="match a disk member name or catalog selector when mapping a file offset")
     map_parser.add_argument("--offset-kind", choices=FILE_OFFSET_KINDS, help="select the file coordinate kind")
+    map_states = map_parser.add_mutually_exclusive_group()
+    map_states.add_argument("--state", help="map runtime addresses in this manifest state")
+    map_states.add_argument("--all-states", action="store_true", help="map the address in every manifest state")
     map_parser.add_argument("--runtime-base", type=_hex_segment, metavar="HEX", help="DOS runtime root segment")
     map_parser.add_argument("--overlay-segment", metavar="UNIT=HEX", action="append", default=[],
                             help="supply a DOS overlay's runtime segment")
@@ -1518,7 +1636,7 @@ def main(argv: list[str] | None = None) -> int:
     bytes_parser.add_argument("--size", type=int, default=32, metavar="N", help=f"read 1–{MAX_BYTES} bytes (default 32)")
     for command in (map_parser, bytes_parser):
         command.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
-        command.add_argument("--source-file", type=Path, help="verify and recover file offsets for an unpacked DOS MZ")
+        command.add_argument("--source-file", type=Path, help="verify and recover file offsets for unpacked DOS input")
         command.add_argument("--json", action="store_true", help="print JSON")
     call_parser = commands.add_parser("call", help="run a routine in an exported image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal address, seg:off, or unit:offset")
@@ -1553,6 +1671,7 @@ def main(argv: list[str] | None = None) -> int:
                               help="include static evidence for gaps observed in the trace (requires --project)")
     trace_parser.add_argument("--evidence", action="store_true",
                               help="include export bytes and source locations for mapped hits in JSON")
+    trace_parser.add_argument("--state", help="start in this load manifest state")
     trace_parser.add_argument(
         "--runtime-base", metavar="HEX", type=_hex_segment, help="runtime root load segment (defaults to the export base)",
     )
@@ -1585,13 +1704,27 @@ def main(argv: list[str] | None = None) -> int:
         from .mcp import serve  # The adapter imports this module.
         return serve(use_worker=not args.no_worker)
     try:
+        if args.command == "members":
+            report = inspect_members(args.program, args.format, args.apple2_disk_order)
+            if args.json:
+                print(json.dumps(report))
+            else:
+                print(f"{report['format']}  {report['count']} members  {report['source']}")
+                for member in report["members"][:_PREVIEW_LIMIT]:
+                    action = member["selector"] if member["selectable"] else "catalog only"
+                    print(f"  {member['name']}  {member['kind']}  {action}")
+                if report["count"] > _PREVIEW_LIMIT:
+                    print("Use --json for the full catalog.")
+            return 0
         if args.command == "worker":
             return _worker(args)
         if args.command == "batch":
             return _batch(args)
         if args.command == "ghidra":
-            report = import_program(args.export, args.project, timeout=args.timeout)
+            report = import_program(args.export, args.project, timeout=args.timeout, load_views=args.load_views)
             summary = f"Imported {report['units']} units into {args.project}"
+            if args.load_views:
+                summary += f" with {len(report['load_views'])} load views"
             print(json.dumps(report) if args.json else summary)
             return 0
         if args.command == "decomp":
@@ -1634,7 +1767,7 @@ def main(argv: list[str] | None = None) -> int:
             report = map_address(args.export, args.address, space=args.space, source=args.source, member=args.member,
                                  runtime_base=args.runtime_base, overlay_segments=_overlay_segments(args.overlay_segment),
                                  runtime_loads=_runtime_loads(args.runtime_load), source_file=args.source_file,
-                                 offset_kind=args.offset_kind)
+                                 offset_kind=args.offset_kind, state=args.state, all_states=args.all_states)
             if args.json:
                 print(json.dumps(report))
             else:
@@ -1648,7 +1781,8 @@ def main(argv: list[str] | None = None) -> int:
                         location += f"  container +{container['offset']:x}"
                     if row["runtime"]:
                         location += f"  runtime {row['runtime']['address']}"
-                    print(f"  {location}")
+                    state = f"  state {row['state']}" if "state" in row else ""
+                    print(f"  {location}{state}")
             return 0
         if args.command == "bytes":
             report = inspect_bytes(args.export, args.address, size=args.size, source_file=args.source_file)
@@ -1729,6 +1863,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(program_map))
     elif args.command == "load":
         print(f"Wrote image.bin and map.json to {args.output}")
+        if diagnostics := program_map.get("diagnostics"):
+            print(f"{len(diagnostics)} loader diagnostics are in map.json.")
     else:
         print("\n".join(summary))
     return 0

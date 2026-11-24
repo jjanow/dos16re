@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from struct import unpack_from
 
 from .errors import CodedError
+from .members import Member, match_members
 
 _SECTOR_SIZE = 512
 _MDB = 2 * _SECTOR_SIZE
@@ -31,6 +32,7 @@ class HfsFork:
     data: bytes
     # Logical fork offset, container file offset, byte count.
     spans: tuple[tuple[int, int, int], ...]
+    member: Member
 
 
 @dataclass(frozen=True)
@@ -196,26 +198,35 @@ class HfsDisk:
             parts.append(name)
         return "/".join(reversed(parts))
 
+    def _member(self, item: _CatalogFile) -> Member:
+        return Member(f"file:{item.file_id}", self._path(item), "file", bool(item.resource_size),
+                      size=item.resource_size, details={"application": item.is_application, "fork": "resource"})
+
+    def list_members(self) -> list[Member]:
+        return [self._member(item) for item in self._files]
+
     def read_resource_fork(self, name: str | None = None) -> HfsFork:
         """Select an application automatically or read a named file's resource fork."""
         if name is None:
             matches = [item for item in self._files if item.is_application and item.resource_size]
         else:
-            parts = name.replace(":", "/").strip("/").casefold()
-            matches = [
-                item for item in self._files
-                if (self._path(item) if "/" in parts else item.name).casefold() == parts
-            ]
+            entries = [(self._member(item), item) for item in self._files]
+            matches = [item for _, item in match_members(entries, name)] if name.casefold().startswith("id:") else []
+            if not matches:
+                parts = name.replace(":", "/").strip("/").casefold()
+                matches = [item for member, item in entries
+                           if (member.name if "/" in parts else item.name).casefold() == parts]
         if not matches:
             label = repr(name) if name is not None else "an application with a resource fork"
             raise HfsError(f"HFS disk does not contain {label}")
         if len(matches) > 1:
-            names = ", ".join(repr(self._path(item)) for item in matches[:8])
+            names = ", ".join(f"{member.name!r} ({member.selector})"
+                              for member in map(self._member, matches[:8]))
             more = f" and {len(matches) - 8} more" if len(matches) > 8 else ""
             raise HfsError(f"select one HFS file with --disk-file NAME: {names}{more}")
         item = matches[0]
         if not item.resource_size:
             raise HfsError(f"HFS file {item.name!r} has no resource fork")
-        path = self._path(item)
-        fork, spans = self._read_fork(item.resource_size, item.resource_extents, path, item.file_id, _RESOURCE_FORK)
-        return HfsFork(path, fork, spans)
+        member = self._member(item)
+        fork, spans = self._read_fork(item.resource_size, item.resource_extents, member.name, item.file_id, _RESOURCE_FORK)
+        return HfsFork(member.name, fork, spans, member)

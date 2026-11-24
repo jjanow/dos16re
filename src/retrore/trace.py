@@ -11,7 +11,8 @@ from typing import TextIO
 from .dynamic import TraceAddressBackend
 from .evidence import EvidenceError, ExportEvidence
 from .ghidra import QUERY_TIMEOUT, trace_coverage
-from .image import ImageUnit, RuntimePlacementError, explicit_runtime_units
+from .image import ImageUnit, RuntimePlacementError, RuntimeSpan, explicit_runtime_units, runtime_spans
+from .load_manifest import LoadManifestError, state_loads, state_spans
 from .mz import Address
 
 _TRACE_LINE = re.compile(r"^\s*(?:\d+\.\d+\s+)?([0-9a-fA-F]{4}):([0-9a-fA-F]{4,8})(?=\s|$)")
@@ -28,6 +29,7 @@ def import_trace(
     overlay_segments: dict[str, int] | None = None, project: Path | None = None,
     timeout: float | None = QUERY_TIMEOUT, classify_gaps: bool = False, evidence: bool = False,
     runtime_loads: dict[str, int | None] | None = None, apply: bool = False, program: str | None = None,
+    state: str | None = None,
 ) -> dict:
     if project is None:
         if classify_gaps:
@@ -35,8 +37,8 @@ def import_trace(
         if apply or program is not None:
             raise TraceError("applying trace additions or selecting a program requires a Ghidra project")
     try:
-        image = ExportEvidence(export, runtime_base, overlay_segments, runtime_loads=runtime_loads)
-    except EvidenceError as error:
+        image = ExportEvidence(export, runtime_base, overlay_segments, runtime_loads=runtime_loads, state=state)
+    except (EvidenceError, LoadManifestError) as error:
         raise TraceError(str(error)) from error
     with trace.open(encoding="utf-8-sig", errors="replace") as source:
         first = source.read(1)
@@ -148,8 +150,9 @@ class _Runtime:
         self.backend = TraceAddressBackend(image)
         self.units = {unit.name.casefold(): unit for unit in image.units}
         self.active = image.runtime
-        self.history: dict[int, tuple[list[tuple[int, ImageUnit]], list[int]]] = {}
-        self._set_ranges(self.active)
+        self.state = image.state
+        self.history: dict[int, tuple[list[RuntimeSpan], list[int]]] = {}
+        self._set_ranges(image.runtime_spans)
 
     def change(self, placements: dict) -> dict:
         changes = {}
@@ -160,19 +163,39 @@ class _Runtime:
             if unit.name in changes:
                 raise TraceError(f"runtime placement specified twice for {unit.name}")
             changes[unit.name] = None if address is None else self.backend.linear(address)
+        if all(self.active.get(unit) == at for unit, at in changes.items()):
+            return changes
         proposed = {unit.name: self.active.get(unit.name) for unit in self.image.units}
         proposed.update(changes)
         try:
-            self.active = explicit_runtime_units(self.image.units, proposed, self.image.format)
+            active = explicit_runtime_units(self.image.units, proposed, self.image.format)
         except RuntimePlacementError as error:
             raise TraceError(str(error)) from error
-        self._set_ranges(self.active)
+        self.state = None
+        self.active = active
+        self._set_ranges(runtime_spans(self.image.units, self.active))
         return changes
 
-    def _set_ranges(self, active: dict[str, int]) -> None:
-        ranges = ((start, self.units[name.casefold()]) for name, start in active.items())
-        self.ranges = sorted((entry for entry in ranges if entry[1].size), key=lambda entry: entry[0])
-        self.starts = [start for start, _ in self.ranges]
+    def transition(self, event: dict) -> dict:
+        if "state" not in event:
+            return self.change(_object(event.get("placements"), "transition placements"))
+        state = event["state"]
+        if "placements" in event or self.image.manifest is None or self.state is None:
+            raise TraceError("a named transition requires an active manifest state and excludes explicit placements")
+        if not any((row["from"], row["to"], row["kind"]) == (self.state, state, event["kind"])
+                   for row in self.image.manifest["transitions"]):
+            raise TraceError(f"no {event['kind']} transition from {self.state!r} to {state!r} in the load manifest")
+        placements = state_loads(self.image.manifest, state)
+        changes = {unit: placements.get(unit) for unit in self.active.keys() | placements.keys()
+                   if placements.get(unit) != self.active.get(unit)}
+        self.active = placements
+        self._set_ranges(state_spans(self.image.manifest, state, self.image.units))
+        self.state = state
+        return dict(sorted(changes.items()))
+
+    def _set_ranges(self, spans: list[RuntimeSpan]) -> None:
+        self.ranges = spans
+        self.starts = [span.linear for span in spans]
 
     def remember(self, event: int) -> None:
         self.history[event] = self.ranges, self.starts
@@ -194,9 +217,9 @@ class _Runtime:
         ranges, starts = (self.ranges, self.starts) if state is None else self.history[state]
         index = bisect_right(starts, linear) - 1
         if index >= 0:
-            start, unit = ranges[index]
-            if linear < start + unit.size:
-                return self._point(linear, display, unit, linear - start)
+            span = ranges[index]
+            if linear < span.end:
+                return self._point(linear, display, span.unit, span.offset + linear - span.linear)
         return self._point(linear, display, None)
 
     def span(self, address: object, size: int) -> dict:
@@ -208,17 +231,18 @@ class _Runtime:
         spans = []
         at = start
         index = max(0, bisect_right(self.starts, at) - 1)
-        for base, unit in self.ranges[index:]:
+        for span in self.ranges[index:]:
+            base = span.linear
             if base >= end:
                 break
-            unit_end = base + unit.size
+            unit_end = span.end
             if unit_end <= at:
                 continue
             if at < base:
                 spans.append({**self._point(at, self._display(at), None), "size": base - at})
                 at = base
             stop = min(end, unit_end)
-            spans.append({**self._point(at, self._display(at), unit, at - base), "size": stop - at})
+            spans.append({**self._point(at, self._display(at), span.unit, span.offset + at - base), "size": stop - at})
             at = stop
         if at < end:
             spans.append({**self._point(at, self._display(at), None), "size": end - at})
@@ -277,6 +301,7 @@ def _structured_trace(image: ExportEvidence, document: dict, evidence: bool) -> 
         raise TraceError(f"initial placements: {error}") from error
     runtime.remember(0)
     initial = runtime.active.copy()
+    initial_state = runtime.state
     events = _array(document.get("events"), "trace events")
     if not events:
         raise TraceError("trace contains no events")
@@ -321,9 +346,11 @@ def _structured_trace(image: ExportEvidence, document: dict, evidence: bool) -> 
                 snapshots.append({"event": index, **_snapshot(event, runtime)})
             elif kind in ("bank", "overlay"):
                 previous = runtime.active
-                placements = runtime.change(_object(event.get("placements"), "transition placements"))
+                previous_state = runtime.state
+                placements = runtime.transition(event)
                 runtime.remember(index)
                 transitions.append({"event": index, "kind": kind, **_name(event), "placements": placements,
+                                    **({"from": previous_state, "to": runtime.state} if "state" in event else {}),
                                     "previous": {unit: previous.get(unit) for unit in placements}})
             else:
                 raise TraceError(f"unknown event kind {kind!r}")
@@ -346,6 +373,7 @@ def _structured_trace(image: ExportEvidence, document: dict, evidence: bool) -> 
         else:
             mapped.append({**hit, **location})
     return {"trace_version": _TRACE_VERSION, "initial_placements": initial, "instructions": visits,
+            **({"initial_state": initial_state} if initial_state is not None else {}),
             "instruction_records": explicit.total(), "ignored_lines": 0,
             "mapped": mapped, "unmapped": unmapped, "analysis": None,
             "edges": edges, "memory": memory, "snapshots": snapshots, "transitions": transitions}

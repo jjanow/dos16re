@@ -16,6 +16,7 @@ from .errors import CONTRACT_VERSION, CodedError, coded
 from .image import (
     FLAT16_FORMATS, M68K_FORMATS, MAC68K_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, Z80_FORMATS, image_units, read_map,
 )
+from .load_manifest import manifest_states
 from .queries import QueryError, echo, normalize_query
 
 
@@ -240,7 +241,8 @@ def _group_alive(process: subprocess.Popen) -> bool:
     return True
 
 
-def import_program(export: Path, project: Path, *, timeout: float | None = IMPORT_TIMEOUT) -> dict:
+def import_program(export: Path, project: Path, *, timeout: float | None = IMPORT_TIMEOUT,
+                   load_views: bool = False) -> dict:
     export = export.resolve()
     from . import worker
     worker.stop(project)  # A worker's read-only session would lock the project and serve the old program.
@@ -249,6 +251,13 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
     if not manifest.is_file() or not image.is_file():
         raise GhidraError(f"expected map.json and image.bin in {export}", code="export_invalid")
     program = read_map(export)
+    extra_scripts = []
+    if program.get("toolchain_symbols") or program.get("toolchain_source_lines"):
+        extra_scripts.append("RetroreToolchain.java")
+    if load_views:
+        if manifest_states(program, image_units(program, image.stat().st_size)) is None:
+            raise GhidraError("--load-views requires a load manifest in the export")
+        extra_scripts.append("RetroreLoadViews.java")
     options = ["-import", str(image), "-loader", "BinaryLoader", "-processor"]
     if program.get("format") in M68K_FORMATS:
         image_units(program, image.stat().st_size)
@@ -256,32 +265,36 @@ def import_program(export: Path, project: Path, *, timeout: float | None = IMPOR
             X68K_FORMAT: "RetroreM68kImport.java", MAC68K_FORMAT: "RetroreMacintosh.java",
         }.get(program["format"])
         report = _run(
-            project, [*options, "68000:BE:32:MC68020"], post_script, str(manifest),
+            project, [*options, "68000:BE:32:MC68020"], (*([post_script] if post_script else []), *extra_scripts),
+            str(manifest),
             pre_script="RetroreM68kImport.java", timeout=timeout,
         )
         if program["format"] == MAC68K_FORMAT and "macintosh" not in report:
             raise GhidraError("Ghidra RetroreMacintosh.java did not run", code="script_error")
-        return report
-    if program.get("format") in FLAT16_FORMATS:
+    elif program.get("format") in FLAT16_FORMATS:
         image_units(program, image.stat().st_size)
         language = "z80:LE:16:default" if program["format"] in Z80_FORMATS else "6502:LE:16:default"
         if program["format"] == X1_FORMAT:
             # The Z180 variant decodes IN/OUT (C) ports as BC; the plain Z80 variant keeps only C.
             language = "z180:LE:16:default"
-        return _run(
-            project, [*options, language], None, str(manifest), pre_script="Retrore8BitImport.java",
+        report = _run(
+            project, [*options, language], tuple(extra_scripts), str(manifest), pre_script="Retrore8BitImport.java",
             timeout=timeout,
         )
-    if program.get("format") == PC98_FORMAT:
-        image_units(program, image.stat().st_size)
-    report = _run(
-        project, [*options, "x86:LE:16:Real Mode"],
-        ("RetroreSegments.java", "RetroreIndirect.java", "RetroreConventions.java"), str(manifest),
-        pre_script="RetroreImport.java", timeout=timeout,
-    )
-    # A post script that fails to compile leaves no result of its own.
-    for key, script in (("indirect", "RetroreIndirect.java"), ("calling_conventions", "RetroreConventions.java")):
-        if key not in report:
+    else:
+        if program.get("format") == PC98_FORMAT:
+            image_units(program, image.stat().st_size)
+        report = _run(
+            project, [*options, "x86:LE:16:Real Mode"],
+            ("RetroreSegments.java", "RetroreIndirect.java", "RetroreConventions.java", *extra_scripts), str(manifest),
+            pre_script="RetroreImport.java", timeout=timeout,
+        )
+        # A post script that fails to compile leaves no result of its own.
+        for key, script in (("indirect", "RetroreIndirect.java"), ("calling_conventions", "RetroreConventions.java")):
+            if key not in report:
+                raise GhidraError(f"Ghidra {script} did not run", code="script_error")
+    for script, key in (("RetroreLoadViews.java", "load_views"), ("RetroreToolchain.java", "toolchain")):
+        if script in extra_scripts and key not in report:
             raise GhidraError(f"Ghidra {script} did not run", code="script_error")
     return report
 

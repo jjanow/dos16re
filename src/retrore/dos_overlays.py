@@ -1,0 +1,222 @@
+"""Read embedded Microsoft LINK and Borland VROOMM overlay members."""
+
+from collections import defaultdict
+from struct import Struct
+
+from .mz import MZError, MZExecutable, read_mz_header, read_mz_relocations
+from .overlays import Descriptor, LinkedFixup, LinkedOverlay
+
+_WORD = Struct("<H")
+_PAIR = Struct("<2H")
+_FB_HEADER = Struct("<4sIII")
+_FB_SEGMENT = Struct("<4H")
+_FB_DESCRIPTOR = Struct("<BBHI3H")
+_FB_STUB = Struct("<BBHB")
+
+
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) & -alignment
+
+
+def _link_offsets(data: bytes, cursor: int) -> list[int]:
+    padded = _align(cursor, 512)
+    return [offset for offset in sorted({cursor, padded}) if data.startswith(b"MZ", offset)
+            and not any(data[cursor:offset])]
+
+
+def embedded_overlays(data: bytes, executable: MZExecutable, source: str,
+                      base: int) -> tuple[list[LinkedOverlay], list[dict]]:
+    start = executable.header.file_size
+    link = _link_offsets(data, start)
+    borland = [offset for offset in sorted({start, _align(start, 16), _align(start, 512)})
+               if data[offset:offset + 2] == b"FB" and len(data) >= offset + 4
+               and (data.startswith(b"FBOV", offset) or data[offset + 2:offset + 4].isalpha())]
+    if len(link) + len(borland) > 1:
+        raise MZError("ambiguous appended DOS overlay header positions")
+    overlays, diagnostics, end = [], [], start
+    if link:
+        overlays, diagnostics, end = _read_link(data, link[0], executable, source, base)
+    elif borland:
+        overlays, diagnostics, end = _read_vroomm(data, borland[0], executable, source)
+    if any(data[end:]):
+        diagnostics.append({"code": "unmapped_trailer", "message":
+                            f"{len(data) - end} bytes after the decoded DOS module(s) remain unmapped",
+                            "file_offset": end, "size": len(data) - end})
+    return overlays, diagnostics
+
+
+def _link_directory(executable: MZExecutable, members: dict[int, tuple]) -> tuple[dict[int, tuple[int, ...]], str | None]:
+    """Find the relocation-backed segment and overlay-number arrays from LINK 3.65."""
+    image = executable.image
+    positions = {site.linear for site in executable.relocations}
+    candidates = []
+    for start in sorted(position - 4 for position in positions if position >= 4):
+        count, count_overlays = _PAIR.unpack_from(image, start)
+        if not 2 <= count <= 256 or not 2 <= count_overlays <= 256 or start + 4 + count * 3 > len(image):
+            continue
+        selectors = range(start + 4, start + 4 + 2 * count, 2)
+        if any(position not in positions for position in selectors):
+            continue
+        numbers = image[selectors.stop:selectors.stop + count]
+        if numbers[0] != 0 or count_overlays != max(numbers) + 1 or set(numbers) != {0, *members}:
+            continue
+        segments = defaultdict(list)
+        for number, position in zip(numbers, selectors, strict=True):
+            if number:
+                segments[number].append(_WORD.unpack_from(image, position)[0])
+        if any(max(values) * 16 >= len(image) or (max(values) - min(values)) * 16 >= len(members[number][1])
+               or min(values) * 16 + len(members[number][1]) > len(image)
+               for number, values in segments.items()):
+            continue
+        candidates.append({number: tuple(sorted(set(values))) for number, values in segments.items()})
+    if len(candidates) != 1:
+        reason = "could not locate" if not candidates else "found multiple candidates for"
+        return {}, f"{reason} the Microsoft LINK segment directory; overlay relocations and runtime addresses are unavailable"
+    return candidates[0], None
+
+
+def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
+               base: int) -> tuple[list[LinkedOverlay], list[dict], int]:
+    members = {}
+    while True:
+        content = memoryview(data)[start:]
+        try:
+            header = read_mz_header(content)
+            relocations = read_mz_relocations(content, header)
+        except MZError as error:
+            raise MZError(f"Microsoft LINK member at file offset {start:#x}: {error}") from error
+        number = header.overlay_number
+        if number == 0 or number in members or header.header_size == header.file_size:
+            raise MZError(f"invalid or duplicate Microsoft LINK overlay {number} at file offset {start:#x}")
+        file_offset, end = start + header.header_size, start + header.file_size
+        members[number] = (file_offset, data[file_offset:end], relocations)
+        locations = _link_offsets(data, end)
+        if not locations:
+            break
+        start = locations[0]
+
+    directory, reason = _link_directory(executable, members)
+    overlays = []
+    for number, (file_offset, image, relocations) in members.items():
+        name = f"link_{number:04x}"
+        segments = directory.get(number, ())
+        runtime = segments[0] if segments else None
+        fixups = []
+        if runtime is not None:
+            for address in relocations:
+                offset = address.linear - runtime * 16
+                if not 0 <= offset <= len(image) - 2:
+                    raise MZError(f"Microsoft LINK overlay {number} relocation {address} lies outside its own image")
+                value, = _WORD.unpack_from(image, offset)
+                fixups.append(LinkedFixup(offset, value - runtime, name) if value in segments else
+                              LinkedFixup(offset, value))
+        runtime_segment = None if runtime is None else base + runtime
+        entries = tuple((segment - runtime) * 16 for segment in segments)
+        overlays.append(LinkedOverlay(source, name, image, file_offset, "MS_LINK", number,
+                                      runtime_segment, entries, fixups=tuple(fixups)))
+    diagnostics = [{"code": "overlay_layout_partial", "message": reason}] if reason else []
+    return overlays, diagnostics, end
+
+
+def _vroomm_directory(data: bytes, start: int, header_size: int, root_size: int) -> tuple[int, int, tuple]:
+    while data[start:start + 2] == b"FB":
+        if start + _FB_HEADER.size > len(data):
+            raise MZError("truncated Borland FB section header")
+        tag, size, directory, count = _FB_HEADER.unpack_from(data, start)
+        payload = start + _FB_HEADER.size
+        end = payload + size
+        if end > len(data):
+            raise MZError(f"truncated Borland {tag.decode('ascii', 'replace')} section")
+        if tag == b"FBOV":
+            if not count or not header_size <= directory <= directory + count * _FB_SEGMENT.size <= root_size:
+                raise MZError("Borland VROOMM segment directory lies outside the resident module")
+            return payload, end, tuple(_FB_SEGMENT.iter_unpack(data[directory:directory + count * _FB_SEGMENT.size]))
+        start = end
+    return start, start, ()
+
+
+def _read_vroomm(data: bytes, start: int, executable: MZExecutable,
+                 source: str) -> tuple[list[LinkedOverlay], list[dict], int]:
+    payload, end, directory = _vroomm_directory(data, start, executable.header.header_size,
+                                                executable.header.file_size)
+    if not directory:
+        return [], [], start
+    root = executable.image
+    descriptors = {}
+    ranges = []
+    resident_ranges = []
+    for number, (segment, limit, flags, _) in enumerate(directory):
+        if not flags & 2 or not limit:
+            continue
+        offset = segment * 16
+        if offset + 32 > len(root):
+            raise MZError(f"Borland VROOMM descriptor for segment {segment:04x} is truncated")
+        opcode, interrupt, _, relative, code_size, fixup_size, count = _FB_DESCRIPTOR.unpack_from(root, offset)
+        file_offset = payload + relative
+        stub_end = offset + 32 + count * _FB_STUB.size
+        if (opcode != 0xCD or not code_size or fixup_size % 2 or stub_end > len(root)
+                or stub_end - offset > 0x10000 or file_offset + code_size + fixup_size > end):
+            raise MZError(f"invalid Borland VROOMM descriptor for segment {segment:04x}")
+        entries = []
+        for stub_opcode, vector, target, _ in _FB_STUB.iter_unpack(root[offset + 32:stub_end]):
+            if (stub_opcode, vector) != (opcode, interrupt) or target >= code_size:
+                raise MZError(f"invalid Borland VROOMM stub for segment {segment:04x}")
+            entries.append(target)
+        descriptor = Descriptor(segment, file_offset, code_size, fixup_size, tuple(entries))
+        descriptors[number] = descriptor
+        ranges.append((file_offset, descriptor.end))
+        resident_ranges.append((offset, stub_end))
+    ranges.sort()
+    resident_ranges.sort()
+    if not descriptors or any(left[1] > right[0] for spans in (ranges, resident_ranges)
+                              for left, right in zip(spans, spans[1:])):
+        raise MZError("Borland VROOMM has missing or overlapping overlay ranges")
+
+    overlays, diagnostics = [], []
+    for number, descriptor in descriptors.items():
+        code_end = descriptor.file_offset + descriptor.code_size
+        code = data[descriptor.file_offset:code_end]
+        fixups = []
+        unresolved = 0
+        unknown_flags = 0
+        for offset, in _WORD.iter_unpack(data[code_end:descriptor.end]):
+            if offset + 2 > len(code):
+                raise MZError(f"Borland VROOMM fixup lies outside segment {descriptor.segment:04x}")
+            value, = _WORD.unpack_from(code, offset)
+            index, flags = divmod(value, 8)
+            if index >= len(directory):
+                raise MZError(f"Borland VROOMM fixup names missing segment index {index}")
+            fixups.append(LinkedFixup(offset, directory[index][0]))
+            if flags & ~1:
+                unknown_flags += 1
+            if flags & 1:
+                stub = _function_ref_stub(code, offset, descriptors.get(index))
+                if stub is None:
+                    unresolved += 1
+                else:
+                    fixups.append(LinkedFixup(offset + 4, stub, segment=False))
+        if unresolved:
+            diagnostics.append({"code": "overlay_fixups_partial", "message":
+                                f"Borland VROOMM segment {descriptor.segment:04x} has "
+                                f"{unresolved} unresolved function-pointer offsets"})
+        if unknown_flags:
+            diagnostics.append({"code": "overlay_fixups_partial", "message":
+                                f"Borland VROOMM segment {descriptor.segment:04x} has "
+                                f"{unknown_flags} fixups with unrecognized flags"})
+        overlays.append(LinkedOverlay(source, f"vroomm_{descriptor.segment:04x}", code, descriptor.file_offset,
+                                      "VROOMM", number, entries=descriptor.entries, descriptor=descriptor,
+                                      fixups=tuple(fixups)))
+    return overlays, diagnostics, end
+
+
+def _function_ref_stub(code: bytes, offset: int, descriptor: Descriptor | None) -> int | None:
+    # Borland emits MOV reg, segment / PUSH reg / MOV reg, offset / PUSH reg.
+    if descriptor is None or not 0 < offset <= len(code) - 7:
+        return None
+    mov, push = code[offset - 1], code[offset + 2]
+    if not (0xB8 <= mov <= 0xBF and push == mov - 0x68 and
+            code[offset + 3] == mov and code[offset + 6] == push):
+        return None
+    target, = _WORD.unpack_from(code, offset + 4)
+    matches = [index for index, entry in enumerate(descriptor.entries) if entry == target]
+    return 32 + _FB_STUB.size * matches[0] if len(matches) == 1 else None

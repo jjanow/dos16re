@@ -8,8 +8,9 @@ from pathlib import Path
 from .ghidra import GhidraError, query_batch
 from .image import (
     ATARI8_FORMAT, M68K_FORMATS, ImageError, ImageUnit, RuntimePlacementError, dos_runtime_units, explicit_runtime_units,
-    image_units, read_map,
+    image_units, read_map, runtime_spans,
 )
+from .load_manifest import LoadManifestError, manifest_states, state_loads, state_spans
 from .mz import Address, MZExecutable
 from .search import SearchError, resolve_address
 
@@ -24,27 +25,41 @@ class EvidenceError(ValueError):
 
 class ExportEvidence:
     def __init__(self, export: Path, runtime_base: int | None = None, overlay_segments: dict | None = None, *,
-                 runtime_loads: dict | None = None, source_file: Path | None = None):
+                 runtime_loads: dict | None = None, source_file: Path | None = None, state: str | None = None):
         self.image = (export / "image.bin").read_bytes()
         self.program = read_map(export)
         self.units = image_units(self.program, len(self.image))
         self.records = {record["name"]: record for record in self.program["units"]}
         self.format = self.program.get("format", "MZ")
+        self.manifest = manifest_states(self.program, self.units)
+        self.state = state
         self.root_file_offset = None
         if source_file is not None:
             if self.format != "MZ" or self.program.get("packer"):
-                raise EvidenceError("source-file recovery requires an unpacked DOS MZ export")
-            executable = MZExecutable.parse(source_file.read_bytes())
+                raise EvidenceError("source-file recovery requires an unpacked DOS export")
             root = self.units[0]
-            start = root.image_offset
-            if executable.packer or executable.image != self.original[0][start:start + root.file_size]:
-                raise EvidenceError("source file does not match the original DOS load module")
-            self.root_file_offset = executable.header.header_size
-            recorded = self.records[root.name].get("file_offset")
-            if recorded is not None and self.root_file_offset != recorded:
-                raise EvidenceError("source file header size differs from the export")
+            source = source_file.read_bytes()
+            if self.program.get("dos_format") in ("COM", "RAW"):
+                spans = self.file_spans(root)
+                prefix = spans[0]["offset"] if spans else root.file_size
+                if source != self.image[root.image_offset + prefix:root.image_offset + root.file_size]:
+                    raise EvidenceError("source file does not match the original DOS load module")
+            else:
+                executable = MZExecutable.parse(source)
+                start = root.image_offset
+                if executable.packer or executable.image != self.original[0][start:start + root.file_size]:
+                    raise EvidenceError("source file does not match the original DOS load module")
+                self.root_file_offset = executable.header.header_size
+                recorded = self.records[root.name].get("file_offset")
+                if recorded is not None and self.root_file_offset != recorded:
+                    raise EvidenceError("source file header size differs from the export")
         try:
-            if runtime_loads:
+            runtime_overrides = bool(runtime_loads or overlay_segments or runtime_base is not None)
+            if state is not None and (self.manifest is None or runtime_overrides):
+                raise EvidenceError("selecting a state requires a load manifest and excludes runtime overrides")
+            if self.manifest is not None and not runtime_overrides:
+                self.select_runtime_state(state if state is not None else self.manifest["initial"])
+            elif runtime_loads:
                 if runtime_base is not None or overlay_segments:
                     raise EvidenceError("runtime loads cannot be combined with DOS segment overrides")
                 self.runtime = explicit_runtime_units(self.units, runtime_loads, self.format)
@@ -55,8 +70,15 @@ class ExportEvidence:
                 if runtime_base is not None or overlay_segments:
                     raise EvidenceError("runtime segment overrides require a DOS MZ export")
                 self.runtime = {unit.name: unit.linear for unit in self.units}
-        except RuntimePlacementError as error:
+            if self.state is None:
+                self.runtime_spans = runtime_spans(self.units, self.runtime)
+        except (RuntimePlacementError, LoadManifestError) as error:
             raise EvidenceError(str(error)) from error
+
+    def select_runtime_state(self, state: str) -> None:
+        self.runtime = state_loads(self.manifest, state)
+        self.runtime_spans = state_spans(self.manifest, state, self.units)
+        self.state = state
 
     def identity(self) -> dict:
         return {"program": self.program.get("program"), "format": self.format,
@@ -65,6 +87,8 @@ class ExportEvidence:
     def file_spans(self, unit: ImageUnit, *, container: bool = False) -> list[dict]:
         record = self.records[unit.name]
         if container:
+            if record.get("file_offset_kind") == "container" and "container_spans" not in record:
+                return self.file_spans(unit)
             spans = record.get("container_spans", [])
         elif "file_spans" in record:
             spans = record["file_spans"]
@@ -131,16 +155,22 @@ class ExportEvidence:
     def file_source(self, unit: ImageUnit, *, container: bool = False) -> dict:
         record = self.records[unit.name]
         member = record.get("disk_file")
-        return {"source": record.get("source", self.program.get("program")),
-                "member": member, "offset_kind": ("container" if container else
-                                                   record.get("file_offset_kind", "member" if member else "file"))}
+        source = {"source": record.get("source", self.program.get("program")),
+                  "member": member, "offset_kind": ("container" if container else
+                                                     record.get("file_offset_kind", "member" if member else "file"))}
+        if isinstance(member_id := record.get("member_id"), str):
+            source["member_id"] = member_id
+        return source
 
     def location(self, unit: ImageUnit, offset: int) -> dict:
         report = unit.location(offset)
         report.update(unit=unit.name, unit_offset=offset, image_offset=unit.image_offset + offset,
                       initialized=offset < unit.file_size, runtime=None, file=None)
+        if variant := self.records[unit.name].get("variant_source"):
+            report["variant_source"] = variant
         start = self.runtime.get(unit.name)
-        if start is not None:
+        if start is not None and any(span.unit is unit and span.offset <= offset < span.offset + span.size
+                                     for span in self.runtime_spans):
             linear = start + offset
             if unit.segment is not None:
                 relative = (start & 0xF) + offset
@@ -182,11 +212,18 @@ class ExportEvidence:
             value = resolve_address(self.program, [], address)["linear"]
         else:
             value = _hex(address)
+        if space == "runtime":
+            for span in self.runtime_spans:
+                if span.linear <= value < span.end:
+                    yield span.unit, span.offset + value - span.linear
+            return
         for unit in self.units:
             if space == "file":
                 file = self.file_source(unit)
+                member_id = file.get("member_id")
+                id_match = member is not None and member_id is not None and member.casefold() == f"id:{member_id}".casefold()
                 if (source is not None and file["source"] != source) or (
-                    member is not None and file["member"] != member
+                    member is not None and file["member"] != member and not id_match
                 ):
                     continue
                 if offset_kind is None or offset_kind == file["offset_kind"]:
@@ -200,9 +237,8 @@ class ExportEvidence:
                     if 0 <= displacement < span["size"]:
                         yield unit, span["offset"] + displacement
                 continue
-            start = (self.runtime.get(unit.name) if space == "runtime" else
-                     unit.image_offset if space == "image" else unit.linear)
-            if start is not None and 0 <= value - start < unit.size:
+            start = unit.image_offset if space == "image" else unit.linear
+            if 0 <= value - start < unit.size:
                 yield unit, value - start
 
     @cached_property
@@ -226,11 +262,16 @@ class ExportEvidence:
                 for record in reversed(self.program.get("stubs", [])):
                     undo(record["address"]["linear"] - origin, bytes.fromhex(record["original"]), "overlay_stub")
                 positions = self.program.get("relocations", [])
+                overlay_edits = self.program.get("overlay_edits", [])
+                edited_relocations = {edit["image_offset"] for edit in overlay_edits if edit["kind"] == "relocation"}
+                positions = [position for position in positions if position not in edited_relocations]
                 if "root_relocation_order" in self.program:
                     positions = self.program["root_relocation_order"] + [
                         position for position in positions if position >= self.units[0].size
                     ]
                 base_segment = self.units[0].segment
+                for edit in reversed(overlay_edits):
+                    undo(edit["image_offset"], bytes.fromhex(edit["original"]), edit["kind"])
                 for position in reversed(positions):
                     value = int.from_bytes(original[position:position + 2], "little")
                     undo(position, ((value - base_segment) & 0xFFFF).to_bytes(2, "little"), "relocation")
@@ -254,10 +295,28 @@ def _hex(text: str) -> int:
 def map_address(export: Path, address: str, *, space: str = "logical", source: str | None = None,
                 member: str | None = None, runtime_base: int | None = None,
                 overlay_segments: dict | None = None, runtime_loads: dict | None = None,
-                source_file: Path | None = None, offset_kind: str | None = None) -> dict:
-    image = ExportEvidence(export, runtime_base, overlay_segments, runtime_loads=runtime_loads, source_file=source_file)
-    matches = [image.location(unit, offset) for unit, offset in image.matches(address, space, source, member, offset_kind)]
-    return {"input": address, "space": space, "count": len(matches), "matches": matches}
+                source_file: Path | None = None, offset_kind: str | None = None,
+                state: str | None = None, all_states: bool = False) -> dict:
+    image = ExportEvidence(export, runtime_base, overlay_segments, runtime_loads=runtime_loads,
+                           source_file=source_file, state=state)
+    if all_states:
+        if image.manifest is None or image.state is None or state is not None:
+            raise EvidenceError("mapping every state requires a load manifest and excludes state and runtime overrides")
+        matches = []
+        for row in image.manifest["states"]:
+            name = row["name"]
+            image.select_runtime_state(name)
+            for unit, offset in image.matches(address, space, source, member, offset_kind):
+                location = image.location(unit, offset)
+                if location["runtime"] is not None:
+                    matches.append({**location, "state": name})
+    else:
+        matches = [image.location(unit, offset)
+                   for unit, offset in image.matches(address, space, source, member, offset_kind)]
+    report = {"input": address, "space": space, "count": len(matches), "matches": matches}
+    if image.state is not None and not all_states:
+        report["state"] = image.state
+    return report
 
 
 def _inspect_bytes(image: ExportEvidence, address: str, size: int) -> dict:

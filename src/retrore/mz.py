@@ -67,11 +67,17 @@ class LoadedMZ:
     packer: str | None = None
     min_alloc_paragraphs: int = 0
     file_offset: int | None = None
+    dos_format: str = "MZ"
+    load_offset: int = 0
+    diagnostics: tuple[dict, ...] = ()
+    toolchain: dict | None = None
 
     @property
     def memory_end(self) -> int:
         """First linear address above the program's image, minimum allocation, and initial stack."""
         image_end = self.base_segment * _PARAGRAPH_SIZE + len(self.image)
+        if self.dos_format != "MZ":
+            return self.base_segment * _PARAGRAPH_SIZE + 0x10000
         allocation_end = image_end + self.min_alloc_paragraphs * _PARAGRAPH_SIZE
         stack_top = self.stack.segment * _PARAGRAPH_SIZE + (self.stack.offset or 0x10000)
         return max(image_end, allocation_end, stack_top)
@@ -83,31 +89,18 @@ class MZExecutable:
     relocations: tuple[Address, ...]
     image: bytes
     packer: str | None = None
+    packed_header: bytes = b""
 
     @classmethod
     def parse(cls, data: bytes) -> "MZExecutable":
-        if len(data) < _HEADER.size:
-            raise MZError("truncated MZ header")
-
-        signature, *fields = _HEADER.unpack_from(data)
-        if signature != b"MZ":
-            raise MZError("missing MZ signature")
-        header = MZHeader(*fields)
-
-        if header.page_count == 0 or header.last_page_bytes >= _PAGE_SIZE:
-            raise MZError("invalid MZ page counts")
-        if not _HEADER.size <= header.header_size <= header.file_size:
-            raise MZError("invalid MZ header size")
-        if header.file_size > len(data):
-            raise MZError("truncated MZ executable")
-
+        header = read_mz_header(data)
         # The file may contain overlay data after the declared MZ module.
         image = data[header.header_size:header.file_size]
-        relocations = _parse_relocations(data, header, len(image))
+        relocations = read_mz_relocations(data, header, len(image))
         from .packers import detect_packer
 
         packer = detect_packer(header, data[_HEADER.size:header.header_size], image)
-        return cls(header, relocations, image, packer)
+        return cls(header, relocations, image, packer, data[:header.header_size] if packer == "PKLITE" else b"")
 
     def load(self, base_segment: int = DEFAULT_BASE_SEGMENT) -> LoadedMZ:
         if not 0 <= base_segment <= _SEGMENT_MASK:
@@ -116,6 +109,7 @@ class MZExecutable:
         entry = Address(header.initial_cs, header.initial_ip)
         stack = Address(header.initial_ss, header.initial_sp)
         image, relocations = self.image, self.relocations
+        packer = self.packer
         # A packed header's minimum allocation describes the packed module, not the program.
         min_alloc = 0 if self.packer else header.min_alloc_paragraphs
         if self.packer == "EXEPACK":
@@ -126,6 +120,10 @@ class MZExecutable:
             from .packers import unpack_lzexe
 
             image, entry, stack, relocations = unpack_lzexe(image, entry, self.packer)
+        elif self.packer == "PKLITE":
+            from .pklite import unpack_pklite
+
+            image, entry, stack, relocations, min_alloc, packer = unpack_pklite(image, self.packed_header, header)
         elif self.packer:
             raise UnsupportedPacker(self.packer)
 
@@ -140,7 +138,7 @@ class MZExecutable:
 
         entry = Address((base_segment + entry.segment) & _SEGMENT_MASK, entry.offset)
         stack = Address((base_segment + stack.segment) & _SEGMENT_MASK, stack.offset)
-        return LoadedMZ(base_segment, bytes(image), entry, stack, relocations, self.packer, min_alloc,
+        return LoadedMZ(base_segment, bytes(image), entry, stack, relocations, packer, min_alloc,
                         None if self.packer else header.header_size)
 
 
@@ -150,7 +148,24 @@ class UnsupportedPacker(MZError):
         super().__init__(f"unsupported DOS executable packer ({packer})")
 
 
-def _parse_relocations(data: bytes, header: MZHeader, image_size: int) -> tuple[Address, ...]:
+def read_mz_header(data: bytes | memoryview) -> MZHeader:
+    if len(data) < _HEADER.size:
+        raise MZError("truncated MZ header")
+    signature, *fields = _HEADER.unpack_from(data)
+    if signature != b"MZ":
+        raise MZError("missing MZ signature")
+    header = MZHeader(*fields)
+    if header.page_count == 0 or header.last_page_bytes >= _PAGE_SIZE:
+        raise MZError("invalid MZ page counts")
+    if not _HEADER.size <= header.header_size <= header.file_size:
+        raise MZError("invalid MZ header size")
+    if header.file_size > len(data):
+        raise MZError("truncated MZ executable")
+    return header
+
+
+def read_mz_relocations(data: bytes | memoryview, header: MZHeader,
+                        image_size: int | None = None) -> tuple[Address, ...]:
     if header.relocation_count == 0:
         return ()
 
@@ -162,7 +177,7 @@ def _parse_relocations(data: bytes, header: MZHeader, image_size: int) -> tuple[
     relocations = []
     for index, (offset, segment) in enumerate(_RELOCATION.iter_unpack(data[start:end])):
         address = Address(segment, offset)
-        if address.linear + _WORD.size > image_size:
+        if image_size is not None and address.linear + _WORD.size > image_size:
             raise MZError(f"MZ relocation {index} at {address} is outside the load module")
         relocations.append(address)
     return tuple(relocations)

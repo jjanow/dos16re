@@ -21,7 +21,7 @@ from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError, _REGIS
 from .evidence import ExportEvidence
 from .image import (
     GENESIS_FORMAT, MAC68K_FORMAT, M68K_ADDRESS_LIMIT, M68K_FORMATS, MOS6502_FORMATS, NES_FORMAT,
-    PC98_FORMAT, X68K_FORMAT, Z80_FORMATS, ImageUnit, check_map_version, image_units, read_map,
+    PC98_FORMAT, X68K_FORMAT, Z80_FORMATS, ImageUnit, check_map_version, image_units, read_map, runtime_spans,
 )
 from .mz import Address
 
@@ -119,27 +119,20 @@ class TraceAddressBackend:
     def __init__(self, image: ExportEvidence):
         self.architecture, self.limit = _architecture(image.format)
         self._units = image.units
-        self._placements = image.runtime
-        self._ranges = self._ordered(self._placements)
-        self._starts = [start for start, _ in self._ranges]
-
-    def _ordered(self, placements: Mapping[str, int]) -> list[tuple[int, ImageUnit]]:
-        return sorted(
-            ((placements[unit.name], unit) for unit in self._units if unit.size and unit.name in placements),
-            key=lambda item: item[0],
-        )
+        self._ranges = image.runtime_spans
+        self._starts = [span.linear for span in self._ranges]
 
     def linear(self, address: AddressInput) -> int:
         return _linear(address, self.architecture, self.limit)
 
     def location(self, linear: int, placements: Mapping[str, int] | None = None) -> tuple[ImageUnit, int] | None:
-        ranges = self._ranges if placements is None else self._ordered(placements)
-        starts = self._starts if placements is None else [start for start, _ in ranges]
+        ranges = self._ranges if placements is None else runtime_spans(self._units, dict(placements))
+        starts = self._starts if placements is None else [span.linear for span in ranges]
         index = bisect_right(starts, linear) - 1
         if index >= 0:
-            start, unit = ranges[index]
-            if (offset := linear - start) < unit.size:
-                return unit, offset
+            span = ranges[index]
+            if linear < span.end:
+                return span.unit, span.offset + linear - span.linear
         return None
 
 

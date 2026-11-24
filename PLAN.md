@@ -14,13 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, Phase 11 added routine fixtures with input matrices, replayable snapshots, and
-differential comparisons. Routine execution now covers x86, 68k, 6502, and Z80. Structured traces
-map snapshots, memory accesses, edges, and bank or overlay changes to static coverage and offer
-a Ghidra preview before changes are applied. The standalone suite passed 460 tests with 101
-skipped. Ghidra 12.2 verified preview and apply on synthetic traces, including runtime byte checks.
+On 2026-11-23, Phase 12 added DOS COM, raw and PKLITE loads, embedded LINK and VROOMM overlays,
+hierarchical Amiga overlays, and more Hunk fixups and debug records. Load manifests now carry
+bank and overlay states through address mapping, traces, and Ghidra. Disk and container catalogs
+share member selectors and source layout records. Microsoft LINK 3.65, Borland TLINK 4.0, and
+PKLITE 2.01 produced the DOS validation inputs. The standalone suite passed 487 tests with 106
+skipped. Ghidra 12.2 verified state views, public symbols, source lines, and Amiga overlay imports.
 
-Resume with Phase 12's DOS `.COM` and raw loads.
+Resume with an original Amiga overlay release and additional native linker and packer variants
+as inputs become available. The remaining format-specific gaps are listed in Phase 12.
 
 ## Why
 
@@ -61,11 +63,11 @@ platforms used by the remaster projects, starting with AmigaDOS.
 1. **Implemented.** Parse the header and relocation table, relocate the module
    at a fixed base segment, and report the initial CS:IP and SS:SP. See the
    [MS-DOS Encyclopedia](https://www.pcjs.org/documents/books/mspl13/msdos/encyclopedia/section2/#article-4-structure-of-an-application-program).
-2. **Implemented.** Unpack EXEPACK and LZEXE 0.90/0.91/0.91e, restore the original entry and stack, and apply the
-   recovered relocations. Report recognized unsupported packers and variants. Implement PKLITE as targets need it.
+2. **Implemented.** Unpack EXEPACK, LZEXE 0.90/0.91/0.91e, and supported PKLITE streams. Restore the
+   original entry and stack, apply recovered relocations, and diagnose unrecognized packed variants.
 3. **Implemented for the validation targets.** Load Turbo Pascal `FBOV`/`TPOV` banks from resident descriptors
    and relocate their unit code. Place flat overlays at supplied or automatically assigned segments above the
-   root. Later formats include Borland VROOMM, Microsoft LINK overlays, and `.COM` programs.
+   root. Phase 12 adds DOS COM and raw loads, Borland VROOMM banks, and Microsoft LINK members.
 4. **Implemented.** Rewrite direct far calls identified by relocations. Convert each overlay stub to a far jump
    for indirect callers. Preserve original bytes and targets in the map.
 5. **Implemented.** `retrore load PROGRAM -o OUT/` exports `image.bin` and `map.json`. Both `load` and `info`
@@ -414,16 +416,27 @@ release. Continue with the analysis backlog below.
 
 ### Phase 12: loader depth on supported platforms
 
-- Add DOS `.COM` and raw loads, PKLITE variants, and Borland VROOMM and Microsoft LINK overlays
-  as representative inputs become available. Improve diagnostics for partial and ambiguous loads.
-- Add Amiga Hunk overlay trees and broader relocation coverage. Add usable symbols and signatures
-  from supported original toolchains, linker maps, and debug records where available.
-- Describe load order, mutually exclusive overlays, and bank transitions in reusable manifests.
-  Support viewing alternative states together where Ghidra permits, and preserve source provenance
-  when runtime addresses overlap.
-- Give disk and container loaders a uniform way to enumerate members, select inputs, and record
-  layout decisions. Validate expanded format coverage with synthetic fixtures and optional original
-  releases.
+- **Implemented.** DOS COM and raw loads record the input byte range and initial segment registers.
+  PKLITE decodes recognized standard and early extra-compression streams and COM stubs. Microsoft
+  LINK and Borland VROOMM overlays retain their source offsets and recovered fixups. Validated
+  LINK directories supply a shared runtime window. VROOMM restores calls through verified resident
+  stubs. Partial layouts and unmapped trailers appear as diagnostics.
+- **Implemented.** Amiga Hunk overlay trees retain each node and its ancestry, active segment indices,
+  table entries, and source offsets. The loader supports additional narrow absolute and PC-relative
+  fixups, recognized LINE records, and the THOR 1.2 manager signature. DOS exports accept LINK and
+  TLINK public and source-line listings. Reusable masked signatures can name unique byte matches.
+- **Implemented.** Versioned load manifests describe ordered placement, replacement, and transitions.
+  Address evidence and traces map reused runtime addresses to the active source. Ghidra can display
+  manifest states in separate overlay address spaces alongside the analysis image. Add separately
+  selected banks from flat 8-bit exports using the manifest.
+- **Implemented.** `members` and `--member` share selectors for supported disk and container inputs.
+  Exports preserve selection order, layout decisions, and member and file offsets. Synthetic tests
+  cover these workflows. Original-tool outputs and releases use optional `RETRORE_*_DIR` inputs.
+
+Open validation includes additional PKLITE stubs and Microsoft LINK directory arrangements, VROOMM
+function-pointer fixup patterns beyond the recognized sequence, and an original hierarchical Amiga
+release. Amiga overlay trees establish coexistence. Captured placements supply physical scatter-load
+addresses for a run.
 
 ## Platform capability parity
 
@@ -440,7 +453,7 @@ underlying analysis uses each machine's conventions and available emulator or tr
 | Bulk lookups, inventories, call graphs, and routine context | Implemented | Implemented | Implemented | Implemented |
 | Ghidra address query field selection and reference pagination | Implemented | Implemented | Implemented | Implemented |
 | Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
-| Runtime layout | MZ relocation and supported overlays | Resident sections and relocations, a fixed Macintosh A5 world, and a linear Genesis cartridge view | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
+| Runtime layout | MZ, COM, raw loads, and supported overlays | Resident sections and relocations, hierarchical Amiga overlays, a fixed Macintosh A5 world, and a linear Genesis cartridge view | Selected bank snapshots and manifest states | Selected real-mode RAM loads and manifest states |
 | Calling conventions, runtime signatures, and indirect control flow | Stack conventions, `int 21h` services, switch patterns, and indirect-call candidates | X68000 DOS and FPACK, Amiga and Atari ST switch recovery, and Macintosh A5 jump targets and named Toolbox traps | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
 | Routine emulation and trace coverage | x86 routines, structured emulator traces, and DOSBox-X | 68k routines and structured emulator traces | 6502 or Z80 routines and structured emulator traces | Real-mode x86 routines and structured emulator traces |
 
@@ -486,7 +499,8 @@ The SSI Phantasie I and III Amiga disk images from the Phantasie remaster suppli
 executables. Ghidra recovered Phantasie I's call from `h20:018c` to the palette routine at
 `h77:0466`. For Phantasie III, a zero-based export placed DATA at `0x21890`, and Ghidra
 decompiled the main loop at `h0:736c` and resolved its write to `h1:286c`.
-Both releases keep their hunks resident. The loader diagnoses AmigaDOS overlay trees as unsupported.
+Both releases keep their hunks resident. Hierarchical AmigaDOS overlay branches are validated with
+synthetic inputs. Set `RETRORE_AMIGA_OVERLAY_DIR` for an original executable named `overlay`.
 
 ### Atari ST
 

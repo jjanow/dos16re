@@ -130,7 +130,7 @@ array of requests), `error`, and `error_report` (the `--json` error object). The
 
 `retrore mcp` serves the same queries to [MCP](https://modelcontextprotocol.io) clients over stdio.
 It offers one tool per query command, `batch`, `where_is`, `relocations`, `lookup`, `bytes`,
-`address_map`, `info`, and `load`. Query tools take the request parameters as arguments, plus `project`,
+`address_map`, `info`, `load`, and `members`. Query tools take the request parameters as arguments, plus `project`,
 an optional exact Ghidra `program` name, and an optional `timeout` in seconds. `batch` takes `requests`,
 the same array `retrore batch` reads. `where_is` takes `export` and one of `bytes`, `string`, `constant`,
 or `pointer`. `bytes` and `address_map` take `export` and `address`. A call runs through the same validation and
@@ -140,8 +140,8 @@ and `hint`. A batch with failed rows, or a `functions` call with failed lookups,
 and reports `error` in those rows, although the CLI exits with status 1. The `gaps` tool
 always uses the paged form, like `retrore gaps --limit N`.
 
-`info` and `load` take `program` and the options of `retrore info` and `retrore load`, named as in
-the CLI with underscores, such as `base_segment`, `overlay`, `disk_file`, `x1_lsn`, and `entry`.
+`info`, `load`, and `members` take `program` and the corresponding CLI options, named as in
+the CLI with underscores, such as `base_segment`, `overlay`, `member`, `x1_lsn`, and `entry`.
 `load` also requires `output`. Flags are booleans, repeatable options are arrays of strings, and
 values use the CLI's text formats, such as `"c000"` and `"OV1.OVR@2000"`. The tool passes them
 through the CLI's parser, so the result is the program map that `--json` prints and usage errors
@@ -181,17 +181,50 @@ Ghidra process group and gets no response for that call; the next call starts a 
 cancelled call that is still waiting for its project never starts. `retrore mcp --no-worker` launches
 Ghidra once per call instead.
 
+## Disk and container members
+
+Use `members` to list a catalog before loading. The JSON includes each member's name, type,
+selector, and available source metadata. Pass a loadable member's selector or name to `info`
+or `load`. IDs are local to the catalog and distinguish duplicate names. `--disk-file` remains
+an alias of `--member`.
+
+```sh
+retrore members DISK.d64 --json
+retrore load DISK.d64 --member MAIN -o out/c64
+retrore members SCENARIO.dsk --format fat12 --json
+retrore load SCENARIO.dsk --msx2 --member id:file:1 --member 'id:file:2@8000' -o out/msx2
+retrore members COLLECTION.d88 --json
+retrore load COLLECTION.d88 --pc88 --member id:disk:2 --pc88-sector '0:0:1@c000' -o out/pc88
+```
+
+Catalogs cover D64, Apple DOS and RDOS, ATR boot sectors and Atari DOS, root FAT12 files,
+disks in D88/D77 and HDM containers, and Classic Macintosh HFS, Disk Copy 4.2, and resource
+fork wrappers. D88/D77 and HDM selection uses the native PC-88, PC-98, or X1 sector options.
+Select `id:boot:1` to load the ATR boot payload explicitly. For a standalone Macintosh resource
+fork or wrapper, `id:application` loads the complete application and individual resources are
+listed for inspection. Repeat `--member` to order co-resident file loads on platforms that
+accept multiple files. Use `--format` for ambiguous filenames and `--apple2-disk-order` for
+explicit Apple II sector order.
+
+`container_layout` in `map.json` records the selected members in request order and the disk
+layout decisions. The per-unit `member_id` identifies the source catalog entry even when a later
+load splits a unit. Use the same selector with `address-map --from file --member` to narrow an
+offset lookup to that source.
+
 ## DOS loader
 
-The loader restores the original load module from EXEPACK and LZEXE 0.90, 0.91, and 0.91e executables.
-It applies segment relocations and records the original initial `CS:IP` and `SS:SP`. Recognized unsupported
-packers such as PKLITE produce a diagnostic.
+The loader restores the original load module from EXEPACK, LZEXE 0.90, 0.91, and 0.91e, and supported
+PKLITE streams. PKLITE support covers standard small and large streams, recognized early extra
+compression variants, and recognized COM stubs. The loader applies segment relocations and records
+the original initial `CS:IP` and `SS:SP`. Unrecognized packed variants produce a coded error.
 
 ```sh
 .venv/bin/retrore info PROGRAM.EXE
 .venv/bin/retrore load PROGRAM.EXE -o out/program --json
 .venv/bin/retrore load START.EXE --overlay GAME.OVR -o out/pool
 .venv/bin/retrore load PHANTASI.EXE --overlay OV1.OVR --overlay OV2.OVR -o out/phantasie
+.venv/bin/retrore load GAME.COM -o out/com
+.venv/bin/retrore load CODE.BIN --dos-raw --base-segment 2000 --dos-offset 100 --dos-entry 120 -o out/raw
 ```
 
 Both commands accept `--json`, `--base-segment HEX` (default `1000`), and repeatable `--overlay FILE`.
@@ -201,6 +234,17 @@ memory: its file image, its initial stack, and for unpacked programs the header'
 `map.json` records that limit as `memory_end`, and the Ghidra importer backs the root's uninitialized
 data and stack below it with an uninitialized `root_bss` block, so globals there get names and references.
 
+DOS COM programs load at offset `0100` above a minimal Program Segment Prefix with an initial stack
+at `FFFE`. Use `--dos-com` to select COM explicitly when the extension or header is ambiguous. Raw loads
+default to offset `0000` and enter at the first input byte unless `--dos-entry` is supplied. Compare
+`dos_format`, `load_offset`, and `file_spans` in the export to identify generated prefixes and input bytes.
+
+Embedded Borland VROOMM banks and Microsoft LINK members are discovered from the executable.
+The loader exports native file offsets, applies verified fixups, and rewrites resolved VROOMM stubs.
+A verified Microsoft segment directory produces a runtime state for each member even when the
+members reuse the same address. Inspect `diagnostics` in JSON for unmatched trailers, unresolved
+VROOMM function-pointer offsets, and LINK variants with an unidentified segment directory.
+
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the
 image offsets and sizes of initialized units, and the image is zero-padded between them. Stack memory can
@@ -209,8 +253,8 @@ such as `tpov_0085`. Their map records include file offsets and exported entries
 through relocations target the resident overlay code. Stubs become far jumps for indirect callers. The map
 records the bytes replaced at each site.
 
-The optional `relocations` list gives the image-relative offsets of relocated 16-bit words in the root and
-Turbo Pascal units.
+The optional `relocations` list gives the image-relative offsets of relocated 16-bit words in the root
+and overlay units.
 
 When the loader finds a bounded CS-relative word jump table, `map.json` records the dispatch, table,
 default branch, and case targets in index order. It uses the `cmp` and `ja` or `jae` guard to size the table.
@@ -225,6 +269,61 @@ The catalog covers Turbo Pascal 5.5, 6.0, and 7.0 helpers for Real48 addition, s
 allocation, and overlays. It also covers selected small-model C routines from Turbo C 2.01, Turbo C++ 1.01,
 Borland C++ 2.0, and Microsoft C 5.1 and 6.0a. The compiler report identifies the linked runtime and only
 includes a version when supported by the evidence. See the validation notes in [PLAN.md](PLAN.md#phase-5-runtime-signatures).
+
+### Linker maps and signature catalogs
+
+Pass `--linker-map PROGRAM.MAP` to `load` or `info` to import resident public symbols and source-line
+tables from segmented Microsoft LINK or Borland TLINK listings. The export records the input digest
+and listing line for each accepted symbol. Ghidra imports labels and shows the source lines as listing
+comments. The map reports skipped addresses, including unresolved overlay addresses.
+[Microsoft LINK manual](https://bitsavers.trailing-edge.com/pdf/microsoft/msdos_3.20/410630013-320-O02-1285_MSDOS_3.20_User_Reference_1986.pdf)
+[Borland TLINK manual](https://www.bitsavers.org/pdf/borland/borland_C%2B%2B/Borland_C%2B%2B_Version_3.1_Tools_and_Utilities_1992.pdf)
+
+Pass `--signatures catalog.json` to match exact bytes and `??` wildcards in initialized units.
+Each entry can supply a `unit` to limit the search and a `toolchain` to record the origin.
+The match report includes candidate bytes. A unique match becomes a symbol available to
+`lookup` and the Ghidra importer.
+
+```json
+{"version": 1, "signatures": [
+  {"name": "runtime_helper", "pattern": "55 8b ec ?? ?? c3", "unit": "root", "toolchain": "local compiler probe"}
+]}
+```
+
+## Load states
+
+Use `--load-manifest FILE` with `load` or `info` to describe which units occupy memory in each
+runtime state. The `loads` array gives load order. Addresses default to each unit's analysis
+address. A later load with `"replace": true` takes over the covered bytes while retaining any
+uncovered portions of earlier loads. A state omits units that are absent. For flat 8-bit images,
+`variants` can add file-backed units from another export of the same platform. Use a free analysis
+address for each added unit. Export paths are relative to the manifest.
+
+```json
+{
+  "version": 1,
+  "initial": "first",
+  "states": [
+    {"name": "first", "loads": [{"unit": "root"}]},
+    {"name": "second", "loads": [{"unit": "bank_two", "linear": "c000"}]}
+  ],
+  "transitions": [{"from": "first", "to": "second", "kind": "bank", "trigger": "bank select write"}],
+  "variants": [{"export": "out/other-bank", "unit": "root", "name": "bank_two", "linear": "8000"}]
+}
+```
+
+```sh
+retrore load BANK1.PRG --load-manifest banks.json -o out/banks
+retrore address-map c000 --from runtime --all-states --export out/banks --json
+retrore ghidra import out/banks out/bank-project --load-views --json
+```
+
+Use `address-map --state NAME` or `trace --state NAME` to select a state. The manifest's initial
+state is the default. In a structured trace, `{"kind":"bank","state":"second"}` follows a declared
+transition. The ordered event record identifies the unit and source at a reused runtime address.
+Ghidra's `--load-views` puts the visible portions of each state in its own address space. These
+blocks show the exported bytes, including analysis-time relocations. The primary address space
+remains the starting point for decompilation and static references.
 
 ## Amiga loader
 
@@ -243,12 +342,16 @@ The default image base is `0x10000`. Use `--base-address HEX` to select another 
 in the 24-bit address space, including `0` for zero-based analysis notes. The layout is for static
 analysis. It records the requested Amiga memory flags and zero-fills BSS, unused allocation, and gaps.
 
-`map.json` identifies hunks as `h0`, `h1`, and so on. Each unit records its file span and memory
-allocation, symbols, and applied absolute 32-bit relocations, including the compact variant. Ghidra
-uses its big-endian 68k language, imports the symbols, and analyzes from the executable's entry in
-`h0`. Amiga Ghidra queries accept `hN:offset` or a flat hexadecimal address. `HUNK_OVERLAY` files
-produce an unsupported-format diagnostic. Use `call` for CPU-level routine execution and `trace`
-to map emulator events onto the exported hunks.
+`map.json` identifies resident hunks as `h0`, `h1`, and so on. Units record file spans and memory
+allocations, symbols, absolute and PC-relative relocations, and recognized `HUNK_DEBUG` LINE records.
+Each branch of a hierarchical `HUNK_OVERLAY` tree has named units, for example `ov1_2_h1`, at distinct
+analysis addresses. The tree records table entries, parentage, and source offsets. Its generated
+load states describe which hunks can coexist along each branch. Actual AmigaOS scatter-load addresses
+can be supplied in a manifest or recorded in a trace.
+
+Ghidra imports native symbols, supported source maps, and overlay entry points. Amiga queries
+accept `unit:offset` or a flat hexadecimal address. Use `call` for CPU-level routine execution and
+`trace` to map emulator events onto the exported hunks.
 [Amiga ROM Kernel Reference Manual, DOS, chapter 11](https://developer.amigaos3.net/sites/default/files/downloads/2024-10/Amiga_ROM_Kernel_Reference_Manual_DOS.pdf)
 
 ## Atari ST loader
@@ -816,8 +919,8 @@ displayed by the analyzed project.
 executable it refers to the unpacked load module. `file_spans` gives available source offsets over
 the requested range. `address-map` accepts logical, linear, runtime, image, or file coordinates.
 File lookups may return several matches. `--source` and `--member` narrow them where applicable.
-New D64, Apple DOS/RDOS, Atari DOS ATR, and MSX-DOS FAT12 exports also preserve physical disk spans
-as `container_spans`. Use `--from file --offset-kind container` to search those disk offsets.
+D64, Apple DOS/RDOS, Atari ATR, MSX-DOS FAT12, D88/D77, HDM, and Macintosh container exports
+preserve available physical spans. Use `--from file --offset-kind container` to search those offsets.
 The default file lookup retains its existing coordinates, including member offsets. Early Atari
 8-bit maps can recover those offsets from their ordered segment records. For an older unpacked
 DOS export, pass `--source-file PROGRAM.EXE` to `bytes` or `address-map` to verify the
@@ -1252,6 +1355,8 @@ With `--json`, a failed command prints this object to stderr:
 | `project_mismatch` | A trace was compared with a project imported from a different image |
 | `query_failed` | Ghidra could not answer the query, for example when decompilation fails |
 | `unsupported_packer` | The DOS executable uses a packer retrore cannot unpack; `packer` names it |
+| `load_manifest_invalid` | A load state, transition, or bank variant failed validation |
+| `toolchain_invalid` | A supplied linker listing or signature catalog failed validation |
 | `input_invalid` | The input program or options are invalid for the selected platform |
 | `io_error` | A file could not be read or written |
 

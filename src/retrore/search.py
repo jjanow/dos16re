@@ -325,7 +325,8 @@ def _relocation_sites(program: dict, units: list[ImageUnit]) -> set[tuple[int, i
     if image_format in M68K_FORMATS:
         by_name = {unit.name: unit for unit in units}
         return {(by_name[unit["name"]].image_offset + reloc["offset"], reloc.get("width", 4))
-                for unit in program["units"] for reloc in unit.get("relocations", ())}
+                for unit in program["units"] for reloc in unit.get("relocations", ())
+                if reloc.get("kind") != "pc_relative"}
     return None
 
 
@@ -473,7 +474,7 @@ def find_relocations(
     """List loader relocations, optionally only those in a unit, at a site range, or pointing into a target.
 
     DOS relocations patch segment words; their `value` is the relocated segment and a target matches when
-    that segment equals the target's segment. 68k relocations patch longs holding linear addresses.
+    that segment equals the target's segment. 68k relocations report the resolved linear target.
     """
     if size is not None and (type(size) is not int or size < 1):
         raise SearchError("size must be a positive integer")
@@ -492,6 +493,9 @@ def find_relocations(
     if image_format == "MZ":
         target_segment = None if target is None else resolve_address(program, units, target)["segment"]
         by_segment = {item.segment: item.name for item in units}
+        for unit in program["units"]:
+            for displacement in unit.get("segment_offsets", ()):
+                by_segment[unit["segment"] + displacement // 16] = unit["name"]
         for position in program.get("relocations", ()):
             owner = units[bisect_right(unit_starts, position) - 1]
             segment = int.from_bytes(image[position:position + 2], "little")
@@ -505,9 +509,15 @@ def find_relocations(
             owner = by_name[record["name"]]
             for reloc in record.get("relocations", ()):
                 value = reloc["value"]
-                if target_range and not target_range[0] <= value < target_range[1]:
+                target_linear = reloc.get("target_linear", value)
+                if target_range and not target_range[0] <= target_linear < target_range[1]:
                     continue
-                extra = {"value": f"{value:08x}", "target": locate(program, units, value), "original": reloc["original"]}
+                extra = {
+                    "value": f"{value:08x}",
+                    "target": locate(program, units, target_linear), "original": reloc["original"],
+                }
+                if "kind" in reloc:
+                    extra.update(kind=reloc["kind"], width=reloc["width"])
                 if "target" in reloc:
                     extra["hunk"] = reloc["target"]
                 records.append((owner.image_offset + reloc["offset"], owner, extra))
@@ -559,6 +569,9 @@ def program_symbols(program: dict, units: list[ImageUnit]) -> list[dict]:
         add(f"stub_{stub['unit']}_{stub['address']['offset']:04x}", "stub", stub["address"]["linear"])
     for signature in program.get("runtime_signatures", ()):
         add(signature["name"], "runtime", signature["address"]["linear"])
+    for symbol in program.get("toolchain_symbols", ()):
+        add(symbol["name"], symbol["kind"], symbol["linear"])
+        symbols[-1]["source"] = symbol["source"]
     for label in program.get("hardware_labels", ()):
         add(label["name"], "hardware", label["linear"])
     for region in program.get("memory_map", ()):

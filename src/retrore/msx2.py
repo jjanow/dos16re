@@ -1,8 +1,10 @@
 """Read MSX-DOS disk members and reconstruct a selected Z80 RAM layout."""
 
+from collections.abc import Iterator
 from struct import unpack_from
 
 from .image import MSX2_FORMAT, SourceSpan
+from .members import Member, select_member
 from .z80 import Z80Source as Msx2Source
 from .z80 import place_z80_sources
 
@@ -39,6 +41,7 @@ class MsxDosDisk:
             raise Msx2Error("invalid FAT12 allocation table or disk size")
 
         root_start = root_sector * sector
+        self._root_offset = root_start
         self._root = data[root_start:root_start + root_size]
         self._data_offset = first_data * sector
         self._data = data[self._data_offset:sectors * sector]
@@ -47,6 +50,10 @@ class MsxDosDisk:
         return self.read_file_with_spans(name)[0]
 
     def read_file_with_spans(self, name: str) -> tuple[bytes, tuple[SourceSpan, ...]]:
+        _, contents, spans = self.extract_file(name)
+        return contents, spans
+
+    def _catalog(self) -> Iterator[tuple[Member, int]]:
         for offset in range(0, len(self._root), 32):
             entry = self._root[offset:offset + 32]
             if entry[0] == 0:
@@ -56,9 +63,18 @@ class MsxDosDisk:
             stem = entry[:8].decode("ascii", errors="replace").rstrip(" ")
             ext = entry[8:11].decode("ascii", errors="replace").rstrip(" ")
             filename = f"{stem}.{ext}" if ext else stem
-            if filename.upper() == name.upper():
-                return self._read_chain(name, *unpack_from("<HI", entry, 26))
-        raise Msx2Error(f"MSX-DOS disk file {name!r} not found")
+            cluster, size = unpack_from("<HI", entry, 26)
+            yield Member(f"file:{offset // 32 + 1}", filename, "file", size=size,
+                         container_offset=self._root_offset + offset,
+                         details={"start_cluster": cluster}), cluster
+
+    def list_members(self) -> list[Member]:
+        return [member for member, _ in self._catalog()]
+
+    def extract_file(self, selector: str) -> tuple[Member, bytes, tuple[SourceSpan, ...]]:
+        member, cluster = select_member(self._catalog(), selector, "MSX-DOS disk file", Msx2Error)
+        contents, spans = self._read_chain(member.name, cluster, member.size)
+        return member, contents, spans
 
     def _read_chain(self, name: str, cluster: int, size: int) -> tuple[bytes, tuple[SourceSpan, ...]]:
         if size == 0 and cluster == 0:

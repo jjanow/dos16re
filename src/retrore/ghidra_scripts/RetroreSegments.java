@@ -443,6 +443,15 @@ public class RetroreSegments extends HeadlessScript {
         Loss psp = new Loss(entry, "entry", "DS and ES hold the PSP at program entry");
         initial.lose(ds, psp);
         initial.lose(es, psp);
+        if (map.has("initial_segments")) {
+            var segments = map.getAsJsonObject("initial_segments");
+            if (segments.has("ds")) {
+                initial.set(ds, segments.get("ds").getAsInt());
+            }
+            if (segments.has("es")) {
+                initial.set(es, segments.get("es").getAsInt());
+            }
+        }
         if (map.has("stack")) {
             initial.set(ss, map.getAsJsonObject("stack").get("segment").getAsInt());
         }

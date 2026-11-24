@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 from struct import pack, unpack_from
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from retrore.amiga import HunkError, build_hunk_image
 from retrore.cli import main
 from retrore.evidence import evidence_bundle
+from retrore.search import find_relocations
 
 
 def _words(*values):
@@ -80,6 +82,163 @@ def test_unpadded_short_relocations(record):
     source += pack(">4H", 1, 0, 0, 0) + _words(0x3F2)
     image, _ = build_hunk_image(source, "demo")
     assert image == _words(0x10000)
+
+
+def _section(kind, data, *records):
+    return _words(kind, len(data) // 4) + data + b"".join(records) + _words(0x3F2)
+
+
+def _tree(relocation_target=1, root_code=bytes.fromhex("4e75 4e71"), second_child_ordinate=2, root_break=False):
+    def node(first, *sections):
+        # Each section in this fixture is allocated four bytes, except the empty data hunk.
+        sizes = [int.from_bytes(section[4:8], "big") for section in sections]
+        return _words(0x3F3, 0, 4, first, first + len(sections) - 1, *sizes) + b"".join(sections)
+
+    return_seven = _section(0x3E9, bytes.fromhex("7007 4e75"))
+    debug = _words(0x3F1, 6, 0) + b"LINE" + _words(1) + b"main" + _words(42, 0)
+    root = node(0, _section(0x3E9, root_code, debug))
+    members = [
+        node(1, return_seven, _section(0x3EA, b"")),
+        node(3, _section(0x3EA, _words(0), _words(0x3EC, 1, relocation_target, 0, 0))),
+        node(1, _section(0x3E9, bytes.fromhex("7008 4e75"))),
+        node(2, _section(0x3EA, _words(0), _words(0x3EC, 1, 1, 0, 0))),
+    ]
+    table_start = len(root)
+    payload_longwords = 3 + 8 * len(members)
+    table = _words(0x3F5, payload_longwords - 1, 3, 0, 0)
+    position = table_start + 8 + 4 * payload_longwords + (4 if root_break else 0)
+    entries = ((1, 1, 1), (2, 1, 3), (1, 2, 1), (2, second_child_ordinate, 2))
+    for index, (level, ordinate, first) in enumerate(entries):
+        table += _words(position, 0, 0, level, ordinate, first, first, 0)
+        position += len(members[index]) + 4
+    return root + table + (_words(0x3F6) if root_break else b"") + b"".join(member + _words(0x3F6) for member in members)
+
+
+def test_hierarchical_overlays_keep_branch_relocations_and_source(tmp_path, capsys):
+    source = tmp_path / "overlay"
+    source.write_bytes(_tree())
+    out = tmp_path / "out"
+    assert main(["load", str(source), "-o", str(out), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    tree = program["overlay_tree"]
+    assert tree["segment_table_size"] == 4
+    assert [(node["id"], node["parent"], node["units"]) for node in tree["nodes"]] == [
+        ("root", None, ["h0"]),
+        ("ov1_1", "root", ["ov1_1_h1", "ov1_1_h2"]),
+        ("ov2_1", "ov1_1", ["ov2_1_h3"]),
+        ("ov1_2", "root", ["ov1_2_h1"]),
+        ("ov2_2", "ov1_2", ["ov2_2_h2"]),
+    ]
+    assert [(entry["unit_address"], entry["kind"]) for entry in tree["entries"]] == [
+        ("ov1_1_h1:0000", "code"), ("ov2_1_h3:0000", "data"),
+        ("ov1_2_h1:0000", "code"), ("ov2_2_h2:0000", "data"),
+    ]
+    units = program["units"]
+    assert len({unit["linear"] for unit in units}) == len(units)
+    assert [unit["segment_index"] for unit in units] == [0, 1, 2, 3, 1, 2]
+    states = program["load_manifest"]["states"]
+    assert [row["unit"] for row in states[-1]["loads"]] == ["h0", "ov1_2_h1", "ov2_2_h2"]
+    assert [unit["relocations"][0]["value"] for unit in (units[3], units[5])] == [
+        units[1]["linear"], units[4]["linear"],
+    ]
+    assert [unit["relocations"][0]["target"] for unit in (units[3], units[5])] == ["ov1_1_h1", "ov1_2_h1"]
+    assert units[0]["source_lines"] == [{"file": "main", "line": 42, "offset": 0, "record_file_offset": 36}]
+    assert units[0]["debug_records"] == [{"format": "LINE", "file_offset": 36, "size": 32}]
+    assert source.read_bytes()[units[3]["file_offset"]:units[3]["file_offset"] + 4] == _words(0)
+    assert unpack_from(">I", (out / "image.bin").read_bytes(), units[3]["image_offset"]) == (units[1]["linear"],)
+
+    if os.environ.get("GHIDRA_HOME"):
+        project = tmp_path / "project"
+        assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+        report = json.loads(capsys.readouterr().out)
+        assert (report["overlay_entries"], report["source_lines"]) == (2, 1)
+        for unit, value in (("ov1_1_h1", 7), ("ov1_2_h1", 8)):
+            assert main(["decomp", f"{unit}:0000", "--project", str(project), "--json"]) == 0
+            assert f"return {value};" in json.loads(capsys.readouterr().out)["decompilation"]
+
+
+def test_overlay_rejects_references_to_inactive_slots_and_missing_breaks():
+    with pytest.raises(HunkError, match="inactive relocation target"):
+        build_hunk_image(_tree(relocation_target=4), "overlay")
+    with pytest.raises(HunkError, match="HUNK_BREAK"):
+        build_hunk_image(_tree()[:-4] + _words(0), "overlay")
+    with pytest.raises(HunkError, match="unlisted bytes"):
+        build_hunk_image(_tree() + _words(0), "overlay")
+
+
+def test_hunk_alink_ordinates_can_repeat_under_different_parents():
+    _, export = build_hunk_image(_tree(second_child_ordinate=1, root_break=True), "overlay")
+    nodes = export["overlay_tree"]["nodes"]
+    assert (nodes[2]["ordinate"], nodes[4]["ordinate"]) == (1, 1)
+    assert nodes[2]["parent"] == "ov1_1"
+    assert nodes[4]["parent"] == "ov1_2"
+    assert nodes[2]["id"] != nodes[4]["id"]
+
+
+def test_hunk_overlay_manager_signature():
+    # The published THOR manager starts with a loader header and its name.
+    code = bytes.fromhex("6000 0044 0000 abcd") + bytes(16)
+    code += _words(23456) + b"\x07Overlay" + bytes(8) + b"THOR Overlay Manager 1.2\0"
+    code += bytes(-len(code) % 4)
+    _, export = build_hunk_image(_tree(root_code=code), "overlay")
+    assert (export["toolchain"]["family"], export["toolchain"]["version"]) == ("THOR Overlay Manager", "1.2")
+    assert export["units"][0]["symbols"] == [
+        {"name": name, "offset": offset} for offset, name in
+        [(8, "oh_FileHandle"), (12, "oh_OVTab"), (16, "oh_Segments"), (20, "oh_GlobVec")]
+    ]
+
+
+def test_optional_malformed_hunk_line_record_keeps_image():
+    root = _section(0x3E9, bytes.fromhex("4e75 4e71"), _words(0x3F1, 2, 0) + b"LINE")
+    image, export = build_hunk_image(_words(0x3F3, 0, 1, 0, 0, 1) + root, "broken_line")
+    assert image == bytes.fromhex("4e75 4e71")
+    assert export["diagnostics"][0]["code"] == "hunk_debug_line_invalid"
+    assert "source_lines" not in export["units"][0]
+
+
+def test_extended_hunk_relocations_and_queries(tmp_path, capsys):
+    root = _section(0x3E9, bytes.fromhex("4e75 4e71"))
+    data = _section(0x3EA, bytes.fromhex("00ff 0000 00000004 fffffff4 0002 0000"),
+                    _words(0x3EE, 1, 0, 1, 0),
+                    _words(0x3FE, 1, 0, 2, 0),
+                    _words(0x3FD, 1, 0, 4, 0),
+                    _words(0x3FD) + pack(">4H", 1, 0, 8, 0),
+                    _words(0x3ED, 1, 0, 12, 0))
+    source = tmp_path / "reloc"
+    source.write_bytes(_words(0x3F3, 0, 2, 0, 1, 1, 4) + root + data)
+    out = tmp_path / "out"
+    assert main(["load", str(source), "--base-address", "2000", "-o", str(out), "--json"]) == 0
+    unit = json.loads(capsys.readouterr().out)["units"][1]
+    assert (out / "image.bin").read_bytes()[16:] == bytes.fromhex("00ee 2000 fffffff0 ffffffe4 ffe6 0000")
+    assert [(row["kind"], row["width"], row["target_linear"]) for row in unit["relocations"]] == [
+        ("pc_relative", 1, 0x1FFF),
+        ("absolute", 2, 0x2000),
+        ("pc_relative", 4, 0x2004),
+        ("pc_relative", 4, 0x1FFC),
+        ("pc_relative", 2, 0x2002),
+    ]
+    result, = find_relocations(out, target="h0:0")["relocations"]
+    assert (result["unit_address"], result["kind"], result["target"]["unit_address"]) == (
+        "h1:0002", "absolute", "h0:0000",
+    )
+    if os.environ.get("GHIDRA_HOME"):
+        project = tmp_path / "project"
+        assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+        assert json.loads(capsys.readouterr().out)["relocations"] == 5
+        assert main(["xrefs", "h1:000c", "--project", str(project), "--json"]) == 0
+        outgoing = json.loads(capsys.readouterr().out)["outgoing"]
+        assert any(row["to"]["unit_address"] == "h0:0002" for row in outgoing)
+
+
+def test_optional_original_hierarchical_overlay():
+    directory = os.environ.get("RETRORE_AMIGA_OVERLAY_DIR")
+    if not directory:
+        pytest.skip("set RETRORE_AMIGA_OVERLAY_DIR to a directory containing an original overlay executable named overlay")
+    source = Path(directory) / "overlay"
+    _, program = build_hunk_image(source.read_bytes(), source.name)
+    tree = program["overlay_tree"]
+    assert tree["manager"] == "hierarchical"
+    assert len(tree["nodes"]) > 1 and tree["entries"]
 
 
 @pytest.mark.parametrize(("code", "encoding", "table", "targets"), [

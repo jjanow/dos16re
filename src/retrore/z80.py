@@ -18,6 +18,7 @@ class Z80Source:
     file_offset: int = 0
     file_spans: tuple[SourceSpan, ...] = ()
     container_spans: tuple[SourceSpan, ...] = ()
+    member_id: str | None = None
 
     @property
     def end(self) -> int:
@@ -29,11 +30,15 @@ class Z80Source:
     def copy(self, name: str, destination: int, offset: int, size: int) -> "Z80Source":
         return Z80Source(name, self.source, destination, self.data[offset:offset + size], self.disk_file,
                          self.file_offset + offset, self.spans(offset, size),
-                         slice_source_spans(self.container_spans, offset, size))
+                         slice_source_spans(self.container_spans, offset, size), self.member_id)
 
     def provenance(self, offset: int, size: int) -> dict:
         spans = self.spans(offset, size)
         report = {"file_offset": spans[0].file_offset if spans else self.file_offset + offset}
+        if self.member_id is not None:
+            report["member_id"] = self.member_id
+            if self.member_id.startswith("disk:"):
+                report["file_offset_kind"] = "container"
         if len(spans) > 1:
             report["file_spans"] = [asdict(span) for span in spans]
         if self.container_spans:
@@ -113,7 +118,8 @@ def disk_span_source(
         payload = payload[:size]
         spans = [SourceSpan(span.offset, span.file_offset, min(span.size, size - span.offset))
                  for span in spans if span.offset < size]
-    return Z80Source(name, filename, address, bytes(payload), file_offset=spans[0].file_offset, file_spans=tuple(spans))
+    return Z80Source(name, filename, address, bytes(payload), file_offset=spans[0].file_offset, file_spans=tuple(spans),
+                     member_id=disk.member.id)
 
 
 def copy_z80_source(
