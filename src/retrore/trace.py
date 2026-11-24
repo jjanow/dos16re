@@ -332,8 +332,8 @@ def _structured_trace(image: ExportEvidence, document: dict, evidence: bool) -> 
                     observe(runtime.point(event.get("address")), explicit, count, data)
                     continue
                 flow = event.get("flow")
-                if flow not in (None, "call", "jump", "return", "fallthrough"):
-                    raise TraceError("edge flow must be call, jump, return, or fallthrough")
+                if flow not in (None, "call", "jump", "return", "fallthrough", "interrupt"):
+                    raise TraceError("edge flow must be call, jump, return, fallthrough, or interrupt")
                 source = runtime.endpoint(event, "from")
                 destination = runtime.endpoint(event, "to")
                 observe(source, departures, count)

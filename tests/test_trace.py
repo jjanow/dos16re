@@ -204,3 +204,34 @@ def test_structured_flat_trace_previews_and_applies_only_observed_additions(tmp_
     assert after["edge_gaps"] == []
     assert [hit["linear"] for hit in after["missed"]] == [0x0811]
     assert [entry["address"]["linear"] for entry in after["additions"]] == [0x0811]
+
+
+def test_trace_recovers_a_real_mode_software_interrupt_entry(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    image = bytes.fromhex("cd60 ffe3 c3") + bytes(11) + b"\xcf"
+    header = bytearray(32)
+    pack_into("<2s13H", header, 0, b"MZ", len(header) + len(image), 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 28, 0)
+    exe, export, project = tmp_path / "test.exe", tmp_path / "export", tmp_path / "interrupt"
+    exe.write_bytes(header + image)
+    assert main(["load", str(exe), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    trace = tmp_path / "interrupt.json"
+    trace.write_text(json.dumps({"version": 1, "events": [
+        {"kind": "edge", "from": 0x10000, "to": 0x10010, "flow": "interrupt"},
+        {"kind": "edge", "from": 0x10002, "to": 0x10010, "flow": "interrupt"},
+    ]}), encoding="utf-8")
+    command = ["trace", str(trace), "--export", str(export), "--project", str(project), "--json"]
+    assert main([*command, "--apply"]) == 0, capsys.readouterr().err
+    applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
+    flow, = (row for row in applied if row["kind"] == "flow")
+    assert (flow["from"]["unit_address"], flow["to"]["unit_address"], flow["type"], flow["events"]) == (
+        "root:0000", "root:0010", "COMPUTED_CALL", [1],
+    )
+    assert main(command) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)["analysis"]
+    assert report["additions"] == []
+    assert [edge["event"] for edge in report["edge_gaps"]] == [2]

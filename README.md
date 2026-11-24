@@ -1451,6 +1451,13 @@ Addresses and register values are hexadecimal. `--mem` writes literal bytes in t
 the resolved address, final registers as integers, and requested memory bytes as hex strings. The
 default instruction limit is one million. Set `--limit N` for another budget.
 
+On real-mode x86, repeat `--ivt-interrupt HEX` for the software interrupt vectors the guest
+may take from the interrupt vector table. Use `--mem` to seed the table with little-endian
+offset and segment words at physical address `4 * vector`, or let guest code populate it.
+For example, `--ivt-interrupt 60 --mem 0000:0180=34120010` dispatches `INT 60h` to `1000:1234`.
+The harness pushes a 16-bit interrupt frame, clears TF and IF, and lets the guest handler
+return with `IRET`. An all-zero table entry is treated as unset.
+
 The DOS `Emulator` Python API supports interrupt handlers, port I/O, and execution hooks. A routine
 that calls BIOS to read a key can receive a scripted Enter key.
 
@@ -1473,8 +1480,9 @@ print(result.registers["ax"])
 
 Use `on_in(cpu, port, size)` to return a port value and `on_out(cpu, port, size, value)` to handle a
 port write. Pass `hooks={address: callback}` to run `callback(cpu)` before executing an instruction
-at that address. These callbacks receive the live Unicorn CPU. Turbo Pascal stubs use the resident
-overlays, including when an original `INT 3Fh` stub is restored. Unhandled interrupts and port I/O
+at that address. These callbacks receive the live Unicorn CPU. Pass `ivt_interrupts=[0x60]` to
+select vectors for table dispatch. Python interrupt callbacks and Turbo Pascal `INT 3Fh` redirects
+to resident overlays take precedence over the table. Unhandled interrupts and port I/O
 stop the call with an error.
 
 `retrore.dynamic.RoutineBackend.from_export()` provides a shared Python routine interface. Pass a
@@ -1569,6 +1577,8 @@ static instruction before proposing additions.
 `--runtime-load UNIT=HEX|unmapped` sets explicit initial placement and `--program NAME` selects
 an existing program in the project. For a DOS MZ capture, `--runtime-base HEX` sets the segment
 where DOS loaded the root. Applied computed edges are visible in `indirect` and `xrefs`.
+For a real-mode x86 `INT imm8`, use `"flow": "interrupt"` on the edge from the instruction to
+the observed handler entry. Apply the trace to add the call reference to `xrefs`.
 Each edge records a successor observed in the capture. Checking the index range requires
 inputs that exercise the dispatch.
 

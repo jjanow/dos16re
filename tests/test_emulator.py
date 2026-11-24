@@ -98,6 +98,36 @@ def test_hooks_supply_interrupt_and_port_io():
     assert result.registers["ax"] == 0x1234
 
 
+def test_software_interrupt_uses_the_selected_ivt_vector_and_iret_frame():
+    emulator = _emulator("cd60 40 c3")
+    handler = Address(0x1250, 0x123)
+    # Save the handler's FLAGS in DX, then set AX and return with IRET.
+    writes = [("0000:0180", pack("<HH", handler.offset, handler.segment)),
+              (handler, bytes.fromhex("9c 5a b83412 cf"))]
+    with pytest.raises(EmulatorError, match="unhandled interrupt 60h"):
+        emulator.call("root:0", writes=writes)
+    with pytest.raises(EmulatorError, match="unhandled interrupt 60h"):
+        emulator.call("root:0", ivt_interrupts=[0x60])
+    result = emulator.call("root:0", writes=writes, regs={"sp": 4, "flags": 0x202}, ivt_interrupts=[0x60])
+    assert result.registers["ax"] == 0x1235
+    assert result.registers["dx"] & 0x200 == 0
+    assert result.registers["flags"] & 0x200
+    assert result.registers["sp"] == 4
+
+
+def test_cli_calls_software_interrupt_through_ivt(tmp_path, capsys):
+    code = bytes.fromhex("cd60 c3 b83412 cf")
+    header = pack("<2s13H4x", b"MZ", 32 + len(code), 1, 0, 2, 0, 0, 0x20, 0x200, 0, 0, 0, 0, 0)
+    exe, export = tmp_path / "test.exe", tmp_path / "export"
+    exe.write_bytes(header + code)
+    assert main(["load", str(exe), "-o", str(export)]) == 0
+    capsys.readouterr()
+
+    assert main(["call", "root:0", "--export", str(export), "--ivt-interrupt", "60",
+                 "--mem", "0000:0180=03000010", "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["registers"]["ax"] == 0x1234
+
+
 @pytest.mark.parametrize(("code", "error"), [
     ("cd21c3", "unhandled interrupt 21h at 1001:0000"),
     ("e460c3", "unhandled IN from port 0060h"),

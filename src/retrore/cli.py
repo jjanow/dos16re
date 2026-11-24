@@ -535,11 +535,12 @@ def _call(args: argparse.Namespace) -> None:
             base = 16 if value.lower().startswith("0x") else 10
             reads.append((address, int(value, base)))
         limit = int(args.limit)
+        ivt_interrupts = tuple(int(vector, 16) for vector in args.ivt_interrupt)
     except ValueError as error:
         raise EmulatorError(str(error)) from error
     backend = RoutineBackend.from_export(args.export)
     result = backend.run(RoutineRequest(args.address, registers=regs, writes=writes, reads=reads, far=args.far,
-                                        limit=limit))
+                                        limit=limit, ivt_interrupts=ivt_interrupts))
     registers, memory = result.after.registers, result.after.memory
     if args.json:
         print(json.dumps({
@@ -1661,6 +1662,8 @@ def main(argv: list[str] | None = None) -> int:
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal address, seg:off, or unit:offset")
     call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     call_parser.add_argument("--far", action="store_true", help="expect x86 RETF (default: near RET)")
+    call_parser.add_argument("--ivt-interrupt", action="append", default=[], metavar="HEX",
+                             help="dispatch this real-mode INT through the interrupt vector table (repeatable)")
     call_parser.add_argument("--regs", action="append", default=[], metavar="REG=HEX,...", help="set initial registers")
     call_parser.add_argument(
         "--mem", action="append", default=[], metavar="ADDR=HEXBYTES", help="write memory before call",

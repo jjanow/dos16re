@@ -486,6 +486,17 @@ public class RetroreQuery extends GhidraScript {
             (target.equals(instruction.getFallThrough()) || Arrays.asList(instruction.getFlows()).contains(target));
     }
 
+    private RefType traceFlowType(Instruction instruction, String flow) throws Exception {
+        var type = instruction.getFlowType();
+        if (flow.equals("interrupt")) {
+            return currentProgram.getLanguageID().getIdAsString().equals("x86:LE:16:Real Mode") &&
+                instruction.getLength() == 2 && (instruction.getByte(0) & 0xff) == 0xcd
+                ? RefType.COMPUTED_CALL : null;
+        }
+        return type.isComputed() && (type.isCall() && (flow.isEmpty() || flow.equals("call")) ||
+            type.isJump() && (flow.isEmpty() || flow.equals("jump"))) ? type : null;
+    }
+
     private TraceEdges traceEdges(
             JsonArray edges, Map<Address, Instruction> additions, JsonObject expected, JsonObject observations,
             Map<TraceFlow, List<Integer>> flows) throws Exception {
@@ -526,10 +537,8 @@ public class RetroreQuery extends GhidraScript {
                 if (instruction != null && destination != null && !traceFlowRecovered(instruction, to) &&
                         traceBytesMatch(instruction, expected) && traceObservedBytesMatch(instruction, observations) &&
                         traceBytesMatch(destination, expected) && traceObservedBytesMatch(destination, observations)) {
-                    var type = instruction.getFlowType();
-                    if (type.isComputed() && (type.isCall() && (flow.isEmpty() || flow.equals("call")) ||
-                            type.isJump() && (flow.isEmpty() || flow.equals("jump"))) &&
-                            refs.getReference(from, to, Reference.MNEMONIC) == null) {
+                    var type = traceFlowType(instruction, flow);
+                    if (type != null && refs.getReference(from, to, Reference.MNEMONIC) == null) {
                         flows.computeIfAbsent(new TraceFlow(from, to, type), unused -> new ArrayList<>()).add(event);
                     }
                 }
@@ -552,7 +561,8 @@ public class RetroreQuery extends GhidraScript {
             }
             // A call's continuation is reached by a callee's return, rather than by a CPU edge from the call site.
             var next = source.getFallThrough();
-            if (next != null && !source.getFlowType().isCall() && !entry.getValue().contains(next)) {
+            if (next != null && !source.getFlowType().isCall() && traceFlowType(source, "interrupt") == null &&
+                    !entry.getValue().contains(next)) {
                 unobserved.add(Map.of("from", location(from), "to", location(next), "kind", "fallthrough"));
             }
         }

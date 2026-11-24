@@ -540,7 +540,8 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
         assert set(recovered["targets"]) == {f"root:{target:x}" for target in targets}
 
 
-def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_export):
+@pytest.fixture
+def phantasie_iii_float_runtime(phantasie_iii_export):
     tmp_path, program = phantasie_iii_export
     export = tmp_path / "export"
     image = (export / "image.bin").read_bytes()
@@ -548,27 +549,43 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_export)
     code_base = 0x118F0
     code_segment = program["units"][0]["segment"] + code_base // 16
     data_segment, = unpack_from("<H", image, 0x1249F)
-    stack_top = Address(data_segment, 0x10)
-    # Run the software runtime's reset routine to seed its stack from the original image.
-    initialized = emulator.call(
-        Address(code_segment, 0x11A09 - code_base), regs={"ds": data_segment}, reads=[(stack_top, 2)],
+
+    def runtime_address(offset):
+        return Address(code_segment, offset - code_base)
+
+    def dos_vectors(cpu, _number):
+        ax = cpu.reg_read(x86.UC_X86_REG_AX)
+        vector = (ax & 0xff) * 4
+        if ax >> 8 == 0x35:
+            offset, segment = unpack_from("<HH", cpu.mem_read(vector, 4))
+            cpu.reg_write(x86.UC_X86_REG_BX, offset)
+            cpu.reg_write(x86.UC_X86_REG_ES, segment)
+        else:
+            assert ax >> 8 == 0x25
+            cpu.mem_write(vector, pack("<HH", cpu.reg_read(x86.UC_X86_REG_DX), cpu.reg_read(x86.UC_X86_REG_DS)))
+
+    vectors = range(0x34, 0x3e)
+    ivt = Address(0, 4 * vectors.start)
+    installed = emulator.call(
+        runtime_address(0x11a32), regs={"ds": data_segment},
+        writes=[(Address(data_segment, 4), b"\0")],  # Select the software path.
+        reads=[(ivt, 4 * len(vectors))], interrupts={0x21: dos_vectors},
     )
-    empty_stack = int.from_bytes(initialized.memory[0][1], "little")
+    assert installed.memory[0][1] == b"".join(
+        pack("<HH", runtime_address(entry).offset, code_segment)
+        for entry in (0x1241c,) * 8 + (0x123db, 0x123be)
+    )
+    initialized = emulator.call(
+        runtime_address(0x11a09), regs={"ds": data_segment}, reads=[(Address(data_segment, 0x0e), 6)],
+    )
+    return emulator, runtime_address, data_segment, vectors, (*installed.memory, *initialized.memory)
+
+
+def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_runtime):
+    emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
+    stack_top = Address(data_segment, 0x10)
+    _, empty_stack, _ = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
     scratch = Address(0x7000, 0)
-    interrupt_entry = 0x1241C - code_base
-
-    def software_float_interrupt(cpu, _number):
-        flags = cpu.reg_read(x86.UC_X86_REG_EFLAGS)
-        cs = cpu.reg_read(x86.UC_X86_REG_CS)
-        ip = cpu.reg_read(x86.UC_X86_REG_IP)
-        sp = (cpu.reg_read(x86.UC_X86_REG_SP) - 6) & 0xFFFF
-        stack = cpu.reg_read(x86.UC_X86_REG_SS) * 16 + sp
-        cpu.mem_write(stack, pack("<HHH", ip, cs, flags & 0xFFFF))
-        cpu.reg_write(x86.UC_X86_REG_SP, sp)
-        cpu.reg_write(x86.UC_X86_REG_EFLAGS, flags & ~0x300)
-        cpu.reg_write(x86.UC_X86_REG_CS, code_segment)
-        cpu.reg_write(x86.UC_X86_REG_IP, interrupt_entry)
-
     def probe(load, operands, operation):
         dispatches = []
 
@@ -591,16 +608,16 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_export)
         final = emulator.call(
             scratch, regs={"ds": scratch.segment, "es": scratch.segment, "ss": scratch.segment, "sp": 0xFF00},
             writes=[
-                *initialized.memory,
+                *setup,
                 (scratch, code),
                 (Address(scratch.segment, 0x200), operands),
                 (Address(scratch.segment, 0x220), pack("<H", 0x037F)),
             ],
             reads=[(stack_top, 2)],
-            interrupts=dict.fromkeys((0x34, 0x35, 0x37, 0x39), software_float_interrupt),
+            ivt_interrupts=vectors,
             hooks={
-                Address(code_segment, 0x13721 - code_base): lambda cpu: observe(cpu, False),
-                Address(code_segment, 0x1366D - code_base): lambda cpu: observe(cpu, True),
+                runtime_address(0x13721): lambda cpu: observe(cpu, False),
+                runtime_address(0x1366d): lambda cpu: observe(cpu, True),
             },
             limit=4000,
         )
@@ -628,6 +645,105 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_export)
         significand = 0x8000000000000000 if exponent else 0
         operands = pack("<QHQH", significand, exponent, significand, exponent)
         assert probe("cd372e0002 cd372e0a02", operands, operation) == expected
+
+
+def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
+    phantasie_iii_export, phantasie_iii_float_runtime, capsys,
+):
+    tmp_path, _ = phantasie_iii_export
+    emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
+    bottom, top, limit = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
+    assert top == bottom and (limit - bottom) // 12 + 1 == 15
+    records = Address(data_segment, bottom)
+    size = limit - bottom + 12
+    live_record = Address(data_segment, top + 12)
+    field = live_record.offset + 11
+    stack_top = Address(data_segment, 0x10)
+    scratch = Address(0x7000, 0)
+    source = pack("<I", 0x3f80007f)
+    regs = {"ds": scratch.segment, "ss": scratch.segment, "sp": 0xff00}
+    loaded = emulator.call(
+        scratch, regs=regs, writes=[*setup, (scratch, bytes.fromhex("cd35060002 c3")),
+                                   (Address(scratch.segment, 0x200), source)],
+        reads=[(records, size), (stack_top, 2)], ivt_interrupts=vectors,
+    )
+    assert loaded.memory[0][1][field - bottom] == 0
+    assert loaded.memory[1][1] == pack("<H", live_record.offset)
+    prefixed_store = emulator.resolve("root:6a5b")
+    wait = emulator.resolve("root:6a5f")
+    edges = set()
+
+    def entry(cpu, target):
+        ss = cpu.reg_read(x86.UC_X86_REG_SS)
+        sp = cpu.reg_read(x86.UC_X86_REG_SP)
+        ip, cs = unpack_from("<HH", cpu.mem_read(Address(ss, sp).linear, 4))
+        caller = Address(cs, (ip - 2) & 0xffff)
+        edges.add((caller.linear, target.linear, cpu.mem_read(caller.linear, 2).hex()))
+
+    for prefixed in (False, True):
+        for alias in (False, True):
+            output = Address(data_segment + 1, field - 16) if alias else Address(scratch.segment, 0x204)
+            stores = []
+
+            def observe_store(cpu):
+                record = Address(cpu.reg_read(x86.UC_X86_REG_DS), cpu.reg_read(x86.UC_X86_REG_SI))
+                destination = Address(cpu.reg_read(x86.UC_X86_REG_ES), cpu.reg_read(x86.UC_X86_REG_DI))
+                stores.append((record, destination))
+
+            hooks = dict.fromkeys((runtime_address(0x12e40), runtime_address(0x12e43)), observe_store)
+            patches = [*setup, *loaded.memory]
+            reads = [(output, 4), (records, size), (stack_top, 2)]
+            if prefixed:
+                # Start at the original FSTP ES:[BX] in the routine's tail. Supply its saved BP and far frame.
+                start = prefixed_store
+                inputs = {**regs, "es": output.segment, "bx": output.offset, "bp": regs["sp"] - 6}
+                reads.append((wait, 2))
+                for offset in (0x123db, 0x123be):
+                    target = runtime_address(offset)
+                    hooks[target] = lambda cpu, target=target: entry(cpu, target)
+            else:
+                start = scratch
+                inputs = {**regs, "ds": output.segment}
+                patches.append((scratch, bytes.fromhex("cd3516") + pack("<H", output.offset) + b"\xc3"))
+
+            final = emulator.call(start, regs=inputs, writes=patches, reads=reads, far=prefixed,
+                                  hooks=hooks, ivt_interrupts=vectors)
+            assert stores == [(live_record, output), (live_record, Address(output.segment, output.offset + 2))]
+            output_bytes, record_bytes, top_bytes = (item[1] for item in final.memory[:3])
+            assert output_bytes == source
+            expected = bytearray(loaded.memory[0][1])
+            if alias:
+                assert output.linear == Address(data_segment, field).linear
+                expected[field - bottom:field - bottom + 4] = source
+                assert record_bytes[field - bottom] == 0x7f
+            else:
+                assert output.linear >= records.linear + size
+            assert record_bytes == expected
+            assert top_bytes == pack("<H", top if prefixed else live_record.offset)
+            if prefixed:
+                assert final.memory[-1][1] == bytes.fromhex("89c0")  # The WAIT handler patches its own call site.
+
+    assert edges == {
+        (prefixed_store.linear, runtime_address(0x123db).linear, "cd3c"),
+        (wait.linear, runtime_address(0x123be).linear, "cd3d"),
+    }
+    if os.environ.get("GHIDRA_HOME"):
+        export, project = tmp_path / "export", tmp_path / "float"
+        assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+        capsys.readouterr()
+        trace = tmp_path / "float_interrupts.json"
+        events = [
+            event for caller, target, data in sorted(edges)
+            for event in ({"kind": "instruction", "address": caller, "bytes": data},
+                          {"kind": "edge", "from": caller, "to": target, "flow": "interrupt"})
+        ]
+        trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
+        assert main(["trace", str(trace), "--export", str(export), "--project", str(project),
+                     "--apply", "--json"]) == 0, capsys.readouterr().err
+        applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
+        assert {(row["from"]["unit_address"], row["to"]["unit_address"]) for row in applied if row["kind"] == "flow"} == {
+            ("root:6a5b", "root:123db"), ("root:6a5f", "root:123be"),
+        }
 
 
 def test_phantasie_iv_x68k_switches(tmp_path, capsys):

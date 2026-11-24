@@ -14,15 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, added `record-writes` to audit real-mode x86 stores using register values
-propagated across calls. The Phantasie III audit identified the caller-addressed `FST` stores
-and the sources of copies from templates and other records. The standalone suite passed 515
-tests with 129 skipped. Seven targeted checks passed with Ghidra 12.2, including all four
-opt-in Phantasie III DOS checks.
+On 2026-11-24, added real-mode interrupt vector dispatch to `call` and interrupt edges to
+Ghidra trace import. Phantasie III's software vector installer populated three distinct
+handlers. Probes distinguished the caller's `FST` and `FSTP` destinations from the runtime's
+record pointer and reproduced a class-byte overwrite through a segment alias. Ghidra 12.2
+replayed the observed segment-override and WAIT edges from the shipped code. The standalone
+suite passed 517 tests with 131 skipped.
 
-Resume Phase 9 by recovering the software interrupt entry paths and tracking the caller's
-output pointers and the runtime's record pointers separately. A static dispatch bound needs
-coverage of those paths and a check that output destinations stay outside the record stack.
+Resume Phase 9 by tracing the shipped callers that supply floating-point store destinations.
+To establish a dispatch bound, prove that those destinations stay outside the record stack and
+account for the remaining unresolved transfers and internal class writes.
 Microsoft LINK still needs a shipped executable with missing directory counts or a member whose first
 listed segment starts after the overlay window start. Expand Microsoft MOVE runtime views as more
 captured placements become available.
@@ -321,10 +322,14 @@ Continue with the analysis backlog below.
   The `record-writes` query reports overlapping stores and potential segment aliases for a byte
   field, with known byte values and copy sources. The Phantasie III audit checks the class
   bytes in all 15 slots in the runtime allocation. The `FST` word stores at `root:12e40` and
-  `root:12e43` use caller-derived `ES:DI`, so the dispatch bound requires disjoint output
-  operands. The handler also has undefined ranges and unresolved transfers in the static
-  listing. Automatic recovery still needs complete control flow and a proof of the internal
-  class writers and copies.
+  `root:12e43` use caller-derived `ES:DI` while reading the live record through `DS:SI`.
+  The runtime's DOS vector installer assigns INT 34h–3Bh to `root:1241c`, INT 3Ch to the
+  segment-override entry at `root:123db`, and INT 3Dh to the WAIT patch handler at
+  `root:123be`. The real-mode harness runs them via the interrupt table. Structured traces
+  can add observed interrupt edges to Ghidra. Tests exercise both `FST` and the original
+  ES-prefixed `FSTP` with a separate buffer and with a segment alias that overwrites a
+  class byte with `0x7f`. Automatic dispatch bounds need disjoint destinations for the
+  shipped callers, complete control flow, and a proof of the internal class writers and copies.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry

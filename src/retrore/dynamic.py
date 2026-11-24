@@ -74,6 +74,7 @@ class RoutineRequest:
     limit: int = DEFAULT_INSTRUCTION_LIMIT
     services: tuple[Service, ...] = ()
     hardware: tuple[HardwareIO, ...] = ()
+    ivt_interrupts: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,8 @@ class RoutineBackend:
             raise EmulatorError("instruction limit must be a positive supported integer")
         if request.far and self._x86 is None:
             raise EmulatorError("far calls require an x86 image")
+        if request.ivt_interrupts and self._x86 is None:
+            raise EmulatorError("IVT dispatch requires an x86 image")
         address = self.resolve(request.address)
         writes = self._spans(request.writes, writes=True)
         reads = self._spans(request.reads)
@@ -465,6 +468,7 @@ class RoutineBackend:
         result = self._x86.call(
             address, regs=request.registers, writes=writes, reads=reads, far=request.far, limit=request.limit,
             interrupts=dict.fromkeys((event.number for event in request.services), interrupt),
+            ivt_interrupts=request.ivt_interrupts,
             on_in=(lambda _cpu, port, size: script.io("port", "read", port, size)) if request.hardware else None,
             on_out=(lambda _cpu, port, size, value: script.io("port", "write", port, size, value))
             if request.hardware else None, _capture=capture,

@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from struct import pack
+from struct import pack, unpack
 from sys import maxsize
 
 from capstone import CS_ARCH_X86, CS_MODE_16, Cs
@@ -139,15 +139,21 @@ class Emulator:
         far: bool = False,
         limit: int = DEFAULT_INSTRUCTION_LIMIT,
         interrupts: Mapping[int, Interrupt] | None = None,
+        ivt_interrupts: Iterable[int] = (),
         on_in: PortIn | None = None,
         on_out: PortOut | None = None,
         hooks: Mapping[AddressInput, CodeHook] | None = None,
         _capture: CodeHook | None = None,
         _setup: Callable[[Uc], Callable[[], None]] | None = None,
     ) -> CallResult:
-        """Set up state and run to a 16-bit RET or RETF. Hooks receive the live Unicorn CPU."""
+        """Run to a 16-bit RET or RETF with optional live hooks and selected IVT vectors."""
         if type(limit) is not int or not 0 < limit < maxsize:
             raise EmulatorError("instruction limit must be a positive supported integer")
+        vectors = set()
+        for number in ivt_interrupts:
+            if type(number) is not int or not 0 <= number <= 0xff:
+                raise EmulatorError("interrupt vectors must be unsigned byte values")
+            vectors.add(number)
         start = self.resolve(address)
         initial = {"ss": self._stack.segment, "sp": self._stack.offset, "flags": 2, **self._initial_segments}
         for name, value in (regs or {}).items():
@@ -182,7 +188,7 @@ class Emulator:
         uc.reg_write(x86.UC_X86_REG_IP, start.offset)
         if _capture is not None:
             _capture(uc)
-        io_error = self._install_io(uc, interrupts or {}, on_in, on_out)
+        io_error = self._install_io(uc, interrupts or {}, vectors, on_in, on_out)
         returned = self._install_return(uc, start, initial, far, hooks or {})
         uc.reg_write(x86.UC_X86_REG_SP, initial["sp"])
         cleanup = _setup(uc) if _setup is not None else None
@@ -246,7 +252,8 @@ class Emulator:
         return lambda: returning
 
     def _install_io(
-        self, uc: Uc, interrupts: Mapping[int, Interrupt], on_in: PortIn | None, on_out: PortOut | None,
+        self, uc: Uc, interrupts: Mapping[int, Interrupt], vectors: set[int],
+        on_in: PortIn | None, on_out: PortOut | None,
     ) -> Callable[[], Exception | None]:
         input_error = None
 
@@ -259,6 +266,11 @@ class Emulator:
             site = Address(pc.segment, (pc.offset - 2) & _WORD_MASK)
             is_int = cpu.mem_read(site.linear, 2) == bytes((0xCD, number))
             target = self._stubs.get(site.linear) if number == 0x3F and is_int else None
+            if target is None and is_int and number in vectors:
+                offset, segment = unpack("<HH", cpu.mem_read(4 * number, 4))
+                if offset or segment:
+                    self._enter_interrupt(cpu, pc)
+                    target = Address(segment, offset)
             if target is None:
                 raise EmulatorError(f"unhandled interrupt {number:02x}h at {site if is_int else pc}")
             cpu.reg_write(x86.UC_X86_REG_CS, target.segment)
@@ -288,3 +300,14 @@ class Emulator:
         uc.hook_add(UC_HOOK_INSN, port_in, None, 1, 0, x86.UC_X86_INS_IN)
         uc.hook_add(UC_HOOK_INSN, port_out, None, 1, 0, x86.UC_X86_INS_OUT)
         return lambda: input_error
+
+    @staticmethod
+    def _enter_interrupt(cpu: Uc, continuation: Address) -> None:
+        flags = cpu.reg_read(x86.UC_X86_REG_EFLAGS)
+        ss = cpu.reg_read(x86.UC_X86_REG_SS)
+        sp = cpu.reg_read(x86.UC_X86_REG_SP)
+        for word in (flags & _WORD_MASK, continuation.segment, continuation.offset):
+            sp = (sp - 2) & _WORD_MASK
+            cpu.mem_write(Address(ss, sp).linear, pack("<H", word))
+        cpu.reg_write(x86.UC_X86_REG_SP, sp)
+        cpu.reg_write(x86.UC_X86_REG_EFLAGS, flags & ~0x300)  # Clear TF and IF.
