@@ -245,14 +245,15 @@ Embedded Borland VROOMM banks and Microsoft LINK members are discovered from the
 The loader exports native file offsets, applies verified fixups, and rewrites resolved VROOMM stubs.
 VROOMM skips empty code descriptors and handles the reserved fixup bit used by Turbo C++ 1.01.
 A flagged VROOMM function-pointer fixup resolves two adjacent `MOV reg,imm16` / `PUSH reg` pairs
-using the same register to a unique resident stub. LINK directories can be recovered from count
+using the same register to a unique resident stub. Static LINK directories can be recovered from count
 fields or adjacent relocation-backed arrays corroborated by member fixups, including when the
 resident module is EXEPACK-compressed. Verified members share one runtime window, including any
 padding before their first routine. A member's minimum allocation can account for trailing segments
 omitted from the file. Only file-backed segment starts appear in
 `segment_offsets`, and fixups to omitted segments keep their relocated runtime addresses. Inspect
 `diagnostics` in JSON for unmatched trailers, unresolved VROOMM function-pointer offsets, and
-unidentified or ambiguous LINK directories.
+unidentified or ambiguous LINK directories. Microsoft MOVE uses dynamic placement and is outside
+the static LINK loader's coverage. See the [Phase 12 validation notes](PLAN.md#phase-12-loader-depth-on-supported-platforms).
 
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the

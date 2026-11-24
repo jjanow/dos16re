@@ -14,18 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, testing shipped DOS executables exposed a LINK directory lookup bug in
-EXEPACK-compressed resident modules. Directory recovery now uses the decoded resident bytes and
-relocations. Civilization 474.03 exported all 23 members with their runtime addresses and file
-offsets, and Ghidra 12.2 imported all 24 load states. The standalone suite passed 511 tests with
-124 skipped. The opt-in DOS and Amiga suite passed all 70 tests with Ghidra enabled.
+On 2026-11-24, the shipped-release search found a counted static LINK directory in NetHack 3.0j
+and a dynamic Microsoft MOVE directory in NetHack 3.1.3. Two new probes showed that LINK 3.65
+and 5.01.21 emit the counts even when the overlay initialization routine ignores them.
+The standalone suite passed 511 tests with 124 skipped. All 49 DOS tests passed with Ghidra
+12.2 and the opt-in inputs enabled.
 
-Keep the native validation item open for a shipped static LINK executable that omits the
-directory counts or places a member's first listed segment after the window start. The shipped
-directories examined this session had counts and listed their first segments at the window start.
-Synthetic coverage includes both cases together under EXEPACK. Microsoft documents the
-window-start placement for LINK 3.x and 5.01.
-[Microsoft KB Q32003](https://www.infania.net/misc/kbarchive/kb/032/Q32003/index.html)
+Resume the static LINK validation when a shipped executable is available that omits the
+directory counts or places a member's first listed segment after the window start. The inspected
+static LINK releases all had counts and listed their first segments at the window start.
 
 ## Why
 
@@ -466,6 +463,23 @@ directories. At base segment `0x1000`, Civilization's 23 members share runtime a
 and have 2,915 fixups. Ghidra 12.2 imported the root and all 23 overlay states. The opt-in test
 checks the window, fixup count, and original file offsets and bytes.
 [Civilization 474.03 archived executable](https://archive.org/details/msdos_Sid_Meiers_Civilization_1991)
+
+The DOS release of NetHack 3.0j ships 63 LINK members across two OVL files. Its resident
+directory has 162 selectors and a physical overlay count of 64 including the root. Every
+member's first listed selector is `0x07BA`, the link-time window. In separate probes, LINK 3.65
+and 5.01.21 both wrote the `$$CGSN` and `$$COVL` words even with a custom `$$OVLINIT`
+that only returns. Both link maps placed the paragraph-aligned and page-aligned first segments
+at `OVERLAY_AREA`. The count-free directory and delayed first selector still have synthetic
+coverage, including in combination with EXEPACK.
+[NetHack 3.0j release archive](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH_older/),
+[Microsoft KB Q32003](https://www.infania.net/misc/kbarchive/kb/032/Q32003/index.html)
+
+NetHack 3.1.3 has 63 embedded members with member-relative relocation sites and Microsoft MOVE
+runtime error messages. Its released Microsoft C 7 build uses `/DYNAMIC`. Recovering MOVE
+placements requires separate loader work.
+[NetHack 3.1.3 DOS release archive](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH31/),
+[NetHack 3.1.3 source archive](https://ftp.zx.net.nz/pub/mirror/ftp.funet.fi/pub/unix/games/nethack/),
+[Microsoft C 7.0 error reference](https://bitsavers.trailing-edge.com/pdf/microsoft/msdos_c/Microsoft_C_7.0_1991/24779_Comprehensive_Index_and_Errors_Reference_199201.pdf)
 
 Turbo C++ 1.01 with TLINK 3.01 and Borland C++ 2.0 with TLINK 4.0 emitted resident stub offsets
 for the C far-pointer probes. Both linkers set the pointer-offset flag for an assembly probe that
