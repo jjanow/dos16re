@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from struct import pack, unpack_from
+from struct import pack, pack_into, unpack_from
 
 import pytest
 
@@ -166,6 +166,21 @@ def test_overlay_rejects_references_to_inactive_slots_and_missing_breaks():
         build_hunk_image(_tree() + _words(0), "overlay")
 
 
+def test_overlay_preserves_symbol_at_segment_boundary():
+    source = bytearray(_tree())
+    table = source.index(_words(0x3F5))
+    first_entry = table + 8 + 3 * 4
+    pack_into(">II", source, first_entry + 4, 0x12345678, 0xFEDCBA98)
+    pack_into(">I", source, first_entry + 28, 4)
+    _, export = build_hunk_image(source, "overlay")
+    entry = export["overlay_tree"]["entries"][0]
+    assert entry["unit_address"] == "ov1_1_h1:0004"
+    assert entry["at_boundary"] and not entry["entry_point"]
+    pack_into(">I", source, first_entry + 28, 6)
+    with pytest.raises(HunkError, match="invalid AmigaDOS HUNK_OVERLAY symbol target"):
+        build_hunk_image(source, "overlay")
+
+
 def test_hunk_alink_ordinates_can_repeat_under_different_parents():
     _, export = build_hunk_image(_tree(second_child_ordinate=1, root_break=True), "overlay")
     nodes = export["overlay_tree"]["nodes"]
@@ -239,6 +254,39 @@ def test_optional_original_hierarchical_overlay():
     tree = program["overlay_tree"]
     assert tree["manager"] == "hierarchical"
     assert len(tree["nodes"]) > 1 and tree["entries"]
+
+
+def test_optional_deluxe_paint_hierarchical_overlay(tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_DPAINT_AMIGA_DIR")):
+        pytest.skip("set RETRORE_DPAINT_AMIGA_DIR to the directory containing the 1986 DeluxePaint I dpaint executable")
+    source = Path(directory) / "dpaint"
+    out = tmp_path / "out"
+    assert main(["load", str(source), "-o", str(out), "--json"]) == 0, capsys.readouterr().err
+    program = json.loads(capsys.readouterr().out)
+    tree = program["overlay_tree"]
+    assert (tree["depth"], tree["segment_table_size"], len(tree["nodes"]), len(tree["entries"])) == (4, 185, 9, 66)
+    assert [node["parent"] for node in tree["nodes"][-2:]] == ["ov1_6", "ov1_6"]
+    assert [entry["index"] for entry in tree["entries"] if entry.get("at_boundary")] == [0, 43, 54]
+    assert sum(entry["entry_point"] for entry in tree["entries"]) == 63
+    assert sum(len(unit["relocations"]) for unit in program["units"]) == 6360
+
+    entry = tree["entries"][1]
+    unit = next(unit for unit in program["units"] if unit["name"] == "ov1_1_h160")
+    node_file_offset, _, _, level, ordinate, first, target, offset = unpack_from(
+        ">8I", source.read_bytes(), entry["file_offset"],
+    )
+    assert (node_file_offset, level, ordinate, first, target, offset) == (0x162D8, 1, 1, 157, 160, 0x1D8)
+    assert entry["unit_address"] == "ov1_1_h160:01d8"
+    assert entry["linear"] == unit["linear"] + 0x1D8
+    assert main(["address-map", entry["unit_address"], "--export", str(out), "--json"]) == 0
+    match, = json.loads(capsys.readouterr().out)["matches"]
+    assert match["file"]["offset"] == unit["file_offset"] + 0x1D8
+    if os.environ.get("GHIDRA_HOME"):
+        project = tmp_path / "project"
+        assert main(["ghidra", "import", str(out), str(project), "--json"]) == 0, capsys.readouterr().err
+        assert json.loads(capsys.readouterr().out)["overlay_entries"] == 63
+        assert main(["decomp", entry["unit_address"], "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        assert "_SetMenuStrip(" in json.loads(capsys.readouterr().out)["decompilation"]
 
 
 @pytest.mark.parametrize(("code", "encoding", "table", "targets"), [

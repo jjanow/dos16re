@@ -265,10 +265,11 @@ def _read_overlay_table(reader: _Reader) -> tuple[dict, dict, list[tuple[int, in
     nodes = {}
     entries = []
     for number, row in enumerate(iter_unpack(">8I", table.data[table.position:])):
-        position, reserved1, reserved2, level, ordinate, first, target, offset = row
+        position, _, _, level, ordinate, first, target, offset = row
+        # The overlay manager ignores both reserved words. Original linkers can leave them nonzero.
         next_node = (level, ordinate, first)
         prior_node = nodes.setdefault(position, next_node)
-        if (reserved1 or reserved2 or not 1 <= level < depth or not ordinate
+        if (not 1 <= level < depth or not ordinate
                 or position < reader.position or position % 4 or prior_node != next_node):
             raise HunkError(f"invalid AmigaDOS HUNK_OVERLAY table entry {number}")
         entries.append((position, target, offset))
@@ -331,14 +332,19 @@ def _overlay_entries(tree: dict, entries: list[tuple[int, int, int]], nodes: lis
     for index, (position, target, offset) in enumerate(entries):
         node = by_position[position]
         unit = node.units.get(target)
-        if unit is None or offset >= unit["size"]:
+        if unit is None or offset > unit["size"]:
             raise HunkError(f"invalid AmigaDOS HUNK_OVERLAY symbol target in table entry {index}")
-        results.append({
+        entry = {
             "index": index, "node": node.id, "file_offset": start + index * 32,
             "unit_address": f"{unit['name']}:{offset:04x}", "linear": unit["linear"] + offset,
             "kind": unit["kind"],
             "entry_point": unit["kind"] == "code" and not offset % 2 and offset + 2 <= unit["file_size"],
-        })
+        }
+        # Some linkers emit symbols at the exact end of a segment. Preserve their coordinates
+        # as table evidence, without treating them as addresses of initialized instructions.
+        if offset == unit["size"]:
+            entry["at_boundary"] = True
+        results.append(entry)
     return results
 
 

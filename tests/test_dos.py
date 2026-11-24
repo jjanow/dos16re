@@ -1,7 +1,7 @@
 import json
 import os
 from pathlib import Path
-from struct import pack, pack_into
+from struct import pack, pack_into, unpack_from
 
 import pytest
 
@@ -318,10 +318,74 @@ def test_original_dos_tool_outputs_when_available():
     assert (packed.image, packed.entry, packed.stack, packed.relocations) == (
         original.image, original.entry, original.stack, original.relocations,
     )
-    packed_com = load_dos_flat((probe / "COM201.COM").read_bytes(), com=True)
+    com = (probe / "COM201.COM").read_bytes()
+    packed_com = load_dos_flat(com, com=True)
     assert (packed_com.packer, packed_com.entry, packed_com.image[0x100:]) == (
         "PKLITE 2.01", Address(0x1000, 0x100), (probe / "testcom.com").read_bytes(),
     )
+    assert com[46:52] == b"\x01\x02PKLI"
+    unlabelled = load_dos_flat(com[:46] + bytes(22) + com[68:], com=True)
+    assert unlabelled.packer == "PKLITE"
+    assert (unlabelled.image, unlabelled.entry) == (packed_com.image, packed_com.entry)
+
+
+@pytest.mark.parametrize("name", ["t10fr", "h10fr"])
+def test_original_pklite_xor_output_when_available(name):
+    if not (directory := os.environ.get("RETRORE_PKLITE_TESTEXE_DIR")):
+        pytest.skip("set RETRORE_PKLITE_TESTEXE_DIR to the testexe repository's compress directory")
+    probe = Path(directory)
+    packed, _ = load_dos_mz((probe / f"{name}.exe").read_bytes(), 0x1000, f"{name}.exe")
+    original, _ = load_dos_mz((probe / f"{name}.unc").read_bytes(), 0x1000, f"{name}.unc")
+    assert packed.packer == "PKLITE 1.15"
+    assert (packed.image, packed.entry, packed.stack, packed.relocations) == (
+        original.image, original.entry, original.stack, original.relocations,
+    )
+
+
+def test_original_pklite_add_output_when_available():
+    if not (directory := os.environ.get("RETRORE_PKLITE_SFX_DIR")):
+        pytest.skip("set RETRORE_PKLITE_SFX_DIR to the PKZIP 2.04g installer and Deark reference")
+    probe = Path(directory)
+    packed, _ = load_dos_mz((probe / "pk204g.exe").read_bytes(), 0x1000, "pk204g.exe")
+    original, _ = load_dos_mz((probe / "pk204g-unpacked.000.exe").read_bytes(), 0x1000, "pk204g-unpacked.000.exe")
+    assert packed.packer == "PKLITE 1.20"
+    assert len(packed.relocations) == 24
+    assert (packed.image, packed.entry, packed.stack, packed.relocations) == (
+        original.image, original.entry, original.stack, original.relocations,
+    )
+
+
+def test_original_dos_overlay_probe_outputs_when_available(tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_DOS_OVERLAY_PROBE_DIR")):
+        pytest.skip("set RETRORE_DOS_OVERLAY_PROBE_DIR to the PADDED.EXE, VROOMM.EXE and VROOM86.EXE probe outputs")
+    probe = Path(directory)
+    out = tmp_path / "link"
+    program = _command(capsys, "load", probe / "PADDED.EXE", "-o", out)
+    _, first, second = program["units"]
+    assert "diagnostics" not in program
+    assert first["runtime_linear"] == second["runtime_linear"] == 0x10100
+    assert first["segment_offsets"] == [0, 0x30]
+    proof = _command(capsys, "bytes", "link_0001:30", "--export", out, "--size", 3)
+    assert proof["original"] == "b81300"
+    assert proof["loaded"] == pack("<BH", 0xB8, first["segment"] + 3).hex()
+    assert proof["address"]["file"]["offset"] == 0x830
+
+    for filename, encoded, offset_site in (
+        ("VROOMM.EXE", "689000682000", 4),
+        ("VROOM86.EXE", "b8900050b8200050", 5),
+    ):
+        binary = probe / filename
+        out = tmp_path / binary.stem
+        program = _command(capsys, "load", binary, "-o", out)
+        _, caller, target = program["units"]
+        assert "diagnostics" not in program
+        proof = _command(capsys, "bytes", f"{caller['name']}:3", "--export", out, "--size", len(encoded) // 2)
+        assert proof["original"] == encoded
+        stub = next(row["address"] for row in program["stubs"] if row["target"]["linear"] == target["linear"])
+        loaded = bytearray.fromhex(encoded)
+        pack_into("<H", loaded, 1, stub["segment"])
+        assert unpack_from("<H", loaded, offset_site)[0] == stub["offset"]
+        assert proof["loaded"] == loaded.hex()
 
 
 def test_original_tlink_vroomm_output_when_available():

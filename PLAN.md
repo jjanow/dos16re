@@ -14,14 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, Phase 12 added PKLITE decoder variants, Microsoft LINK directory recovery with
-padded members, and VROOMM function-pointer fixups for additional word-push encodings. Synthetic
-DOS fixtures check decoded bytes, relocation targets, and source offsets. The standalone suite
-passed 504 tests with 106 skipped. The focused Ghidra 12.2 run passed 28 with two skipped and
-verified the LINK member's runtime placement.
+On 2026-11-23, Phase 12 validated PKLITE's XOR and ADD paths, the PKLITE COM decoder pointers,
+and original LINK and TLINK overlay outputs. DeluxePaint I exposed two Amiga loader assumptions.
+The parser now accepts nonzero reserved table words and retains exact-end symbols without
+seeding code there. Ghidra 12.2 imported 282 hunks and decompiled an overlay entry. The standalone
+suite passed 505 tests with 111 skipped, and the focused DOS and Amiga run passed all 51 tests
+with Ghidra and native inputs enabled.
 
-Resume with native DOS tool outputs for the new cases and an original hierarchical Amiga overlay
-release. Both validation tasks are deferred.
+Resume native validation with LINK members whose first segment follows the shared window start,
+LINK directories without count words, and VROOMM outputs that flag pointer offsets for rewriting.
 
 ## Why
 
@@ -434,10 +435,20 @@ release. Continue with the analysis backlog below.
   Exports preserve selection order, layout decisions, and member and file offsets. Synthetic tests
   cover these workflows. Original-tool outputs and releases use optional `RETRORE_*_DIR` inputs.
 
-Native DOS validation remains open for the new PKLITE stub paths, LINK directory arrangements, and
-VROOMM pointer-push encodings. Amiga validation still needs an original hierarchical overlay release.
-Amiga overlay trees establish coexistence. Captured placements supply physical scatter-load addresses
-for a run.
+**Validated with original tools.** PKLITE 1.15 registered small and large XOR outputs match their
+unpacked references. The PKZIP 2.04g installer exercises the ADD decoder and matches Deark on
+its image, entry, stack, and 24 relocations. The PKLITE 2.01 COM probe still decodes after its
+copyright fields are cleared. LINK 3.65 and 5.01.21 counted-directory probes agree with their
+linker maps, including a page-aligned shared window and padding between segments in the LINK 3.65
+member. Turbo C++ 1.01 and TLINK 3.01 produced immediate and `MOV`/`PUSH` far-pointer arguments
+that resolve to resident stubs. Both probes ran in DOSBox. Leading member padding, LINK directories
+without counts, and VROOMM pointer-offset rewrites still have synthetic coverage.
+
+**Validated with an original Amiga release.** The 1986 DeluxePaint I executable has eight overlay
+nodes, including two children of `ov1_6`, and 66 table entries. Ghidra 12.2 imported 6,360
+relocations and seeded 63 overlay entries. The other three entries mark exact hunk boundaries.
+Amiga overlay trees establish coexistence. Captured placements supply physical scatter-load
+addresses for a run. [DeluxePaint release background](https://computerhistory.org/blog/electronic-arts-deluxepaint-early-source-code/)
 
 ## Platform capability parity
 
@@ -500,8 +511,10 @@ The SSI Phantasie I and III Amiga disk images from the Phantasie remaster suppli
 executables. Ghidra recovered Phantasie I's call from `h20:018c` to the palette routine at
 `h77:0466`. For Phantasie III, a zero-based export placed DATA at `0x21890`, and Ghidra
 decompiled the main loop at `h0:736c` and resolved its write to `h1:286c`.
-Both releases keep their hunks resident. Hierarchical AmigaDOS overlay branches are validated with
-synthetic inputs. Set `RETRORE_AMIGA_OVERLAY_DIR` for an original executable named `overlay`.
+Both Phantasie releases keep their hunks resident. DeluxePaint I validates hierarchical AmigaDOS
+overlays on an original release. Ghidra decompiled `ov1_1_h160:01d8` and recovered its call to
+`_SetMenuStrip`. Set `RETRORE_DPAINT_AMIGA_DIR` for the DeluxePaint I check or
+`RETRORE_AMIGA_OVERLAY_DIR` for another original executable named `overlay`.
 
 ### Atari ST
 

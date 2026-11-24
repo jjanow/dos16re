@@ -350,8 +350,9 @@ analysis. It records the requested Amiga memory flags and zero-fills BSS, unused
 allocations, symbols, absolute and PC-relative relocations, and recognized `HUNK_DEBUG` LINE records.
 Each branch of a hierarchical `HUNK_OVERLAY` tree has named units, for example `ov1_2_h1`, at distinct
 analysis addresses. The tree records table entries, parentage, and source offsets. Its generated
-load states describe which hunks can coexist along each branch. Actual AmigaOS scatter-load addresses
-can be supplied in a manifest or recorded in a trace.
+load states describe which hunks can coexist along each branch. Table symbols at the exact end of a
+hunk carry `at_boundary` and are excluded from Ghidra entry points. Actual AmigaOS scatter-load
+addresses can be supplied in a manifest or recorded in a trace.
 
 Ghidra imports native symbols, supported source maps, and overlay entry points. Amiga queries
 accept `unit:offset` or a flat hexadecimal address. Use `call` for CPU-level routine execution and
@@ -1581,6 +1582,19 @@ releases respectively. Set `RETRORE_CTD_GENESIS_DIR` to the directory containing
 U.S./Europe `Buck Rogers: Countdown to Doomsday` Genesis cartridge image. The Ghidra tests use
 `GHIDRA_HOME` and include synthetic programs for all
 supported platforms. Tests skip when their input variables are unset.
+
+Phase 12 has optional checks against original tool outputs and releases.
+
+| Environment variable | Inputs |
+|---|---|
+| `RETRORE_DOS_LOADER_DIR` | Microsoft LINK 3.65 `TEST2.EXE`, PKLITE 2.01 `PACK201.EXE` and `COM201.COM`, and their unpacked `PACK.EXE` and `testcom.com` counterparts |
+| `RETRORE_VROOMM_DIR` | The TLINK 4.0 three-overlay `VROOMM.EXE` probe |
+| `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
+| `RETRORE_PKLITE_TESTEXE_DIR` | The `compress` directory with `t10fr` and `h10fr` EXE and UNC pairs from [testexe](https://github.com/camoto-project/testexe) |
+| `RETRORE_PKLITE_SFX_DIR` | The [PKZIP 2.04g installer](https://www.hpcalc.org/details/3882) as `pk204g.exe` and its [Deark](https://github.com/jsummers/deark) reference produced by `deark -m pklite -o pk204g-unpacked pk204g.exe` |
+| `RETRORE_AMIGA_OVERLAY_DIR` | An original hierarchical executable named `overlay` |
+| `RETRORE_DPAINT_AMIGA_DIR` | `dpaint` from the 1986 DeluxePaint I disk. With Ghidra, the test imports it and decompiles an overlay entry. [Release background](https://computerhistory.org/blog/electronic-arts-deluxepaint-early-source-code/) |
+
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
 runs the synthetic suites with the headless tests enabled. [Release workflow](.github/workflows/release-ci.yml)
 
