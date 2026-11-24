@@ -52,6 +52,10 @@ def test_c64_disk_export_and_search(tmp_path, capsys):
     assert image[:root["size"]] == prg[2:]
     assert image[root["size"]:worker["image_offset"]] == bytes(worker["image_offset"] - root["size"])
     assert image[worker["image_offset"]:] == b"C\x60"
+    assert main(["bytes", "root:fb", "--size", "2", "--export", str(out), "--json"]) == 0
+    proof = json.loads(capsys.readouterr().out)
+    assert [span["file_offset"] for span in proof["container_spans"]] == [255, (768 - 17) * 256 + 2]
+    assert proof["file_spans"][0]["file_offset"] == 253
 
     def search(flag, value):
         assert main(["where-is", "--export", str(out), flag, value, "--json"]) == 0

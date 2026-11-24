@@ -1,10 +1,10 @@
 """Load binary files into a static Apple II Plus memory view."""
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from struct import unpack_from
 
-from .image import APPLE2_FORMAT, MOS6502_ADDRESS_LIMIT
+from .image import APPLE2_FORMAT, MOS6502_ADDRESS_LIMIT, SourceSpan, slice_source_spans
 
 DEFAULT_LC = 0xC082
 DISK_SUFFIXES = (".dsk", ".do", ".po", ".d13")
@@ -28,15 +28,16 @@ class Binary:
     payload: bytes
     load_address: int | None
     file_offset: int = 0
+    container_spans: tuple[SourceSpan, ...] = ()
 
     @classmethod
-    def from_dos(cls, data: bytes, name: str) -> "Binary":
+    def from_dos(cls, data: bytes, name: str, spans: tuple[SourceSpan, ...] = ()) -> "Binary":
         if len(data) < 4:
             raise Apple2Error(f"Apple II binary {name!r} needs a four-byte DOS header")
         address, length = unpack_from("<HH", data)
         if not 0 < length <= len(data) - 4:
             raise Apple2Error(f"invalid length in DOS binary {name!r}")
-        return cls(data[4:4 + length], address, 4)
+        return cls(data[4:4 + length], address, 4, slice_source_spans(spans, 4, length))
 
 
 def _filename(data: memoryview) -> str:
@@ -89,10 +90,13 @@ class SectorImage:
                     return candidate
         return "physical"
 
-    def _sector(self, track: int, sector: int) -> memoryview:
+    def _sector_offset(self, track: int, sector: int) -> int:
         if not (0 <= track < _TRACKS and 0 <= sector < self._sectors):
             raise Apple2Error(f"invalid Apple II track/sector {track}/{sector}")
-        start = (track * self._stride + self._slots[sector]) * _SECTOR_SIZE
+        return (track * self._stride + self._slots[sector]) * _SECTOR_SIZE
+
+    def _sector(self, track: int, sector: int) -> memoryview:
+        start = self._sector_offset(track, sector)
         return self._data[start:start + _SECTOR_SIZE]
 
     def _chain(self, track: int, sector: int) -> Iterator[memoryview]:
@@ -149,18 +153,19 @@ class SectorImage:
                 if track:
                     if index in sectors:
                         raise Apple2Error(f"overlapping track/sector lists for DOS binary {name!r}")
-                    sectors[index] = self._sector(track, sector)
+                    sectors[index] = self._sector_offset(track, sector)
                 index += 1
 
         if 0 not in sectors:
             raise Apple2Error(f"missing first data sector for DOS binary {name!r}")
-        length = unpack_from("<H", sectors[0], 2)[0]
+        length = unpack_from("<H", self._data, sectors[0] + 2)[0]
         blocks = (length + 4 + _SECTOR_SIZE - 1) // _SECTOR_SIZE
         try:
-            contents = b"".join(sectors[index] for index in range(blocks))
+            offsets = [sectors[index] for index in range(blocks)]
         except KeyError as error:
             raise Apple2Error(f"missing data sector {error.args[0]} for DOS binary {name!r}") from None
-        return Binary.from_dos(contents, name)
+        contents, spans = self._binary_sectors(offsets)
+        return Binary.from_dos(contents, name, spans)
 
     def _read_rdos_binary(self, entry: memoryview, name: str) -> Binary:
         address, length, start = unpack_from("<HHH", entry, 26)
@@ -168,8 +173,14 @@ class SectorImage:
         if not 0 < length <= count * _SECTOR_SIZE or start + count > _TRACKS * self._sectors:
             raise Apple2Error(f"invalid sector range or length for RDOS binary {name!r}")
         blocks = (length + _SECTOR_SIZE - 1) // _SECTOR_SIZE
-        payload = b"".join(self._sector(*divmod(index, self._sectors)) for index in range(start, start + blocks))
-        return Binary(payload[:length], address)
+        offsets = [self._sector_offset(*divmod(index, self._sectors)) for index in range(start, start + blocks)]
+        payload, spans = self._binary_sectors(offsets)
+        return Binary(payload[:length], address, container_spans=slice_source_spans(spans, 0, length))
+
+    def _binary_sectors(self, offsets: list[int]) -> tuple[bytes, tuple[SourceSpan, ...]]:
+        payload = b"".join(self._data[start:start + _SECTOR_SIZE] for start in offsets)
+        spans = tuple(SourceSpan(index * _SECTOR_SIZE, start, _SECTOR_SIZE) for index, start in enumerate(offsets))
+        return payload, spans
 
 
 @dataclass(frozen=True)
@@ -249,6 +260,8 @@ def build_apple2_image(
             "load_address": unit.binary.load_address, "source": unit.source, "disk_file": unit.disk_file,
             "writable": address < 0xC000 or bool(lc & 1),
         })
+        if unit.binary.container_spans:
+            records[-1]["container_spans"] = [asdict(span) for span in unit.binary.container_spans]
         previous_end = end
 
     entry_records = []

@@ -1,18 +1,11 @@
 """Place ordered loads in a selected Z80 address space."""
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import groupby
 
 from .d88 import D88Disk
-from .image import FLAT16_ADDRESS_LIMIT
-
-
-@dataclass(frozen=True)
-class SourceSpan:
-    offset: int
-    file_offset: int
-    size: int
+from .image import FLAT16_ADDRESS_LIMIT, SourceSpan, slice_source_spans
 
 
 @dataclass(frozen=True)
@@ -24,27 +17,29 @@ class Z80Source:
     disk_file: str | None = None
     file_offset: int = 0
     file_spans: tuple[SourceSpan, ...] = ()
+    container_spans: tuple[SourceSpan, ...] = ()
 
     @property
     def end(self) -> int:
         return self.address + len(self.data)
 
     def spans(self, offset: int, size: int) -> tuple[SourceSpan, ...]:
-        spans = []
-        for span in self.file_spans:
-            start = max(span.offset, offset)
-            end = min(span.offset + span.size, offset + size)
-            if start < end:
-                spans.append(SourceSpan(start - offset, span.file_offset + start - span.offset, end - start))
-        return tuple(spans)
+        return slice_source_spans(self.file_spans, offset, size)
+
+    def copy(self, name: str, destination: int, offset: int, size: int) -> "Z80Source":
+        return Z80Source(name, self.source, destination, self.data[offset:offset + size], self.disk_file,
+                         self.file_offset + offset, self.spans(offset, size),
+                         slice_source_spans(self.container_spans, offset, size))
 
     def provenance(self, offset: int, size: int) -> dict:
         spans = self.spans(offset, size)
         report = {"file_offset": spans[0].file_offset if spans else self.file_offset + offset}
         if len(spans) > 1:
-            report["file_spans"] = [
-                {"offset": span.offset, "file_offset": span.file_offset, "size": span.size} for span in spans
-            ]
+            report["file_spans"] = [asdict(span) for span in spans]
+        if self.container_spans:
+            report["container_spans"] = [asdict(span) for span in slice_source_spans(
+                self.container_spans, offset, size,
+            )]
         return report
 
 
@@ -130,10 +125,6 @@ def copy_z80_source(
         if source.address < end and address < source.end:
             if source.address <= address < end <= source.end:
                 offset = address - source.address
-                return Z80Source(
-                    f"copy_{destination:04x}_from_{address:04x}_{size:x}", source.source,
-                    destination, source.data[offset:offset + size], source.disk_file,
-                    file_offset=source.file_offset + offset, file_spans=source.spans(offset, size),
-                )
+                return source.copy(f"copy_{destination:04x}_from_{address:04x}_{size:x}", destination, offset, size)
             break
     raise error(f"{prefix} copy {address:x}:{size:x} must fit within a single visible load")

@@ -29,6 +29,39 @@ def test_dos_bytes_and_runtime_mapping(capsys):
     assert map_address(export, "root:20")["count"] == 0
 
 
+def test_legacy_mz_provenance_verifies_supplied_source(tmp_path, capsys):
+    export = FIXTURES / "mz"
+    proof = inspect_bytes(export, "root:0", size=32)
+    assert proof["file_spans"] == []
+    original = bytes.fromhex(proof["original"])
+    header = bytearray(48)
+    pack_into("<2s13H", header, 0, b"MZ", len(header) + len(original), 1, 2, 3, 0, 0, 0, 0, 0, 3, 1, 28, 0)
+    pack_into("<4H", header, 28, 1, 0, 20, 0)
+    path = tmp_path / "demo.exe"
+    path.write_bytes(header + original)
+    command = ["--export", str(export), "--source-file", str(path), "--json"]
+    assert main(["address-map", "31", "--from", "file", *command]) == 0
+    match, = json.loads(capsys.readouterr().out)["matches"]
+    assert match["unit_offset"] == 1 and match["file"]["offset"] == 49
+    path.write_bytes(header + original[:-1] + bytes([original[-1] ^ 1]))
+    assert main(["bytes", "root:0", *command]) == 1
+    assert "does not match" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+
+def test_runtime_loads_place_flat_and_segmented_units():
+    flat = FIXTURES / "hunk"
+    result = call_tool("address_map", {"export": str(flat), "address": "200002", "space": "runtime",
+                                       "runtime_loads": ["H0=200000", "h3=unmapped"]})
+    match, = result["structuredContent"]["matches"]
+    assert match["unit_offset"] == 2 and match["runtime"] == {"address": "00200002", "linear": 0x200002}
+    assert map_address(flat, "h3:1", runtime_loads={"h3": None})["matches"][0]["runtime"] is None
+    with pytest.raises(evidence.EvidenceError, match="overlap"):
+        map_address(flat, "h0:0", runtime_loads={"h0": 0x10020})
+    match, = map_address(FIXTURES / "mz", "2000:0004", space="runtime",
+                         runtime_loads={"root": 0x20003})["matches"]
+    assert match["unit_offset"] == 1 and match["runtime"]["address"] == "2000:0004"
+
+
 def test_hunk_file_mapping_and_bss():
     export = FIXTURES / "hunk"
     matches = map_address(export, "36", space="file", source="demo")["matches"]
@@ -515,45 +548,60 @@ def test_annotation_custom_storage_round_trip(tmp_path, capsys):
 
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
-@pytest.mark.parametrize("variant", ["unchanged", "renamed", "resized"])
+@pytest.mark.parametrize("variant", ["unchanged", "renamed", "resized", "moved", "moved_renamed"])
 def test_annotation_custom_storage_transfer_rebases_memory(tmp_path, capsys, variant):
     code = bytes.fromhex("00 c0 a9 07 ea 60")
     before, after = (tmp_path / name for name in ("before", "after"))
+    moved = variant.startswith("moved")
+    renamed = "renamed" in variant
+    revised_offset = 0x2b if moved else 0x10
     for project, entry in ((before, "c000"), (after, "c400")):
         export = project.with_name(project.name + "-export")
         source = tmp_path / f"{project.name}.prg"
-        source.write_bytes(code + bytes(0x1e if project == after and variant == "resized" else 0x20))
+        if moved:
+            start = revised_offset if project == after else 0x10
+            filler = b"\x35" if project == after else b"\x79"
+            source.write_bytes(code + filler * (start - 4) + bytes(range(0x80, 0xb0)) + filler * 16)
+        else:
+            source.write_bytes(code + bytes(0x1e if project == after and variant == "resized" else 0x20))
         assert main(["load", str(source), "--base-address", entry, "--entry", entry, "-o", str(export)]) == 0
         assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
     capsys.readouterr()
 
-    _edit_storage(before, "seed", "c000", "relative", variant)
-    if variant == "renamed":
+    _edit_storage(before, "seed", "c000", "20", variant)
+    if renamed:
         _edit_storage(after, "rename", "c400")
     original = tmp_path / "annotations.json"
     original.write_text(json.dumps(export_annotations(before)), encoding="utf-8")
     assert main(["compare", str(before), str(after), "--storage", "--json"]) == 0, capsys.readouterr().err
     comparison = tmp_path / "comparison.json"
     mapping = json.loads(capsys.readouterr().out)
-    assert mapping["comparison_version"] == (1 if variant == "unchanged" else 2)
+    assert mapping["comparison_version"] == (3 if moved else 1 if variant == "unchanged" else 2)
     comparison.write_text(json.dumps(mapping), encoding="utf-8")
     assert main(["annotations", "transfer", str(original), str(comparison), "--json"]) == 0
     transferred = json.loads(capsys.readouterr().out)
-    assert transferred["version"] == (5 if variant == "unchanged" else 7)
+    assert transferred["version"] == (8 if moved else 5 if variant == "unchanged" else 7)
     signature, = [row for row in transferred["annotations"] if row["kind"] == "signature"]
     block, = [pair for pair in transferred["storage_blocks"] if pair["unit"] == "root"]
     assert (block["before_start"], block["after_start"]) == ("c000", "c400")
     if variant == "renamed":
         assert (block["after_unit"], block["after_size"]) == ("renamed_root", block["size"])
+    if moved or renamed:
         layout, = [row for row in transferred["annotations"] if row["kind"] == "data_layout"]
-        assert (layout["unit"], layout["offset"], layout["provenance"]["unit"]) == ("renamed_root", 0x10, "root")
+        assert (layout["unit"], layout["offset"], layout["provenance"]["unit"]) == (
+            "renamed_root" if renamed else "root", revised_offset, "root",
+        )
+        if moved:
+            assert block["after_size"] - block["size"] == revised_offset - 0x10
+            assert block["ranges"] == [{"before_offset": 0x10, "after_offset": revised_offset, "length": 0x30}]
+            assert layout["provenance"]["matched_by"] == "matching_bytes"
     elif variant == "resized":
         assert (block["after_unit"], block["after_size"]) == ("root", block["size"] - 2)
     path = tmp_path / "transferred.json"
 
     path.write_text(json.dumps(transferred | {"storage_blocks": []}), encoding="utf-8")
     conflict = import_annotations(after, path, apply=True)
-    count = 2 if variant == "renamed" else 1
+    count = 2 if moved or renamed else 1
     assert not conflict["applied"] and conflict["conflicts"] == count
     assert all("no matching memory block" in change["reason"] for change in conflict["changes"])
 
@@ -579,6 +627,11 @@ def test_annotation_custom_storage_transfer_rebases_memory(tmp_path, capsys, var
     preview = import_annotations(after, path)
     assert not preview["applied"] and preview["additions"] == count and preview["conflicts"] == 0
     assert import_annotations(after, path, apply=True)["applied"]
-    _edit_storage(after, "check", "c400", "relative")
+    _edit_storage(after, "check", "c400", f"{revised_offset + 0x10:x}")
     again = import_annotations(after, path)
     assert again["additions"] == again["conflicts"] == 0
+    if moved:
+        _edit_storage(after, "patch", "c400", f"{revised_offset:x}")
+        stale = import_annotations(after, path, apply=True)
+        assert not stale["applied"] and stale["conflicts"] == 2
+        assert all("bytes differ from the comparison" in change["reason"] for change in stale["changes"])

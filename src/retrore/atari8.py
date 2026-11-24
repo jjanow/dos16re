@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from itertools import groupby
 from struct import unpack_from
 
-from .image import ATARI8_FORMAT, MOS6502_ADDRESS_LIMIT
+from .image import ATARI8_FORMAT, MOS6502_ADDRESS_LIMIT, SourceSpan, slice_source_spans
 
 ATR_MAGIC = b"\x96\x02"
 XEX_MAGIC = b"\xff\xff"
@@ -118,6 +118,9 @@ class AtrImage:
         return Atari8Binary(tuple(segments), "boot", init_addresses=(init,), boot_entry=segments[0].address + 6)
 
     def read_file(self, name: str) -> bytes:
+        return self.read_file_with_spans(name)[0]
+
+    def read_file_with_spans(self, name: str) -> tuple[bytes, tuple[SourceSpan, ...]]:
         if self.sector_count < 368 or self._sector(360)[0] != 2:
             raise Atari8Error("ATR has no supported Atari DOS 2.x directory")
         matches = []
@@ -143,22 +146,26 @@ class AtrImage:
 
         index, count, number = matches[0]
         contents = bytearray()
+        spans = []
         seen = set()
         while number:
             if number in seen:
                 raise Atari8Error(f"ATR disk member {name!r} has a sector loop at {number}")
             seen.add(number)
-            sector = self._sector(number)
+            start, length = self._sector_location(number)
+            sector = self._data[start:start + length]
             if number <= 3 or 360 <= number <= 368 or sector[-3] >> 2 != index:
                 raise Atari8Error(f"ATR disk member {name!r} has an invalid file link to sector {number}")
             size = sector[-1]
             if size > len(sector) - 3:
                 raise Atari8Error(f"invalid byte count in ATR file sector {number}")
+            if size:
+                spans.append(SourceSpan(len(contents), _ATR_HEADER + start, size))
             contents.extend(sector[:size])
             number = (sector[-3] & 3) << 8 | sector[-2]
         if len(seen) != count:
             raise Atari8Error(f"ATR disk member {name!r} has a mismatched sector count")
-        return bytes(contents)
+        return bytes(contents), tuple(spans)
 
 
 @dataclass(frozen=True)
@@ -167,6 +174,7 @@ class Atari8Source:
     source: str
     binary: Atari8Binary
     disk_file: str | None = None
+    container_spans: tuple[SourceSpan, ...] = ()
 
 
 def memory_map(portb: int) -> list[dict]:
@@ -279,6 +287,13 @@ def build_atari8_image(
         unit["file_offset"] = spans[0]["file_offset"]
         if len(spans) > 1:
             unit["file_spans"] = spans
+        if source.container_spans:
+            unit["container_spans"] = [
+                {"offset": span["offset"] + container.offset, "file_offset": container.file_offset,
+                 "size": container.size}
+                for span in spans
+                for container in slice_source_spans(source.container_spans, span["file_offset"], span["size"])
+            ]
         units.append(unit)
     if len({unit["name"].casefold() for unit in units}) != len(units):
         raise Atari8Error("duplicate Atari 8-bit memory block name")

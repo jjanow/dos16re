@@ -38,28 +38,36 @@ import ghidra.program.model.listing.ReturnParameterImpl;
 import ghidra.program.model.listing.Variable;
 import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.listing.VariableUtilities;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolType;
 import ghidra.program.model.symbol.SymbolUtilities;
+import ghidra.util.exception.CancelledException;
 import ghidra.util.exception.InvalidInputException;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.ToLongFunction;
 
 public class RetroreAnnotations extends GhidraScript {
+    private final Map<MemoryBlock, String> blockDigests = new HashMap<>();
     private record Item(String unit, long offset, String kind, String value, String commentType,
             String callingConvention, Prototype prototype, CustomStorage customStorage, DataLayout dataLayout,
             Location function) {}
@@ -106,8 +114,9 @@ public class RetroreAnnotations extends GhidraScript {
                 && noreturn == actual.noreturn && stackPurge == actual.stackPurge;
         }
     }
+    private record StorageRange(long beforeOffset, long afterOffset, long length) {}
     private record StorageBlock(String unit, String space, String beforeStart, String afterStart, long size,
-            String afterUnit, Long afterSize) {
+            String afterUnit, Long afterSize, List<StorageRange> ranges, String afterSha256) {
         long sourceOffset(Address address) {
             return address.getOffset() - Long.parseUnsignedLong(beforeStart, 16);
         }
@@ -116,14 +125,32 @@ public class RetroreAnnotations extends GhidraScript {
             return afterUnit == null ? unit : afterUnit;
         }
 
+        long destinationSize() {
+            return afterSize == null ? size : afterSize;
+        }
+
         long sharedSize() {
-            return afterSize == null ? size : Math.min(size, afterSize);
+            return Math.min(size, destinationSize());
+        }
+
+        long mapRange(long offset, long length, boolean reverse) {
+            if (ranges == null) {
+                return offset >= 0 && offset <= sharedSize() - length ? offset : -1;
+            }
+            for (var range : ranges) {
+                long start = reverse ? range.afterOffset() : range.beforeOffset();
+                long target = reverse ? range.beforeOffset() : range.afterOffset();
+                if (offset >= start && offset - start <= range.length() - length) {
+                    return target + offset - start;
+                }
+            }
+            return -1;
         }
 
         boolean matchesDestination(MemoryBlock block) {
             return block != null && space.equals(block.getStart().getAddressSpace().getName()) &&
                 block.getStart().getOffset() == Long.parseUnsignedLong(afterStart, 16) &&
-                block.getSize() == (afterSize == null ? size : afterSize);
+                block.getSize() == destinationSize();
         }
     }
     private record TypeArchive(String format, List<TypePath> types, String archive) {}
@@ -438,9 +465,9 @@ public class RetroreAnnotations extends GhidraScript {
             throw new IllegalArgumentException("annotation executable SHA-256 differs from the Ghidra program");
         }
         int version = document.get("version").getAsBigDecimal().intValueExact();
-        if (version < 1 || version > 7 || document.has("data_types") != (version >= 2) ||
+        if (version < 1 || version > 8 || document.has("data_types") != (version >= 2) ||
                 document.has("storage_blocks") != (version >= 5)) {
-            throw new IllegalArgumentException("expected a version 1 through 7 annotation document");
+            throw new IllegalArgumentException("expected a version 1 through 8 annotation document");
         }
         try (var staged = version >= 2 ? readTypes(document, version) : null) {
             var blocks = version >= 5 ? readStorageBlocks(document, version) : null;
@@ -463,12 +490,77 @@ public class RetroreAnnotations extends GhidraScript {
             }
             Long.parseUnsignedLong(block.beforeStart(), 16);
             Long.parseUnsignedLong(block.afterStart(), 16);
+            validateStorageRanges(block, version);
         }
         return blocks;
     }
 
+    private static void validateStorageRanges(StorageBlock block, int version) {
+        var ranges = block.ranges();
+        var hash = block.afterSha256();
+        if (ranges == null && hash == null) {
+            return;
+        }
+        if (version < 8 || ranges == null || (hash == null) != ranges.isEmpty() ||
+                hash != null && !hash.matches("[0-9a-f]{64}") ||
+                ranges.stream().anyMatch(range -> range == null || range.length() <= 0)) {
+            throw new IllegalArgumentException("invalid annotation storage ranges");
+        }
+        validateRangeSide(ranges, StorageRange::beforeOffset, block.size());
+        validateRangeSide(ranges, StorageRange::afterOffset, block.destinationSize());
+    }
+
+    private static void validateRangeSide(List<StorageRange> ranges,
+            ToLongFunction<StorageRange> offset, long size) {
+        long end = 0;
+        for (var range : ranges.stream().sorted(Comparator.comparingLong(offset)).toList()) {
+            long start = offset.applyAsLong(range);
+            if (start < end || start > size - range.length()) {
+                throw new IllegalArgumentException("overlapping or out-of-bounds annotation storage ranges");
+            }
+            end = start + range.length();
+        }
+    }
+
+    private boolean matchesBlockContents(StorageBlock pair, MemoryBlock block) throws CancelledException {
+        if (pair.afterSha256() == null) {
+            return true;
+        }
+        var saved = blockDigests.get(block);
+        if (saved == null) {
+            saved = blockDigest(block);
+            blockDigests.put(block, saved);
+        }
+        return pair.afterSha256().equals(saved);
+    }
+
+    private String blockDigest(MemoryBlock block) throws CancelledException {
+        if (!block.isInitialized() || block.getSize() > 4 * 1024 * 1024) {
+            return "";
+        }
+        var buffer = new byte[64 * 1024];
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            for (long offset = 0; offset < block.getSize();) {
+                monitor.checkCancelled();
+                int count = (int) Math.min(buffer.length, block.getSize() - offset);
+                if (block.getBytes(block.getStart().addNoWrap(offset), buffer, 0, count) != count) {
+                    return "";
+                }
+                digest.update(buffer, 0, count);
+                offset += count;
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (MemoryAccessException | AddressOverflowException error) {
+            return "";
+        } catch (NoSuchAlgorithmException error) {
+            throw new IllegalStateException(error);
+        }
+    }
+
     private Map<String, Object> replay(JsonObject document, boolean apply, int version,
             DataTypeManager staged, Map<String, StorageBlock> storageBlocks) throws Exception {
+        blockDigests.clear();
         var changes = new ArrayList<Change>();
         var typeChanges = new ArrayList<TypeChange>();
         var typesToAdd = new ArrayList<DataType>();
@@ -524,7 +616,7 @@ public class RetroreAnnotations extends GhidraScript {
             if (row.has("custom_storage")) {
                 if (version < 3 || !kind.equals("signature") || prototype != null ||
                         !row.get("custom_storage").isJsonObject()) {
-                    throw new IllegalArgumentException("custom storage requires a version 3 through 7 signature annotation");
+                    throw new IllegalArgumentException("custom storage requires a version 3 through 8 signature annotation");
                 }
                 customStorage = GSON.fromJson(row.get("custom_storage"), CustomStorage.class);
                 if (!GSON.toJsonTree(customStorage).equals(row.get("custom_storage")) ||
@@ -592,7 +684,7 @@ public class RetroreAnnotations extends GhidraScript {
         }
         if ((version != 4 && version < 6) || !kind.equals("data_layout") || !row.has("data_layout") ||
                 !row.get("data_layout").isJsonObject()) {
-            throw new IllegalArgumentException("data layouts require a version 4, 6, or 7 data_layout annotation");
+            throw new IllegalArgumentException("data layouts require a version 4 or 6 through 8 data_layout annotation");
         }
         var layout = GSON.fromJson(row.get("data_layout"), DataLayout.class);
         if (!GSON.toJsonTree(layout).equals(row.get("data_layout")) || layout.type() == null || layout.length() < 1) {
@@ -638,7 +730,17 @@ public class RetroreAnnotations extends GhidraScript {
         }
         Address address = block.getStart().addNoWrap(item.offset());
         if (item.dataLayout() != null) {
-            long size = pair == null ? block.getSize() : pair.sharedSize();
+            long size = block.getSize();
+            if (pair != null && pair.ranges() != null) {
+                if (pair.mapRange(item.offset(), item.dataLayout().length(), true) < 0) {
+                    return new Change(item, address, "conflict", "the data layout has no matching byte range");
+                }
+                if (!matchesBlockContents(pair, block)) {
+                    return new Change(item, address, "conflict", "destination data layout bytes differ from the comparison");
+                }
+            } else if (pair != null) {
+                size = pair.sharedSize();
+            }
             return checkLayout(item, address, size - item.offset(), staged, layoutRanges);
         }
         var listing = currentProgram.getListing();
@@ -870,7 +972,7 @@ public class RetroreAnnotations extends GhidraScript {
     }
 
     private CustomStorage remapCustomStorage(CustomStorage storage, Function function, Collection<StorageBlock> blocks,
-            Set<String> ambiguousUnits) throws InvalidInputException {
+            Set<String> ambiguousUnits) throws InvalidInputException, CancelledException {
         var returnStorage = remapStorage(storage.returnStorage(), blocks, ambiguousUnits);
         var parameters = new ArrayList<StoredVariable>();
         var locals = new ArrayList<StoredVariable>();
@@ -898,7 +1000,7 @@ public class RetroreAnnotations extends GhidraScript {
     }
 
     private StoredVariable remapVariable(StoredVariable variable, Collection<StorageBlock> blocks,
-            Set<String> ambiguousUnits) throws InvalidInputException {
+            Set<String> ambiguousUnits) throws InvalidInputException, CancelledException {
         if (variable == null) {
             throw new InvalidInputException("invalid custom variable record");
         }
@@ -908,7 +1010,7 @@ public class RetroreAnnotations extends GhidraScript {
     }
 
     private String remapStorage(String encoded, Collection<StorageBlock> blocks, Set<String> ambiguousUnits)
-            throws InvalidInputException {
+            throws InvalidInputException, CancelledException {
         var pieces = variableStorage(encoded).getVarnodes();
         for (int i = 0; i < pieces.length; i++) {
             var piece = pieces[i];
@@ -928,7 +1030,7 @@ public class RetroreAnnotations extends GhidraScript {
     }
 
     private Varnode remapMemoryPiece(Varnode piece, Collection<StorageBlock> blocks, Set<String> ambiguousUnits)
-            throws InvalidInputException {
+            throws InvalidInputException, CancelledException {
         var address = piece.getAddress();
         var space = address.getAddressSpace().getName();
         for (var pair : blocks) {
@@ -941,10 +1043,15 @@ public class RetroreAnnotations extends GhidraScript {
             if (ambiguousUnits.contains(unit) || !pair.matchesDestination(block)) {
                 throw new InvalidInputException("destination storage block differs from the comparison: " + unit);
             }
-            if (piece.getSize() > pair.sharedSize() - offset) {
-                throw new InvalidInputException("custom storage crosses the block boundary: " + address.toString(true));
+            long destination = pair.mapRange(offset, piece.getSize(), false);
+            if (destination < 0) {
+                String reason = pair.ranges() == null ? "crosses the block boundary" : "has no matching byte range";
+                throw new InvalidInputException("custom storage " + reason + ": " + address.toString(true));
             }
-            return new Varnode(block.getStart().add(offset), piece.getSize());
+            if (!matchesBlockContents(pair, block)) {
+                throw new InvalidInputException("destination storage bytes differ from the comparison: " + unit);
+            }
+            return new Varnode(block.getStart().add(destination), piece.getSize());
         }
         throw new InvalidInputException("custom storage has no matching memory block: " + address.toString(true));
     }

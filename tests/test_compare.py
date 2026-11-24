@@ -1,5 +1,7 @@
 import json
 import os
+from base64 import b64encode
+from hashlib import sha256
 
 import pytest
 
@@ -50,6 +52,21 @@ def test_duplicate_bodies_remain_ambiguous_and_paged():
     assert unpaired["candidates"][0]["matched_by"] == ["normalized_instructions"]
 
 
+def test_cross_port_semantics_keeps_duplicates_unpaired():
+    profile = {"operations": {"equal": 1, "add_sub": 2, "int_and": 1},
+               "branch_degrees": [2], "constants": [17, 39]}
+    original, candidate, duplicate = (_routine(i, i) | {"semantics": profile} for i in ("10", "20", "30"))
+    before = _listing("6502", original)
+    after = _listing("Z80", candidate)
+    match, = _compare(before, after, 100, 0)["matches"]
+    assert match["status"] == "cross_port_candidate" and match["matched_by"] == "pcode_shape"
+    assert match["evidence"]["semantics"] == profile
+    after["functions"].append(duplicate)
+    report = _compare(before, after, 100, 0)
+    assert report["matches"] == []
+    assert report["unpaired_before"][0]["candidate_count"] == 2
+
+
 def test_storage_block_matches_require_unique_names_or_contents():
     def block(unit, start, digest=None, **overrides):
         return {"unit": unit, "start": start, "size": 32, "space": "ram", "type": "DEFAULT",
@@ -74,6 +91,57 @@ def test_storage_block_matches_require_unique_names_or_contents():
          "after_unit": "shrunk", "after_size": 16},
         {"unit": "already_matched", "space": "ram", "size": 32, "before_start": "1800", "after_start": "2800"},
     ]
+
+
+def test_changed_block_ranges_require_unique_bytes_in_each_listing():
+    def block(unit, data):
+        return {"unit": unit, "start": "1000", "size": len(data), "space": "ram", "type": "DEFAULT",
+                "initialized": True, "read": True, "write": True, "execute": False,
+                "content": b64encode(data).decode(), "content_sha256": sha256(data).hexdigest()}
+
+    record = bytes(range(100, 148))
+    source = block("source", b"a" * 16 + record + b"b" * 32)
+    destination = block("revised", b"x" * 27 + record + b"y" * 32)
+    match, = _storage_blocks([source], [destination])
+    assert match["ranges"] == [{"before_offset": 16, "after_offset": 27, "length": 48}]
+    assert match["after_sha256"] == destination["content_sha256"]
+    repeated = block("second_copy", b"z" * 16 + record + b"w" * 32)
+    assert _storage_blocks([source], [destination, repeated]) == []
+    same_name = block("source", record + b"x" * 27 + record)
+    assert _storage_blocks([source], [same_name])[0]["ranges"] == []
+
+    prefix = b"\x60" + bytes(63)
+    original = block("root", prefix + record + bytes(64))
+    revised = block("root", prefix + bytes(19) + record + bytes(64))
+    match, = _storage_blocks([original], [revised])
+    assert any(row["before_offset"] <= 64 and row["before_offset"] + row["length"] >= 112
+               and row["after_offset"] - row["before_offset"] == 19 for row in match["ranges"])
+
+
+@pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
+def test_compare_decompiles_unnamed_cross_port_routines(tmp_path, capsys):
+    before, after = (tmp_path / name for name in ("before", "after"))
+    # Apply the same byte transformation on two CPUs and store the result.
+    c64 = bytes.fromhex("00 c0 a5 02 49 36 29 7f 18 69 25 49 4a 85 03 60")
+    msx = bytes.fromhex("3a 00 20 ee 36 e6 7f c6 25 ee 4a 32 01 20 c9")
+    for project, name, contents, options in (
+        (before, "old.prg", c64, ["--entry", "c000"]),
+        (after, "new.com", msx, ["--msx2", "--entry", "0100"]),
+    ):
+        source = tmp_path / name
+        source.write_bytes(contents)
+        export = tmp_path / (project.name + "-export")
+        assert main(["load", str(source), "-o", str(export), *options]) == 0, capsys.readouterr().err
+        assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    command = ["compare", str(before), str(after), "--json"]
+    assert main(command) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["matches"] == []
+    assert main([*command, "--semantics"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    match, = report["matches"]
+    assert match["status"] == "cross_port_candidate" and match["matched_by"] == "pcode_shape"
+    assert match["evidence"]["semantics"]["constants"] == [0x25, 0x36, 0x4a, 0x7f]
 
 
 @pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")

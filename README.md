@@ -806,6 +806,7 @@ displayed by the analyzed project.
 ```sh
 .venv/bin/retrore bytes root:12a --export out/pool --size 16 --json
 .venv/bin/retrore address-map 02b0 --from file --source START.EXE --export out/pool --json
+.venv/bin/retrore address-map c002 --from runtime --runtime-load root=c000 --export out/msx2 --json
 .venv/bin/retrore disasm root:12a --project out/pool-project --limit 32 --json
 ```
 
@@ -814,8 +815,17 @@ displayed by the analyzed project.
 executable it refers to the unpacked load module. `file_spans` gives available source offsets over
 the requested range. `address-map` accepts logical, linear, runtime, image, or file coordinates.
 File lookups may return several matches. `--source` and `--member` narrow them where applicable.
-For DOS, use `--runtime-base` and `--overlay-segment UNIT=HEX` for the observed placement.
-For flat formats, runtime coordinates use the view selected at export.
+New D64, Apple DOS/RDOS, Atari DOS ATR, and MSX-DOS FAT12 exports also preserve physical disk spans
+as `container_spans`. Use `--from file --offset-kind container` to search those disk offsets.
+The default file lookup retains its existing coordinates, including member offsets. Early Atari
+8-bit maps can recover those offsets from their ordered segment records. For an older unpacked
+DOS export, pass `--source-file PROGRAM.EXE` to `bytes` or `address-map` to verify the
+original load module and recover its file offsets.
+
+On all platforms, repeat `--runtime-load UNIT=HEX` to describe an observed view using linear
+load addresses. Use `UNIT=unmapped` for an absent unit. Other units keep their exported locations
+in that view. DOS also supports the existing `--runtime-base` and `--overlay-segment UNIT=HEX`
+options, which describe paragraph segments. Use one placement method per lookup.
 
 `disasm` reads up to 512 bytes in one Ghidra block. It returns instructions, defined data, and
 undefined or uninitialized bytes, with explicit offcuts if the range splits a code unit. Operand
@@ -1025,6 +1035,13 @@ candidates. JSON includes the match method, shared evidence, and unresolved alte
 `--limit` and `--offset` to review another page. The result can identify where a routine changed
 without establishing that the two routines have identical behavior.
 
+Add `--semantics` to compare unnamed routines across Ghidra languages without shared call or
+data anchors. It decompiles the listings and compares arithmetic and comparison operations,
+branch degrees, and literal constants in high p-code. Unique profiles yield review-only
+`pcode_shape` candidates when they have at least four operations across three operation kinds
+and two distinct constants. Duplicate profiles appear among the unresolved alternatives. The
+report includes profile coverage for each project. Use `--timeout` to allow more time for large listings.
+
 `annotations transfer` prepares a new annotation document from a comparison report. It carries
 names, signatures, and comments at same-body function entries on the comparison page, records
 the source and match method for each, and lists skipped entries. Source anchor evidence and the export
@@ -1049,25 +1066,33 @@ custom storage.
 
 With `--storage`, same-body matches on the same language and compiler specification can carry custom
 return, parameter, and local storage. Register pieces and stack offsets retain their original order
-and values. Absolute storage follows block-relative offsets. A uniquely named block may grow or
-shrink. A renamed block can match by identical, non-uniform initialized bytes when that content
-identifies one compatible block in each project. Block matches require the same address space,
-block type, initialization state, and permissions. Local first-use offsets follow the corresponding
-instructions when their positions change. Preview shows the resolved storage and reports conflicts
-if a piece extends beyond either block or if the destination block's geometry differs from the
-comparison. Export the applied destination project before transferring its custom storage again.
+and values. Local first-use offsets follow the corresponding instructions when their positions change.
+Block matches require the same address space, block type, initialization state, and permissions.
+A uniquely named block may grow or shrink. A renamed block can match by identical, non-uniform
+initialized bytes when that content identifies one compatible block in each project.
 
 `compare --storage` also lets `annotations transfer` carry fixed-size data layouts alongside any
-matched function annotations or custom storage. Layouts use the same offset within a matching
-memory block and can transfer regardless of function pagination. Transfer lists unmatched blocks
-and layouts that cross either block boundary among the skips. Preview reports overlaps with
-instructions or defined data before apply. Check that the record still occupies the same
-block-relative offset in the destination revision.
+matched function annotations or custom storage. Layouts can transfer regardless of function
+pagination. Absolute storage and layouts retain their relative offsets in unchanged blocks,
+uninitialized blocks matched by name, and named blocks whose smaller image is an exact prefix
+of the larger one.
 
-Comparisons with renamed or resized block pairs use `comparison_version: 2`. In those pairs,
-`unit` and `size` describe the source, and `after_unit` and `after_size` describe the destination.
-Transfers based on those pairs use version 7. Version 5 custom storage and version 6 data layout
-transfers remain supported.
+In other changed initialized blocks, transfer requires the whole storage or data layout range to
+fit inside one byte alignment. The comparison extends exact 16-byte anchors that occur once on
+each side, trims overlapping extensions, and discards competing anchors. A changed, renamed block requires two disjoint
+anchors and a unique compatible pairing in both directions. Range matching reads up to 4 MiB of
+block bytes per project. A changed named block with no usable byte evidence has an empty range
+list. Transfer lists unmapped data layouts among the skips, and preview reports unmapped storage
+pieces as conflicts. Preview checks destination geometry, checks the byte digest for range-based
+transfers, and reports listing overlaps before apply. Export the applied destination project before
+transferring its custom storage again.
+
+Version 2 comparisons introduced renamed or resized block pairs. In those pairs, `unit` and `size`
+describe the source, and `after_unit` and `after_size` describe the destination.
+Comparisons with byte ranges use version 3. Each range records the source offset, destination
+offset, and length, with the destination block SHA-256 alongside the ranges. Transfers from
+version 3 comparisons use annotation document version 8 for custom storage and layouts. Earlier
+annotation and comparison versions remain supported.
 
 ### Persistent query workers
 

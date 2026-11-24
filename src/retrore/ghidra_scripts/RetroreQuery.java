@@ -157,8 +157,8 @@ public class RetroreQuery extends GhidraScript {
         try {
             var args = new ArrayList<String>();
             args.add(output.toString());
-            for (var option : List.of("storage", "instructions")) {
-                if (request.has(option)) {
+            for (var option : List.of("storage", "instructions", "semantics")) {
+                if (request.has(option) && request.get(option).getAsBoolean()) {
                     args.add(option);
                 }
             }

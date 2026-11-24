@@ -39,7 +39,25 @@ class ImageError(CodedError):
 
 
 class RuntimePlacementError(ValueError):
-    """An invalid DOS runtime image placement."""
+    """An invalid runtime image placement."""
+
+
+@dataclass(frozen=True)
+class SourceSpan:
+    offset: int
+    file_offset: int
+    size: int
+
+
+def slice_source_spans(spans: tuple[SourceSpan, ...], offset: int, size: int) -> tuple[SourceSpan, ...]:
+    """Return source spans for a slice, with offsets relative to its beginning."""
+    result = []
+    for span in spans:
+        start = max(span.offset, offset)
+        end = min(span.offset + span.size, offset + size)
+        if start < end:
+            result.append(SourceSpan(start - offset, span.file_offset + start - span.offset, end - start))
+    return tuple(result)
 
 
 def check_map_version(program: object) -> int:
@@ -107,6 +125,36 @@ def dos_runtime_units(
         if left_start + left.size > right_start:
             raise RuntimePlacementError(f"runtime ranges overlap for {left.name} and {right.name}")
     return ranges
+
+
+def explicit_runtime_units(
+    units: list[ImageUnit], placements: dict[str, int | None], image_format: str,
+) -> dict[str, int]:
+    """Place exported units in a caller-supplied linear address view."""
+    units_by_name = {unit.name.casefold(): unit for unit in units}
+    overrides = {}
+    for name, start in placements.items():
+        key = name.casefold()
+        if key not in units_by_name:
+            raise RuntimePlacementError(f"unknown runtime unit {name}")
+        if key in overrides:
+            raise RuntimePlacementError(f"runtime placement specified twice for {name}")
+        overrides[key] = start
+    limit = _FLAT_LIMITS.get(image_format, 0x100000)
+    ranges = []
+    for unit in units:
+        start = overrides.get(unit.name.casefold(), unit.linear)
+        if start is None:
+            continue
+        if type(start) is not int or not 0 <= start < limit or start + unit.size > limit:
+            raise RuntimePlacementError(f"runtime placement for {unit.name} exceeds the platform address space")
+        if unit.size:
+            ranges.append((start, unit))
+    ranges.sort(key=lambda item: item[0])
+    for (start, unit), (next_start, next_unit) in zip(ranges, ranges[1:]):
+        if start + unit.size > next_start:
+            raise RuntimePlacementError(f"runtime ranges overlap for {unit.name} and {next_unit.name}")
+    return {unit.name: start for start, unit in ranges}
 
 
 def read_map(export: Path) -> dict:

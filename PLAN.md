@@ -14,13 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, `compare --storage` gained matches for resized blocks by unique name and for
-renamed blocks by unique, identical initialized content. Version 7 transfer documents carry the
-destination name and size. Replay checks the destination geometry and requires each storage or
-data layout range to fit within both blocks. The standalone suite passed 424 tests with 97 skipped.
-The comparison, evidence, and layout suites on Ghidra 12.2 passed 31 tests with 2 skipped.
+On 2026-11-23, Phase 10 added byte-backed transfers for data and custom storage that moved in
+changed blocks, including renamed blocks. Address evidence gained physical disk offsets for
+extracted members, recovery for legacy DOS and Atari exports, and explicit runtime placement.
+`compare --semantics` added review candidates for unnamed routines across ports.
+The standalone suite passed 428 tests with 100 skipped. On Ghidra 12.2, the comparison,
+evidence, and layout suites passed 38 tests with 2 skipped. The final moved-storage and
+cross-port checks passed all four selected tests.
 
-Resume Phase 10 with locating data that moved within a memory block.
+Resume with Phase 11's declarative routine fixtures.
 
 ## Why
 
@@ -352,8 +354,11 @@ release. Continue with the analysis backlog below.
 - **Implemented.** `bytes` reports export bytes, original values, source spans, and recorded fixups.
   `address-map` maps logical, linear, runtime, image, and available source file coordinates.
   `disasm` reads a bounded Ghidra range with resolved references and flags unresolved computed flow.
-  `decomp --map-lines` maps C lines to contributing instruction ranges. Open: source offsets for
-  older maps and formats with incomplete provenance, and generalized runtime placement.
+  `decomp --map-lines` maps C lines to contributing instruction ranges. `--source-file` recovers
+  verified DOS root offsets for older unpacked exports, and early Atari 8-bit maps recover offsets
+  from their ordered segment records. D64, Apple DOS/RDOS, Atari DOS ATR, and MSX-DOS FAT12
+  exports preserve both member and physical disk offsets. `address-map --runtime-load` accepts
+  explicit linear placements and unmapped units on each supported platform.
 - **Implemented.** `batch --evidence` bundles selected results and their requests. It can
   attach loader evidence to disassembly and the distinct instructions cited by returned decompiler
   fields. Both comparisons report address, initialized size, and byte mismatches, plus incomplete
@@ -364,7 +369,7 @@ release. Continue with the analysis backlog below.
   pointer writers. `trace --evidence` attaches the export identity and a byte at each mapped DOSBox-X
   address to the report, including disassembly misses and observed gap examples. The evidence
   includes the original byte before loader fixups and source coordinates where available.
-- **Partly implemented.** `annotations` exports names, global labels, function-local instruction
+- **Implemented.** `annotations` exports names, global labels, function-local instruction
   labels, signatures, comments, and entry points. An optional loader export adds byte and source
   evidence at each anchor. Transfer preserves the source evidence. Replay previews conflicts and
   applies changes in one transaction.
@@ -379,15 +384,19 @@ release. Continue with the analysis backlog below.
   fixed-size data layouts at their original block-relative offsets. Preview checks the destination
   block geometry and listing overlaps before replay. Version 7 extends both transfers to uniquely
   named blocks that grew or shrank and to renamed blocks with unique, identical non-uniform bytes.
-  Replay checks each range against both block sizes. Older documents remain supported. Open work
-  includes locating data that moved within a block and matching renamed blocks with changed bytes.
+  Replay checks each range against both block sizes. Version 8 uses unique byte alignments for
+  data and storage that moved inside changed initialized blocks. Renamed, changed blocks require
+  two disjoint unique anchors and an unambiguous pairing. Replay verifies the destination block
+  digest and requires each layout or storage piece to fit one alignment. Older documents remain
+  supported.
 - **Implemented for review.** `compare` matches normalized bodies in the same language and uses
   names, call graphs, and referenced data to suggest changed and cross-port matches. The result
   shows unresolved alternatives. `annotations transfer` preserves provenance when preparing replay
   at a matched same-body entry. `compare --instructions` also maps instruction starts so interior
   comments and global and function-local labels follow the matched instructions. Preview checks
-  that each destination instruction belongs to the expected function. Open: matching unnamed
-  cross-port routines without shared call or data anchors.
+  that each destination instruction belongs to the expected function. `compare --semantics` uses
+  decompiled p-code operation counts, branch degrees, and constants to suggest unnamed cross-port
+  candidates without shared call or data anchors. Duplicate profiles remain unresolved.
 - **Implemented.** Read-only queries accept an exact name for a compatible existing Ghidra program
   at the project root. `project-summary` and `batch --evidence` support review and handoff.
 

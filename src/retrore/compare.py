@@ -4,6 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from . import ghidra
+from .storage_compare import storage_content_matches
 
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
@@ -14,7 +15,7 @@ _MIN_BODY_INSTRUCTIONS = 3
 
 def compare_projects(before: Path, after: Path, *, before_program: str = "image.bin",
                      after_program: str = "image.bin", limit: int = DEFAULT_LIMIT, offset: int = 0,
-                     storage: bool = False, instructions: bool = False,
+                     storage: bool = False, instructions: bool = False, semantics: bool = False,
                      timeout: float | None = ghidra.QUERY_TIMEOUT) -> dict:
     """Read the projects and report exact normalized bodies and reviewable match candidates."""
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
@@ -25,9 +26,8 @@ def compare_projects(before: Path, after: Path, *, before_program: str = "image.
     ghidra._check_program_name(after_program)
     ghidra._require_project(before)
     ghidra._require_project(after)
-    request = {"storage": True} if storage else {}
-    if instructions:
-        request["instructions"] = True
+    request = {name: True for name, enabled in (("storage", storage), ("instructions", instructions),
+                                                ("semantics", semantics)) if enabled}
     first = ghidra._query_json(before, "fingerprints", request, timeout=timeout, program=before_program)
     second = (first if ghidra._project_parts(before) == ghidra._project_parts(after)
               and before_program == after_program else
@@ -84,6 +84,16 @@ def _context_key(context):
     return context if (callers or callees) and len(callers) + len(callees) + len(data) >= 2 else None
 
 
+def _semantic_key(function: dict) -> tuple | None:
+    profile = function.get("semantics")
+    if not profile:
+        return None
+    operations, branches, constants = (profile[name] for name in ("operations", "branch_degrees", "constants"))
+    if len(constants) < 2 or len(operations) < 3 or sum(operations.values()) < 4:
+        return None
+    return tuple(sorted(operations.items())), tuple(branches), tuple(constants)
+
+
 def _routine(function: dict) -> dict:
     return {name: function[name] for name in ("name", "address", "unit", "offset", "instructions")}
 
@@ -96,14 +106,14 @@ def _storage_blocks(before: list[dict], after: list[dict]) -> list[dict]:
         return tuple(block[key] for key in ("space", "type", "initialized", "read", "write", "execute"))
 
     def contents(block):
-        if digest := block.get("content_sha256"):
+        if block.get("non_uniform", True) and (digest := block.get("content_sha256")):
             return attributes(block), block["size"], digest
         return None
 
     old_contents, new_contents = (_index(side, contents) for side in (first, second))
-    pairs = []
+    fixed = {}
 
-    for old in before:
+    for index, old in first.items():
         unit = old["unit"]
         if len(old_names[unit]) != 1:
             continue
@@ -122,10 +132,30 @@ def _storage_blocks(before: list[dict], after: list[dict]) -> list[dict]:
             continue
         if attributes(old) != attributes(new):
             continue
+        fixed[index] = destinations[0]
+
+    rename_sources = {i for i, row in first.items() if row["unit"] not in new_names
+                      and len(old_names[row["unit"]]) == 1 and i not in fixed}
+    used = set(fixed.values())
+    rename_destinations = {i for i, row in second.items() if row["unit"] not in old_names
+                           and len(new_names[row["unit"]]) == 1 and i not in used}
+    renamed, ranges = storage_content_matches(first, second, attributes, fixed, rename_sources, rename_destinations)
+    matches = fixed | renamed
+    pairs = []
+    for index, old in first.items():
+        if index not in matches:
+            continue
+        destination = matches[index]
+        new = second[destination]
+        unit, new_unit = old["unit"], new["unit"]
         pair = {"unit": unit, "space": old["space"], "size": old["size"],
                 "before_start": old["start"], "after_start": new["start"]}
         if unit != new_unit or old["size"] != new["size"]:
             pair.update(after_unit=new_unit, after_size=new["size"])
+        if (index, destination) in ranges:
+            pair["ranges"] = ranges[index, destination]
+            if pair["ranges"]:
+                pair["after_sha256"] = new["content_sha256"]
         pairs.append(pair)
     return pairs
 
@@ -194,6 +224,8 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
         left_context, right_context = contexts()
     pair_unique(lambda function: _context_key(left_context[function["id"]]),
                 lambda function: _context_key(right_context[function["id"]]), "call_graph_and_data")
+    if not same_language:
+        pair_unique(_semantic_key, _semantic_key, "pcode_shape")
     left_context, right_context = contexts()
 
     matches = []
@@ -228,6 +260,8 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
                                                            original["raw_sha256"] == revised["raw_sha256"]),
                             "shared": shared, "different_known_context": differences,
                         }})
+        if matched_by == "pcode_shape":
+            matches[-1]["evidence"]["semantics"] = original["semantics"]
         if storage and status == "same_body":
             offsets = _storage_offsets(original["instruction_offsets"], revised["instruction_offsets"])
             if offsets is not None:
@@ -245,6 +279,8 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
         )]
         if same_language:
             keys.append(("normalized_instructions", _fingerprint, _fingerprint))
+        else:
+            keys.append(("pcode_shape", _semantic_key, _semantic_key))
         groups = [(reason, key, _index(target, other)) for reason, key, other in keys]
         cached = {}
         rows = []
@@ -260,6 +296,8 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
                     for identifier in sorted(options)[:_CANDIDATE_LIMIT]
                 ]}
             rows.append({**_routine(function), **cached[signatures]})
+            if not same_language and _semantic_key(function) is not None:
+                rows[-1]["semantics"] = function["semantics"]
         return rows
 
     unpaired_before = unpaired(left, right, left_context, right_context)
@@ -271,11 +309,16 @@ def _compare(before: dict, after: dict, limit: int, offset: int) -> dict:
     if storage:
         blocks = _storage_blocks(before["storage_blocks"], after["storage_blocks"])
         report["storage_blocks"] = blocks
-        if any("after_unit" in block for block in blocks):
+        if any("ranges" in block for block in blocks):
+            report["comparison_version"] = 3
+        elif any("after_unit" in block for block in blocks):
             report["comparison_version"] = 2
     for side, listing in (("before", before), ("after", after)):
         report[side] = {key: listing[key] for key in ("program", "language", "sha256")} | {
             "function_count": len(listing["functions"])}
+        if listing.get("semantics"):
+            report[side]["semantic_profiles"] = sum(row.get("semantics") is not None for row in listing["functions"])
+            report[side]["usable_semantic_profiles"] = sum(_semantic_key(row) is not None for row in listing["functions"])
     report["counts"] = counts
     report["pagination"] = {}
     for key, rows in (("matches", matches), ("unpaired_before", unpaired_before), ("unpaired_after", unpaired_after)):

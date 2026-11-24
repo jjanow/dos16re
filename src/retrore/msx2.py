@@ -2,7 +2,7 @@
 
 from struct import unpack_from
 
-from .image import MSX2_FORMAT
+from .image import MSX2_FORMAT, SourceSpan
 from .z80 import Z80Source as Msx2Source
 from .z80 import place_z80_sources
 
@@ -40,9 +40,13 @@ class MsxDosDisk:
 
         root_start = root_sector * sector
         self._root = data[root_start:root_start + root_size]
-        self._data = data[first_data * sector:sectors * sector]
+        self._data_offset = first_data * sector
+        self._data = data[self._data_offset:sectors * sector]
 
     def read_file(self, name: str) -> bytes:
+        return self.read_file_with_spans(name)[0]
+
+    def read_file_with_spans(self, name: str) -> tuple[bytes, tuple[SourceSpan, ...]]:
         for offset in range(0, len(self._root), 32):
             entry = self._root[offset:offset + 32]
             if entry[0] == 0:
@@ -56,23 +60,26 @@ class MsxDosDisk:
                 return self._read_chain(name, *unpack_from("<HI", entry, 26))
         raise Msx2Error(f"MSX-DOS disk file {name!r} not found")
 
-    def _read_chain(self, name: str, cluster: int, size: int) -> bytes:
+    def _read_chain(self, name: str, cluster: int, size: int) -> tuple[bytes, tuple[SourceSpan, ...]]:
         if size == 0 and cluster == 0:
-            return b""
+            return b"", ()
         contents = bytearray()
+        spans = []
         seen = set()
         while len(contents) < size:
             if not 2 <= cluster < self._cluster_end or cluster in seen:
                 raise Msx2Error(f"invalid FAT12 cluster chain for {name!r}")
             seen.add(cluster)
             offset = (cluster - 2) * self._cluster_size
-            contents.extend(self._data[offset:offset + self._cluster_size])
+            length = min(self._cluster_size, size - len(contents))
+            spans.append(SourceSpan(len(contents), self._data_offset + offset, length))
+            contents.extend(self._data[offset:offset + length])
             fat_offset = cluster * 3 // 2
             pair = int.from_bytes(self._fat[fat_offset:fat_offset + 2], "little")
             cluster = pair >> 4 if cluster & 1 else pair & 0xFFF
         if not _FAT12_END <= cluster <= 0xFFF:
             raise Msx2Error(f"FAT12 cluster chain does not end at the size of {name!r}")
-        return bytes(contents[:size])
+        return bytes(contents), tuple(spans)
 
 
 def build_msx2_image(

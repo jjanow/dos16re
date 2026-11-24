@@ -2,11 +2,11 @@
 
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import accumulate
 from struct import unpack_from
 
-from .image import C64_FORMAT, MOS6502_ADDRESS_LIMIT
+from .image import C64_FORMAT, MOS6502_ADDRESS_LIMIT, SourceSpan, slice_source_spans
 
 DEFAULT_BANK = 7
 _SECTOR_SIZE = 256
@@ -32,7 +32,7 @@ class D64Image:
         else:
             raise C64Error("expected a 35-, 40-, or 42-track D64 image")
 
-    def _chain(self, track: int, sector: int) -> Iterator[memoryview]:
+    def _chain(self, track: int, sector: int) -> Iterator[tuple[int, memoryview]]:
         seen = set()
         while track:
             if not (1 <= track <= self._tracks
@@ -43,15 +43,18 @@ class D64Image:
             seen.add((track, sector))
             offset = (_TRACK_STARTS[track - 1] + sector) * _SECTOR_SIZE
             block = self._data[offset:offset + _SECTOR_SIZE]
-            yield block
+            yield offset, block
             track, sector = block[:2]
 
     def read_prg(self, name: str) -> bytes:
+        return self.read_prg_with_spans(name)[0]
+
+    def read_prg_with_spans(self, name: str) -> tuple[bytes, tuple[SourceSpan, ...]]:
         if not name.isascii() or not 1 <= len(name) <= 16:
             raise C64Error("expected a D64 filename of 1 to 16 ASCII characters")
         encoded = name.upper().encode("ascii").ljust(16, b"\xa0")
         matches = []
-        for block in self._chain(18, 1):
+        for _, block in self._chain(18, 1):
             for offset in range(0, _SECTOR_SIZE, 32):
                 file_type = block[offset + 2]
                 if file_type & 0x87 == 0x82 and block[offset + 5:offset + 21] == encoded:
@@ -61,13 +64,16 @@ class D64Image:
             raise C64Error(f"D64 PRG {name!r} {reason}")
 
         contents = bytearray()
-        for block in self._chain(*matches[0]):
+        spans = []
+        for offset, block in self._chain(*matches[0]):
             next_track, link = block[:2]
             if next_track == 0 and link == 0:
                 raise C64Error("invalid final D64 file sector length")
             end = _SECTOR_SIZE if next_track else link + 1
+            if end > 2:
+                spans.append(SourceSpan(len(contents), offset + 2, end - 2))
             contents.extend(block[2:end])
-        return bytes(contents)
+        return bytes(contents), tuple(spans)
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,7 @@ class PrgUnit:
     data: bytes
     address: int | None = None
     disk_file: str | None = None
+    container_spans: tuple[SourceSpan, ...] = ()
 
 
 def memory_map(bank: int) -> list[dict]:
@@ -168,6 +175,10 @@ def build_c64_image(
             "image_offset": address - origin, "file_offset": 2, "file_size": len(payload),
             "load_address": file_address, "source": unit.source, "disk_file": unit.disk_file,
         })
+        if unit.container_spans:
+            records[-1]["container_spans"] = [asdict(span) for span in slice_source_spans(
+                unit.container_spans, 2, len(payload),
+            )]
         previous_end = end
 
     entry_records = []

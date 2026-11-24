@@ -19,7 +19,7 @@ from .compare import DEFAULT_LIMIT as DEFAULT_COMPARE_LIMIT, compare_projects
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
-from .evidence import ADDRESS_SPACES, MAX_BYTES, EvidenceError, evidence_bundle, inspect_bytes, map_address
+from .evidence import ADDRESS_SPACES, FILE_OFFSET_KINDS, MAX_BYTES, EvidenceError, evidence_bundle, inspect_bytes, map_address
 from .genesis import GenesisError, build_genesis_image, is_genesis
 from .ghidra import (
     BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, check_timeout, decompile,
@@ -162,13 +162,11 @@ def _c64_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     source = args.program.name
     if args.disk_file:
         disk = D64Image(data)
-        units = [
-            PrgUnit(
-                "root" if index == 0 else name, source, disk.read_prg(name),
-                address=args.base_address if index == 0 else None, disk_file=name.upper(),
-            )
-            for index, name in enumerate(args.disk_file)
-        ]
+        units = []
+        for index, name in enumerate(args.disk_file):
+            contents, spans = disk.read_prg_with_spans(name)
+            units.append(PrgUnit("root" if index == 0 else name, source, contents,
+                                 args.base_address if index == 0 else None, name.upper(), spans))
     elif args.program.suffix.lower() == ".d64":
         raise C64Error("select a D64 program with --disk-file NAME")
     else:
@@ -234,11 +232,11 @@ def _atari8_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     elif is_disk or args.disk_file:
         disk = AtrImage(data)
         if args.disk_file:
-            sources = [
-                Atari8Source("root" if index == 0 else name.upper(), source,
-                             Atari8Binary.from_xex(disk.read_file(name), name), name.upper())
-                for index, name in enumerate(args.disk_file)
-            ]
+            sources = []
+            for index, name in enumerate(args.disk_file):
+                contents, spans = disk.read_file_with_spans(name)
+                sources.append(Atari8Source("root" if index == 0 else name.upper(), source,
+                                            Atari8Binary.from_xex(contents, name), name.upper(), spans))
         else:
             sources = [Atari8Source("root", source, disk.boot_binary())]
     else:
@@ -289,8 +287,9 @@ def _msx2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
                 address = COM_ADDRESS
             if index == 0 and com and not entries:
                 entries = [address]
+            contents, spans = filesystem.read_file_with_spans(member)
             sources.append(Msx2Source("root" if index == 0 else member.upper(), name, address,
-                                      filesystem.read_file(member), member.upper()))
+                                      contents, member.upper(), container_spans=spans))
     else:
         com = args.program.suffix.lower() == ".com"
         address = args.base_address
@@ -311,8 +310,7 @@ def _msx2_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         offset = address - root.address
         if not 0 <= offset < offset + size <= len(root.data):
             raise Msx2Error(f"MSX2 copy {address:x}:{size:x} is outside the root file")
-        copies.append(Msx2Source(f"copy_{destination:04x}", root.source, destination, root.data[offset:offset + size],
-                                 root.disk_file, offset))
+        copies.append(root.copy(f"copy_{destination:04x}", destination, offset, size))
     sources[1:1] = copies
     return build_msx2_image(sources, name, entries, disk=disk)
 
@@ -927,6 +925,20 @@ def _overlay_segments(values: list[str]) -> dict[str, int]:
     return segments
 
 
+def _runtime_loads(values: list[str]) -> dict[str, int | None]:
+    loads = {}
+    try:
+        for value in values:
+            unit, address = _assignment(value, "UNIT=HEX or UNIT=unmapped")
+            key = unit.casefold()
+            if key in loads:
+                raise ValueError(f"runtime placement specified twice for {unit}")
+            loads[key] = None if address.casefold() == "unmapped" else _hex_address(address)
+    except (ValueError, argparse.ArgumentTypeError) as error:
+        raise EvidenceError(str(error)) from error
+    return loads
+
+
 def _schema(args: argparse.Namespace) -> None:
     document = query_schema()
     if args.json:
@@ -1377,6 +1389,8 @@ def main(argv: list[str] | None = None) -> int:
                                 help="include memory block matches for custom storage and data layout transfer")
     compare_parser.add_argument("--instructions", action="store_true",
                                 help="include instruction locations for transferring comments and labels")
+    compare_parser.add_argument("--semantics", action="store_true",
+                                help="decompile routines to suggest additional cross-language candidates")
     compare_parser.add_argument("--json", action="store_true", help="print JSON")
     compare_parser.add_argument("--timeout", type=_seconds, default=QUERY_TIMEOUT, metavar="SECONDS",
                                 help="maximum seconds per Ghidra project")
@@ -1439,14 +1453,18 @@ def main(argv: list[str] | None = None) -> int:
     map_parser.add_argument("--from", dest="space", choices=ADDRESS_SPACES, default="logical")
     map_parser.add_argument("--source", help="match a source filename when mapping a file offset")
     map_parser.add_argument("--member", help="match a disk member when mapping a file offset")
+    map_parser.add_argument("--offset-kind", choices=FILE_OFFSET_KINDS, help="select the file coordinate kind")
     map_parser.add_argument("--runtime-base", type=_hex_segment, metavar="HEX", help="DOS runtime root segment")
     map_parser.add_argument("--overlay-segment", metavar="UNIT=HEX", action="append", default=[],
                             help="supply a DOS overlay's runtime segment")
+    map_parser.add_argument("--runtime-load", metavar="UNIT=HEX|unmapped", action="append", default=[],
+                            help="place an exported unit at a linear runtime address or mark it unmapped")
     bytes_parser = commands.add_parser("bytes", help="read initialized bytes and the loader edits that changed them")
     bytes_parser.add_argument("address", metavar="ADDR")
     bytes_parser.add_argument("--size", type=int, default=32, metavar="N", help=f"read 1–{MAX_BYTES} bytes (default 32)")
     for command in (map_parser, bytes_parser):
         command.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
+        command.add_argument("--source-file", type=Path, help="verify and recover file offsets for an unpacked DOS MZ")
         command.add_argument("--json", action="store_true", help="print JSON")
     call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
     call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
@@ -1547,7 +1565,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "address-map":
             report = map_address(args.export, args.address, space=args.space, source=args.source, member=args.member,
-                                 runtime_base=args.runtime_base, overlay_segments=_overlay_segments(args.overlay_segment))
+                                 runtime_base=args.runtime_base, overlay_segments=_overlay_segments(args.overlay_segment),
+                                 runtime_loads=_runtime_loads(args.runtime_load), source_file=args.source_file,
+                                 offset_kind=args.offset_kind)
             if args.json:
                 print(json.dumps(report))
             else:
@@ -1557,12 +1577,14 @@ def main(argv: list[str] | None = None) -> int:
                     file = row["file"]
                     if file:
                         location += f"  {file['source']}:{file['member'] or ''}+{file['offset']:x}"
+                    if container := row.get("container"):
+                        location += f"  container +{container['offset']:x}"
                     if row["runtime"]:
                         location += f"  runtime {row['runtime']['address']}"
                     print(f"  {location}")
             return 0
         if args.command == "bytes":
-            report = inspect_bytes(args.export, args.address, size=args.size)
+            report = inspect_bytes(args.export, args.address, size=args.size, source_file=args.source_file)
             if args.json:
                 print(json.dumps(report))
             else:
@@ -1577,7 +1599,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "compare":
             report = compare_projects(args.before, args.after, before_program=args.before_program,
                                       after_program=args.after_program, limit=args.limit, offset=args.offset,
-                                      storage=args.storage, instructions=args.instructions, timeout=args.timeout)
+                                      storage=args.storage, instructions=args.instructions, semantics=args.semantics,
+                                      timeout=args.timeout)
             if args.json:
                 print(json.dumps(report))
             else:

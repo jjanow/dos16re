@@ -17,7 +17,7 @@ public class AnnotationStorage extends GhidraScript {
     public void run() throws Exception {
         var args = getScriptArgs();
         var entry = args.length > 1 ? toAddr(Long.parseLong(args[1], 16)) : toAddr(0xc000);
-        var scratch = args.length > 2 ? entry.add(0x20) : toAddr(0x200);
+        var scratch = args.length > 2 ? entry.add(Long.parseLong(args[2], 16)) : toAddr(0x200);
         var function = getFunctionAt(entry);
         var accumulator = currentProgram.getRegister("A");
         var x = currentProgram.getRegister("X");
@@ -42,7 +42,7 @@ public class AnnotationStorage extends GhidraScript {
                 function.addLocalVariable(
                     new LocalVariableImpl("scratch", 0, variant.equals("resized") ? word : byteType,
                         scratch, currentProgram), manual);
-                if (variant.equals("renamed")) {
+                if (variant.equals("renamed") || variant.startsWith("moved")) {
                     createData(entry.add(0x10), new ArrayDataType(byteType, 4, 1));
                 }
                 function.setVarArgs(true);
@@ -52,6 +52,7 @@ public class AnnotationStorage extends GhidraScript {
             case "conflict" -> function.addLocalVariable(
                 new LocalVariableImpl("manual_cache", word, -4, currentProgram), manual);
             case "rename" -> currentProgram.getMemory().getBlock(entry).setName("renamed_root");
+            case "patch" -> currentProgram.getMemory().setByte(scratch, (byte) 0);
             case "check" -> {
                 check(function.hasCustomVariableStorage(), "custom storage mode");
                 check(function.getReturn().getRegister().equals(accumulator), "return register");

@@ -2,8 +2,8 @@
 
 from .d88 import D88_SUFFIXES as DISK_SUFFIXES
 from .d88 import D88Disk
-from .image import PC88_FORMAT
-from .z80 import SourceSpan, Z80Source, place_z80_sources
+from .image import PC88_FORMAT, SourceSpan
+from .z80 import Z80Source, copy_z80_source, place_z80_sources
 
 BOOT_ADDRESS = 0xC000
 LOW_BANKS = ("ram", "n88-rom", "n-rom")
@@ -33,18 +33,7 @@ def boot_source(disk: D88Disk, filename: str) -> Z80Source:
 
 
 def copy_source(sources: list[Z80Source], address: int, size: int, destination: int) -> Z80Source:
-    end = address + size
-    for source in reversed(sources):
-        if source.address < end and address < source.end:
-            if source.address <= address < end <= source.end:
-                offset = address - source.address
-                return Z80Source(
-                    f"copy_{destination:04x}_from_{address:04x}_{size:x}", source.source,
-                    destination, source.data[offset:offset + size],
-                    file_offset=source.file_offset + offset, file_spans=source.spans(offset, size),
-                )
-            break
-    raise Pc88Error(f"PC-88 copy {address:x}:{size:x} must fit within a single visible load")
+    return copy_z80_source(sources, address, size, destination, Pc88Error, "PC-88")
 
 
 def build_pc88_image(

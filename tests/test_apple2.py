@@ -63,6 +63,12 @@ def test_dos_disk_export_and_search(tmp_path, capsys, suffix, options, slots, or
     assert (root["disk_file"], root["file_offset"], root["size"]) == ("DEMO", 4, len(payload))
     assert (helper["linear"], helper["source"]) == (0x2102, worker.name)
     assert (out / "image.bin").read_bytes() == payload + b"C"
+    offset = (3 * 16 + slots[3]) * 256 + 4
+    assert main(["address-map", f"{offset:x}", "--from", "file", "--offset-kind", "container",
+                 "--member", "DEMO", "--export", str(out), "--json"]) == 0
+    match, = json.loads(capsys.readouterr().out)["matches"]
+    assert match["unit_address"] == "root:0100"
+    assert match["container"]["offset"] == offset and match["file"]["offset"] == 260
 
     for flag, value, expected in [("--string", "ABC", []), ("--constant", "0x4241", [
         {"address": "2100", "unit_address": "root:0100", "linear": 0x2100},

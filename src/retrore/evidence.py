@@ -2,14 +2,19 @@
 
 from functools import cached_property
 from hashlib import sha256
+from itertools import groupby
 from pathlib import Path
 
 from .ghidra import GhidraError, query_batch
-from .image import M68K_FORMATS, ImageError, ImageUnit, RuntimePlacementError, dos_runtime_units, image_units, read_map
-from .mz import Address
+from .image import (
+    ATARI8_FORMAT, M68K_FORMATS, ImageError, ImageUnit, RuntimePlacementError, dos_runtime_units, explicit_runtime_units,
+    image_units, read_map,
+)
+from .mz import Address, MZExecutable
 from .search import SearchError, resolve_address
 
 ADDRESS_SPACES = ("logical", "linear", "runtime", "image", "file")
+FILE_OFFSET_KINDS = ("file", "member", "container")
 MAX_BYTES = 4096
 
 
@@ -18,35 +23,60 @@ class EvidenceError(ValueError):
 
 
 class ExportEvidence:
-    def __init__(self, export: Path, runtime_base: int | None = None, overlay_segments: dict | None = None):
+    def __init__(self, export: Path, runtime_base: int | None = None, overlay_segments: dict | None = None, *,
+                 runtime_loads: dict | None = None, source_file: Path | None = None):
         self.image = (export / "image.bin").read_bytes()
         self.program = read_map(export)
         self.units = image_units(self.program, len(self.image))
         self.records = {record["name"]: record for record in self.program["units"]}
         self.format = self.program.get("format", "MZ")
-        if self.format == "MZ":
-            try:
+        self.root_file_offset = None
+        if source_file is not None:
+            if self.format != "MZ" or self.program.get("packer"):
+                raise EvidenceError("source-file recovery requires an unpacked DOS MZ export")
+            executable = MZExecutable.parse(source_file.read_bytes())
+            root = self.units[0]
+            start = root.image_offset
+            if executable.packer or executable.image != self.original[0][start:start + root.file_size]:
+                raise EvidenceError("source file does not match the original DOS load module")
+            self.root_file_offset = executable.header.header_size
+            recorded = self.records[root.name].get("file_offset")
+            if recorded is not None and self.root_file_offset != recorded:
+                raise EvidenceError("source file header size differs from the export")
+        try:
+            if runtime_loads:
+                if runtime_base is not None or overlay_segments:
+                    raise EvidenceError("runtime loads cannot be combined with DOS segment overrides")
+                self.runtime = explicit_runtime_units(self.units, runtime_loads, self.format)
+            elif self.format == "MZ":
                 placements = dos_runtime_units(self.units, runtime_base, overlay_segments or {})
-            except RuntimePlacementError as error:
-                raise EvidenceError(str(error)) from error
-            self.runtime = {unit.name: start for start, unit in placements}
-        else:
-            if runtime_base is not None or overlay_segments:
-                raise EvidenceError("runtime segment overrides require a DOS MZ export")
-            self.runtime = {unit.name: unit.linear for unit in self.units}
+                self.runtime = {unit.name: start for start, unit in placements}
+            else:
+                if runtime_base is not None or overlay_segments:
+                    raise EvidenceError("runtime segment overrides require a DOS MZ export")
+                self.runtime = {unit.name: unit.linear for unit in self.units}
+        except RuntimePlacementError as error:
+            raise EvidenceError(str(error)) from error
 
     def identity(self) -> dict:
         return {"program": self.program.get("program"), "format": self.format,
                 "image_sha256": sha256(self.image).hexdigest()}
 
-    def file_spans(self, unit: ImageUnit) -> list[dict]:
+    def file_spans(self, unit: ImageUnit, *, container: bool = False) -> list[dict]:
         record = self.records[unit.name]
-        if "file_spans" in record:
+        if container:
+            spans = record.get("container_spans", [])
+        elif "file_spans" in record:
             spans = record["file_spans"]
+        elif self.format == ATARI8_FORMAT and "file_offset" not in record:
+            spans = self.legacy_atari8_spans.get(unit.name, [])
         else:
             offset = record.get("file_offset")
-            if self.format == "MZ" and unit.name != "root" and "file_offset" not in record:
-                offset = 0
+            if self.format == "MZ" and offset is None:
+                if unit.name == "root":
+                    offset = self.root_file_offset
+                elif "file_offset" not in record:
+                    offset = 0
             spans = [] if offset is None or unit.file_size == 0 else [
                 {"offset": 0, "file_offset": offset, "size": unit.file_size},
             ]
@@ -63,11 +93,47 @@ class ExportEvidence:
             end = start + size
         return spans
 
-    def file_source(self, unit: ImageUnit) -> dict:
+    @cached_property
+    def legacy_atari8_spans(self) -> dict:
+        """Recover visible source offsets from the ordered segments in early Atari maps."""
+        sources = self.program.get("sources", [])
+        if not isinstance(sources, list) or any(not isinstance(source, dict) for source in sources):
+            raise ImageError("invalid Atari source records")
+        result = {}
+        for unit in self.units:
+            record = self.records[unit.name]
+            if "file_spans" in record or "file_offset" in record:
+                continue
+            candidates = [source for source in sources if isinstance(source.get("name"), str)
+                          and unit.name in (source["name"], f"{source['name']}_{unit.linear:04x}")
+                          and all(source.get(key) == record.get(key) for key in ("source", "disk_file"))]
+            if len(candidates) != 1:
+                continue
+            offsets = [None] * unit.file_size
+            segments = candidates[0].get("segments", [])
+            if not isinstance(segments, list) or any(not isinstance(segment, dict) for segment in segments):
+                raise ImageError(f"invalid Atari source segments for unit {unit.name}")
+            for segment in segments:
+                start, size, offset = (segment.get(key) for key in ("linear", "size", "file_offset"))
+                if any(type(value) is not int or value < 0 for value in (start, size, offset)):
+                    raise ImageError(f"invalid Atari source segment for unit {unit.name}")
+                left, right = max(start, unit.linear), min(start + size, unit.linear + unit.file_size)
+                if left < right:
+                    offsets[left - unit.linear:right - unit.linear] = range(offset + left - start, offset + right - start)
+            spans = []
+            for base, group in groupby(enumerate(offsets), lambda row: None if row[1] is None else row[1] - row[0]):
+                if base is not None:
+                    first, offset = next(group)
+                    spans.append({"offset": first, "file_offset": offset, "size": 1 + sum(1 for _ in group)})
+            result[unit.name] = spans
+        return result
+
+    def file_source(self, unit: ImageUnit, *, container: bool = False) -> dict:
         record = self.records[unit.name]
         member = record.get("disk_file")
         return {"source": record.get("source", self.program.get("program")),
-                "member": member, "offset_kind": record.get("file_offset_kind", "member" if member else "file")}
+                "member": member, "offset_kind": ("container" if container else
+                                                   record.get("file_offset_kind", "member" if member else "file"))}
 
     def location(self, unit: ImageUnit, offset: int) -> dict:
         report = unit.location(offset)
@@ -76,23 +142,33 @@ class ExportEvidence:
         start = self.runtime.get(unit.name)
         if start is not None:
             linear = start + offset
-            address = report["address"]
-            if self.format == "MZ":
-                address = str(Address(start >> 4, offset) if offset <= 0xFFFF else
+            if unit.segment is not None:
+                relative = (start & 0xF) + offset
+                address = str(Address(start >> 4, relative) if relative <= 0xFFFF else
                               Address(linear >> 4, linear & 0xF))
+            else:
+                address = f"{linear:0{unit.address_width}x}"
             report["runtime"] = {"address": address, "linear": linear}
         for span in self.file_spans(unit):
             if span["offset"] <= offset < span["offset"] + span["size"]:
                 report["file"] = {**self.file_source(unit),
                                   "offset": span["file_offset"] + offset - span["offset"]}
                 break
+        for span in self.file_spans(unit, container=True):
+            if span["offset"] <= offset < span["offset"] + span["size"]:
+                report["container"] = {**self.file_source(unit, container=True),
+                                       "offset": span["file_offset"] + offset - span["offset"]}
+                break
         return report
 
-    def matches(self, address: str, space: str, source: str | None, member: str | None):
+    def matches(self, address: str, space: str, source: str | None, member: str | None,
+                offset_kind: str | None = None):
         if not isinstance(address, str) or not address or space not in ADDRESS_SPACES:
             raise EvidenceError("expected an address and a supported address space")
-        if space != "file" and (source is not None or member is not None):
-            raise EvidenceError("source and member selectors require file offsets")
+        if space != "file" and any(value is not None for value in (source, member, offset_kind)):
+            raise EvidenceError("source, member, and offset kind selectors require file offsets")
+        if offset_kind is not None and offset_kind not in FILE_OFFSET_KINDS:
+            raise EvidenceError("invalid file offset kind")
         if space == "logical":
             head, colon, tail = address.rpartition(":")
             selected = next((unit for unit in self.units if unit.name.casefold() == head.casefold()), None)
@@ -113,7 +189,13 @@ class ExportEvidence:
                     member is not None and file["member"] != member
                 ):
                     continue
-                for span in self.file_spans(unit):
+                if offset_kind is None or offset_kind == file["offset_kind"]:
+                    spans = self.file_spans(unit)
+                elif offset_kind == "container":
+                    spans = self.file_spans(unit, container=True)
+                else:
+                    continue
+                for span in spans:
                     displacement = value - span["file_offset"]
                     if 0 <= displacement < span["size"]:
                         yield unit, span["offset"] + displacement
@@ -171,9 +253,10 @@ def _hex(text: str) -> int:
 
 def map_address(export: Path, address: str, *, space: str = "logical", source: str | None = None,
                 member: str | None = None, runtime_base: int | None = None,
-                overlay_segments: dict | None = None) -> dict:
-    image = ExportEvidence(export, runtime_base, overlay_segments)
-    matches = [image.location(unit, offset) for unit, offset in image.matches(address, space, source, member)]
+                overlay_segments: dict | None = None, runtime_loads: dict | None = None,
+                source_file: Path | None = None, offset_kind: str | None = None) -> dict:
+    image = ExportEvidence(export, runtime_base, overlay_segments, runtime_loads=runtime_loads, source_file=source_file)
+    matches = [image.location(unit, offset) for unit, offset in image.matches(address, space, source, member, offset_kind)]
     return {"input": address, "space": space, "count": len(matches), "matches": matches}
 
 
@@ -189,25 +272,27 @@ def _inspect_bytes(image: ExportEvidence, address: str, size: int) -> dict:
     end = start + length
     original = b""
     evidence = []
-    files = []
+    report = {"address": image.location(unit, offset), "requested": size, "size": length, "truncated": length < size,
+              "loaded": image.image[start:end].hex(), "file_spans": []}
     if length:
         restored, edits = image.original
         original = restored[start:end]
         evidence = [edit for edit in edits if edit["image_offset"] < end
                     and start < edit["image_offset"] + edit["size"]]
-        for span in image.file_spans(unit):
-            left = max(offset, span["offset"])
-            right = min(offset + length, span["offset"] + span["size"])
-            if left < right:
-                files.append({**image.file_source(unit), "unit_offset": left,
-                              "file_offset": span["file_offset"] + left - span["offset"], "size": right - left})
-    return {"address": image.location(unit, offset), "requested": size, "size": length, "truncated": length < size,
-            "loaded": image.image[start:end].hex(), "original": original.hex(), "file_spans": files,
-            "evidence": evidence}
+        for container, name in ((False, "file_spans"), (True, "container_spans")):
+            for span in image.file_spans(unit, container=container):
+                left = max(offset, span["offset"])
+                right = min(offset + length, span["offset"] + span["size"])
+                if left < right:
+                    report.setdefault(name, []).append({
+                        **image.file_source(unit, container=container), "unit_offset": left,
+                        "file_offset": span["file_offset"] + left - span["offset"], "size": right - left,
+                    })
+    return {**report, "original": original.hex(), "evidence": evidence}
 
 
-def inspect_bytes(export: Path, address: str, *, size: int = 32) -> dict:
-    return _inspect_bytes(ExportEvidence(export), address, size)
+def inspect_bytes(export: Path, address: str, *, size: int = 32, source_file: Path | None = None) -> dict:
+    return _inspect_bytes(ExportEvidence(export, source_file=source_file), address, size)
 
 
 def _compare_bytes(image: ExportEvidence, location: dict, size: int, project_bytes: str,

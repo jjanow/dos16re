@@ -21,9 +21,12 @@ from pathlib import Path
 from typing import IO
 
 from . import worker
-from .cli import HANDLED_ERRORS, _export_image, _hex_segment, _overlay_segments, build_program, error_report, program_options
+from .cli import (
+    HANDLED_ERRORS, _export_image, _hex_segment, _overlay_segments, _runtime_loads, build_program, error_report,
+    program_options,
+)
 from .errors import CONTRACT_VERSION
-from .evidence import ADDRESS_SPACES, MAX_BYTES, inspect_bytes, map_address
+from .evidence import ADDRESS_SPACES, FILE_OFFSET_KINDS, MAX_BYTES, inspect_bytes, map_address
 from .ghidra import QUERY_TIMEOUT, GhidraError, cancellable, check_cancelled, check_timeout, query, query_batch
 from .queries import query_definitions
 from .schema import DIALECT, query_schema
@@ -233,14 +236,19 @@ def _lookup_tool() -> dict:
 _EXPORT_EVIDENCE = {
     "bytes": ("Read initialized bytes before and after loader edits", {
         "size": {"type": "integer", "minimum": 1, "maximum": MAX_BYTES, "default": 32},
+        "source_file": {"type": "string", "minLength": 1, "description": "Original unpacked DOS MZ file"},
     }),
     "address_map": ("Map a location across the address spaces of an export", {
         "space": {"type": "string", "enum": list(ADDRESS_SPACES), "default": "logical"},
         "source": {"type": "string", "minLength": 1},
         "member": {"type": "string", "minLength": 1},
+        "offset_kind": {"type": "string", "enum": list(FILE_OFFSET_KINDS)},
+        "source_file": {"type": "string", "minLength": 1, "description": "Original unpacked DOS MZ file"},
         "runtime_base": {"type": "string", "pattern": "^[a-fA-F0-9]{1,4}$"},
         "overlay_segments": {"type": "array", "items": {"type": "string"},
                              "description": "DOS overlay placements as UNIT=HEX"},
+        "runtime_loads": {"type": "array", "items": {"type": "string"},
+                          "description": "Linear runtime placements as UNIT=HEX or UNIT=unmapped"},
     }),
 }
 
@@ -489,20 +497,27 @@ def _call_evidence(name: str, arguments: dict) -> dict:
     address = _optional(arguments, "address", str)
     if address is None:
         raise InvalidArguments("address is required")
+    original = _optional(arguments, "source_file", str)
+    source_file = Path(original) if original is not None else None
     if name == "bytes":
         size = _optional(arguments, "size", int)
-        return inspect_bytes(export, address, size=32 if size is None else size)
+        return inspect_bytes(export, address, size=32 if size is None else size, source_file=source_file)
     runtime_base = _optional(arguments, "runtime_base", str)
     segments = arguments.get("overlay_segments", [])
     if not isinstance(segments, list) or any(not isinstance(value, str) for value in segments):
         raise InvalidArguments("overlay_segments must be an array of UNIT=HEX assignments")
+    loads = arguments.get("runtime_loads", [])
+    if not isinstance(loads, list) or any(not isinstance(value, str) for value in loads):
+        raise InvalidArguments("runtime_loads must be an array of UNIT=HEX or UNIT=unmapped assignments")
     try:
         base = _hex_segment(runtime_base) if runtime_base is not None else None
     except argparse.ArgumentTypeError as error:
         raise InvalidArguments(str(error)) from error
     return map_address(export, address, space=_optional(arguments, "space", str) or "logical",
                        source=_optional(arguments, "source", str), member=_optional(arguments, "member", str),
-                       runtime_base=base, overlay_segments=_overlay_segments(segments))
+                       runtime_base=base, overlay_segments=_overlay_segments(segments),
+                       runtime_loads=_runtime_loads(loads), source_file=source_file,
+                       offset_kind=_optional(arguments, "offset_kind", str))
 
 
 def call_tool(name: str, arguments: dict) -> dict:

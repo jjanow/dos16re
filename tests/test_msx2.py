@@ -47,6 +47,11 @@ def test_disk_chain_and_runtime_view(tmp_path, capsys):
     assert (export / "image.bin").read_bytes()[0x30:0x35] == filesystem.read_file("HELPER.OVR")
     assert main(["where-is", "--export", str(export), "--string", "HELLO", "--json"]) == 0
     assert [row["address"] for row in json.loads(capsys.readouterr().out)["matches"]] == ["0300", "c000"]
+    assert main(["address-map", "c00", "--from", "file", "--offset-kind", "container",
+                 "--export", str(export), "--json"]) == 0
+    matches = json.loads(capsys.readouterr().out)["matches"]
+    assert [row["linear"] for row in matches] == [0x300, 0xC000]
+    assert all(row["file"]["offset"] == 512 and row["container"]["offset"] == 3072 for row in matches)
 
 
 def test_standalone_msx_com_and_raw(tmp_path, capsys):

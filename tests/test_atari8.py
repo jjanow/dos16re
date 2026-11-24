@@ -31,7 +31,7 @@ def _sector(disk, number, sector_size=128):
 
 
 @pytest.mark.parametrize(("sector_size", "count", "flag"), [(128, 720, 0x62), (256, 720, 0x42), (128, 1040, 0x03)])
-def test_atr_reads_linked_dos_binary(sector_size, count, flag):
+def test_atr_reads_linked_dos_binary(sector_size, count, flag, tmp_path, capsys):
     disk = _disk(count, sector_size)
     _sector(disk, 360, sector_size)[0] = 2
     for slot in range(8):
@@ -50,6 +50,15 @@ def test_atr_reads_linked_dos_binary(sector_size, count, flag):
     last[:len(executable) - 100] = executable[100:]
     last[-3:] = bytes((9 << 2, 0, len(executable) - 100))
     assert AtrImage(disk).read_file("demo.com") == executable
+    source, out = tmp_path / "demo.atr", tmp_path / "out"
+    source.write_bytes(disk)
+    assert main(["load", str(source), "--disk-file", "DEMO.COM", "-o", str(out), "--json"]) == 0
+    capsys.readouterr()
+    assert main(["bytes", "2000", "--size", "100", "--export", str(out), "--json"]) == 0
+    proof = json.loads(capsys.readouterr().out)
+    assert [(span["file_offset"], span["size"]) for span in proof["container_spans"]] == [
+        (16 + 384 + (20 - 4) * sector_size + 6, 94), (16 + 384 + (last_number - 4) * sector_size, 6),
+    ]
 
     last[-3:] = bytes((9 << 2, 20, len(executable) - 100))
     with pytest.raises(Atari8Error, match="sector loop"):
@@ -109,6 +118,16 @@ def test_xex_patch_vectors_and_overlay_export(tmp_path, capsys):
     assert image[i + 3:i + 0x100] == bytes(0xFD)
     assert main(["where-is", "--export", str(out), "--string", "EF", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["matches"][0]["address"] == "2100"
+    command = ["bytes", "2000", "--size", "2", "--export", str(out), "--json"]
+    assert main(command) == 0
+    fresh = json.loads(capsys.readouterr().out)
+    for unit in program["units"]:
+        unit.pop("file_offset", None)
+        unit.pop("file_spans", None)
+    (out / "map.json").write_text(json.dumps(program), encoding="utf-8")
+    assert main(command) == 0
+    legacy = json.loads(capsys.readouterr().out)
+    assert legacy == fresh and [span["size"] for span in legacy["file_spans"]] == [1, 1]
 
 
 def test_portb_maps_rom_and_xe_ram(tmp_path, capsys):
