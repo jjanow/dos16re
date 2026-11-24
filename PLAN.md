@@ -14,13 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, added 729 opt-in Unicorn probes for Phantasie III's floating-point arithmetic and
-register-stack copies. The probes confirmed class values 0–3 at both dispatch sites. The docs now
-refer to original releases as validation inputs. The standalone suite passed 513 tests with 128 skipped.
-All four opt-in Phantasie III DOS checks passed with Ghidra 12.2.
+On 2026-11-24, added `record-writes` to audit real-mode x86 stores using register values
+propagated across calls. The Phantasie III audit identified the caller-addressed `FST` stores
+and the sources of copies from templates and other records. The standalone suite passed 515
+tests with 129 skipped. Seven targeted checks passed with Ghidra 12.2, including all four
+opt-in Phantasie III DOS checks.
 
-Resume Phase 9 by tracking record-field writes across calls and checking which writes can alias
-the record.
+Resume Phase 9 by recovering the software interrupt entry paths and tracking the caller's
+output pointers and the runtime's record pointers separately. A static dispatch bound needs
+coverage of those paths and a check that output destinations stay outside the record stack.
 Microsoft LINK still needs a shipped executable with missing directory counts or a member whose first
 listed segment starts after the overlay window start. Expand Microsoft MOVE runtime views as more
 captured placements become available.
@@ -316,8 +318,13 @@ Continue with the analysis backlog below.
   The class is byte 11 of a 12-byte record. Input converters and arithmetic write the class or
   copy a record. Unicorn tests exercise six arithmetic forms, extended-precision overflow and
   underflow, and stack duplication, exchange, and store paths.
-  Automatic static recovery still needs a proof covering all writes to the fields read by both
-  dispatches, including writes through unresolved segment aliases.
+  The `record-writes` query reports overlapping stores and potential segment aliases for a byte
+  field, with known byte values and copy sources. The Phantasie III audit checks the class
+  bytes in all 15 slots in the runtime allocation. The `FST` word stores at `root:12e40` and
+  `root:12e43` use caller-derived `ES:DI`, so the dispatch bound requires disjoint output
+  operands. The handler also has undefined ranges and unresolved transfers in the static
+  listing. Automatic recovery still needs complete control flow and a proof of the internal
+  class writers and copies.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry

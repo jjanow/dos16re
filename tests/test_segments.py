@@ -52,6 +52,59 @@ def _check_references(project, *checks):
     assert "All segment references checked" in result.stdout, result.stdout
 
 
+def test_record_writes_follows_callers_and_checks_segment_aliases(tmp_path, capsys):
+    code = bytes.fromhex(
+        "b8 20 00 8e d8"          # DS = root segment + 0x20
+        " b8 21 00 8e c0"         # ES = root segment + 0x21
+        " e8 01 00 c3"            # call helper; ret
+        " 26 c7 06 0f 01 02 7f"  # 000e: word at ES:010f overlaps the first field by one byte
+        " c6 06 2c 01 03"         # 0015: byte at DS:012c is the second field
+        " b8 02 01 88 26 20 01"   # 001d: write AH to the first field
+        " be 2c 01 bf 10 01 a4"   # 0027: copy the second field to the first using MOVSB
+        " f3 aa"                  # 0028: REP STOSB can also reach the fields
+        " 8e 06 50 01"            # load an unknown segment into ES
+        " 26 c6 06 20 01 04"      # 002e: can alias a field with the same low four bits
+        " 26 c6 06 21 01 04 c3"   # 0034: cannot alias either field
+    )
+    image = code.ljust(0x360, b"\0")
+    header = bytearray(48)
+    pack_into("<2s13H", header, 0, b"MZ", (len(header) + len(image)) % 512, 2, 2, 3,
+              0x100, 0x100, 0x80, 0x20, 0, 0, 0, 0x1c, 0)
+    pack_into("<4H", header, 0x1c, 1, 0, 6, 0)
+    exe = tmp_path / "records.exe"
+    exe.write_bytes(header + image)
+    project, _ = _import_program(tmp_path, capsys, exe)
+
+    def query(*options):
+        assert main(["record-writes", "root:320", "--stride", "12", "--count", "2", "--project", str(project),
+                     "--code-end", "root:3a", "--code-start", "root:0", "--json", "--compact",
+                     *options]) == 0, capsys.readouterr().err
+        return _single(capsys)
+
+    report = query()
+    assert report["counts"] == {"overlap": 4, "possible": 2}
+    assert report["undefined_bytes"] == 0 and report["unresolved_transfers"] == 0
+    rows = {row["address"]: row for row in report["writes"]}
+    assert all(row["function"]["entry"] == "root:000e" and row["context"] for row in rows.values())
+    assert rows["root:000e"]["destination"] == {
+        "register": "ES", "segment": 0x1021, "offset": 0x10f, "linear": 0x1031f,
+    }
+    assert rows["root:000e"]["hits"] == [{"address": "root:0320", "value": 0x7f}]
+    assert rows["root:0015"]["hits"] == [{"address": "root:032c", "value": 3}]
+    assert rows["root:001d"]["hits"] == [{"address": "root:0320", "value": 1}]
+    assert rows["root:0027"]["source"] == {
+        "register": "DS", "segment": 0x1020, "offset": 0x12c, "linear": 0x1032c,
+    }
+    assert rows["root:0027"]["hits"] == [{"address": "root:0320", "value": None}]
+    assert rows["root:0028"]["destination"] == {
+        "register": "ES", "segment": 0x1021, "offset": None, "linear": None,
+    }
+    assert rows["root:002e"]["destination"] == {"register": "ES", "segment": None, "offset": 0x120, "linear": None}
+    second = query("--status", "possible", "--limit", "1", "--offset", "1", "--fields", "address,status")
+    assert second["writes"] == [{"address": "root:002e", "status": "possible"}]
+    assert second["pagination"]["writes"] == {"offset": 1, "returned": 1, "total": 2, "next_offset": None}
+
+
 def test_tracks_segment_values_and_drops_conflicting_or_mutable_values(tmp_path, capsys):
     image = bytearray(0x540)
     code = bytes.fromhex(

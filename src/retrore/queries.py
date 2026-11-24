@@ -227,6 +227,25 @@ QUERIES = {
         "fields_scope": "record",
         "echo": ["unit", "at"],
     },
+    "record-writes": {
+        "description": "find analyzed real-mode x86 stores that can overlap a byte field in one or more records",
+        "parameters": {
+            "address": {**_address("address of the first field byte"), "required": True},
+            "stride": _integer(1, 0x10000, "distance in bytes between field addresses", 1),
+            "count": _integer(1, 4096, "number of records to check", 1),
+            "code_start": _address("first instruction address to consider"),
+            "code_end": _address("last instruction address to consider (inclusive)"),
+            "status": {"type": "string", "enum": ["overlap", "possible"],
+                       "description": "keep stores with this overlap status"},
+            **_paging(1000, 100, "writes"),
+            "compact": _COMPACT,
+        },
+        "dependent_required": {"code_start": ["code_end"], "code_end": ["code_start"]},
+        "fields": ["address", "function", "instruction", "status", "width", "destination", "value", "source",
+                   "hits", "context"],
+        "fields_scope": "record",
+        "echo": ["address"],
+    },
     "disasm": {
         "description": "read analyzed instructions, data, and gaps within one Ghidra memory block",
         "parameters": {

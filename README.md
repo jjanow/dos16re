@@ -1008,6 +1008,28 @@ project. The preview lists defined data in the proposed range. Replacing it requ
 The `functions` record reports omitted functions when `--max-functions` limits the analysis.
 An explicitly sized or defined table can establish a larger count than a loop that accesses a subset.
 
+`record-writes` checks writes to a byte field in a real-mode x86 project. Pass the address of the
+first field byte. Use `--stride` and `--count` to check the same field in consecutive records.
+
+```sh
+.venv/bin/retrore record-writes 280a:00ab --stride 12 --count 15 --project out/ph3-project \
+    --code-start root:12dc9 --code-end root:12e43 --json
+```
+
+The query examines the listing's Ghidra p-code stores, including implicit string and stack
+writes. It uses the segment pass's register values at each instruction, including values
+propagated from callers. A store is an `overlap` when its tracked destination covers a field
+byte. The `hits` list gives those bytes and their values when known. A `possible` store has
+an unresolved address component or a possible 20-bit wrap to the field. The query reports
+the segment, offset, and copy source when available. A row with `context: false` has no saved
+register values for that instruction. Use `--status` to filter the page and
+`--code-start` with `--code-end` to limit the instruction range.
+
+The report gives the count of undefined bytes and computed transfers with no listed target in
+the selected code range. Results depend on the listing and the segment analysis's caller and
+entry assumptions. A project imported before write context was recorded still reports
+possible overlaps from the listing. Reimport to use tracked register values.
+
 ### Limit Ghidra address query results
 
 On `xrefs`, `callers`, `callees`, and `func`, use `--limit N` and `--offset N` to page each reference
@@ -1309,6 +1331,7 @@ lists. A `next_offset` other than `null` means more records remain.
 | `context` | `address` | Prototype, calling convention, return type, parameters, callees, and referenced data |
 | `gaps` | Optional `unit` | Undefined ranges in executable units, as for plain `gaps` |
 | `coverage` | Optional `unit` | Per-unit counts of functions, instruction bytes, data bytes, and undefined bytes |
+| `record-writes` | Field `address` with optional `stride`, `count`, code range, and `status` | Stores that overlap or may alias a field byte |
 
 `functions` reports each function's name, entry, inclusive body ranges, size, prototype, and
 calling convention. Each row starts with `query`, the address or name it answers. A row for an

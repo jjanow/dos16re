@@ -729,7 +729,7 @@ def _batch(args: argparse.Namespace) -> int:
 
 
 _REGISTRY_COMMANDS = ("functions", "symbols", "inventory", "callgraph", "context", "coverage", "layout", "indirect",
-                      "disasm", "project-summary")
+                      "record-writes", "disasm", "project-summary")
 
 
 def _add_query_parser(commands: argparse._SubParsersAction, command: str) -> argparse.ArgumentParser:
@@ -860,6 +860,11 @@ def _registry_query(args: argparse.Namespace) -> int:
     elif command == "indirect":
         print("  ".join(f"{count} {name}" for name, count in report["counts"].items()))
         _print_page(report, "sites", [_indirect_row(row) for row in report["sites"]])
+    elif command == "record-writes":
+        print("  ".join(f"{count} {name}" for name, count in report["counts"].items()))
+        _print_page(report, "writes", [
+            f"{_location(row['address'])}  {row['instruction']}  {row['status']}" for row in report["writes"]
+        ])
     elif command == "disasm":
         print(f"{report['size']} bytes from {_location(report['start'])}")
         for row in report["rows"][:_PREVIEW_LIMIT]:

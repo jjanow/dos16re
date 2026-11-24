@@ -21,6 +21,7 @@ import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.lang.InsufficientBytesException;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.UnknownContextException;
 import ghidra.program.model.lang.UnknownInstructionException;
 import ghidra.program.model.mem.MemoryBlock;
@@ -640,6 +641,7 @@ public class RetroreQuery extends GhidraScript {
             case "coverage" -> coverage(request, options);
             case "layout" -> layout(request, options);
             case "indirect" -> indirect(request, options);
+            case "record-writes" -> recordWrites(request, options);
             case "disasm" -> disassembly(request, options);
             case "project-summary" -> projectSummary(options);
             default -> addressQuery(command, request, options);
@@ -1478,6 +1480,283 @@ public class RetroreQuery extends GhidraScript {
             ((List<Object>) list).replaceAll(RetroreQuery::integral);
         }
         return value;
+    }
+
+    // ---- record writes: p-code STOREs with the segment pass's incoming register values ----
+
+    private static final long MAX_SEGMENT_BASE = 0xffff0L;
+    private static final long MAX_SEGMENT_OFFSET = 0xffffL;
+    private static final long REAL_MODE_WRAP = 0x100000L;
+    private static final StoreAddress UNKNOWN_STORE_ADDRESS = new StoreAddress(null, null, null);
+    private static final StoreValue UNKNOWN_STORE_VALUE = new StoreValue(null, null);
+
+    private record StoreAddress(String register, Long segment, Long offset) {
+        Long linear() {
+            return segment == null || offset == null ? null : segment * 16 + offset;
+        }
+
+        boolean canWrite(long address, int width) {
+            if (segment != null) {
+                long start = segment * 16 + (offset == null ? 0 : offset);
+                long end = start + (offset == null ? MAX_SEGMENT_OFFSET : 0) + width;
+                return start <= address && address < end;
+            }
+            if (offset == null) {
+                return 0 <= address && address < MAX_SEGMENT_BASE + MAX_SEGMENT_OFFSET + width;
+            }
+            // An unknown selector changes the linear address in paragraphs. Check each byte of the store.
+            long delta = address - offset;
+            return delta >= 0 && delta < MAX_SEGMENT_BASE + width && (delta & 15) < width;
+        }
+    }
+
+    private record StoreValue(Long constant, StoreAddress source) {}
+    private record StoreHit(Object address, Integer value) {}
+
+    private Map<String, Object> recordWrites(JsonObject request, Options options) throws Exception {
+        var space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+        if (!currentProgram.getLanguageID().getIdAsString().equals("x86:LE:16:Real Mode")) {
+            throw new QueryError("invalid_request", "record-writes requires a 16-bit x86 real-mode project");
+        }
+        var start = resolve(request.get("address").getAsString());
+        int stride = request.get("stride").getAsInt();
+        int count = request.get("count").getAsInt();
+        var memory = currentProgram.getMemory();
+        long[] fields = new long[count];
+        for (int index = 0; index < count; index++) {
+            var field = start.addNoWrap((long) index * stride);
+            if (!memory.contains(field)) {
+                throw new QueryError("address_not_found", "record field outside mapped memory: " + field);
+            }
+            fields[index] = field.getOffset();
+        }
+        var scope = new AddressSet();
+        for (var block : memory.getBlocks()) {
+            if (block.isExecute() && block.isInitialized() && block.getStart().getAddressSpace().equals(space)) {
+                scope.add(span(block));
+            }
+        }
+        if (request.has("code_start")) {
+            var first = resolve(request.get("code_start").getAsString());
+            var last = resolve(request.get("code_end").getAsString());
+            if (first.compareTo(last) > 0) {
+                throw new QueryError("invalid_request", "code_start must precede or equal code_end");
+            }
+            scope = scope.intersect(new AddressSet(first, last));
+        }
+        String filter = request.has("status") ? request.get("status").getAsString() : null;
+        var contexts = currentProgram.getUsrPropertyManager().getStringPropertyMap("RetroreWriteContext");
+        var listing = currentProgram.getListing();
+        var rows = new ArrayList<Map<String, Object>>();
+        var counts = new LinkedHashMap<String, Integer>();
+        counts.put("overlap", 0);
+        counts.put("possible", 0);
+        int instructions = 0, unresolved = 0;
+        for (var instruction : listing.getInstructions(scope, true)) {
+            monitor.checkCancelled();
+            instructions++;
+            var flow = instruction.getFlowType();
+            if (flow.isComputed() && (flow.isCall() || flow.isJump()) && instruction.getFlows().length == 0) {
+                unresolved++;
+            }
+            var pcode = instruction.getPcode();
+            if (Arrays.stream(pcode).noneMatch(op -> op.getOpcode() == PcodeOp.STORE)) {
+                continue;
+            }
+            String json = contexts == null ? null : contexts.getString(instruction.getAddress());
+            var initial = json == null ? new JsonObject() : JsonParser.parseString(json).getAsJsonObject();
+            var values = new HashMap<Varnode, StoreValue>();
+            var pointers = new HashMap<Varnode, StoreAddress>();
+            boolean repeated = repeatedInstruction(instruction);
+            boolean internalBranch = Arrays.stream(pcode).anyMatch(op ->
+                (op.getOpcode() == PcodeOp.BRANCH || op.getOpcode() == PcodeOp.CBRANCH) && op.getInput(0).isConstant());
+            for (var op : pcode) {
+                if (op.getOpcode() == PcodeOp.STORE && op.getInput(0).getOffset() == space.getSpaceID()) {
+                    var destination = pointers.getOrDefault(op.getInput(1), UNKNOWN_STORE_ADDRESS);
+                    // A lifted call can push an IP relative to Ghidra's normalized CS.
+                    var value = flow.isCall() ? UNKNOWN_STORE_VALUE : storeValue(op.getInput(2), initial, values);
+                    if (repeated) {
+                        destination = new StoreAddress(destination.register(), destination.segment(), null);
+                        if (value.source() != null) {
+                            var source = value.source();
+                            value = new StoreValue(null, new StoreAddress(source.register(), source.segment(), null));
+                        }
+                    } else if (internalBranch) {
+                        destination = UNKNOWN_STORE_ADDRESS;
+                        value = UNKNOWN_STORE_VALUE;
+                    }
+                    int width = op.getInput(2).getSize();
+                    var hits = new ArrayList<StoreHit>();
+                    boolean mayOverlap = false;
+                    Long linear = destination.linear();
+                    for (long field : fields) {
+                        if (linear != null && field >= linear && field < linear + width) {
+                            Integer b = value.constant() == null || field - linear >= Long.BYTES ? null :
+                                (int) ((value.constant() >>> (8 * (field - linear))) & 0xff);
+                            hits.add(new StoreHit(addressRecord(linearAddress(field), options.compact()), b));
+                        } else if (destination.canWrite(field, width) ||
+                                (field < REAL_MODE_WRAP && destination.canWrite(field + REAL_MODE_WRAP, width))) {
+                            mayOverlap = true;
+                        }
+                    }
+                    if (hits.isEmpty() && !mayOverlap) {
+                        continue;
+                    }
+                    String status = hits.isEmpty() ? "possible" : "overlap";
+                    counts.merge(status, 1, Integer::sum);
+                    if (filter != null && !filter.equals(status)) {
+                        continue;
+                    }
+                    var row = new LinkedHashMap<String, Object>();
+                    row.put("address", addressRecord(instruction.getAddress(), options.compact()));
+                    row.put("function", routine(getFunctionContaining(instruction.getAddress()), options.compact()));
+                    row.put("instruction", instruction.toString());
+                    row.put("status", status);
+                    row.put("width", width);
+                    row.put("destination", storeAddressRecord(destination));
+                    row.put("value", value.constant() == null ? null : "0x" + Long.toHexString(value.constant()));
+                    row.put("source", value.source() == null ? null : storeAddressRecord(value.source()));
+                    row.put("hits", hits);
+                    row.put("context", json != null);
+                    rows.add(row);
+                } else if (op.getOutput() != null) {
+                    followStoreExpression(op, initial, values, pointers, space.getSpaceID());
+                }
+            }
+        }
+        var pages = new LinkedHashMap<String, Page>();
+        var report = new LinkedHashMap<String, Object>();
+        report.put("address", addressRecord(start, options.compact()));
+        report.put("stride", stride);
+        report.put("count", count);
+        report.put("instructions", instructions);
+        report.put("undefined_bytes", listing.getUndefinedRanges(scope, true, monitor).getNumAddresses());
+        report.put("unresolved_transfers", unresolved);
+        report.put("counts", counts);
+        report.put("writes", select(page("writes", rows, options, pages), options));
+        report.put("pagination", pages);
+        return report;
+    }
+
+    private static Map<String, Object> storeAddressRecord(StoreAddress address) {
+        var result = new LinkedHashMap<String, Object>();
+        result.put("register", address.register());
+        result.put("segment", address.segment());
+        result.put("offset", address.offset());
+        result.put("linear", address.linear());
+        return result;
+    }
+
+    private static boolean repeatedInstruction(Instruction instruction) throws Exception {
+        for (byte raw : instruction.getBytes()) {
+            switch (raw & 0xff) {
+                case 0xf2, 0xf3 -> { return true; }
+                case 0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0 -> { }
+                default -> { return false; }
+            }
+        }
+        return false;
+    }
+
+    private void followStoreExpression(PcodeOp op, JsonObject initial, Map<Varnode, StoreValue> values,
+            Map<Varnode, StoreAddress> pointers, int spaceId) {
+        var output = op.getOutput();
+        var a = storeValue(op.getNumInputs() > 0 ? op.getInput(0) : null, initial, values);
+        var b = storeValue(op.getNumInputs() > 1 ? op.getInput(1) : null, initial, values);
+        StoreValue result = UNKNOWN_STORE_VALUE;
+        StoreAddress pointer = null;
+        switch (op.getOpcode()) {
+            case PcodeOp.CALLOTHER -> {
+                if (op.getNumInputs() == 3 && currentProgram.getLanguage()
+                        .getUserDefinedOpName((int) op.getInput(0).getOffset()).equals("segment")) {
+                    Register selector = storeRegister(op.getInput(1));
+                    // SLEIGH synthesizes CS from the normalized listing address. Use the flow value.
+                    Long segment = selector != null && selector.getName().equals("CS")
+                        ? initialRegister(selector, initial) : b.constant();
+                    Long offset = op.getInput(2).getSize() == 2
+                        ? storeValue(op.getInput(2), initial, values).constant() : null;
+                    pointer = new StoreAddress(selector == null ? null : selector.getName(), segment, offset);
+                }
+            }
+            case PcodeOp.LOAD -> {
+                if (op.getInput(0).getOffset() == spaceId) {
+                    result = new StoreValue(null, pointers.get(op.getInput(1)));
+                }
+            }
+            case PcodeOp.COPY -> {
+                result = a;
+                pointer = pointers.get(op.getInput(0));
+            }
+            case PcodeOp.INT_ZEXT -> {
+                if (output.getSize() <= Long.BYTES) {
+                    result = new StoreValue(a.constant(), null);
+                }
+            }
+            case PcodeOp.INT_ADD, PcodeOp.INT_SUB, PcodeOp.INT_AND, PcodeOp.INT_OR, PcodeOp.INT_XOR -> {
+                if (output.getSize() <= Long.BYTES && a.constant() != null && b.constant() != null) {
+                    long x = a.constant(), y = b.constant();
+                    long constant = switch (op.getOpcode()) {
+                        case PcodeOp.INT_ADD -> x + y;
+                        case PcodeOp.INT_SUB -> x - y;
+                        case PcodeOp.INT_AND -> x & y;
+                        case PcodeOp.INT_OR -> x | y;
+                        default -> x ^ y;
+                    };
+                    result = new StoreValue(constant & storeMask(output.getSize()), null);
+                }
+            }
+        }
+        if (output.isRegister()) {
+            values.replaceAll((node, value) -> overlapsRegister(node, output) ? UNKNOWN_STORE_VALUE : value);
+        }
+        values.put(output, result);
+        if (pointer == null) {
+            pointers.remove(output);
+        } else {
+            pointers.put(output, pointer);
+        }
+    }
+
+    private StoreValue storeValue(Varnode node, JsonObject initial, Map<Varnode, StoreValue> values) {
+        if (node == null) {
+            return UNKNOWN_STORE_VALUE;
+        }
+        if (node.isConstant()) {
+            return new StoreValue(node.getSize() <= Long.BYTES ? node.getOffset() & storeMask(node.getSize()) : null,
+                null);
+        }
+        var known = values.get(node);
+        if (known != null) {
+            return known;
+        }
+        var register = storeRegister(node);
+        Long value = register == null || values.keySet().stream().anyMatch(written -> overlapsRegister(node, written))
+            ? null : initialRegister(register, initial);
+        return new StoreValue(value, null);
+    }
+
+    private Register storeRegister(Varnode node) {
+        return node.isRegister() ? currentProgram.getRegister(node.getAddress(), node.getSize()) : null;
+    }
+
+    private static Long initialRegister(Register register, JsonObject initial) {
+        for (var parent = register; parent != null; parent = parent.getParentRegister()) {
+            if (initial.has(parent.getName())) {
+                return (initial.get(parent.getName()).getAsLong() >>>
+                    (register.getLeastSignificantBitInBaseRegister() - parent.getLeastSignificantBitInBaseRegister())) &
+                    storeMask(register.getMinimumByteSize());
+            }
+        }
+        return null;
+    }
+
+    private static boolean overlapsRegister(Varnode a, Varnode b) {
+        return a.isRegister() && b.isRegister() && a.getOffset() < b.getOffset() + b.getSize() &&
+            b.getOffset() < a.getOffset() + a.getSize();
+    }
+
+    private static long storeMask(int width) {
+        return width >= Long.BYTES ? -1L : (1L << (width * 8)) - 1;
     }
 
     // ---- indirect: computed calls and jumps, with candidates recorded by RetroreIndirect.java ----

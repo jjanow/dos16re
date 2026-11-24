@@ -62,6 +62,7 @@ public class RetroreSegments extends HeadlessScript {
     private static final String LOSS_MAP = "RetroreSegmentLosses";
     // Per origin: one "REG\treason\tdetail" line for each segment register lost there.
     private static final String LOSS_ORIGIN_MAP = "RetroreSegmentLossOrigins";
+    private static final String WRITE_CONTEXT_MAP = "RetroreWriteContext";
     private SegmentedAddressSpace space;
     private Register cs, ds, es, ss, sp, bp;
     private List<Register> segmentRegisters;
@@ -1329,8 +1330,11 @@ public class RetroreSegments extends HeadlessScript {
         var properties = currentProgram.getUsrPropertyManager();
         properties.removePropertyMap(LOSS_MAP);
         properties.removePropertyMap(LOSS_ORIGIN_MAP);
+        properties.removePropertyMap(WRITE_CONTEXT_MAP);
         var lossMap = properties.createStringPropertyMap(LOSS_MAP);
         var originMap = properties.createStringPropertyMap(LOSS_ORIGIN_MAP);
+        var writeContext = properties.createStringPropertyMap(WRITE_CONTEXT_MAP);
+        var gson = new Gson();
         var origins = new TreeMap<Address, Map<String, Loss>>();
         int direct = 0;
         int based = 0;
@@ -1340,6 +1344,15 @@ public class RetroreSegments extends HeadlessScript {
             monitor.checkCancelled();
             Instruction instruction = getInstructionAt(entry.getKey());
             State state = entry.getValue();
+            if (java.util.Arrays.stream(instruction.getPcode()).anyMatch(op -> op.getOpcode() == PcodeOp.STORE)) {
+                var registers = new TreeMap<String, Integer>();
+                state.registers.forEach((register, value) -> {
+                    if (value < SYMBOL) {
+                        registers.put(register.getName(), value);
+                    }
+                });
+                writeContext.add(entry.getKey(), gson.toJson(registers));
+            }
             var lost = new StringBuilder();
             for (Register segment : segmentRegisters) {
                 Integer value = state.registers.get(segment);

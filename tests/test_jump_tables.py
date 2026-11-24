@@ -486,16 +486,34 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
     requests = [
         {"command": "indirect", "at": address, "compact": True} for address in ("root:42df", "root:13721")
     ]
+    requests.append({
+        "command": "record-writes", "address": "280a:00ab", "stride": 12, "count": 15, "compact": True,
+        "code_start": "root:1241c", "code_end": "root:13721", "limit": 1000,
+    })
     batch = tmp_path / "queries.json"
     batch.write_text(json.dumps(requests), encoding="utf-8")
     assert main(["batch", str(batch), "--project", str(project), "--evidence", "--json"]) == 0
-    callback, dispatch = (row["result"]["sites"][0] for row in json.loads(capsys.readouterr().out)["results"])
+    callback_result, dispatch_result, writes_result = (
+        row["result"] for row in json.loads(capsys.readouterr().out)["results"]
+    )
+    callback, = callback_result["sites"]
+    dispatch, = dispatch_result["sites"]
     assert (callback["status"], callback["segment"], callback["table"]) == (
         "candidate", {"register": "SS", "value": 0x38C0}, "root:2b224",
     )
     candidate, = callback["candidates"]
     assert candidate["target"] == "root:11914" and "relocated" in candidate["evidence"]
     assert dispatch["status"] == "unresolved" and dispatch["reason"] == "no_valid_entries"
+
+    # FST's ordinary output store can reach the record through an external segment and offset.
+    # Record copies read either a CS template or another DS record.
+    writes = {row["address"]: row for row in writes_result["writes"]}
+    assert writes_result["undefined_bytes"] > 0 and writes_result["unresolved_transfers"] > 0
+    fst = writes["root:12e40"]
+    assert fst["status"] == "possible" and fst["width"] == 2 and fst["context"]
+    assert fst["destination"] == {"register": "ES", "segment": None, "offset": None, "linear": None}
+    assert writes["root:1271c"]["source"]["register"] == "CS"
+    assert writes["root:1273c"]["source"]["register"] == "DS"
 
     # Replay the FCOM/FCOMP and FTST successors validated with the software floating-point emulator.
     runtime_base = 0x0824
