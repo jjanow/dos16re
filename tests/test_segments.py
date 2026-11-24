@@ -18,14 +18,14 @@ def require_ghidra():
         pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
 
 
-def _import_program(tmp_path, capsys, exe, *options):
+def _import_program(tmp_path, capsys, exe, *options, expected_units=1):
     export = tmp_path / "export"
     project = tmp_path / "segments"
     assert main(["load", str(exe), "-o", str(export), "--json", *options]) == 0
     program = json.loads(capsys.readouterr().out)
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)
-    assert report["units"] == 1
+    assert report["units"] == expected_units
     program["import"] = report
     return project, program
 
@@ -378,7 +378,7 @@ def test_ghidra_types_phantasie_iii_far_globals(tmp_path, capsys):
     if not directory:
         pytest.skip("set RETRORE_PH3_DIR to run the real-game test")
     exe = next(path for path in Path(directory).iterdir() if path.name.upper() == "MAIN.EXE")
-    project, program = _import_program(tmp_path, capsys, exe)
+    project, program = _import_program(tmp_path, capsys, exe, expected_units=5)
 
     # The save-game code reads and writes a word through the relocated FAR segment.
     # 1000:125d, called from main, keeps DGROUP now that a misread jump table no longer joins

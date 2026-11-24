@@ -326,7 +326,8 @@ def test_phantasie_iii_roster_records(tmp_path, capsys):
     layout = report["layout"]
     assert (layout["kind"], layout["element_size"], layout["count"]) == ("record_array", 262, 20)
     assert layout["count_source"].endswith(" INT_SLESS 20 after the increment at root:a90b")
-    assert report["strides"][0]["evidence"][0] == "root:1f8c INT_MULT by 0x106"
+    stride = report["strides"][0]
+    assert stride["stride"] == 262 and "link_0002:3a1a INT_MULT by 0x106" in stride["evidence"]
     fields = {field["offset"]: field for field in layout["fields"]}
-    assert fields[0x7E]["widths"] == [2] and fields[0x7E]["writes"] == 2  # the roster slot
-    assert fields[0]["bulk"] == 8 and not report["conflicts"]  # record copies and clears, not a field
+    assert fields[0x7E]["widths"] == [2] and fields[0x7E]["writes"] == 3  # the roster slot
+    assert fields[0]["bulk"] == 12 and not report["conflicts"]  # record copies and clears

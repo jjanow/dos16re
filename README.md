@@ -1544,7 +1544,10 @@ from measured sites, and proposed additions. Review the JSON preview before reru
 When an instruction record includes `bytes`, the preview checks those runtime bytes against the
 static instruction before proposing additions.
 `--runtime-load UNIT=HEX|unmapped` sets explicit initial placement and `--program NAME` selects
-an existing program in the project.
+an existing program in the project. For a DOS MZ capture, `--runtime-base HEX` sets the segment
+where DOS loaded the root. Applied computed edges are visible in `indirect` and `xrefs`.
+Each edge records a successor observed in the capture. Checking the index range requires
+inputs that exercise the dispatch.
 
 ```sh
 .venv/bin/retrore trace capture.json --export out/program --project out/project --json

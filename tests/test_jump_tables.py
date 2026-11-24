@@ -444,32 +444,35 @@ def phantasie_iii_export(tmp_path, capsys):
     return tmp_path, json.loads(capsys.readouterr().out)
 
 
-def test_phantasie_iii_switches_in_every_code_segment(phantasie_iii_export, capsys):
+def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
     tmp_path, program = phantasie_iii_export
-    tables = {(table["address"]["segment"], table["address"]["offset"]): table for table in program["jump_tables"]}
-    # Microsoft C switches branch over the default jump (cmp ax,0x12; jbe; jmp default) in several segments,
-    # and the sound driver at segment 0x218f dispatches through masked jump and call tables.
+    tables = {(table["address"]["segment"], table["address"]["offset"]): table
+              for table in program["jump_tables"] if table["unit"] == "root"}
+    # Microsoft C switches branch over the default jump (cmp ax,0x12; jbe; jmp default).
+    # The floating-point emulator at segment 0x218f dispatches through masked jump and call tables.
     assert len(tables) == 22
     switch = tables[0x1284, 0x0BA9]
     assert (switch["bound"], len(switch["targets"]), switch["default"]["offset"]) == ("compare", 19, 0x0C3E)
-    driver = tables[0x218F, 0x0BCC]
-    assert (driver["kind"], driver["bound"], driver["table"]["offset"]) == ("call", "mask", 0x077E)
-    assert [target["offset"] for target in driver["targets"]][:4] == [0x0CB6, 0x0D97, 0x0CC1, 0x0CCC]
+    emulator = tables[0x218F, 0x0BCC]
+    assert (emulator["kind"], emulator["bound"], emulator["table"]["offset"]) == ("call", "mask", 0x077E)
+    assert [target["offset"] for target in emulator["targets"]][:4] == [0x0CB6, 0x0D97, 0x0CC1, 0x0CCC]
 
     if not os.environ.get("GHIDRA_HOME"):
         return
     project = tmp_path / "ph3"
-    assert main(["ghidra", "import", str(tmp_path / "export"), str(project), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["seeded_gaps"] == 2
-    # root:532c was an undefined gap reached only through a relocated far pointer in DGROUP; its frame prologue
-    # and clean decode made it a function.
+    export = tmp_path / "export"
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["units"] == 5
+    # With the LINK overlays loaded, Ghidra reaches this function through a direct call.
     assert main(["xrefs", "root:532c", "--project", str(project), "--json"]) == 0
     refs = json.loads(capsys.readouterr().out)
-    assert [(ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]] == [("root:a9c0", "DATA")]
+    assert ("root:a9bf", "UNCONDITIONAL_CALL") in [
+        (ref["from"]["unit_address"], ref["type"]) for ref in refs["incoming"]
+    ]
     assert main(["gaps", "--project", str(project), "--classify", "--unit", "root", "--json", "--limit", "1000"]) == 0
     gaps = {gap["start"]: gap for gap in json.loads(capsys.readouterr().out)["ranges"]}
-    assert (gaps["root:2bcd"]["class"], gaps["root:2bcd"]["entry"]) == ("code", "root:2bcd")
-    assert {"prologue", "valid_subroutine"} <= set(gaps["root:2bcd"]["counts"])
+    assert (gaps["root:3a33"]["class"], gaps["root:3a33"]["entry"]) == ("code", "root:3a33")
+    assert {"prologue", "valid_subroutine"} <= set(gaps["root:3a33"]["counts"])
     assert main(["func", "218f:0ccc", "--project", str(project), "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["function"]["entry"]["unit_address"] == "root:125bc"
@@ -490,6 +493,23 @@ def test_phantasie_iii_switches_in_every_code_segment(phantasie_iii_export, caps
     candidate, = callback["candidates"]
     assert candidate["target"] == "root:11914" and "relocated" in candidate["evidence"]
     assert dispatch["status"] == "unresolved" and dispatch["reason"] == "no_valid_entries"
+
+    # Replay the four FTST successors validated with the software floating-point emulator.
+    runtime_base = 0x0824
+    target_offsets = (0x136BC, 0x13699, 0x136AE, 0x136B5)
+    trace = tmp_path / "ftst.json"
+    trace.write_text(json.dumps({"version": 1, "events": [
+        {"kind": "edge", "from": runtime_base * 16 + 0x13721, "to": runtime_base * 16 + offset, "flow": "jump"}
+        for offset in target_offsets
+    ]}), encoding="utf-8")
+    assert main(["trace", str(trace), "--export", str(export), "--runtime-base", f"{runtime_base:x}",
+                 "--project", str(project), "--apply", "--json"]) == 0, capsys.readouterr().err
+    applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
+    targets = {f"root:{offset:x}" for offset in target_offsets}
+    assert {row["to"]["unit_address"] for row in applied if row["kind"] == "flow"} == targets
+    assert main(["indirect", "--at", "root:13721", "--project", str(project), "--compact", "--json"]) == 0
+    recovered, = json.loads(capsys.readouterr().out)["sites"]
+    assert recovered["status"] == "resolved" and set(recovered["targets"]) == targets
 
 
 def test_phantasie_iv_x68k_switches(tmp_path, capsys):

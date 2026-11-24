@@ -14,16 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, profiled and fixed DOS calling-convention recovery for negative frame
-displacements and oversized inferred signatures. Ghidra 12.2 imported NetHack 3.0j with all
-63 static LINK members and their runtime views in 52 seconds. Decompilation worked in two
-of the imported overlays. The standalone suite passed 513 tests with 127 skipped. The DOS
-and runtime suites passed all 60 tests with Ghidra 12.2 and the opt-in inputs.
+On 2026-11-24, traced Phantasie III's software floating-point test at `root:13721`. Ten
+controlled inputs exercised indexes 0 through 3. Ghidra 12.2 applied 16 instruction starts and
+four computed jumps to the import with all four LINK overlays, and `indirect` reported the
+four successors. The standalone suite passed 513 tests with 127 skipped. All three opt-in
+Phantasie III checks passed with Ghidra 12.2 and the full overlay layout.
 
-Resume Phase 9 with Phantasie III's unresolved dispatch at `root:13721`. Use a trace to
-check the live index range. Static LINK validation still needs a shipped executable that
-omits the directory counts or places a member's first listed segment after the window start.
-Use captured placements for Microsoft MOVE runtime views as more formats are verified.
+Resume Phase 9 with the adjacent two-operand comparison dispatch at `root:1366d`. Check
+whether the runtime's operand classification can also supply static bounds for the two
+tables. Static LINK validation still needs a shipped executable that omits the directory
+counts or places a member's first listed segment after the window start. Use captured
+placements for Microsoft MOVE runtime views as more formats are verified.
 
 ## Why
 
@@ -184,7 +185,7 @@ across separated overlay units.
 |---|---|---|
 | Pool of Radiance (DOS v1.3) | TP6, EXEPACK, `FBOV` overlays | Unit table, stub resolution, addresses listed in the Gold Box RE docs |
 | Phantasie I (DOS) | LZEXE 0.90 MZ + program-loaded `OV1.OVR`/`OV2.OVR` | Distinct overlay segments, jump-table recovery (Mystic SCORE) |
-| Phantasie III (DOS) | MZ, far data segment `0x1820` | Segment tracking, far globals |
+| Phantasie III (DOS) | EXEPACK MZ, four LINK overlays, far data segment `0x1820` | Segment tracking, far globals, traced floating-point dispatch |
 | Phantasie I (Amiga) | AmigaDOS Hunk, 240 resident hunks | Cross-hunk relocation and palette routine callers |
 | Phantasie III (Amiga) | AmigaDOS Hunk, CODE/DATA/BSS | Flat memory layout, main-loop decompilation and global reference |
 | Phantasie II (Atari ST v1.0) | GEMDOS PRG, resident TEXT/DATA/BSS | Longword fixups, DRI symbols, startup decompilation and references |
@@ -309,9 +310,11 @@ release. Continue with the analysis backlog below.
   and jumps, with evidence and the writer's address (`indirect` query). `gaps --classify` scores gaps as
   code, data, or padding with evidence. A gap whose entry a relocated pointer names, that has a prologue,
   and that decodes cleanly is seeded as a function. Ghidra already treats tail jumps to function entries as calls.
-  **Validated:** Phantasie III recovers 22 tables (was 0), including the sound driver's call table
-  at `218f:0bcc`, and has 448 functions (was 380). `root:532c`, reached only through a relocated far
-  pointer, is now a function. Phantasie I has 17 tables (was 15), and Mystic SCORE still decompiles.
+  **Validated:** Phantasie III recovers 22 root tables (was 0), including the call table at
+  `218f:0bcc`. The root-only import recovered 448 functions (was 380) and seeded `root:532c` from
+  a relocated far pointer. With all four LINK overlays loaded, Ghidra finds 528 functions and
+  reaches `root:532c` through a direct call. Phantasie I has 17 tables (was 15), and Mystic SCORE
+  still decompiles.
   P4.X resolves all 41 computed jumps (was 32). In Pool of Radiance, `tpov_0096:0d70 CALLF [0x6b84]` gets
   candidates `root:0994` and `root:06e6`, written at `tpov_0035:006f` and `:008b`.
   Far CS jump and call tables use relocated selector words for destination evidence. Amiga
@@ -321,8 +324,14 @@ release. Continue with the analysis backlog below.
   indexed memory operands without a displacement. `indirect` reports `segment_loss` with the origin
   and reason when the operand's segment is genuinely unknown. In Phantasie III, `root:42df` reads
   `SS:[2624]` and finds the relocation-backed candidate `root:11914`.
-  Open: genuinely unknown segment values and Phantasie III's dispatch at `root:13721`. Its
-  zero-extended index allows 256 values, and the available bytes do not corroborate a table of that size.
+  Phantasie III's `FTST` at `root:13721` dispatches through the table at `root:120fe`. A DOSBox-X
+  startup snapshot with the hardware FPU disabled supplied the initialized MSEM87 state for
+  Unicorn probes. Finite nonzero values, including subnormals, reached index 0 and `root:136bc`. Signed
+  zero reached index 1 and `root:13699`. Quiet and signaling NaNs reached index 2 and
+  `root:136ae`. Signed infinities reached index 3 and `root:136b5`. The loader's local index
+  analysis allows 256 values. The structured trace supplied the four observed successors
+  to `trace --apply`, and replay reported no remaining gaps in the capture.
+  Open work includes proving these bounds statically and recovering genuinely unknown segment values.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry
