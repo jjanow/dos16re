@@ -14,17 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, checked both outputs of Phantasie III's installed conversion callback and
-exercised the detached parser store and comparison entries with supplied operands. The root
-and four LINK members yielded no decoded caller for those paths. Exception probes checked
-class bytes in the operand temporary and at both stack limits. The 11 full-record templates
-each carry a class in 0–3. The game's registered handler exited to DOS in all three exception
-probes. Five checks passed against the original release with Ghidra 12.2. The standalone suite
-passed 517 tests with 133 skipped.
+On 2026-11-24, traced Phantasie III's computed startup call from `root:4405` to the
+floating-point callback installer at `root:6017` and replayed the edge in Ghidra. A Unicorn
+run of the unpacked game through Pendragon's character roll reached all four LINK member 2
+floating-point stores. The observed destinations were outside the record allocation, and the
+three detached entries had zero hits. Five checks passed against the original release with
+Ghidra 12.2. The standalone suite passed 517 tests with 133 skipped.
 
-Resume Phase 9 by tracing computed transfers to the detached entries and resolving whether any
-caller-supplied store destination can overlap the records. An automatic dispatch bound still
-needs proof that all reachable stores and record sources preserve class bytes.
+Resume Phase 9 by checking the remaining computed flow in the root and other LINK members for
+callers of the conversion, alternate parser, and comparison entries. The conversion callback's
+far output pointer still needs caller provenance. An automatic dispatch bound requires coverage
+of reachable stores and record sources.
 Microsoft LINK still needs a shipped executable with missing directory counts or a member whose first
 listed segment starts after the overlay window start. Expand Microsoft MOVE runtime views as more
 captured placements become available.
@@ -337,15 +337,23 @@ Continue with the analysis backlog below.
   status word stores, the integer conversion's `SS:[BP-0xc]`, and all four single-precision
   store sites in LINK member 2, each at `SS:[BP-8]`. The member runs in its original overlay
   window and the probes check physical write intervals against the full record allocation.
-  `root:6017` installs `root:6a12` at DGROUP:`1dd6`. That entry decodes its output
-  pointer through two `LES` instructions before the store at `root:6a5b`. The alternative
-  path copies eight bytes to the pointer at `root:6a38`. Both probes supply the output pointer
-  and check the converted value. Ghidra's root and four LINK members have no incoming references
-  to the callback slot or entry, the alternate parser entry at `root:6383`, or the comparison
-  entry at `root:68a4`. The integer-parser call at `root:60e4` reaches `root:6349`.
-  Direct entry probes for `root:6383` and `root:68a4` verify the double output through `DI`
-  and the comparison status in `SS:[BP-2]`. A runtime trace is still needed to establish
-  reachability of the detached paths through computed transfers.
+  The startup initializer loop at `root:4405` calls `root:6017` through the relocated far
+  pointer at DGROUP:`2630`. The installer copies a five-entry table into DGROUP, placing
+  `root:6a12` in DGROUP:`1dd6` from the relocated template at `root:2b0d4`. The callback
+  decodes the caller's output pointer through two `LES` instructions before the store at
+  `root:6a5b`. Its other path copies eight bytes to that pointer at `root:6a38`.
+  Direct entry probes supply the output pointer and check both converted values. Ghidra's
+  root and four LINK members have no incoming references to the callback slot or entry, the
+  alternate parser entry at `root:6383`, or the comparison entry at `root:68a4`. A search of
+  the five file-backed units found no stored near or far pointer to either of the latter
+  entries. The call at `root:60e4` reaches the integer parser at `root:6349`. Direct probes of
+  the alternate entries verify the double through `DS:[DI]` and status through `SS:[BP-2]`.
+  A Unicorn run with DOS and BIOS shims booted the game with `NO87=` and rolled characters
+  of all five selectable races in Pendragon. The computed menu call at `root:721d` reached
+  the Guild handler at `root:ac21`. The game loaded LINK member 2 and reached
+  `link_0002:22a7`, `:269b`, `:26c7`, and `:2708`. All four stored at DGROUP:`764c`,
+  and the control word and integer stores used DGROUP:`761e` and `7614`. The detached entries
+  had zero hits in those runs. Caller provenance and reachability for them remain open.
 - **Validated arithmetic dispatch slots.** `root:12524` and `root:1253f` use the same
   eight-word table at `root:1205e`. The `0x0e` mask and optional XOR with 2 keep BX
   on those slots. At `root:126cf`, arithmetic uses three 16-word tables at `root:12106`,

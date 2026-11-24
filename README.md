@@ -1033,11 +1033,12 @@ possible overlaps from the listing. Reimport to use tracked register values.
 With `RETRORE_PH3_DIR` set, the Phantasie III validation runs the shipped software floating-point
 handlers and checks writes from parser, formatter, conversion, and LINK overlay code against the
 record stack. It checks the class bytes used by six arithmetic operations across all 16 input class
-pairs, plus temporary records and selected exception paths. Both conversion callback outputs use
-a caller-supplied far pointer, so proof for those stores depends on the caller.
+pairs, plus temporary records and selected exception paths. The startup probe follows the computed
+initializer call and replays it in Ghidra. The installed conversion callback uses a caller-supplied
+far pointer for either output. Its callers remain unresolved.
 
 ```sh
-.venv/bin/python -m pytest -q tests/test_jump_tables.py -k 'phantasie_iii and (float or arithmetic_and_stack)'
+.venv/bin/python -m pytest -q tests/test_jump_tables.py -k phantasie_iii
 ```
 
 ### Limit Ghidra address query results

@@ -447,8 +447,9 @@ def phantasie_iii_export(tmp_path, capsys):
     return tmp_path, json.loads(capsys.readouterr().out)
 
 
-def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
+def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_startup, capsys):
     tmp_path, program = phantasie_iii_export
+    export = tmp_path / "export"
     tables = {(table["address"]["segment"], table["address"]["offset"]): table
               for table in program["jump_tables"] if table["unit"] == "root"}
     # Microsoft C switches branch over the default jump (cmp ax,0x12; jbe; jmp default).
@@ -460,10 +461,22 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
     assert (emulator["kind"], emulator["bound"], emulator["table"]["offset"]) == ("call", "mask", 0x077E)
     assert [target["offset"] for target in emulator["targets"]][:4] == [0x0CB6, 0x0D97, 0x0CC1, 0x0CCC]
 
+    # Check initialized far-pointer sources across the root and all four LINK members.
+    for target, sources in (
+        ("root:6017", ["root:2b230"]), ("root:6a12", ["root:2b0d4"]),
+        ("root:6383", []), ("root:68a4", []),
+    ):
+        assert main(["where-is", "--export", str(export), "--pointer", target, "--pointer-kind", "far", "--json"]) == 0
+        matches = json.loads(capsys.readouterr().out)["matches"]
+        assert [match["unit_address"] for match in matches] == sources
+        assert all(match["relocated"] for match in matches)
+    for target in ("13b2:2863", "13b2:2d84"):  # Runtime CS:IP for root:6383 and root:68a4.
+        assert main(["where-is", "--export", str(export), "--pointer", target, "--pointer-kind", "near", "--json"]) == 0
+        assert json.loads(capsys.readouterr().out)["matches"] == []
+
     if not os.environ.get("GHIDRA_HOME"):
         return
     project = tmp_path / "ph3"
-    export = tmp_path / "export"
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["units"] == 5
     # With the LINK overlays loaded, Ghidra reaches this function through a direct call.
@@ -522,29 +535,99 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
     assert writes["root:1271c"]["source"]["register"] == "CS"
     assert writes["root:1273c"]["source"]["register"] == "DS"
 
-    # Replay the FCOM/FCOMP and FTST successors validated with the software floating-point emulator.
+    # Replay the observed initializer call and the validated FCOM/FCOMP and FTST successors.
     runtime_base = 0x0824
+    (initializer_call, installer), _ = phantasie_iii_float_startup
+    image_delta = (program["units"][0]["segment"] - runtime_base) * 16
     dispatch_targets = {
         0x1366D: (0x13672, 0x13699, 0x136AE, 0x136B5, 0x136BC, 0x136C2, 0x136C9, 0x136D0),
         0x13721: (0x136BC, 0x13699, 0x136AE, 0x136B5),
     }
     trace = tmp_path / "float_dispatch.json"
-    trace.write_text(json.dumps({"version": 1, "events": [
+    events = [
+        {"kind": "edge", "from": initializer_call.linear - image_delta,
+         "to": installer.linear - image_delta, "flow": "call"},
+    ] + [
         {"kind": "edge", "from": runtime_base * 16 + site, "to": runtime_base * 16 + target, "flow": "jump"}
         for site, targets in dispatch_targets.items() for target in targets
-    ]}), encoding="utf-8")
+    ]
+    trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
     assert main(["trace", str(trace), "--export", str(export), "--runtime-base", f"{runtime_base:x}",
                  "--project", str(project), "--apply", "--json"]) == 0, capsys.readouterr().err
     applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
     assert any(row["address"]["unit_address"] == "root:1366d" for row in applied if row["kind"] == "instruction")
     assert {(row["from"]["unit_address"], row["to"]["unit_address"]) for row in applied if row["kind"] == "flow"} == {
         (f"root:{site:x}", f"root:{target:x}") for site, targets in dispatch_targets.items() for target in targets
-    }
-    for site, targets in dispatch_targets.items():
+    } | {("root:4405", "root:6017")}
+    for site, targets in {0x4405: (0x6017,), **dispatch_targets}.items():
         assert main(["indirect", "--at", f"root:{site:x}", "--project", str(project), "--compact", "--json"]) == 0
         recovered, = json.loads(capsys.readouterr().out)["sites"]
         assert recovered["status"] == "resolved"
         assert set(recovered["targets"]) == {f"root:{target:x}" for target in targets}
+
+
+def _dos_vector(cpu, _number):
+    ax = cpu.reg_read(x86.UC_X86_REG_AX)
+    vector = 4 * (ax & 0xff)
+    if ax >> 8 == 0x35:
+        offset, segment = unpack_from("<HH", cpu.mem_read(vector, 4))
+        cpu.reg_write(x86.UC_X86_REG_BX, offset)
+        cpu.reg_write(x86.UC_X86_REG_ES, segment)
+    else:
+        assert ax >> 8 == 0x25
+        cpu.mem_write(vector, pack("<HH", cpu.reg_read(x86.UC_X86_REG_DX), cpu.reg_read(x86.UC_X86_REG_DS)))
+
+
+@pytest.fixture
+def phantasie_iii_float_startup(phantasie_iii_export):
+    tmp_path, program = phantasie_iii_export
+    emulator = Emulator.from_export(tmp_path / "export")
+    base = program["units"][0]["segment"]
+    psp, environment = base - 0x10, base - 0x11
+    dgroup = base + 0x28c0
+    code = base + 0x3b2
+
+    def root(offset):
+        return Address(code, offset - 0x3b20)
+
+    def dos(cpu, number):
+        ax = cpu.reg_read(x86.UC_X86_REG_AX)
+        service = ax >> 8
+        if service == 0x30:
+            cpu.reg_write(x86.UC_X86_REG_AX, 6)  # DOS 6.0
+        elif service in (0x25, 0x35):
+            _dos_vector(cpu, number)
+        else:
+            assert ax == 0x4400  # IOCTL device information for the standard handles.
+            cpu.reg_write(x86.UC_X86_REG_DX, 0x80)
+        cpu.reg_write(x86.UC_X86_REG_EFLAGS, cpu.reg_read(x86.UC_X86_REG_EFLAGS) & ~1)
+
+    site, installer = root(0x4405), root(0x6017)
+    edges = []
+
+    def observe_installer(cpu):
+        ss, sp = (cpu.reg_read(register) for register in (x86.UC_X86_REG_SS, x86.UC_X86_REG_SP))
+        ip, cs = unpack_from("<HH", cpu.mem_read(Address(ss, sp).linear, 4))
+        assert Address(cs, ip) == root(0x4407)  # Return to the initializer loop.
+        assert cpu.mem_read(site.linear, 2) == bytes.fromhex("ff1d")  # CALL FAR [DI]
+        ds, di = (cpu.reg_read(register) for register in (x86.UC_X86_REG_DS, x86.UC_X86_REG_DI))
+        assert (ds, di) == (dgroup, 0x2630)
+        offset, segment = unpack_from("<HH", cpu.mem_read(Address(ds, di).linear, 4))
+        assert Address(segment, offset) == installer
+        edges.append((site, installer))
+
+    # Enter the shipped C initialization subroutine with the PSP and software-FPU setting.
+    callback = Address(dgroup, 0x1dd6)
+    installed = emulator.call(
+        root(0x42a8), far=True, regs={"ds": dgroup, "ss": dgroup, "sp": 0x7600},
+        writes=[(Address(dgroup, 0x1d5f), pack("<H", psp)), (Address(psp, 0x2c), pack("<H", environment)),
+                (Address(environment, 0), b"NO87=\0\0")],
+        reads=[(callback, 4)], interrupts={0x21: dos}, hooks={installer: observe_installer},
+    )
+    edge, = edges
+    offset, segment = unpack_from("<HH", dict(installed.memory)[callback])
+    assert Address(segment, offset) == root(0x6a12)
+    return edge, installed.memory
 
 
 @pytest.fixture
@@ -560,23 +643,12 @@ def phantasie_iii_float_runtime(phantasie_iii_export):
     def runtime_address(offset):
         return Address(code_segment, offset - code_base)
 
-    def dos_vectors(cpu, _number):
-        ax = cpu.reg_read(x86.UC_X86_REG_AX)
-        vector = (ax & 0xff) * 4
-        if ax >> 8 == 0x35:
-            offset, segment = unpack_from("<HH", cpu.mem_read(vector, 4))
-            cpu.reg_write(x86.UC_X86_REG_BX, offset)
-            cpu.reg_write(x86.UC_X86_REG_ES, segment)
-        else:
-            assert ax >> 8 == 0x25
-            cpu.mem_write(vector, pack("<HH", cpu.reg_read(x86.UC_X86_REG_DX), cpu.reg_read(x86.UC_X86_REG_DS)))
-
     vectors = range(0x34, 0x3e)
     ivt = Address(0, 4 * vectors.start)
     installed = emulator.call(
         runtime_address(0x11a32), regs={"ds": data_segment},
         writes=[(Address(data_segment, 4), b"\0")],  # Select the software path.
-        reads=[(ivt, 4 * len(vectors))], interrupts={0x21: dos_vectors},
+        reads=[(ivt, 4 * len(vectors))], interrupts={0x21: _dos_vector},
     )
     assert installed.memory[0][1] == b"".join(
         pack("<HH", runtime_address(entry).offset, code_segment)
@@ -903,7 +975,9 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
         }
 
 
-def test_phantasie_iii_shipped_float_store_destinations(phantasie_iii_export, phantasie_iii_float_runtime):
+def test_phantasie_iii_shipped_float_store_destinations(
+    phantasie_iii_export, phantasie_iii_float_runtime, phantasie_iii_float_startup,
+):
     tmp_path, program = phantasie_iii_export
     emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
     bottom, _, limit = unpack_from("<HHH", dict(setup)[Address(data_segment, 0x0e)])
@@ -1021,9 +1095,8 @@ def test_phantasie_iii_shipped_float_store_destinations(phantasie_iii_export, ph
     # This callback uses two LES loads to find the caller's output slot.
     # Recover its entry from the table populated by the shipped installer.
     callback = Address(dgroup, 0x1dd6)
-    installed = check(root(0x6017), {}, reads=[(callback, 4)])
-    offset, segment = unpack_from("<HH", installed[callback])
-    assert Address(segment, offset) == root(0x6a12)
+    _, installed = phantasie_iii_float_startup
+    offset, segment = unpack_from("<HH", dict(installed)[callback])
     slot, output = Address(dgroup, 0x7010), Address(dgroup, 0x7020)
     for double_output in (False, True):
         expected = pack("<d" if double_output else "<f", 1.25)
@@ -1033,7 +1106,7 @@ def test_phantasie_iii_shipped_float_store_destinations(phantasie_iii_export, ph
         converted = check(
             Address(segment, offset), stores,
             arguments=pack("<5H", double_output, slot.offset, slot.segment, text.offset, text.segment),
-            writes=[*installed.items(), (text, ascii_number), (slot, pack("<HH", output.offset, output.segment))],
+            writes=[*installed, (text, ascii_number), (slot, pack("<HH", output.offset, output.segment))],
             reads=[(output, len(expected))],
         )
         assert converted[output] == expected
