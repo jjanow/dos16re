@@ -33,7 +33,7 @@ def _link_program(directory=True):
     return _align(_mz(root, relocations=offsets)) + _align(first) + second
 
 
-def _split_link_directory(*, counted=False, duplicate=False, outside_window=False):
+def _split_link_directory(*, counted=False, duplicate=False, outside_window=False, packed=False):
     root = bytearray(0xC0)
     root[0] = 0xC3
     offsets = []
@@ -42,12 +42,21 @@ def _split_link_directory(*, counted=False, duplicate=False, outside_window=Fals
             pack_into("<2H", root, start - 4, 5, 8)
         pack_into("<5H5B", root, start, 0, 4, 2, 3, 5, 0, 7, 1, 1, 7)
         offsets.extend((position, 0) for position in range(start, start + 10, 2))
-    resident = _align(_mz(root, relocations=offsets))
+    if packed:
+        # One EXEPACK literal run, with the resident selector relocations in the decoder.
+        message = b"Packed file is corrupt"
+        relocations = pack("<H", len(offsets)) + b"".join(pack("<H", site) for site, _ in offsets) + bytes(30)
+        decoder = pack("<7H2s", 0, 0, 0, 16 + len(message) + len(relocations), 0x100, 0,
+                       len(root) // 16, b"RB")
+        compressed = (root + pack("<HB", len(root), 0xB3)).ljust(len(root) + 16, b"\xff")
+        resident = _mz(compressed + decoder + message + relocations, cs=len(compressed) // 16, ip=16)
+    else:
+        resident = _mz(root, relocations=offsets)
     first_code = bytes.fromhex("b80300cb").ljust(16, b"\0") + b"\xcb"
     first = _mz(first_code, relocations=[(1, 2)], member=1)
     second_code = bytes(0x20) + bytes.fromhex("b80400cb").ljust(16, b"\0") + bytes.fromhex("b80100cb")
     second = _mz(second_code, relocations=[(1, 6 if outside_window else 4), (1, 5)], member=7)
-    return resident + _align(first) + second
+    return _align(resident) + _align(first) + second
 
 
 @pytest.mark.parametrize("counted", [False, True])
@@ -140,10 +149,10 @@ def test_link_native_states_relocate_and_keep_member_bytes(tmp_path, capsys):
         load_dos_mz(_link_program()[:-1], 0x1000, "bad.exe")
 
 
-@pytest.mark.parametrize("counted", [True, False])
-def test_link_directory_keeps_member_padding_in_shared_runtime_window(counted, tmp_path, capsys):
+@pytest.mark.parametrize(("counted", "packed"), [(True, False), (False, False), (False, True)])
+def test_link_directory_keeps_member_padding_in_shared_runtime_window(counted, packed, tmp_path, capsys):
     source, out = tmp_path / "link.exe", tmp_path / "out"
-    source.write_bytes(_split_link_directory(counted=counted))
+    source.write_bytes(_split_link_directory(counted=counted, packed=packed))
     report = _command(capsys, "load", source, "-o", out)
     _, first, second = report["units"]
     assert "diagnostics" not in report
@@ -158,7 +167,7 @@ def test_link_directory_keeps_member_padding_in_shared_runtime_window(counted, t
     mapping = _command(capsys, "address-map", "10040", "--from", "runtime", "--state", "link_0007", "--export", out)
     match, = mapping["matches"]
     assert match["unit"] == "link_0007" and match["file"]["offset"] == second["file_offset"] + 0x20
-    if os.environ.get("GHIDRA_HOME") and not counted:
+    if os.environ.get("GHIDRA_HOME") and not counted and not packed:
         imported = _command(capsys, "ghidra", "import", out, tmp_path / "project", "--load-views")
         blocks = imported["load_views"]["link_0007"]["blocks"]
         block, = (block for block in blocks if block["unit"] == "link_0007")
@@ -430,6 +439,29 @@ def test_original_link_member_with_leading_padding(clear_counts, tmp_path, capsy
     match, = mapping["matches"]
     assert match["unit"] == "link_0002"
     assert match["file"]["offset"] == 0x1D00
+
+
+def test_shipped_exepacked_link_overlays_when_available(tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_CIV_DOS_DIR")):
+        pytest.skip("set RETRORE_CIV_DOS_DIR to Civilization for DOS 474.03")
+    source = Path(directory) / "CIV.EXE"
+    out = tmp_path / "civ"
+    program = _command(capsys, "load", source, "-o", out)
+    assert program["packer"] == "EXEPACK"
+    assert "diagnostics" not in program
+    overlays = program["units"][1:]
+    assert [member["overlay_number"] for member in overlays] == list(range(1, 24))
+    assert {member["runtime_linear"] for member in overlays} == {0x32F30}
+    assert sum(member["relocation_count"] for member in overlays) == 2915
+    assert (overlays[0]["file_offset"], overlays[-1]["file_offset"]) == (0x2B200, 0x49800)
+
+    mapping = _command(capsys, "address-map", "32f30", "--from", "runtime",
+                       "--state", "link_0001", "--export", out)
+    match, = mapping["matches"]
+    assert (match["unit"], match["file"]["offset"]) == ("link_0001", 0x2B200)
+    proof = _command(capsys, "bytes", "link_0001:1a", "--export", out, "--size", 2)
+    assert bytes.fromhex(proof["original"]) == source.read_bytes()[0x2B21A:0x2B21C]
+    assert int.from_bytes(bytes.fromhex(proof["loaded"]), "little") == 0x2FC3
 
 
 @pytest.mark.parametrize(("filename", "count_offset", "selector_count", "window"), [

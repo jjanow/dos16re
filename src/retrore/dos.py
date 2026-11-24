@@ -49,7 +49,7 @@ def load_dos_mz(data: bytes, base_segment: int, source: str) -> tuple[LoadedMZ, 
         raise MZError(f"MZ member is overlay {header.overlay_number}; pass the complete executable")
     executable = MZExecutable.parse(data)
     loaded = executable.load(base_segment)
-    overlays, diagnostics = embedded_overlays(data, executable, source, base_segment)
+    overlays, diagnostics = embedded_overlays(data, executable, loaded, source)
     toolchain = None
     # Borland's header generation is independent of the TLINK banner version.
     if (0x22 <= header.relocation_offset <= header.header_size

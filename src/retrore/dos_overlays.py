@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from struct import Struct
 
-from .mz import Address, MZError, MZExecutable, read_mz_header, read_mz_relocations
+from .mz import Address, LoadedMZ, MZError, MZExecutable, read_mz_header, read_mz_relocations
 from .overlays import Descriptor, LinkedFixup, LinkedOverlay
 
 _WORD = Struct("<H")
@@ -37,8 +37,8 @@ def _link_offsets(data: bytes, cursor: int) -> list[int]:
             and not any(data[cursor:offset])]
 
 
-def embedded_overlays(data: bytes, executable: MZExecutable, source: str,
-                      base: int) -> tuple[list[LinkedOverlay], list[dict]]:
+def embedded_overlays(data: bytes, executable: MZExecutable, loaded: LoadedMZ,
+                      source: str) -> tuple[list[LinkedOverlay], list[dict]]:
     start = executable.header.file_size
     link = _link_offsets(data, start)
     borland = [offset for offset in sorted({start, _align(start, 16), _align(start, 512)})
@@ -48,7 +48,7 @@ def embedded_overlays(data: bytes, executable: MZExecutable, source: str,
         raise MZError("ambiguous appended DOS overlay header positions")
     overlays, diagnostics, end = [], [], start
     if link:
-        overlays, diagnostics, end = _read_link(data, link[0], executable, source, base)
+        overlays, diagnostics, end = _read_link(data, link[0], loaded, source)
     elif borland:
         overlays, diagnostics, end = _read_vroomm(data, borland[0], executable, source)
     if any(data[end:]):
@@ -58,14 +58,17 @@ def embedded_overlays(data: bytes, executable: MZExecutable, source: str,
     return overlays, diagnostics
 
 
-def _link_directory_at(image: bytes, selectors: range, members: dict[int, _LinkMember]) -> _LinkDirectory | None:
+def _link_directory_at(loaded: LoadedMZ, selectors: range,
+                       members: dict[int, _LinkMember]) -> _LinkDirectory | None:
+    image = loaded.image
     numbers = image[selectors.stop:selectors.stop + len(selectors)]
     if len(numbers) != len(selectors) or numbers[0] != 0 or set(numbers) != {0, *members}:
         return None
     segments = defaultdict(set)
     for number, position in zip(numbers, selectors, strict=True):
         if number:
-            segments[number].add(_WORD.unpack_from(image, position)[0])
+            segment, = _WORD.unpack_from(image, position)
+            segments[number].add((segment - loaded.base_segment) & 0xFFFF)
     # LINK reserves one OVERLAY_AREA for all members. A member's first code segment can follow
     # the start of that window if its segment alignment requires padding.
     runtime = min(min(values) for values in segments.values())
@@ -89,11 +92,12 @@ def _link_directory_at(image: bytes, selectors: range, members: dict[int, _LinkM
 
 
 def _link_directory(
-    executable: MZExecutable, members: dict[int, _LinkMember],
+    loaded: LoadedMZ, members: dict[int, _LinkMember],
 ) -> tuple[_LinkDirectory | None, str | None]:
     """Find the resident selector words and matching overlay-number bytes."""
-    image = executable.image
-    positions = {site.linear for site in executable.relocations}
+    # EXEPACK can compress the resident overlay directory and its relocation table.
+    image = loaded.image
+    positions = {site.linear for site in loaded.relocations}
     candidates = []
     overlay_count = max(members) + 1
     for start in sorted(positions):
@@ -104,13 +108,13 @@ def _link_directory(
             continue
         selectors = range(start, start + _WORD.size * count, _WORD.size)
         if all(position in positions for position in selectors):
-            directory = _link_directory_at(image, selectors, members)
+            directory = _link_directory_at(loaded, selectors, members)
             if directory is not None:
                 candidates.append(directory)
 
     if not candidates:
-        # Some layouts expose the adjacent arrays without the LINK 3.65 count words. Require
-        # a complete run of relocated selector words and independent support from member fixups.
+        # If the count words are unavailable, require adjacent arrays with a complete run of
+        # relocated selector words and independent support from member fixups.
         # See https://github.com/fenugrec/overlazy for the paired arrays in Microsoft C 5.1 output.
         for start in sorted(position for position in positions if position - _WORD.size not in positions):
             end = start
@@ -119,7 +123,7 @@ def _link_directory(
             selectors = range(start, end, _WORD.size)
             if not len(members) < len(selectors) <= _LINK_MAX_SEGMENTS:
                 continue
-            directory = _link_directory_at(image, selectors, members)
+            directory = _link_directory_at(loaded, selectors, members)
             if directory is None:
                 continue
             runtime, _ = directory
@@ -134,8 +138,8 @@ def _link_directory(
     return candidates[0], None
 
 
-def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
-               base: int) -> tuple[list[LinkedOverlay], list[dict], int]:
+def _read_link(data: bytes, start: int, loaded: LoadedMZ,
+               source: str) -> tuple[list[LinkedOverlay], list[dict], int]:
     members: dict[int, _LinkMember] = {}
     while True:
         content = memoryview(data)[start:]
@@ -155,7 +159,7 @@ def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
             break
         start = locations[0]
 
-    directory, reason = _link_directory(executable, members)
+    directory, reason = _link_directory(loaded, members)
     runtime, backed_by_member = directory if directory is not None else (None, {})
     overlays = []
     for number, member in members.items():
@@ -172,7 +176,7 @@ def _read_link(data: bytes, start: int, executable: MZExecutable, source: str,
                 value, = _WORD.unpack_from(member.image, offset)
                 fixups.append(LinkedFixup(offset, value - runtime, name) if value in backed else
                               LinkedFixup(offset, value))
-        runtime_segment = None if runtime is None else base + runtime
+        runtime_segment = None if runtime is None else loaded.base_segment + runtime
         overlays.append(LinkedOverlay(source, name, member.image, member.file_offset, "MS_LINK", number,
                                       runtime_segment, entries, fixups=tuple(fixups)))
     diagnostics = [{"code": "overlay_layout_partial", "message": reason}] if reason else []

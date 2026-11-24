@@ -14,16 +14,18 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, LINK 3.65 and 5.01.21 probes showed that trailing empty and uninitialized segments
-can appear in the directory beyond the member's file bytes. The loader now uses the member's
-minimum allocation to validate those selectors. TLINK 3.01 and 4.0 emitted the pointer-offset flag
-for a same-segment assembly pointer. All six probes ran successfully in DOSBox. Ghidra 12.2
-imported the 29-byte LINK member in its runtime view. The standalone suite passed 510 tests with
-123 skipped. The opt-in DOS and Amiga suite passed 67 tests with one skipped.
+On 2026-11-24, testing shipped DOS executables exposed a LINK directory lookup bug in
+EXEPACK-compressed resident modules. Directory recovery now uses the decoded resident bytes and
+relocations. Civilization 474.03 exported all 23 members with their runtime addresses and file
+offsets, and Ghidra 12.2 imported all 24 load states. The standalone suite passed 511 tests with
+124 skipped. The opt-in DOS and Amiga suite passed all 70 tests with Ghidra enabled.
 
-Continue native validation with a shipped LINK executable that omits the directory counts or places
-a member's first listed segment after the window start. The LINK 3.65 and 5.01.21 alignment probes
-still list each member's first segment at the window start.
+Keep the native validation item open for a shipped static LINK executable that omits the
+directory counts or places a member's first listed segment after the window start. The shipped
+directories examined this session had counts and listed their first segments at the window start.
+Synthetic coverage includes both cases together under EXEPACK. Microsoft documents the
+window-start placement for LINK 3.x and 5.01.
+[Microsoft KB Q32003](https://www.infania.net/misc/kbarchive/kb/032/Q32003/index.html)
 
 ## Why
 
@@ -422,8 +424,9 @@ release. Continue with the analysis backlog below.
   decoding handles encoded match distances and the ADD variant's big-endian relocation offsets.
   Microsoft LINK and Borland VROOMM overlays retain their source offsets and recovered fixups.
   LINK recovers the shared runtime window from counted directories and adjacent arrays with matching
-  member fixups. It validates trailing segments using the member allocation and exports file-backed
-  segment starts. VROOMM skips header-only descriptors for empty code segments and resolves flagged
+  member fixups, including from EXEPACK-compressed resident modules. It validates trailing segments
+  using the member allocation and exports file-backed segment starts. VROOMM skips header-only
+  descriptors for empty code segments and resolves flagged
   pointer pushes to verified resident stubs. Partial layouts and unmapped trailers appear as diagnostics.
 - **Implemented.** Amiga Hunk overlay trees retain each node and its ancestry, active segment indices,
   table entries, and source offsets. The loader supports additional narrow absolute and PC-relative
@@ -456,6 +459,13 @@ on disk before that address. The probe with an empty trailing segment has 16 fil
 probe with a 16-byte uninitialized segment has 29 file bytes and compares the relocated segment
 with CS in DOSBox. Retrore keeps the two initialized payload sizes and retains the native runtime
 address for the trailing segment's fixup. Ghidra's runtime view replaces only the member's file bytes.
+
+**Validated with shipped static LINK executables.** Civilization for DOS 474.03, Railroad Tycoon
+455.00 and 455.02, and Silent Service II use EXEPACK-compressed resident modules with counted
+directories. At base segment `0x1000`, Civilization's 23 members share runtime address `0x32F30`
+and have 2,915 fixups. Ghidra 12.2 imported the root and all 23 overlay states. The opt-in test
+checks the window, fixup count, and original file offsets and bytes.
+[Civilization 474.03 archived executable](https://archive.org/details/msdos_Sid_Meiers_Civilization_1991)
 
 Turbo C++ 1.01 with TLINK 3.01 and Borland C++ 2.0 with TLINK 4.0 emitted resident stub offsets
 for the C far-pointer probes. Both linkers set the pointer-offset flag for an assembly probe that

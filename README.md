@@ -246,9 +246,10 @@ The loader exports native file offsets, applies verified fixups, and rewrites re
 VROOMM skips empty code descriptors and handles the reserved fixup bit used by Turbo C++ 1.01.
 A flagged VROOMM function-pointer fixup resolves two adjacent `MOV reg,imm16` / `PUSH reg` pairs
 using the same register to a unique resident stub. LINK directories can be recovered from count
-fields or adjacent relocation-backed arrays corroborated by member fixups. Verified members share
-one runtime window, including any padding before their first routine. A member's minimum allocation
-can account for trailing segments omitted from the file. Only file-backed segment starts appear in
+fields or adjacent relocation-backed arrays corroborated by member fixups, including when the
+resident module is EXEPACK-compressed. Verified members share one runtime window, including any
+padding before their first routine. A member's minimum allocation can account for trailing segments
+omitted from the file. Only file-backed segment starts appear in
 `segment_offsets`, and fixups to omitted segments keep their relocated runtime addresses. Inspect
 `diagnostics` in JSON for unmatched trailers, unresolved VROOMM function-pointer offsets, and
 unidentified or ambiguous LINK directories.
@@ -1594,6 +1595,7 @@ Phase 12 has optional checks against original tool outputs and releases.
 | `RETRORE_DOS_LOADER_DIR` | Microsoft LINK 3.65 `TEST2.EXE`, PKLITE 2.01 `PACK201.EXE` and `COM201.COM`, and their unpacked `PACK.EXE` and `testcom.com` counterparts |
 | `RETRORE_DOS_LINK_2X_DIR` | Microsoft LINK 2.40 `PAD240.EXE` and 2.45 `PAD245.EXE` with a relocated, padded overlay member. See the [build steps](#microsoft-link-2x-probes). |
 | `RETRORE_DOS_LINK_LAYOUT_DIR` | LINK 3.65 `LIVE365.EXE` with a 16-byte uninitialized CODE segment before a page-aligned routine in member 2. The test also checks a copy with the directory counts cleared. |
+| `RETRORE_CIV_DOS_DIR` | `CIV.EXE` from Civilization for DOS 474.03 (SHA-256 `31e35b01f4d00df81685dfcb81e6de196a3876bd2afff6e39cbbfd964f5852ad`). Checks EXEPACK and 23 embedded Microsoft LINK members. |
 | `RETRORE_VROOMM_DIR` | The TLINK 4.0 three-overlay `VROOMM.EXE` probe |
 | `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
 | `RETRORE_DOS_NATIVE_OVERLAY_DIR` | LINK 3.65 and 5.01.21 `TAIL365.EXE`, `TAIL501.EXE`, `BSS365.EXE`, and `BSS501.EXE` plus TLINK 3.01 and 4.0 `INSEG.EXE` and `INSEG4.EXE`. See the [build steps](#trailing-link-segments-and-flagged-tlink-pointers). |
