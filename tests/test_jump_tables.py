@@ -490,12 +490,15 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
         "command": "record-writes", "address": "280a:00ab", "stride": 12, "count": 15, "compact": True,
         "code_start": "root:1241c", "code_end": "root:13721", "limit": 1000,
     })
+    requests.extend({"command": "xrefs", "address": address, "direction": "incoming"} for address in (
+        "38c0:1dd6", "root:6a12", "root:6383", "root:68a4", "root:6349",
+    ))
     batch = tmp_path / "queries.json"
     batch.write_text(json.dumps(requests), encoding="utf-8")
     assert main(["batch", str(batch), "--project", str(project), "--evidence", "--json"]) == 0
-    callback_result, dispatch_result, writes_result = (
+    callback_result, dispatch_result, writes_result, *references = [
         row["result"] for row in json.loads(capsys.readouterr().out)["results"]
-    )
+    ]
     callback, = callback_result["sites"]
     dispatch, = dispatch_result["sites"]
     assert (callback["status"], callback["segment"], callback["table"]) == (
@@ -504,6 +507,10 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
     candidate, = callback["candidates"]
     assert candidate["target"] == "root:11914" and "relocated" in candidate["evidence"]
     assert dispatch["status"] == "unresolved" and dispatch["reason"] == "no_valid_entries"
+    # The listing shows the integer-parser call but has no incoming reference for these paths.
+    assert [report["incoming"] for report in references[:-1]] == [[], [], [], []]
+    parser_call, = references[-1]["incoming"]
+    assert parser_call["from"]["unit_address"] == "root:60e4"
 
     # FST's ordinary output store can reach the record through an external segment and offset.
     # Record copies read either a CS template or another DS record.
@@ -676,6 +683,127 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
     assert written_classes == {0, 1, 2, 3}
 
 
+def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phantasie_iii_float_runtime):
+    emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
+    tmp_path, program = phantasie_iii_export
+    image = (tmp_path / "export" / "image.bin").read_bytes()
+    # The arithmetic substitutions and FLD constants copy complete CS records.
+    templates = (0x1216e, 0x1217a, 0x12186, 0x12192, 0x121b6, 0x121c2,
+                 0x1220a, 0x12216, 0x12222, 0x1222e, 0x1223a)
+    assert [image[offset + 11] for offset in templates] == [1, 3, 2, 0, 1, 0, 0, 0, 0, 0, 0]
+
+    bottom, empty_top, limit = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
+    scratch = Address(0x7000, 0)
+    operands_address = Address(scratch.segment, 0x200)
+    control_word = Address(scratch.segment, 0x218)
+    report = Address(scratch.segment, 0x300)
+    handler_pointer = Address(data_segment, 0)
+    stack_top = Address(data_segment, 0x10)
+    first_field = Address(data_segment, bottom - 1).linear
+    last_field = Address(data_segment, limit + 23).linear  # Include the slot past the stack limit.
+
+    # Run the startup's BX=3 indirect call to register the game's exception callback.
+    base = program["units"][0]["segment"]
+    dgroup = base + 0x28c0
+    c_segment = base + 0x3b2
+    sp = program["stack"]["offset"] + 0x6c4e - 0x100
+    registered = emulator.call(
+        Address(c_segment, 0x42eb - 0x3b20), regs={"ds": dgroup, "ss": dgroup, "sp": sp},
+        writes=[(Address(c_segment, 0x42fa - 0x3b20), b"\xc3")], reads=[(handler_pointer, 4)],
+    )
+    assert registered.memory == ((handler_pointer, pack("<HH", 0x602b - 0x3b20, c_segment)),)
+
+    class ProgramExit(Exception):
+        pass
+
+    def dos(cpu, _number):
+        ax = cpu.reg_read(x86.UC_X86_REG_AX)
+        service = ax >> 8
+        if service == 0x4c:
+            raise ProgramExit(ax & 0xff)
+        if service == 0x40:
+            cpu.reg_write(x86.UC_X86_REG_AX, cpu.reg_read(x86.UC_X86_REG_CX))
+        else:
+            assert service == 0x25  # Restore interrupt vectors during shutdown.
+        cpu.reg_write(x86.UC_X86_REG_EFLAGS, cpu.reg_read(x86.UC_X86_REG_EFLAGS) & ~1)
+
+    def probe(code, operands, mask, *, game_handler=False):
+        errors, classes = [], []
+        writes = {}
+
+        def audit(cpu):
+            def record_write(_cpu, _access, address, size, value, _data):
+                for byte in range(address, address + size):
+                    if first_field <= byte <= last_field and (byte - first_field) % 12 == 0:
+                        field = (value >> (8 * (byte - address))) & 0xff
+                        assert field <= 3
+                        writes.setdefault(byte - data_segment * 16, []).append(field)
+
+            hook = cpu.hook_add(UC_HOOK_MEM_WRITE, record_write, begin=first_field - 11, end=last_field)
+            return lambda: cpu.hook_del(hook)
+
+        def exception(cpu):
+            errors.append(cpu.reg_read(x86.UC_X86_REG_AL))
+
+        def observe_test(cpu):
+            assert cpu.reg_read(x86.UC_X86_REG_DS) == data_segment
+            record = cpu.reg_read(x86.UC_X86_REG_SI)
+            value = cpu.mem_read(Address(data_segment, record + 11).linear, 1)[0]
+            assert value <= 3 and cpu.reg_read(x86.UC_X86_REG_BX) == 2 * value
+            classes.append((record, value))
+
+        operand_writes = [(operands_address, operands)] if operands else []
+        # The supplied callback returns so FTST observes the state after the exception.
+        handler = registered.memory if game_handler else (
+            (handler_pointer, pack("<HH", report.offset, report.segment)), (report, b"\xcb"),
+        )
+        result = emulator.call(
+            scratch, regs={"ds": scratch.segment, "ss": dgroup if game_handler else scratch.segment,
+                           "sp": sp if game_handler else 0xff00},
+            writes=[
+                *setup,
+                (scratch, bytes.fromhex(f"cd352e1802 {code} cd35e4 c3")),  # FLDCW; probe; FTST.
+                *operand_writes,
+                (control_word, pack("<H", mask)),
+                *handler,
+            ],
+            reads=[(stack_top, 2)], ivt_interrupts=vectors, interrupts={0x21: dos} if game_handler else {},
+            hooks={report: exception, runtime_address(0x13721): observe_test}, _setup=audit,
+        )
+        final_top, = unpack_from("<H", result.memory[0][1])
+        return errors, classes, final_top, writes
+
+    divide_by_zero = ("cd35060002 cd35060402 cd34f9", pack("<2f", 1, 0), 0x037b)
+    empty_store = ("cd351e0802", b"", 0x037e)
+    pushes = (limit - empty_top) // 12 + 1
+    stack_overflow = ("cd35e8 " * pushes, b"", 0x037e)
+
+    # Unmasked divide by zero substitutes the infinity template before returning to FTST.
+    errors, classes, top, writes = probe(*divide_by_zero)
+    assert errors == [0x83] and top == empty_top + 24 and classes == [(top, 3)]
+    assert writes[top + 11] == [1, 3]
+
+    # An invalid store on an empty stack leaves FTST reading the slot below the initial top.
+    errors, classes, top, writes = probe(*empty_store)
+    assert errors == [0x8b] and top == empty_top - 12 and classes == [(top, 0)]
+    assert writes == {}
+
+    # A returning exception callback lets the FLD1 copy write the slot past the limit.
+    errors, classes, top, writes = probe(*stack_overflow)
+    assert errors == [0x8a] and top == limit + 12 and classes == [(top, 0)]
+    assert writes == {record + 11: [0] for record in range(empty_top + 12, top + 1, 12)}
+
+    # Memory division stages a double zero in the next record. The register form then underflows.
+    errors, classes, top, writes = probe("cd35e8 cd383e0002 cd34f9", pack("<d", 0), 0x037b)
+    assert errors == [0x8b] and top == empty_top + 12 and classes == [(top, 1)]
+    assert writes == {top + 11: [0, 1], top + 23: [1]}
+
+    for operation, status in ((divide_by_zero, 0x83), (empty_store, 0x8b), (stack_overflow, 0x8a)):
+        with pytest.raises(ProgramExit) as error:
+            probe(*operation, game_handler=True)
+        assert error.value.args == (status,)
+
+
 def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
     phantasie_iii_export, phantasie_iii_float_runtime, capsys,
 ):
@@ -802,7 +930,7 @@ def test_phantasie_iii_shipped_float_store_destinations(phantasie_iii_export, ph
 
     operand_decoder = runtime_address(0x1249b)
 
-    def check(start, stores, *, arguments=b"", writes=(), reads=(), **registers):
+    def check(start, stores, *, arguments=b"", writes=(), reads=(), far=True, **registers):
         observed = {}
         current = None
 
@@ -844,7 +972,7 @@ def test_phantasie_iii_shipped_float_store_destinations(phantasie_iii_export, ph
 
         argument_writes = [(args, arguments)] if arguments else []
         result = emulator.call(
-            start, far=True, regs={**regs, **registers}, writes=[*setup, *writes, *argument_writes],
+            start, far=far, regs={**regs, **registers}, writes=[*setup, *writes, *argument_writes],
             reads=reads, hooks={operand_decoder: operand, runtime_address(0x125a2): returned},
             ivt_interrupts=vectors, _setup=audit_writes,
         )
@@ -897,13 +1025,41 @@ def test_phantasie_iii_shipped_float_store_destinations(phantasie_iii_export, ph
     offset, segment = unpack_from("<HH", installed[callback])
     assert Address(segment, offset) == root(0x6a12)
     slot, output = Address(dgroup, 0x7010), Address(dgroup, 0x7020)
-    converted = check(
-        Address(segment, offset), {**decimal_stores, root(0x6a5b): (output, 4)},
-        arguments=pack("<5H", 0, slot.offset, slot.segment, text.offset, text.segment),
-        writes=[*installed.items(), (text, ascii_number), (slot, pack("<HH", output.offset, output.segment))],
-        reads=[(output, 4)],
+    for double_output in (False, True):
+        expected = pack("<d" if double_output else "<f", 1.25)
+        stores = dict(decimal_stores)
+        if not double_output:
+            stores[root(0x6a5b)] = (output, len(expected))
+        converted = check(
+            Address(segment, offset), stores,
+            arguments=pack("<5H", double_output, slot.offset, slot.segment, text.offset, text.segment),
+            writes=[*installed.items(), (text, ascii_number), (slot, pack("<HH", output.offset, output.segment))],
+            reads=[(output, len(expected))],
+        )
+        assert converted[output] == expected
+
+    # Enter these detached paths directly with valid operands. Neither test establishes a caller.
+    stack_top = Address(data_segment, 0x10)
+    records = Address(data_segment, bottom)
+    record_size = records_end - records_start
+
+    def load_ones(count):
+        return emulator.call(
+            text, regs=regs, writes=[*setup, (text, bytes.fromhex("cd35e8" * count + "c3"))],
+            reads=[(stack_top, 2), (records, record_size)], ivt_interrupts=vectors,
+        ).memory
+
+    stored = check(
+        root(0x6383), {root(0x6386): (double, 8), root(0x6389): (Address(dgroup, 0x2531), 2)},
+        writes=load_ones(1), reads=[(double, 8)], far=False, di=double.offset, cx=0,
     )
-    assert converted[output] == pack("<f", 1.25)
+    assert stored[double] == pack("<d", 1.0)
+
+    comparison = Address(dgroup, sp - 8)
+    compared = check(
+        root(0x68a4), {root(0x68ae): (comparison, 2)}, writes=load_ones(2), reads=[(comparison, 2)],
+    )
+    assert unpack_from("<H", compared[comparison])[0] & 0x4500 == 0x4000  # Equal operands.
 
     # Place the LINK member in the original window and stop after each conversion call.
     member = next(unit for unit in program["units"] if unit["name"] == "link_0002")

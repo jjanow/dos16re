@@ -1032,9 +1032,9 @@ possible overlaps from the listing. Reimport to use tracked register values.
 
 With `RETRORE_PH3_DIR` set, the Phantasie III validation runs the shipped software floating-point
 handlers and checks writes from parser, formatter, conversion, and LINK overlay code against the
-record stack. It also checks the class bytes written by six arithmetic operations across all 16
-input class pairs. The conversion callback accepts a caller-supplied far pointer, so proof for that
-store depends on the caller.
+record stack. It checks the class bytes used by six arithmetic operations across all 16 input class
+pairs, plus temporary records and selected exception paths. Both conversion callback outputs use
+a caller-supplied far pointer, so proof for those stores depends on the caller.
 
 ```sh
 .venv/bin/python -m pytest -q tests/test_jump_tables.py -k 'phantasie_iii and (float or arithmetic_and_stack)'
