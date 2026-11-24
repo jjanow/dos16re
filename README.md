@@ -197,9 +197,9 @@ retrore members COLLECTION.d88 --json
 retrore load COLLECTION.d88 --pc88 --member id:disk:2 --pc88-sector '0:0:1@c000' -o out/pc88
 ```
 
-Catalogs cover D64, Apple DOS and RDOS, ATR boot sectors and Atari DOS, root FAT12 files,
-disks in D88/D77 and HDM containers, and Classic Macintosh HFS, Disk Copy 4.2, and resource
-fork wrappers. D88/D77 and HDM selection uses the native PC-88, PC-98, or X1 sector options.
+Catalogs cover DOS MZ overlays, D64, Apple DOS and RDOS, ATR boot sectors and Atari DOS, root
+FAT12 files, disks in D88/D77 and HDM containers, and Classic Macintosh HFS, Disk Copy 4.2, and
+resource fork wrappers. D88/D77 and HDM selection uses the native PC-88, PC-98, or X1 sector options.
 Select `id:boot:1` to load the ATR boot payload explicitly. For a standalone Macintosh resource
 fork or wrapper, `id:application` loads the complete application and individual resources are
 listed for inspection. Repeat `--member` to order co-resident file loads on platforms that
@@ -241,8 +241,21 @@ at `FFFE`. Use `--dos-com` to select COM explicitly when the extension or header
 default to offset `0000` and enter at the first input byte unless `--dos-entry` is supplied. Compare
 `dos_format`, `load_offset`, and `file_spans` in the export to identify generated prefixes and input bytes.
 
-Embedded Borland VROOMM banks and Microsoft LINK members are discovered from the executable.
-The loader exports native file offsets, applies verified fixups, and rewrites resolved VROOMM stubs.
+Embedded Borland VROOMM, Microsoft LINK, and Microsoft MOVE overlays are discovered from the
+executable. Pass each separate Microsoft LINK bank as `--overlay FILE` to `members`, `info`, or
+`load`. Supply all banks to resolve the resident directory. Each member keeps the source file
+and payload offset from its own bank.
+
+```sh
+retrore members GAME.EXE --overlay GAME1.OVL --overlay GAME2.OVL --json
+retrore load GAME.EXE --overlay GAME1.OVL --overlay GAME2.OVL --member id:link_0001 -o out/link
+retrore members DYNAMIC.EXE --json
+retrore load DYNAMIC.EXE --member id:move_0001 --member id:move_0002 -o out/move
+```
+
+Repeat `--member` to select a subset in request order when the full analysis image would exceed
+1 MiB. The loader exports native file offsets, applies verified fixups, and rewrites resolved
+resident stubs.
 VROOMM skips empty code descriptors and handles the reserved fixup bit used by Turbo C++ 1.01.
 A flagged VROOMM function-pointer fixup resolves two adjacent `MOV reg,imm16` / `PUSH reg` pairs
 using the same register to a unique resident stub. Static LINK directories can be recovered from count
@@ -250,10 +263,17 @@ fields or adjacent relocation-backed arrays corroborated by member fixups, inclu
 resident module is EXEPACK-compressed. Verified members share one runtime window, including any
 padding before their first routine. A member's minimum allocation can account for trailing segments
 omitted from the file. Only file-backed segment starts appear in
-`segment_offsets`, and fixups to omitted segments keep their relocated runtime addresses. Inspect
-`diagnostics` in JSON for unmatched trailers, unresolved VROOMM function-pointer offsets, and
-unidentified or ambiguous LINK directories. Microsoft MOVE uses dynamic placement and is outside
-the static LINK loader's coverage. See the [Phase 12 validation notes](PLAN.md#phase-12-loader-depth-on-supported-platforms).
+`segment_offsets`, and fixups to omitted segments keep their relocated runtime addresses.
+Inspect `diagnostics` in JSON for unmatched trailers, unresolved VROOMM function-pointer offsets,
+and unidentified or ambiguous LINK directories.
+
+MOVE verifies its resident directory against member file offsets and allocation sizes. It
+applies member-relative fixups using the resident load segment and follows relocated pointers
+to resident dispatch stubs. Verified stubs become far jumps to selected members in the analysis
+image. Ghidra backs any allocation beyond the file bytes with uninitialized memory. MOVE chooses
+physical placements at runtime. Supply segments from a capture with `--runtime-base` and
+`--overlay-segment UNIT=HEX`, or describe observed states in a load manifest.
+See the [Phase 12 validation notes](PLAN.md#phase-12-loader-depth-on-supported-platforms).
 
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the
@@ -1597,6 +1617,8 @@ Phase 12 has optional checks against original tool outputs and releases.
 | `RETRORE_DOS_LINK_2X_DIR` | Microsoft LINK 2.40 `PAD240.EXE` and 2.45 `PAD245.EXE` with a relocated, padded overlay member. See the [build steps](#microsoft-link-2x-probes). |
 | `RETRORE_DOS_LINK_LAYOUT_DIR` | LINK 3.65 `LIVE365.EXE` with a 16-byte uninitialized CODE segment before a page-aligned routine in member 2. The test also checks a copy with the directory counts cleared. |
 | `RETRORE_CIV_DOS_DIR` | `CIV.EXE` from Civilization for DOS 474.03 (SHA-256 `31e35b01f4d00df81685dfcb81e6de196a3876bd2afff6e39cbbfd964f5852ad`). Checks EXEPACK and 23 embedded Microsoft LINK members. |
+| `RETRORE_NETHACK_30J_DIR` | `NETHACK.EXE`, `NETHACK1.OVL`, and `NETHACK2.OVL` from [NetHack 3.0j for DOS](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH_older/). Checks the external LINK directory and file provenance. |
+| `RETRORE_NETHACK_313_DIR` | `NETHACK.EXE` from [NetHack 3.1.3 for DOS](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH31/). Checks the MOVE catalog, selected member fixups, and resident stubs. |
 | `RETRORE_VROOMM_DIR` | The TLINK 4.0 three-overlay `VROOMM.EXE` probe |
 | `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
 | `RETRORE_DOS_NATIVE_OVERLAY_DIR` | LINK 3.65 and 5.01.21 `TAIL365.EXE`, `TAIL501.EXE`, `BSS365.EXE`, and `BSS501.EXE` plus TLINK 3.01 and 4.0 `INSEG.EXE` and `INSEG4.EXE`. See the [build steps](#trailing-link-segments-and-flagged-tlink-pointers). |

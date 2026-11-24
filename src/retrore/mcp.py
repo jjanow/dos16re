@@ -365,7 +365,7 @@ def _program_argv(command: str, arguments: dict) -> list[str]:
 def _call_program(command: str, arguments: dict) -> dict:
     args = _program_parser(command).parse_args(_program_argv(command, arguments))
     if command == "members":
-        return inspect_members(args.program, args.format, args.apple2_disk_order)
+        return inspect_members(args.program, args.format, args.apple2_disk_order, args.overlay)
     args.command = command
     image, program_map, _ = build_program(args)
     if command == "load":

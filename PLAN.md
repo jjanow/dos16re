@@ -14,15 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, the shipped-release search found a counted static LINK directory in NetHack 3.0j
-and a dynamic Microsoft MOVE directory in NetHack 3.1.3. Two new probes showed that LINK 3.65
-and 5.01.21 emit the counts even when the overlay initialization routine ignores them.
-The standalone suite passed 511 tests with 124 skipped. All 49 DOS tests passed with Ghidra
-12.2 and the opt-in inputs enabled.
+On 2026-11-24, added Microsoft MOVE analysis and support for separate static LINK banks.
+NetHack 3.0j exports all 63 static members from their original OVL files and imports selected
+members with runtime views in Ghidra. NetHack 3.1.3 lists all 63 MOVE members and imports
+selected members into Ghidra. LINK 5.30 probes ran in
+DOSBox, including cross-member calls, a function pointer, a custom interrupt, and a member
+whose allocation extends past the file bytes. The standalone suite passed 513 tests with 126
+skipped, and all 53 DOS tests passed with Ghidra 12.2 and the opt-in inputs.
 
-Resume the static LINK validation when a shipped executable is available that omits the
-directory counts or places a member's first listed segment after the window start. The inspected
-static LINK releases all had counts and listed their first segments at the window start.
+Resume static LINK validation when a shipped executable turns up that omits the directory
+counts or places a member's first listed segment after the window start. For MOVE, use
+captured placements for runtime views and expand coverage as additional formats are verified.
 
 ## Why
 
@@ -419,12 +421,15 @@ release. Continue with the analysis backlog below.
 - **Implemented.** DOS COM and raw loads record the input byte range and initial segment registers.
   PKLITE recognizes additional XOR- and ADD-scrambled EXE stubs and COM decoder pointers. V1.20
   decoding handles encoded match distances and the ADD variant's big-endian relocation offsets.
-  Microsoft LINK and Borland VROOMM overlays retain their source offsets and recovered fixups.
+  Microsoft LINK, Microsoft MOVE, and Borland VROOMM overlays retain their source offsets and
+  recovered fixups. DOS catalogs expose member selectors for exports that exceed the first MiB.
   LINK recovers the shared runtime window from counted directories and adjacent arrays with matching
-  member fixups, including from EXEPACK-compressed resident modules. It validates trailing segments
-  using the member allocation and exports file-backed segment starts. VROOMM skips header-only
-  descriptors for empty code segments and resolves flagged
-  pointer pushes to verified resident stubs. Partial layouts and unmapped trailers appear as diagnostics.
+  member fixups, including from EXEPACK-compressed resident modules and separate OVL files. It validates
+  trailing segments using the member allocation and exports file-backed segment starts. MOVE reads
+  member-relative fixups and resolves resident dispatch stubs using its segment and member tables.
+  Ghidra backs the rest of each MOVE allocation with uninitialized memory. VROOMM skips header-only
+  descriptors for empty code segments and resolves flagged pointer pushes to verified resident stubs.
+  Partial layouts and unmapped trailers appear as diagnostics.
 - **Implemented.** Amiga Hunk overlay trees retain each node and its ancestry, active segment indices,
   table entries, and source offsets. The loader supports additional narrow absolute and PC-relative
   fixups, recognized LINE records, and the THOR 1.2 manager signature. DOS exports accept LINK and
@@ -464,22 +469,35 @@ and have 2,915 fixups. Ghidra 12.2 imported the root and all 23 overlay states. 
 checks the window, fixup count, and original file offsets and bytes.
 [Civilization 474.03 archived executable](https://archive.org/details/msdos_Sid_Meiers_Civilization_1991)
 
-The DOS release of NetHack 3.0j ships 63 LINK members across two OVL files. Its resident
-directory has 162 selectors and a physical overlay count of 64 including the root. Every
-member's first listed selector is `0x07BA`, the link-time window. In separate probes, LINK 3.65
-and 5.01.21 both wrote the `$$CGSN` and `$$COVL` words even with a custom `$$OVLINIT`
-that only returns. Both link maps placed the paragraph-aligned and page-aligned first segments
-at `OVERLAY_AREA`. The count-free directory and delayed first selector still have synthetic
-coverage, including in combination with EXEPACK.
+NetHack 3.0j for DOS exports 63 LINK members and 6,127 fixups from its two original OVL files.
+Its resident directory has 162 selectors and a physical overlay count of 64 including the root.
+Every member's first listed selector is `0x07BA`, the link-time window. The last file has an
+unmapped 330-byte trailer. In separate probes, LINK 3.65 and 5.01.21 both wrote the `$$CGSN`
+and `$$COVL` words even with a custom `$$OVLINIT` that only returns. Both link maps placed the
+paragraph-aligned and page-aligned first segments at `OVERLAY_AREA`. The count-free directory
+and delayed first selector have synthetic coverage, including in combination with EXEPACK.
+Older DOS releases of NetHack 2.3a and 2.3e and PC Hack 3.51 and 3.60 had no appended members
+or separate overlay files. Ghidra 12.2 imported selected 3.0j members with runtime views.
+The all-member import reached calling-convention analysis and exceeded a 420-second headless
+budget. Profile that pass for larger static LINK exports.
 [NetHack 3.0j release archive](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH_older/),
 [Microsoft KB Q32003](https://www.infania.net/misc/kbarchive/kb/032/Q32003/index.html)
 
-NetHack 3.1.3 has 63 embedded members with member-relative relocation sites and Microsoft MOVE
-runtime error messages. Its released Microsoft C 7 build uses `/DYNAMIC`. Recovering MOVE
-placements requires separate loader work.
+**Validated with Microsoft MOVE.** NetHack 3.1.3 uses Microsoft C 7 and `/DYNAMIC`. Retrore
+catalogs its 63 members and 18,119 member-relative fixups. An export of members 1 and 2 recovers
+126 dispatch stubs and imports in Ghidra 12.2. The full analysis image requires more than 1 MiB,
+so use `--member` to select overlays.
 [NetHack 3.1.3 DOS release archive](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH31/),
-[NetHack 3.1.3 source archive](https://ftp.zx.net.nz/pub/mirror/ftp.funet.fi/pub/unix/games/nethack/),
-[Microsoft C 7.0 error reference](https://bitsavers.trailing-edge.com/pdf/microsoft/msdos_c/Microsoft_C_7.0_1991/24779_Comprehensive_Index_and_Errors_Reference_199201.pdf)
+[NetHack 3.1.3 source archive](https://ftp.zx.net.nz/pub/mirror/ftp.funet.fi/pub/unix/games/nethack/)
+
+LINK 5.30 and the Microsoft C 7 MOVE library produced runnable probes with two overlays,
+including two C code segments in one member. Ghidra decompiled the first member's calls to both
+members. A probe linked with `/OV:62` had 12 file bytes in member 2 and a 288-byte allocation.
+Ghidra imported the tail as a 276-byte uninitialized block. A DOSBox capture placed two members
+at the same segment in different states. A load manifest mapped each state to its original
+file offsets, and Ghidra imported both runtime views into separate address spaces.
+[Microsoft C 7 distribution](https://www.pcjs.org/software/pcx86/lang/microsoft/c/7.00/),
+[Microsoft C 7 Environment and Tools, chapter 15](https://bitsavers.trailing-edge.com/pdf/microsoft/msdos_c/Microsoft_C_7.0_1991/24778_Environment_and_Tools_199112.pdf)
 
 Turbo C++ 1.01 with TLINK 3.01 and Borland C++ 2.0 with TLINK 4.0 emitted resident stub offsets
 for the C far-pointer probes. Both linkers set the pointer-offset flag for an assembly probe that

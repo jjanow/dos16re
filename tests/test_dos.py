@@ -149,6 +149,75 @@ def test_link_native_states_relocate_and_keep_member_bytes(tmp_path, capsys):
         load_dos_mz(_link_program()[:-1], 0x1000, "bad.exe")
 
 
+def test_link_external_members_keep_their_source_files(tmp_path, capsys):
+    program = _link_program()
+    source = tmp_path / "demo.exe"
+    first = tmp_path / "first.ovl"
+    second = tmp_path / "second.ovl"
+    source.write_bytes(program[:0x200])
+    first.write_bytes(program[0x200:0x400])
+    second.write_bytes(program[0x400:])
+    options = ["--overlay", first, "--overlay", second]
+    catalog = _command(capsys, "members", source, *options)
+    assert [(row["name"], row["details"]["source"]) for row in catalog["members"]] == [
+        ("link_0001", "first.ovl"), ("link_0002", "second.ovl"),
+    ]
+    out = tmp_path / "out"
+    report = _command(capsys, "load", source, *options, "--member", "link_0002", "-o", out)
+    unit = report["units"][1]
+    assert (unit["name"], unit["runtime_linear"]) == ("link_0002", 0x10020)
+    address = _command(capsys, "address-map", "10020", "--from", "runtime", "--state", "link_0002", "--export", out)
+    match, = address["matches"]
+    assert (match["file"]["source"], match["file"]["offset"]) == ("second.ovl", 0x20)
+    with pytest.raises(MZError, match="duplicate Microsoft LINK overlay 1"):
+        load_dos_mz(source.read_bytes(), 0x1000, source.name,
+                    link_files=((first.name, first.read_bytes()), (second.name, first.read_bytes())))
+
+
+def test_move_selects_members_and_rewrites_verified_stubs(tmp_path, capsys):
+    root = bytearray(0x80)
+    root[:11] = bytes.fromhex("9a00000200 9a06000200 cb")
+    root[0x20:0x2C] = bytes.fromhex("cd3e01000200 cd3e02000000")
+    root[0x30:0x36] = bytes.fromhex("cd3e01000200")  # No relocated pointer names this copy.
+    # Two word arrays give offset adjustments and member IDs. The directory also names
+    # the original header offsets, paragraph counts, and interrupt vector.
+    directory = pack("<8H6IB", 3, 3, 0, 2, 0, 0, 1, 2, 0, 0x200, 0x400, 0, 0x12, 1, 0x3E)
+    root[0x40:0x40 + len(directory)] = directory
+    first = _mz(bytes.fromhex("90909090 b80300cb"), relocations=[(5, 0)], member=1, min_alloc=0x11)
+    second = _mz(b"\xcb", member=2)
+    source = tmp_path / "demo.exe"
+    source.write_bytes(_align(_mz(root, relocations=[(3, 0), (8, 0)])) + _align(first) + second)
+
+    catalog = _command(capsys, "members", source)
+    assert [row["details"]["overlay_format"] for row in catalog["members"]] == ["MS_MOVE", "MS_MOVE"]
+    assert [row["container_offset"] for row in catalog["members"]] == [0x220, 0x420]
+    full = _command(capsys, "info", source)
+    _, first_unit, second_unit = full["units"]
+    assert first_unit["allocation_size"] == 0x120
+    assert second_unit["linear"] == first_unit["linear"] + 0x120
+    out = tmp_path / "out"
+    report = _command(capsys, "load", source, "--base-segment", "2000", "--member", "id:move_0001", "-o", out)
+    resident, overlay = report["units"]
+    assert "load_manifest" not in report and "runtime_linear" not in overlay
+    assert overlay["entries"] == [4] and overlay["relocation_count"] == 1
+    assert report["container_layout"]["members"] == catalog["members"][:1]
+    stub, = report["stubs"]
+    assert (stub["address"]["linear"], stub["target"]["linear"]) == (0x20020, overlay["linear"] + 4)
+    call, = report["calls"]
+    assert call["linear"] == resident["linear"]
+
+    assert (out / "image.bin").read_bytes()[0x26:0x36] == root[0x26:0x36]
+    proof = _command(capsys, "bytes", "move_0001:4", "--export", out, "--size", 4)
+    assert (proof["original"], proof["loaded"]) == ("b80300cb", "b80320cb")
+    unmapped = _command(capsys, "address-map", "move_0001:4", "--export", out)["matches"][0]
+    assert unmapped["runtime"] is None
+    mapped = _command(capsys, "address-map", "move_0001:4", "--export", out,
+                      "--overlay-segment", "move_0001=3100")["matches"][0]
+    assert (mapped["runtime"]["linear"], mapped["file"]["offset"]) == (0x31004, 0x224)
+    from_file = _command(capsys, "address-map", "224", "--from", "file", "--member", "id:move_0001", "--export", out)
+    assert from_file["matches"][0]["unit_address"] == "move_0001:0004"
+
+
 @pytest.mark.parametrize(("counted", "packed"), [(True, False), (False, False), (False, True)])
 def test_link_directory_keeps_member_padding_in_shared_runtime_window(counted, packed, tmp_path, capsys):
     source, out = tmp_path / "link.exe", tmp_path / "out"
@@ -462,6 +531,47 @@ def test_shipped_exepacked_link_overlays_when_available(tmp_path, capsys):
     proof = _command(capsys, "bytes", "link_0001:1a", "--export", out, "--size", 2)
     assert bytes.fromhex(proof["original"]) == source.read_bytes()[0x2B21A:0x2B21C]
     assert int.from_bytes(bytes.fromhex(proof["loaded"]), "little") == 0x2FC3
+
+
+def test_shipped_link_overlay_files_when_available(tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_NETHACK_30J_DIR")):
+        pytest.skip("set RETRORE_NETHACK_30J_DIR to NetHack 3.0j for DOS")
+    source, first, second = (Path(directory) / name for name in ("NETHACK.EXE", "NETHACK1.OVL", "NETHACK2.OVL"))
+    out = tmp_path / "static"
+    program = _command(capsys, "load", source, "--overlay", first, "--overlay", second, "-o", out)
+    overlays = program["units"][1:]
+    assert [row["overlay_number"] for row in overlays] == list(range(1, 64))
+    assert [row["source"] for row in overlays] == [first.name] * 48 + [second.name] * 15
+    assert sum(row["relocation_count"] for row in overlays) == 6127
+    assert {row["runtime_linear"] for row in overlays} == {0x17BA0}
+    assert all(row["segment_offsets"][0] == 0 for row in overlays)
+    diagnostic, = program["diagnostics"]
+    assert (diagnostic["code"], diagnostic["source"], diagnostic["size"]) == ("unmapped_trailer", second.name, 330)
+
+    start = overlays[-1]["file_offset"]
+    proof = _command(capsys, "bytes", "link_003f:0", "--export", out, "--size", 32)
+    assert bytes.fromhex(proof["original"]) == second.read_bytes()[start:start + 32]
+
+
+def test_shipped_move_members_when_available(tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_NETHACK_313_DIR")):
+        pytest.skip("set RETRORE_NETHACK_313_DIR to NetHack 3.1.3 for DOS")
+    source = Path(directory) / "NETHACK.EXE"
+    catalog = _command(capsys, "members", source)["members"]
+    assert [row["details"]["overlay_number"] for row in catalog] == list(range(1, 64))
+    assert {row["details"]["overlay_format"] for row in catalog} == {"MS_MOVE"}
+    assert sum(row["details"]["relocation_count"] for row in catalog) == 18119
+    out = tmp_path / "move"
+    program = _command(capsys, "load", source, "--member", "id:move_0002", "--member", "move_0001", "-o", out)
+    _, second, first = program["units"]
+    assert program["container_layout"]["members"] == [catalog[1], catalog[0]]
+    assert [row["relocation_count"] for row in (first, second)] == [629, 380]
+    assert len(program["stubs"]) == 126
+    assert "diagnostics" not in program and "load_manifest" not in program
+
+    proof = _command(capsys, "bytes", "move_0001:0", "--export", out, "--size", 32)
+    start = first["file_offset"]
+    assert bytes.fromhex(proof["original"]) == source.read_bytes()[start:start + 32]
 
 
 @pytest.mark.parametrize(("filename", "count_offset", "selector_count", "window"), [

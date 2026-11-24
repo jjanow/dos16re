@@ -6,13 +6,14 @@ from .apple2 import DISK_SUFFIXES, Apple2Error, SectorImage
 from .atari8 import ATR_MAGIC, AtrImage
 from .c64 import D64Image
 from .d88 import D88_SUFFIXES, D88Disk
+from .dos import dos_overlay_member, load_dos_mz
 from .errors import CONTRACT_VERSION
 from .macintosh import is_macintosh, list_macintosh_members
 from .members import MemberError
 from .msx2 import Msx2Error, MsxDosDisk
 from .pc98 import HDM_SUFFIX, HdmDisk
 
-CONTAINER_FORMATS = ("d64", "apple2", "atr", "fat12", "d88", "hdm", "macintosh")
+CONTAINER_FORMATS = ("d64", "apple2", "atr", "fat12", "d88", "hdm", "macintosh", "mz")
 MACINTOSH_SUFFIXES = (".rsrc", ".dc42", ".macbin", ".as", ".ad")
 
 
@@ -36,7 +37,8 @@ def _dsk_format(data: bytes, order: str | None) -> str:
     raise MemberError("no supported .dsk catalog found. Select --format apple2 or --format fat12 for details")
 
 
-def inspect_members(program: Path, format_name: str | None = None, order: str | None = None) -> dict:
+def inspect_members(program: Path, format_name: str | None = None, order: str | None = None,
+                    overlay_paths: list[Path] | None = None) -> dict:
     """Read catalog metadata without extracting or loading the selected program."""
     data = program.read_bytes()
     suffix = program.suffix.lower()
@@ -51,6 +53,8 @@ def inspect_members(program: Path, format_name: str | None = None, order: str | 
             format_name = "hdm"
         elif suffix == ".atr" or data.startswith(ATR_MAGIC):
             format_name = "atr"
+        elif data.startswith(b"MZ"):
+            format_name = "mz"
         elif suffix in MACINTOSH_SUFFIXES or is_macintosh(data):
             format_name = "macintosh"
         elif suffix == ".dsk":
@@ -59,6 +63,8 @@ def inspect_members(program: Path, format_name: str | None = None, order: str | 
             raise MemberError("no supported container detected. Specify --format if the filename is ambiguous")
     if order is not None and format_name != "apple2":
         raise MemberError("--apple2-disk-order requires an Apple II sector image")
+    if overlay_paths and format_name != "mz":
+        raise MemberError("--overlay requires a DOS MZ executable")
 
     details = {}
     if format_name == "d64":
@@ -80,6 +86,12 @@ def inspect_members(program: Path, format_name: str | None = None, order: str | 
         rows = [HdmDisk(data).member]
     elif format_name == "macintosh":
         format_name, rows = list_macintosh_members(data, program.name)
+    elif format_name == "mz":
+        link_files = tuple((path.name, path.read_bytes()) for path in overlay_paths or ())
+        loaded, overlays = load_dos_mz(data, 0, program.name, link_files=link_files)
+        rows = [dos_overlay_member(overlay) for overlay in overlays]
+        if loaded.diagnostics:
+            details["diagnostics"] = loaded.diagnostics
     else:
         raise MemberError(f"unknown container format {format_name!r}")
     report = {"contract": CONTRACT_VERSION, "format": format_name, "source": program.name,

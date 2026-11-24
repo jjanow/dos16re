@@ -57,6 +57,8 @@ class LinkedOverlay:
     entries: tuple[int, ...] = ()
     descriptor: Descriptor | None = None
     fixups: tuple[LinkedFixup, ...] = ()
+    resident_stubs: tuple[tuple[Address, int], ...] = ()
+    allocation_size: int | None = None
 
 
 def address_record(address: Address) -> dict[str, int]:
@@ -129,6 +131,12 @@ class _Unit:
     fixups: tuple[int, ...] = ()
     linked: LinkedOverlay | None = None
 
+    @property
+    def placement_size(self) -> int:
+        if self.linked is not None and self.linked.allocation_size is not None:
+            return self.linked.allocation_size
+        return len(self.data)
+
 
 def _read_units(root: bytes, overlays: list[Overlay | LinkedOverlay]) -> list[_Unit]:
     units = []
@@ -171,7 +179,7 @@ def _place_units(root_end: int, memory_end: int, units: list[_Unit]) -> list[int
         if unit.segment is None:
             continue
         start = unit.segment * 16
-        end = start + len(unit.data)
+        end = start + unit.placement_size
         if not 0 <= unit.segment <= 0xFFFF or start < root_end or end > _IMAGE_LIMIT:
             raise MZError(f"overlay {unit.name} segment is outside available image space")
         used.append((start, end))
@@ -187,13 +195,16 @@ def _place_units(root_end: int, memory_end: int, units: list[_Unit]) -> list[int
             continue
         start = (next_start + 15) & ~15
         for lo, hi in used:
-            if start + len(unit.data) <= lo:
+            if start + unit.placement_size <= lo:
                 break
             if start < hi:
                 start = (hi + 15) & ~15
-        next_start = start + len(unit.data)
+        next_start = start + unit.placement_size
         if next_start > _IMAGE_LIMIT:
-            raise MZError(f"overlay {unit.name} extends past the 1 MiB image limit")
+            message = f"overlay {unit.name} extends past the 1 MiB image limit"
+            if unit.linked is not None:
+                message += ". Use retrore members to list overlays and --member to select a subset"
+            raise MZError(message)
         segments.append(start // 16)
     return segments
 
@@ -357,14 +368,18 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay | LinkedOve
         code_start = record["image_offset"]
         data = bytearray(unit.data)
         linked = unit.linked
+        stubs = ()
         if linked is not None:
             record.update(overlay_format=linked.format, overlay_number=linked.number,
                           file_offset=linked.file_offset, entries=list(linked.entries),
-                          relocation_count=sum(fixup.segment for fixup in linked.fixups))
+                          relocation_count=sum(fixup.segment for fixup in linked.fixups), member_id=linked.name)
+            if linked.allocation_size is not None:
+                record["allocation_size"] = linked.allocation_size
             if linked.runtime_segment is not None:
                 record["runtime_linear"] = linked.runtime_segment * 16
             if linked.format == "MS_LINK":
                 record["segment_offsets"] = list(linked.entries)
+            stubs = linked.resident_stubs
             for fixup in linked.fixups:
                 position = code_start + fixup.offset
                 old = data[fixup.offset:fixup.offset + 2].hex()
@@ -387,17 +402,18 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay | LinkedOve
                 fixup_positions.add(code_start + fixup)
 
             stub_segment = root.base_segment + descriptor.segment
-            for index, offset in enumerate(descriptor.entries):
-                stub = Address(stub_segment, _HEADER_SIZE + index * _STUB_SIZE)
-                target = Address(segment, offset)
-                stub_targets[stub.linear] = target
-                stub_records.append({
-                    "address": address_record(stub),
-                    "target": address_record(target),
-                    "unit": unit.name,
-                    "file_offset": descriptor.file_offset + offset,
-                    "original": _rewrite(image, stub.linear - origin, 0xEA, target),
-                })
+            stubs = tuple((Address(stub_segment, _HEADER_SIZE + index * _STUB_SIZE), offset)
+                          for index, offset in enumerate(descriptor.entries))
+        for stub, offset in stubs:
+            target = Address(segment, offset)
+            stub_targets[stub.linear] = target
+            stub_records.append({
+                "address": address_record(stub),
+                "target": address_record(target),
+                "unit": unit.name,
+                "file_offset": record["file_offset"] + offset,
+                "original": _rewrite(image, stub.linear - origin, 0xEA, target),
+            })
         code_end = code_start + len(data)
         if code_end > len(image):
             image.extend(bytes(code_end - len(image)))

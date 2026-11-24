@@ -4,6 +4,7 @@ from dataclasses import replace
 from struct import pack_into
 
 from .dos_overlays import embedded_overlays
+from .members import Member
 from .mz import Address, DEFAULT_BASE_SEGMENT, LoadedMZ, MZError, MZExecutable, read_mz_header
 from .overlays import LinkedOverlay
 from .pklite import unpack_pklite_com
@@ -43,13 +44,14 @@ def load_dos_flat(data: bytes, base_segment: int = DEFAULT_BASE_SEGMENT, *, com:
                     dos_format="COM" if com else "RAW", load_offset=start)
 
 
-def load_dos_mz(data: bytes, base_segment: int, source: str) -> tuple[LoadedMZ, list[LinkedOverlay]]:
+def load_dos_mz(data: bytes, base_segment: int, source: str, *,
+                link_files: tuple[tuple[str, bytes], ...] = ()) -> tuple[LoadedMZ, list[LinkedOverlay]]:
     header = read_mz_header(data)
     if header.overlay_number:
         raise MZError(f"MZ member is overlay {header.overlay_number}; pass the complete executable")
     executable = MZExecutable.parse(data)
     loaded = executable.load(base_segment)
-    overlays, diagnostics = embedded_overlays(data, executable, loaded, source)
+    overlays, diagnostics = embedded_overlays(data, executable, loaded, source, link_files)
     toolchain = None
     # Borland's header generation is independent of the TLINK banner version.
     if (0x22 <= header.relocation_offset <= header.header_size
@@ -58,3 +60,16 @@ def load_dos_mz(data: bytes, base_segment: int, source: str) -> tuple[LoadedMZ, 
         toolchain = {"family": "Borland TLINK", "header_version": f"{generation >> 4}.{generation & 15}",
                      "evidence": "extended MZ header", "file_offset": 0x1C}
     return replace(loaded, diagnostics=tuple(diagnostics), toolchain=toolchain), overlays
+
+
+def dos_overlay_member(overlay: LinkedOverlay) -> Member:
+    details = {"overlay_format": overlay.format, "overlay_number": overlay.number, "source": overlay.source,
+               "relocation_count": sum(fixup.segment for fixup in overlay.fixups)}
+    if overlay.allocation_size is not None:
+        details["allocation_size"] = overlay.allocation_size
+    return Member(overlay.name, overlay.name, "overlay", size=len(overlay.image),
+                  container_offset=overlay.file_offset, details=details)
+
+
+def is_link_overlay(data: bytes) -> bool:
+    return len(data) >= 28 and data.startswith(b"MZ") and data[26:28] != b"\0\0"

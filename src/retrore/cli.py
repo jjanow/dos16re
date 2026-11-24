@@ -18,7 +18,7 @@ from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .compare import DEFAULT_LIMIT as DEFAULT_COMPARE_LIMIT, compare_projects
 from .containers import CONTAINER_FORMATS, MACINTOSH_SUFFIXES, apple2_disk_order, inspect_members
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
-from .dos import load_dos_flat, load_dos_mz
+from .dos import dos_overlay_member, is_link_overlay, load_dos_flat, load_dos_mz
 from .dynamic import RoutineBackend, RoutineRequest
 from .emulator import DEFAULT_INSTRUCTION_LIMIT, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
@@ -35,7 +35,7 @@ from .image import (
     NES_FORMAT, PC88_FORMAT, PC98_FORMAT, X1_FORMAT, X68K_FORMAT, ImageError,
 )
 from .macintosh import MacintoshError, build_macintosh_image, is_macintosh
-from .members import MemberError, disk_index, record_container
+from .members import MemberError, disk_index, record_container, select_member
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, UnsupportedPacker
 from .nes import NES_MAGIC, NesError, build_nes_image
@@ -1206,7 +1206,7 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         image, program_map = _apple2_image(args, data)
     elif args.apple2_unit or args.apple2_lc is not None:
         raise Apple2Error("--apple2-unit and --apple2-lc require an Apple II program")
-    elif args.c64 or args.disk_file or extension == ".d64" or (
+    elif args.c64 or (args.disk_file and not data.startswith(b"MZ")) or extension == ".d64" or (
         extension == ".prg" and not (m68k or data.startswith(b"MZ"))
     ):
         image, program_map = _c64_image(args, data)
@@ -1222,12 +1222,24 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         if args.base_address is not None:
             raise MZError("--base-address applies to 68k and 8-bit programs")
         base_segment = DEFAULT_BASE_SEGMENT if args.base_segment is None else args.base_segment
-        loaded, overlays = load_dos_mz(data, base_segment, args.program.name)
-        overlays.extend([
-            Overlay(path.name, path.stem, path.read_bytes(), segment)
-            for path, segment in args.overlay
-        ])
+        link_files, other_overlays = [], []
+        for path, segment in args.overlay:
+            contents = path.read_bytes()
+            if segment is None and is_link_overlay(contents):
+                link_files.append((path.name, contents))
+            else:
+                other_overlays.append(Overlay(path.name, path.stem, contents, segment))
+        loaded, embedded = load_dos_mz(data, base_segment, args.program.name, link_files=tuple(link_files))
+        selected = []
+        if args.disk_file:
+            catalog = [(dos_overlay_member(overlay), overlay) for overlay in embedded]
+            selected = [select_member(catalog, selector, "DOS overlay member", MemberError)
+                        for selector in args.disk_file]
+            embedded = [overlay for _, overlay in selected]
+        overlays = [*embedded, *other_overlays]
         image, program_map = build_image(loaded, args.program.name, overlays)
+        if selected:
+            record_container(program_map, "mz", [member for member, _ in selected], decisions={"selection": "explicit"})
     if args.load_manifest:
         image = apply_load_manifest(args.load_manifest, image, program_map)
     else:
@@ -1320,7 +1332,7 @@ def program_options() -> argparse.ArgumentParser:
     )
     command.add_argument(
         "--overlay", type=_overlay, action="append", default=[], metavar="FILE[@SEG]",
-        help="add a Turbo Pascal overlay bank or raw overlay (optionally at hex SEG)",
+        help="add a Microsoft LINK or Turbo Pascal overlay bank, or raw overlay (optionally at hex SEG)",
     )
     platform = command.add_mutually_exclusive_group()
     platform.add_argument("--dos-com", action="store_true", help="load a DOS .COM program at offset 0100")
@@ -1451,6 +1463,8 @@ def member_options() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("program", type=Path, metavar="INPUT")
     parser.add_argument("--format", choices=CONTAINER_FORMATS, help="override container detection")
+    parser.add_argument("--overlay", action="append", type=Path, default=[], metavar="FILE",
+                        help="include an external Microsoft LINK overlay file")
     parser.add_argument("--apple2-disk-order", choices=("dos", "prodos", "physical"),
                         help="override Apple II sector ordering")
     return parser
@@ -1705,7 +1719,7 @@ def main(argv: list[str] | None = None) -> int:
         return serve(use_worker=not args.no_worker)
     try:
         if args.command == "members":
-            report = inspect_members(args.program, args.format, args.apple2_disk_order)
+            report = inspect_members(args.program, args.format, args.apple2_disk_order, args.overlay)
             if args.json:
                 print(json.dumps(report))
             else:

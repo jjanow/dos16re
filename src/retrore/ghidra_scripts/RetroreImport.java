@@ -74,6 +74,19 @@ public class RetroreImport extends HeadlessScript {
             MemoryBlock block = memory.createInitializedBlock(name, start, bytes, fileOffset, size, false);
             block.setExecute(true);
             block.setWrite(true);
+            if (unit.has("allocation_size")) {
+                long allocation = unit.get("allocation_size").getAsLong();
+                if (allocation < size || allocation > 0x100000L - start.getOffset()) {
+                    throw new IllegalArgumentException("invalid allocation for unit " + name);
+                }
+                if (allocation > size) {
+                    var extra = memory.createUninitializedBlock(name + "_bss",
+                        space.getAddress(start.getOffset() + size), allocation - size, false);
+                    extra.setRead(true);
+                    extra.setWrite(true);
+                    extra.setExecute(false);
+                }
+            }
         }
         if (map.has("memory_end")) {
             addRootAllocation(units, root, map.get("memory_end").getAsLong(), memory);
