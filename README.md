@@ -243,6 +243,7 @@ default to offset `0000` and enter at the first input byte unless `--dos-entry` 
 
 Embedded Borland VROOMM banks and Microsoft LINK members are discovered from the executable.
 The loader exports native file offsets, applies verified fixups, and rewrites resolved VROOMM stubs.
+VROOMM skips empty code descriptors and handles the reserved fixup bit used by Turbo C++ 1.01.
 A flagged VROOMM function-pointer fixup resolves two adjacent `MOV reg,imm16` / `PUSH reg` pairs
 using the same register to a unique resident stub. LINK directories can be recovered from count
 fields or adjacent relocation-backed arrays corroborated by member fixups. Verified members share
@@ -1589,9 +1590,11 @@ Phase 12 has optional checks against original tool outputs and releases.
 | Environment variable | Inputs |
 |---|---|
 | `RETRORE_DOS_LOADER_DIR` | Microsoft LINK 3.65 `TEST2.EXE`, PKLITE 2.01 `PACK201.EXE` and `COM201.COM`, and their unpacked `PACK.EXE` and `testcom.com` counterparts |
+| `RETRORE_DOS_LINK_2X_DIR` | Microsoft LINK 2.40 `PAD240.EXE` and 2.45 `PAD245.EXE` with a relocated, padded overlay member. See the [build steps](#microsoft-link-2x-probes). |
 | `RETRORE_DOS_LINK_LAYOUT_DIR` | LINK 3.65 `LIVE365.EXE` with a 16-byte uninitialized CODE segment before a page-aligned routine in member 2. The test also checks a copy with the directory counts cleared. |
 | `RETRORE_VROOMM_DIR` | The TLINK 4.0 three-overlay `VROOMM.EXE` probe |
 | `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
+| `RETRORE_BORLAND_COMPILERS_DIR` | Original `TCC.EXE` from [Turbo C++ 1.01](https://altd.embarcadero.com/download/museum/tcpp101.zip) and `BCC.EXE` from [Borland C++ 2.0](https://winworldpc.com/product/borland-c/20) |
 | `RETRORE_PKLITE_TESTEXE_DIR` | The `compress` directory with `t10fr` and `h10fr` EXE and UNC pairs from [testexe](https://github.com/camoto-project/testexe) |
 | `RETRORE_PKLITE_SFX_DIR` | The [PKZIP 2.04g installer](https://www.hpcalc.org/details/3882) as `pk204g.exe` and its [Deark](https://github.com/jsummers/deark) reference produced by `deark -m pklite -o pk204g-unpacked pk204g.exe` |
 | `RETRORE_AMIGA_OVERLAY_DIR` | An original hierarchical executable named `overlay` |
@@ -1600,8 +1603,76 @@ Phase 12 has optional checks against original tool outputs and releases.
 Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
 runs the synthetic suites with the headless tests enabled. [Release workflow](.github/workflows/release-ci.yml)
 
-See the roadmap for upcoming work.
-[PLAN.md](PLAN.md)
+### Microsoft LINK 2.x probes
+
+Use `PAS1.EXE`, `PAS2.EXE`, `PASCAL.LIB`, and `MATH.LIB` from Microsoft Pascal 3.20 and
+`MASM.EXE` from MASM 5.10. Copy the distribution's `LINK.V2` as `LP2.EXE` (2.40) and
+`LINK.V1` as `LP1.EXE` (2.45). Save the source files with DOS line endings.
+[Microsoft Pascal 3.20 disks](https://www.pcjs.org/software/pcx86/lang/microsoft/pascal/compiler/3.20/)
+
+`RUN.PAS`
+
+```pascal
+program run(output);
+function one: integer; extern;
+function two: integer; extern;
+begin
+  if (one = 1) and (two = 7) and (one = 1) and (two = 7) then
+    writeln('PASS')
+  else
+    writeln('FAIL')
+end.
+```
+
+`ONE.PAS`
+
+```pascal
+module partone;
+function one: integer;
+begin
+  one := 1
+end;
+end.
+```
+
+`PADDED.ASM`
+
+```asm
+lead segment para public 'CODE'
+db 10h dup (?)
+lead ends
+two_code segment page public 'PAGECODE'
+assume cs:two_code
+public TWO
+TWO proc far
+    mov dx,seg TWO
+    mov ax,cs
+    cmp ax,dx
+    mov ax,0
+    jne done
+    mov ax,7
+done:
+    ret
+TWO endp
+two_code ends
+end
+```
+
+Run these commands in DOS. Both executables print `PASS` if overlay switching and relocation work.
+
+```bat
+pas1 run;
+pas2
+pas1 one;
+pas2
+masm padded,padded;
+lp2 run+(one)+(padded),pad240,pad240/map,pascal+math;
+lp1 run+(one)+(padded),pad245,pad245/map,pascal+math;
+pad240
+pad245
+```
+
+The roadmap tracks upcoming work. [PLAN.md](PLAN.md)
 
 ## License
 

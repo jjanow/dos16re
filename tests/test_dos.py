@@ -50,17 +50,21 @@ def _split_link_directory(*, counted=False, duplicate=False, outside_window=Fals
     return resident + _align(first) + second
 
 
-def _vroomm(code=bytes.fromhex("b80000cb"), *, fixups=(1,), entries=(0,)):
-    root = bytearray(0x80)
+def _vroomm(code=bytes.fromhex("b80000cb"), *, fixups=(1,), entries=(0,), empty_descriptor=False):
+    root = bytearray(0xA0 if empty_descriptor else 0x80)
     root[:6] = bytes.fromhex("9a20000200c3")
     fixup_table = pack(f"<{len(fixups)}H", *fixups)
     pack_into("<BBHI3H", root, 0x20, 0xCD, 0x3F, 0, 0, len(code), len(fixup_table), len(entries))
     for index, entry in enumerate(entries):
         pack_into("<BBHB", root, 0x40 + index * 5, 0xCD, 0x3F, entry, 0)
     pack_into("<8H", root, 0x60, 0, 0x20, 0, 0, 2, 0x20 + len(entries) * 5, 2, 0)
+    payload = code + fixup_table
+    if empty_descriptor:
+        pack_into("<4H", root, 0x70, 8, 0x20, 3, 0)
+        pack_into("<BBHI3H", root, 0x80, 0xCD, 0x3F, 0, len(payload), 0, 0, 0)
     resident = _mz(root, relocations=[(3, 0)])
-    directory = len(resident) - 0x80 + 0x60
-    return resident + pack("<4sIII", b"FBOV", len(code) + len(fixup_table), directory, 2) + code + fixup_table
+    directory = len(resident) - len(root) + 0x60
+    return resident + pack("<4sIII", b"FBOV", len(payload), directory, 2 + empty_descriptor) + payload
 
 
 def _command(capsys, *arguments):
@@ -164,8 +168,26 @@ def test_vroomm_restores_stub_call_fixup_and_source(tmp_path, capsys):
         load_dos_mz(_vroomm()[:-1], 0x1000, "bad.exe")
 
 
+def test_vroomm_accepts_empty_descriptor_and_ignores_reserved_fixup_bit(tmp_path, capsys):
+    binary = _vroomm(bytes.fromhex("b80400cb"), empty_descriptor=True)
+    source, out = tmp_path / "vroomm.exe", tmp_path / "out"
+    source.write_bytes(binary)
+    program = _command(capsys, "load", source, "-o", out)
+    assert [unit["name"] for unit in program["units"]] == ["root", "vroomm_0002"]
+    assert "diagnostics" not in program
+    proof = _command(capsys, "bytes", "vroomm_0002:0", "--export", out, "--size", 4)
+    assert (proof["original"], proof["loaded"]) == ("b80400cb", "b80010cb")
+
+    malformed = bytearray(binary)
+    descriptor = read_mz_header(binary).header_size + 0x80
+    pack_into("<I3H", malformed, descriptor + 4, 0, 0, 2, 0)
+    with pytest.raises(MZError, match="invalid Borland VROOMM descriptor for segment 0008"):
+        load_dos_mz(malformed, 0x1000, source.name)
+
+
 @pytest.mark.parametrize(("encoded", "restored"), [
     ("b8090050b8000050", "b8021050b8250050"),
+    ("b80d0050b8000050", "b8021050b8250050"),
     ("bb090053bb000053", "bb021053bb250053"),
 ])
 def test_vroomm_restores_flagged_far_pointer_pushes(encoded, restored, tmp_path, capsys):
@@ -386,6 +408,36 @@ def test_original_link_member_with_leading_padding(clear_counts, tmp_path, capsy
     assert match["file"]["offset"] == 0x1D00
 
 
+@pytest.mark.parametrize(("filename", "count_offset", "selector_count", "window"), [
+    ("PAD240.EXE", 0x4320, 32, 0x337),
+    ("PAD245.EXE", 0x42F0, 4, 0x335),
+])
+def test_original_link_2x_padded_member(filename, count_offset, selector_count, window, tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_DOS_LINK_2X_DIR")):
+        pytest.skip("set RETRORE_DOS_LINK_2X_DIR to the Microsoft Pascal LINK 2.x probes")
+    source = Path(directory) / filename
+    original = source.read_bytes()
+    header = read_mz_header(original)
+    assert unpack_from("<2H", original, header.header_size + count_offset) == (selector_count, 3)
+
+    out = tmp_path / "link"
+    program = _command(capsys, "load", source, "-o", out)
+    _, first, second = program["units"]
+    runtime = (0x1000 + window) * 16
+    assert "diagnostics" not in program
+    assert first["runtime_linear"] == second["runtime_linear"] == runtime
+    assert second["segment_offsets"] == [0, 0x10]
+    assert second["size"] == 0x20
+    proof = _command(capsys, "bytes", "link_0002:0", "--export", out, "--size", "19")
+    assert proof["original"] == (bytes(0x10) + pack("<BH", 0xBA, window + 1)).hex()
+    assert proof["loaded"] == (bytes(0x10) + pack("<BH", 0xBA, second["segment"] + 1)).hex()
+    mapped = _command(capsys, "address-map", f"{runtime + 0x10:x}", "--from", "runtime",
+                      "--state", "link_0002", "--export", out)
+    match, = mapped["matches"]
+    assert match["unit_address"] == "link_0002:0010"
+    assert match["file"]["offset"] == 0x5210
+
+
 def test_original_dos_overlay_probe_outputs_when_available(tmp_path, capsys):
     if not (directory := os.environ.get("RETRORE_DOS_OVERLAY_PROBE_DIR")):
         pytest.skip("set RETRORE_DOS_OVERLAY_PROBE_DIR to the PADDED.EXE, VROOMM.EXE and VROOM86.EXE probe outputs")
@@ -449,3 +501,25 @@ def test_original_tlink_vroomm_output_when_available():
     resident, overlays = load_dos_mz(source.read_bytes(), 0x1000, source.name)
     assert resident.toolchain["family"] == "Borland TLINK"
     assert overlays and all(overlay.format == "VROOMM" and overlay.entries for overlay in overlays)
+
+
+@pytest.mark.parametrize(("filename", "stub_count", "relocation_count"), [
+    ("TCC.EXE", 894, 7282),
+    ("BCC.EXE", 914, 7612),
+])
+def test_original_borland_compiler_overlays(filename, stub_count, relocation_count, tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_BORLAND_COMPILERS_DIR")):
+        pytest.skip("set RETRORE_BORLAND_COMPILERS_DIR to Turbo C++ 1.01 TCC.EXE and Borland C++ 2.0 BCC.EXE")
+    out = tmp_path / "borland"
+    program = _command(capsys, "load", Path(directory) / filename, "-o", out)
+    overlays = program["units"][1:]
+    assert "diagnostics" not in program
+    assert len(overlays) == 122
+    assert all(unit["overlay_format"] == "VROOMM" and unit["size"] for unit in overlays)
+    assert len(program["stubs"]) == stub_count
+    assert sum(unit["relocation_count"] for unit in overlays) == relocation_count
+    if filename == "TCC.EXE":
+        proof = _command(capsys, "bytes", "vroomm_078c:02e6", "--export", out, "--size", 2)
+        relocation, = (edit for edit in proof["evidence"] if edit["kind"] == "relocation")
+        assert proof["address"]["file"]["offset"] == 0x17BB6
+        assert (relocation["before"], relocation["after"]) == ("1403", "6618")

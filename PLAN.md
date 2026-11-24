@@ -14,14 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, LINK 3.65 and 5.01.21 probes switched between two overlays in DOSBox, including a
-member with 256 bytes of leading padding. A copy with its counts cleared verified the LINK fallback.
-TLINK 3.01 and 4.0 runtime checks narrowed flagged VROOMM pointer rewrites to adjacent
-`MOV`/`PUSH` pairs using the same register. The standalone suite passed 506 tests with 113 skipped.
-The focused DOS and Amiga suite passed 54 tests with native inputs and Ghidra 12.2.
+On 2026-11-23, LINK 2.40 and 2.45 probes built with Microsoft Pascal 3.20 switched between two
+overlays and checked the padded member's relocation in DOSBox. The VROOMM loader now accepts the
+empty descriptors and unused fixup bit found in Borland's shipped compilers. Both compilers
+built a probe in DOSBox, and retrore exported 122 overlays from each. The standalone suite passed
+508 tests with 117 skipped. The DOS and Amiga suite with native inputs and Ghidra 12.2 passed 59
+tests with one skipped.
 
-Resume with untouched LINK outputs whose directory omits the counts or whose first listed segment
-for a member follows the window start, and untouched TLINK outputs that set the pointer-offset flag.
+Continue native validation when a LINK executable omits the counts or starts a member's first listed
+segment past the window start, or when a TLINK executable sets the pointer-offset flag.
 
 ## Why
 
@@ -420,8 +421,8 @@ release. Continue with the analysis backlog below.
   decoding handles encoded match distances and the ADD variant's big-endian relocation offsets.
   Microsoft LINK and Borland VROOMM overlays retain their source offsets and recovered fixups.
   LINK recovers the shared runtime window from counted directories and adjacent arrays with matching
-  member fixups. VROOMM resolves flagged pointer pushes to verified resident stubs. Partial layouts
-  and unmapped trailers appear as diagnostics.
+  member fixups. VROOMM skips header-only descriptors for empty code segments and resolves flagged
+  pointer pushes to verified resident stubs. Partial layouts and unmapped trailers appear as diagnostics.
 - **Implemented.** Amiga Hunk overlay trees retain each node and its ancestry, active segment indices,
   table entries, and source offsets. The loader supports additional narrow absolute and PC-relative
   fixups, recognized LINE records, and the THOR 1.2 manager signature. DOS exports accept LINK and
@@ -437,7 +438,10 @@ release. Continue with the analysis backlog below.
 **Validated with original tools.** PKLITE 1.15 registered small and large XOR outputs match their
 unpacked references. The PKZIP 2.04g installer exercises the ADD decoder and matches Deark on
 its image, entry, stack, and 24 relocations. The PKLITE 2.01 COM probe still decodes after its
-copyright fields are cleared. LINK 3.05, 3.65, and 5.01.21 probes produced counted directories.
+copyright fields are cleared. LINK 2.40, 2.45, 3.01, 3.05, 3.65, and 5.01.21 probes produced counted
+directories. The LINK 2.40 and 2.45 probes have 32 and 4 selectors respectively. Both list the
+leading empty CODE segment at the window start and execute the padded member successfully in DOSBox.
+The opt-in tests check the window, relocated bytes, and original file offset for both executables.
 In the runnable LINK 3.65 and 5.01.21 probes, the shared window begins at image offset `0xB00`.
 Member 2 begins with an uninitialized segment, and its first routine is page-aligned at `0xC00`.
 Both probes returned the expected values on alternating calls to the two members in DOSBox. The
@@ -450,6 +454,14 @@ for the far-pointer probes. Setting the flag and substituting the function's ove
 copies of those binaries verified the runtime rewrite in DOSBox. The runtime pointer check passed
 for same-register `MOV`/`PUSH` pairs and failed for flagged immediate pushes and pairs using
 different registers. The loader reports these unsupported flagged offsets as unresolved.
+
+**Validated with shipped Borland executables.** Turbo C++ 1.01 `TCC.EXE` and Borland C++ 2.0
+`BCC.EXE` each export 122 nonempty overlays. `TCC.EXE` has 4 empty descriptors, 894 stubs, and
+7,282 fixups. Its overlay manager discards bit 2 of a fixup word before indexing the segment table
+and tests bit 0 for pointer-offset rewriting. `BCC.EXE` has 5 empty descriptors, 914 stubs, and
+7,612 fixups. DOSBox compiled the same simple C program with both executables. TLINK 3.01 and
+4.0 also emitted resident stub offsets in C pointer initializers and return values, and MASM
+segment/offset pairs and in-code far pointers.
 
 **Validated with an original Amiga release.** The 1986 DeluxePaint I executable has eight overlay
 nodes, including two children of `ov1_6`, and 66 table entries. Ghidra 12.2 imported 6,360

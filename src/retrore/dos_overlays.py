@@ -11,6 +11,7 @@ _PAIR = Struct("<2H")
 _FB_HEADER = Struct("<4sIII")
 _FB_SEGMENT = Struct("<4H")
 _FB_DESCRIPTOR = Struct("<BBHI3H")
+_FB_DESCRIPTOR_SIZE = 0x20
 _FB_STUB = Struct("<BBHB")
 _LINK_MAX_SEGMENTS = 256
 
@@ -186,23 +187,29 @@ def _read_vroomm(data: bytes, start: int, executable: MZExecutable,
         if not flags & 2 or not limit:
             continue
         offset = segment * 16
-        if offset + 32 > len(root):
+        stub_start = offset + _FB_DESCRIPTOR_SIZE
+        if stub_start > len(root):
             raise MZError(f"Borland VROOMM descriptor for segment {segment:04x} is truncated")
         opcode, interrupt, _, relative, code_size, fixup_size, count = _FB_DESCRIPTOR.unpack_from(root, offset)
         file_offset = payload + relative
-        stub_end = offset + 32 + count * _FB_STUB.size
-        if (opcode != 0xCD or not code_size or fixup_size % 2 or stub_end > len(root)
+        stub_end = stub_start + count * _FB_STUB.size
+        if (opcode != 0xCD or fixup_size % 2 or stub_end > len(root)
                 or stub_end - offset > 0x10000 or file_offset + code_size + fixup_size > end):
             raise MZError(f"invalid Borland VROOMM descriptor for segment {segment:04x}")
+        resident_ranges.append((offset, stub_end))
+        if not code_size:
+            # The shipped Borland compilers have header-only descriptors for empty code segments.
+            if fixup_size or count or limit != _FB_DESCRIPTOR_SIZE:
+                raise MZError(f"invalid Borland VROOMM descriptor for segment {segment:04x}")
+            continue
         entries = []
-        for stub_opcode, vector, target, _ in _FB_STUB.iter_unpack(root[offset + 32:stub_end]):
+        for stub_opcode, vector, target, _ in _FB_STUB.iter_unpack(root[stub_start:stub_end]):
             if (stub_opcode, vector) != (opcode, interrupt) or target >= code_size:
                 raise MZError(f"invalid Borland VROOMM stub for segment {segment:04x}")
             entries.append(target)
         descriptor = Descriptor(segment, file_offset, code_size, fixup_size, tuple(entries))
         descriptors[number] = descriptor
         ranges.append((file_offset, descriptor.end))
-        resident_ranges.append((offset, stub_end))
     ranges.sort()
     resident_ranges.sort()
     if not descriptors or any(left[1] > right[0] for spans in (ranges, resident_ranges)
@@ -228,7 +235,8 @@ def _read_vroomm(data: bytes, start: int, executable: MZExecutable,
             if index >= len(directory):
                 raise MZError(f"Borland VROOMM fixup names missing segment index {index}")
             fixups.append(LinkedFixup(offset, directory[index][0]))
-            if flags & ~1:
+            # Turbo C++ 1.01 emits bit 2. The original manager masks it off before the table lookup.
+            if flags & ~(0x01 | 0x04):
                 unknown_flags += 1
             if flags & 1:
                 pointer = _function_ref_fixup(code, offset, descriptors.get(index))
@@ -265,4 +273,4 @@ def _function_ref_fixup(code: bytes, offset: int, descriptor: Descriptor | None)
     matches = [index for index, entry in enumerate(descriptor.entries) if entry == target]
     if len(matches) != 1:
         return None
-    return LinkedFixup(offset_site, 32 + _FB_STUB.size * matches[0], segment=False)
+    return LinkedFixup(offset_site, _FB_DESCRIPTOR_SIZE + _FB_STUB.size * matches[0], segment=False)
