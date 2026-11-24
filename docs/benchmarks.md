@@ -23,8 +23,7 @@ project with questions written for it:
 
 ## Results, 2026-11-22
 
-Linux, 16 cores, Ghidra 12.2 (snap), Python 3.14. Medians of 3 runs. Other agents were running
-headless Ghidra on the same machine at the time (load average about 3), so expect some noise.
+Linux, 16 cores, Ghidra 12.2 (snap), Python 3.14. Medians of 3 runs at a system load of about 3.
 
 | Measurement | Wall time | Launches | JSON output |
 |---|---|---|---|
@@ -98,9 +97,7 @@ Synthetic program:
 
 A single query through a warm worker takes 6–8 ms, against 3.2–3.5 s with its own launch.
 
-Pool of Radiance (36 units), from a fresh import made after the overlay placement change. The
-questions were rewritten with addresses from that export. As before, the question file stays outside
-the repository with the game.
+Pool of Radiance (36 units), with query addresses from the tested export.
 
 | Question | One launch per query | One batch per step | Worker, cold | Worker, warm (batch per step) | Worker, warm (call per query) |
 |---|---|---|---|---|---|
@@ -122,10 +119,8 @@ Separate CLI processes, as a shell user or a coding agent issuing commands runs 
 
 Through the daemon a CLI query costs Python startup plus the query, about 0.1 s.
 
-## Is a persistent worker justified?
+## Persistent worker impact
 
-Yes, and it is now implemented. Batching amortizes the fixed cost for independent queries, but
-typical questions need two or three dependent steps, where each answer picks the next address. Each
-step used to pay about 4 s to launch Ghidra for about 0.1 s of work. With a worker, a question pays
-one 4 s launch at most, and later questions on the same project pay none. The PoR questions went
-from 8–11 s batched (11–19 s with one launch per query) to about 4 s cold and 0.03–0.11 s warm.
+The worker reuses one Ghidra session across dependent steps. The Pool of Radiance scenarios took
+11–19 s with a launch per query, 8–11 s with a launch per batch, about 4 s with a cold worker, and
+0.03–0.11 s with a warm worker.

@@ -14,42 +14,29 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, traced Phantasie III's FCOM/FCOMP dispatch at `root:1366d`. The 400 probes
-covered all 16 slots and eight successors. Ghidra 12.2 applied 65 instruction starts and
-eight computed jumps in the import with all four LINK overlays. A second preview found
-zero remaining gaps in the capture. The opt-in test replays the comparison and FTST edges.
-The standalone suite passed 513 tests with 127 skipped. All three opt-in Phantasie III
-DOS checks passed with Ghidra 12.2.
+On 2026-11-24, added 729 opt-in Unicorn probes for Phantasie III's floating-point arithmetic and
+register-stack copies. The probes confirmed class values 0–3 at both dispatch sites. The docs now
+refer to original releases as validation inputs. The standalone suite passed 513 tests with 128 skipped.
+All four opt-in Phantasie III DOS checks passed with Ghidra 12.2.
 
-Resume Phase 9 by checking the operand-class bounds through arithmetic and stack-record
-copies before using them for static table recovery. Static LINK validation still needs a
-shipped executable that omits the directory counts or places a member's first listed segment
-after the window start. Use captured placements for Microsoft MOVE runtime views as more
-formats are verified.
+Resume Phase 9 by tracking record-field writes across calls and checking which writes can alias
+the record.
+Microsoft LINK still needs a shipped executable with missing directory counts or a member whose first
+listed segment starts after the overlay window start. Expand Microsoft MOVE runtime views as more
+captured placements become available.
 
 ## Why
 
-Recurring failures from the Gold Box (Pool of Radiance) and Phantasie remaster projects:
-
-| Problem | Seen as |
-|---|---|
-| Overlays all load at segment 0 | Phantasie OV1/OV2 code appears as `FUN_0000_xxxx`; addresses collide between overlays; a table query script was built on a wrong segment delta |
-| Overlay stubs break cross-references | PoR `GAME.OVR` (Turbo Pascal `FBOV`, 35 units) is reached through INT 3Fh stubs; every doc resolves `lcall 0085:0039`-style calls by hand |
-| Jump-table targets dropped | Ghidra removes switch targets as "unreachable" (Phantasie Mystic SCORE had to be recovered with raw capstone) |
-| Segment values not tracked | Phantasie III state lives in far segment `0x1820`, reached through segment words stored in DGROUP (`mov es,[0x2aaa]`); data references stay anonymous |
-| Packed executables | EXEPACK unpacked by hand in each project |
-| Runtime library noise | Turbo Pascal 6 runtime (Real48, strings, sets, I/O) decompiles as clutter instead of named calls |
-| Emulator harness is one-off | PoR's unicorn harness and ~4,500 lines of per-routine oracle scripts only work for that one game |
-
-The initial scope was 16-bit real-mode x86 for DOS. The post-DOS roadmap now covers original source
-platforms used by the remaster projects, starting with AmigaDOS.
+Packed executables and overlays need a reconstructed memory map before analysis can resolve
+addresses. Segment tracking and jump-table recovery improve cross-references. Runtime signatures
+identify compiler helpers, and routine emulation verifies behavior against the loaded image.
 
 ## Design
 
 - **Python 3 package + CLI** (`retrore`), with Capstone for disassembly and Unicorn, py65, and z80 for
   routine execution. Every command can print JSON (`--json`) so agents can call it cheaply. The
-  package and its default test suite run independently of sibling projects. Game-specific addresses
-  and expectations belong in opt-in validation tests.
+  package and its default test suite are self-contained. Game-specific addresses and expectations
+  belong in opt-in validation tests.
 - **Ghidra integration through headless scripts**, not a full Ghidra extension at first: the loader writes a flat
   image + a JSON "program map" (segments, units, symbols, segment-register assumptions, functions, jump tables),
   and a Ghidra headless script imports it into a project. A real Ghidra loader
@@ -61,7 +48,7 @@ platforms used by the remaster projects, starting with AmigaDOS.
 
 ## Phases
 
-### Phase 1: whole-program loader (the main win)
+### Phase 1: whole-program loader
 
 1. **Implemented.** Parse the header and relocation table, relocate the module
    at a fixed base segment, and report the initial CS:IP and SS:SP. See the
@@ -97,11 +84,8 @@ up to that limit. In PoR the first overlay unit moved from `0x20BF0` to `0x28F20
 **Validated on Ghidra 12.2.** The Pool of Radiance loot handler decompiles with its View call named
 `tpov_0085_0ab3` directly after import.
 
-The first remaster check used Pool of Radiance's LOADPIECES handler at `GAME.OVR:0x19BA`. In the ordinary
-branch a 255 operand invalidates the two slot words without clearing the wall buffer. With both area flags
-set, the handler instead passes operands 1 and 3 straight to the wall-set loader at `GAME.OVR:0x2F6FF`,
-including 255. The decompiler resolved the overlay calls. Its remaining anonymous data operands give
-Phase 3 a second validation case alongside Phantasie III.
+Ghidra also resolved the overlay calls in Pool of Radiance's LOADPIECES handler at
+`GAME.OVR:0x19BA`, including the wall-set loader at `GAME.OVR:0x2F6FF`.
 
 ### Phase 3: segment-register tracking
 
@@ -184,7 +168,7 @@ across separated overlay units.
 
 | Target | Format | Checks |
 |---|---|---|
-| Pool of Radiance (DOS v1.3) | TP6, EXEPACK, `FBOV` overlays | Unit table, stub resolution, addresses listed in the Gold Box RE docs |
+| Pool of Radiance (DOS v1.3) | TP6, EXEPACK, `FBOV` overlays | Unit table, stub resolution, overlay cross-references |
 | Phantasie I (DOS) | LZEXE 0.90 MZ + program-loaded `OV1.OVR`/`OV2.OVR` | Distinct overlay segments, jump-table recovery (Mystic SCORE) |
 | Phantasie III (DOS) | EXEPACK MZ, four LINK overlays, far data segment `0x1820` | Segment tracking, far globals, traced floating-point dispatch |
 | Phantasie I (Amiga) | AmigaDOS Hunk, 240 resident hunks | Cross-hunk relocation and palette routine callers |
@@ -225,8 +209,8 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 Phases 1–7 are implemented for the initial DOS scope, including the optional DOSBox-X trace import.
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
 Sharp X1, Sharp X68000, Classic Macintosh, Nintendo NES / Famicom, and Sega Genesis / Mega Drive
-milestones are complete for the validated releases. X1turbo validation waits for a copy of the Gold Box
-release. Continue with the analysis backlog below.
+milestones are complete for the validated releases. X1turbo validation awaits original media.
+Continue with the analysis backlog below.
 
 ## Analysis backlog
 
@@ -325,21 +309,15 @@ release. Continue with the analysis backlog below.
   indexed memory operands without a displacement. `indirect` reports `segment_loss` with the origin
   and reason when the operand's segment is genuinely unknown. In Phantasie III, `root:42df` reads
   `SS:[2624]` and finds the relocation-backed candidate `root:11914`.
-  Phantasie III's `FTST` at `root:13721` dispatches through the table at `root:120fe`. A DOSBox-X
-  startup snapshot with the hardware FPU disabled supplied the initialized MSEM87 state for
-  Unicorn probes. Finite nonzero values, including subnormals, reached index 0 and `root:136bc`. Signed
-  zero reached index 1 and `root:13699`. Quiet and signaling NaNs reached index 2 and
-  `root:136ae`. Signed infinities reached index 3 and `root:136b5`. The loader's local index
-  analysis allows 256 values. The structured trace supplied the four observed successors
-  to `trace --apply`, and replay reported no remaining gaps in the capture.
-  FCOM and FCOMP share the dispatch at `root:1366d`, with a 16-word table at `root:120de`.
-  The memory and register forms each covered every pair of classes. The index is
-  `4 * class(SI) + class(DI)` when the two bytes are in 0 through 3. FTST uses
-  `class(SI)`. The single-, double-, and extended-precision input converters write
-  class values 0 through 3 at `root:12d47`, `root:12f6d`, and `root:134f3` respectively.
-  Both dispatch sites read the class from an operand record without a local range check.
-  A static bound still needs proof that arithmetic results and record copies preserve
-  that range. Open work also includes recovering genuinely unknown segment values.
+- **Validated with traces.** Phantasie III's `FTST` at `root:13721` uses `class(SI)`.
+  `FCOM` and `FCOMP` at `root:1366d` use `4 * class(SI) + class(DI)` for class values 0–3.
+  Traces covered all four `FTST` slots and all 16 comparison slots. The Ghidra regression test
+  replays their four and eight distinct successors.
+  The class is byte 11 of a 12-byte record. Input converters and arithmetic write the class or
+  copy a record. Unicorn tests exercise six arithmetic forms, extended-precision overflow and
+  underflow, and stack duplication, exchange, and store paths.
+  Automatic static recovery still needs a proof covering all writes to the fields read by both
+  dispatches, including writes through unresolved segment aliases.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry
@@ -563,32 +541,11 @@ For each new capability, use shared synthetic contract checks where possible and
 platform-specific behavior. Track missing capabilities so a platform's loader milestone is distinct
 from its analysis coverage.
 
-## Post-DOS stretch goals
+## Post-DOS platform milestones
 
 For each source platform, validate the executable or ROM loader, memory map, applicable bank or overlay
 handling, and analysis on a representative release before starting the next platform. Keep original media
 outside this repository and platform-specific game expectations in opt-in validation.
-
-| Order | Original source platform | Phantasie remaster | Gold Box remaster |
-|---|---|---|---|
-| 1 | Commodore Amiga | Yes | Yes |
-| 2 | Atari ST | Yes | Yes |
-| 3 | Commodore 64 | Yes | Yes |
-| 4 | Apple II | Yes | Yes |
-| 5 | Atari 8-bit | Yes | |
-| 6 | MSX2 | Yes | |
-| 7 | NEC PC-88 | Yes | Yes |
-| 8 | NEC PC-98 | Yes | Yes |
-| 9 | Sharp X1 / X1turbo | X1 | X1turbo |
-| 10 | Sharp X68000 | Yes | |
-| 11 | Classic Macintosh | | Yes |
-| 12 | Nintendo NES / Famicom | | Yes |
-| 13 | Sega Genesis / Mega Drive | | Yes |
-
-The matrix follows OpenPhantasie's supported copies and planned source platforms, and the Gold Box
-remaster's port matrix. Gold Box PC-88 and X1turbo validation depends on finding copies of the releases.
-The Phantasie project also tracks FM-7 and additional ports on platforms already in the table as research
-candidates pending release confirmation. [OpenPhantasie source-platform roadmap](https://github.com/jjanow/OpenPhantasie#planned-source-platform-support)
 
 ### Commodore Amiga
 
@@ -597,9 +554,8 @@ place their resident CODE, DATA, and BSS at stable addresses, and apply absolute
 relocations. The headless importer restores that layout for 68k analysis and makes the DOS
 toolkit's existing decompilation and reference queries available at `hN:offset` addresses.
 
-The SSI Phantasie I and III Amiga disk images from the Phantasie remaster supplied the validation
-executables. Ghidra recovered Phantasie I's call from `h20:018c` to the palette routine at
-`h77:0466`. For Phantasie III, a zero-based export placed DATA at `0x21890`, and Ghidra
+Ghidra recovered Phantasie I's call from `h20:018c` to the palette routine at `h77:0466`.
+For Phantasie III, a zero-based export placed DATA at `0x21890`, and Ghidra
 decompiled the main loop at `h0:736c` and resolved its write to `h1:286c`.
 Both Phantasie releases keep their hunks resident. DeluxePaint I validates hierarchical AmigaDOS
 overlays on an original release. Ghidra decompiled `ov1_1_h160:01d8` and recovered its call to

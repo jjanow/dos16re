@@ -1,11 +1,14 @@
 import json
 import os
+from itertools import product
 from pathlib import Path
-from struct import pack_into
+from struct import pack, pack_into, unpack_from
 
 import pytest
+from unicorn import x86_const as x86
 
 from retrore.cli import main
+from retrore.emulator import Emulator
 from retrore.evidence import evidence_bundle
 from retrore.jump_tables import JumpTable, M68kJumpTable, recover_jump_tables, recover_m68k_jump_tables
 from retrore.mz import Address, LoadedMZ, MZExecutable
@@ -517,6 +520,96 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, capsys):
         recovered, = json.loads(capsys.readouterr().out)["sites"]
         assert recovered["status"] == "resolved"
         assert set(recovered["targets"]) == {f"root:{target:x}" for target in targets}
+
+
+def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_export):
+    tmp_path, program = phantasie_iii_export
+    export = tmp_path / "export"
+    image = (export / "image.bin").read_bytes()
+    emulator = Emulator.from_export(export)
+    code_base = 0x118F0
+    code_segment = program["units"][0]["segment"] + code_base // 16
+    data_segment, = unpack_from("<H", image, 0x1249F)
+    stack_top = Address(data_segment, 0x10)
+    # Run the software runtime's reset routine to seed its stack from the original image.
+    initialized = emulator.call(
+        Address(code_segment, 0x11A09 - code_base), regs={"ds": data_segment}, reads=[(stack_top, 2)],
+    )
+    empty_stack = int.from_bytes(initialized.memory[0][1], "little")
+    scratch = Address(0x7000, 0)
+    interrupt_entry = 0x1241C - code_base
+
+    def software_float_interrupt(cpu, _number):
+        flags = cpu.reg_read(x86.UC_X86_REG_EFLAGS)
+        cs = cpu.reg_read(x86.UC_X86_REG_CS)
+        ip = cpu.reg_read(x86.UC_X86_REG_IP)
+        sp = (cpu.reg_read(x86.UC_X86_REG_SP) - 6) & 0xFFFF
+        stack = cpu.reg_read(x86.UC_X86_REG_SS) * 16 + sp
+        cpu.mem_write(stack, pack("<HHH", ip, cs, flags & 0xFFFF))
+        cpu.reg_write(x86.UC_X86_REG_SP, sp)
+        cpu.reg_write(x86.UC_X86_REG_EFLAGS, flags & ~0x300)
+        cpu.reg_write(x86.UC_X86_REG_CS, code_segment)
+        cpu.reg_write(x86.UC_X86_REG_IP, interrupt_entry)
+
+    def probe(load, operands, operation):
+        dispatches = []
+
+        def observe(cpu, comparison):
+            segment = cpu.reg_read(x86.UC_X86_REG_DS) * 16
+            registers = (x86.UC_X86_REG_SI, x86.UC_X86_REG_DI) if comparison else (x86.UC_X86_REG_SI,)
+            classes = tuple(cpu.mem_read(segment + cpu.reg_read(register) + 11, 1)[0] for register in registers)
+            assert all(0 <= value <= 3 for value in classes)
+            slot = 4 * classes[0] + classes[1] if comparison else classes[0]
+            assert cpu.reg_read(x86.UC_X86_REG_BX) == 2 * slot
+            dispatches.append(classes)
+
+        # FLDCW masks numeric exceptions. The trailing probes test, duplicate, exchange,
+        # copy, and pop the result using the runtime's software interrupt encoding.
+        code = bytes.fromhex(
+            f"cd352e2002 {load} cd34{operation:02x} "
+            "cd35e4 cd35c0 cd35e4 cd34d9 cd35c9 cd35e4 cd34d1 "
+            "cd39d1 cd34d1 cd39d9 cd35e4 c3"
+        )
+        final = emulator.call(
+            scratch, regs={"ds": scratch.segment, "es": scratch.segment, "ss": scratch.segment, "sp": 0xFF00},
+            writes=[
+                *initialized.memory,
+                (scratch, code),
+                (Address(scratch.segment, 0x200), operands),
+                (Address(scratch.segment, 0x220), pack("<H", 0x037F)),
+            ],
+            reads=[(stack_top, 2)],
+            interrupts=dict.fromkeys((0x34, 0x35, 0x37, 0x39), software_float_interrupt),
+            hooks={
+                Address(code_segment, 0x13721 - code_base): lambda cpu: observe(cpu, False),
+                Address(code_segment, 0x1366D - code_base): lambda cpu: observe(cpu, True),
+            },
+            limit=4000,
+        )
+        result, duplicate, compared_copy, exchanged, compared_exchange, stored, popped = dispatches
+        assert duplicate == result and compared_copy == result * 2
+        assert compared_exchange == (*exchanged, *result)
+        assert stored == exchanged * 2 and popped == exchanged
+        assert int.from_bytes(final.memory[0][1], "little") == empty_stack + 12
+        return result[0]
+
+    samples = (
+        0x3F800000, 0xBF800000, 0x00000001, 0x00000000, 0x80000000, 0x7FC00001,
+        0x7F800001, 0x7F800000, 0xFF800000, 0x7F7FFFFF, 0x00800000,
+    )
+    # FADD, FMUL, FSUB, FSUBR, FDIV, FDIVR ST,ST(1).
+    for operation in (0xC1, 0xC9, 0xE1, 0xE9, 0xF1, 0xF9):
+        classes = {
+            probe("cd35060002 cd35060402", pack("<II", a, b), operation)
+            for a, b in product(samples, repeat=2)
+        }
+        assert classes == {0, 1, 2, 3}
+
+    # Extended inputs reach result paths outside the exponent range of single-precision inputs.
+    for exponent, operation, expected in ((0x7FFE, 0xC9, 3), (1, 0xC9, 1), (0, 0xF1, 2)):
+        significand = 0x8000000000000000 if exponent else 0
+        operands = pack("<QHQH", significand, exponent, significand, exponent)
+        assert probe("cd372e0002 cd372e0a02", operands, operation) == expected
 
 
 def test_phantasie_iv_x68k_switches(tmp_path, capsys):

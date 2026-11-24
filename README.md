@@ -4,8 +4,8 @@ Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS
 Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
 NEC PC-88 and PC-98 programs, Sharp X1 programs, Sharp X68000 Human68k executables, Classic
 Macintosh 68k applications, NES / Famicom cartridges, and Sega Genesis / Mega Drive cartridges.
-Install and run `retrore` independently of any game or remaster project. The games in [PLAN.md](PLAN.md)
-are optional validation targets for particular executable formats and compiler patterns.
+The games in [PLAN.md](PLAN.md) are optional validation targets for executable formats and compiler
+patterns.
 
 ## Installation
 
@@ -1549,10 +1549,6 @@ where DOS loaded the root. Applied computed edges are visible in `indirect` and 
 Each edge records a successor observed in the capture. Checking the index range requires
 inputs that exercise the dispatch.
 
-In Phantasie III's DOS software floating-point runtime, the opt-in Ghidra test replays
-eight FCOM/FCOMP successors and four FTST successors. The comparison trace covered all
-16 pairs of operand classes across memory and register forms of FCOM and FCOMP.
-
 ```sh
 .venv/bin/retrore trace capture.json --export out/program --project out/project --json
 .venv/bin/retrore trace capture.json --export out/program --project out/project --apply --json
@@ -1616,6 +1612,9 @@ releases respectively. Set `RETRORE_CTD_GENESIS_DIR` to the directory containing
 U.S./Europe `Buck Rogers: Countdown to Doomsday` Genesis cartridge image. The Ghidra tests use
 `GHIDRA_HOME` and include synthetic programs for all
 supported platforms. Tests skip when their input variables are unset.
+
+The Phantasie III DOS tests exercise floating-point arithmetic and register-stack copies in Unicorn.
+The Ghidra test replays the observed `FTST`, `FCOM`, and `FCOMP` successors.
 
 Phase 12 has optional checks against original tool outputs and releases.
 

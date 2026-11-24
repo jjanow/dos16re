@@ -9,3 +9,4 @@ out/
 *.gpr
 *.rep/
 .claude/
+/LOCAL-VALIDATION.md
