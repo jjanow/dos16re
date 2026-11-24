@@ -14,17 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, added Microsoft MOVE analysis and support for separate static LINK banks.
-NetHack 3.0j exports all 63 static members from their original OVL files and imports selected
-members with runtime views in Ghidra. NetHack 3.1.3 lists all 63 MOVE members and imports
-selected members into Ghidra. LINK 5.30 probes ran in
-DOSBox, including cross-member calls, a function pointer, a custom interrupt, and a member
-whose allocation extends past the file bytes. The standalone suite passed 513 tests with 126
-skipped, and all 53 DOS tests passed with Ghidra 12.2 and the opt-in inputs.
+On 2026-11-24, profiled and fixed DOS calling-convention recovery for negative frame
+displacements and oversized inferred signatures. Ghidra 12.2 imported NetHack 3.0j with all
+63 static LINK members and their runtime views in 52 seconds. Decompilation worked in two
+of the imported overlays. The standalone suite passed 513 tests with 127 skipped. The DOS
+and runtime suites passed all 60 tests with Ghidra 12.2 and the opt-in inputs.
 
-Resume static LINK validation when a shipped executable turns up that omits the directory
-counts or places a member's first listed segment after the window start. For MOVE, use
-captured placements for runtime views and expand coverage as additional formats are verified.
+Resume Phase 9 with Phantasie III's unresolved dispatch at `root:13721`. Use a trace to
+check the live index range. Static LINK validation still needs a shipped executable that
+omits the directory counts or places a member's first listed segment after the window start.
+Use captured placements for Microsoft MOVE runtime views as more formats are verified.
 
 ## Why
 
@@ -325,12 +324,13 @@ release. Continue with the analysis backlog below.
   Open: genuinely unknown segment values and Phantasie III's dispatch at `root:13721`. Its
   zero-extended index allows 256 values, and the available bytes do not corroborate a table of that size.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
+  It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry
   as a result. X68000 DOS stubs have prototypes for about 80 calls. Call fixups model stacked FPACK
   remainder, conversion, float, double, and compare helpers. `trap #15` IOCS calls are named.
   **Validated:** P4.X shows `DOS::_WRITE(handle,buffer,length)` in `_write` at `text:3c2dc`,
   `uVar2 % param_1 + 1` in `_rand`, and `(dVar2 + dVar1) / local_24` in `_avg_attr`. Pool of Radiance
-  names 35 `int 21h` sites. It recovers 491 callee-cleanup functions and 356 far pointer arguments, and
+  names 35 `int 21h` sites. It recovers 564 callee-cleanup functions and 445 far pointer arguments, and
   Seek at `root:c4e3` tests `extraout_CF` instead of a multiply's carry.
   MSC 5.1 medium-model signatures recognized eight routines in a compiler probe, including the
   DX:AX `lseek` return. The Phantasie III export matches four, and Ghidra applies three to analyzed
@@ -477,9 +477,12 @@ and `$$COVL` words even with a custom `$$OVLINIT` that only returns. Both link m
 paragraph-aligned and page-aligned first segments at `OVERLAY_AREA`. The count-free directory
 and delayed first selector have synthetic coverage, including in combination with EXEPACK.
 Older DOS releases of NetHack 2.3a and 2.3e and PC Hack 3.51 and 3.60 had no appended members
-or separate overlay files. Ghidra 12.2 imported selected 3.0j members with runtime views.
-The all-member import reached calling-convention analysis and exceeded a 420-second headless
-budget. Profile that pass for larger static LINK exports.
+or separate overlay files. The original all-member NetHack 3.0j import exceeded a 420-second
+headless budget. A JVM recording found that Ghidra spent 99% of the calling-convention
+script samples checking parameter storage conflicts. The script had mistaken signed locals
+for large positive argument offsets and inferred thousands of stack words from stray
+instructions. With the signed displacements and bounded inference, Ghidra 12.2 imported the
+root, all 63 members, and all 64 runtime views in 52 seconds.
 [NetHack 3.0j release archive](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH_older/),
 [Microsoft KB Q32003](https://www.infania.net/misc/kbarchive/kb/032/Q32003/index.html)
 

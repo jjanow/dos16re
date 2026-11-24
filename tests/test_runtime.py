@@ -127,6 +127,31 @@ def test_ghidra_dos_conventions_and_services(tmp_path, capsys):
     assert site["from"]["unit_address"] == "root:0008"
 
 
+def test_ghidra_dos_conventions_bound_inferred_stack_arguments(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    entry = bytes.fromhex(
+        "b8 07 00 50 e8 19 00 83 c4 02"  # Push one argument, call 0120h, remove the argument.
+        " e8 33 00 cd 20"               # Call 0140h, then exit.
+    )
+    c_function = bytes.fromhex(
+        "55 8b ec 81 ec 04 01"  # Frame with 260 local bytes.
+        " c7 86 fc fe 34 12"    # MOV word ptr [BP-104h],1234h, rendered by Ghidra with 0xfefc.
+        " 8b 46 04 8b e5 5d c3"
+    )
+    large_purge = bytes.fromhex("55 8b ec 8b 46 04 5d c2 02 c4")  # RET 0xc402
+    image = (entry.ljust(0x20, b"\x90") + c_function).ljust(0x40, b"\x90") + large_purge
+    source, export, project = (tmp_path / name for name in ("sample.com", "export", "project"))
+    source.write_bytes(image)
+    assert main(["load", str(source), "-o", str(export)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--timeout", "120", "--json"]) == 0, (
+        capsys.readouterr().err)
+    assert json.loads(capsys.readouterr().out)["calling_conventions"] == {
+        "caller_cleanup": 1, "far_pointer_arguments": 0,
+    }
+
+
 def test_ghidra_pool_of_radiance_conventions_and_services(tmp_path, capsys):
     directory = os.environ.get("RETRORE_POR_DIR")
     if not directory or not os.environ.get("GHIDRA_HOME"):
@@ -140,7 +165,7 @@ def test_ghidra_pool_of_radiance_conventions_and_services(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["dos_services"] == 35
     assert report["calling_conventions"] == {
-        "accessed_arguments": 1, "callee_cleanup": 491, "far_pointer_arguments": 356, "no_stack_arguments": 222}
+        "accessed_arguments": 1, "callee_cleanup": 564, "far_pointer_arguments": 445, "no_stack_arguments": 270}
 
     def decompile(address):
         assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err

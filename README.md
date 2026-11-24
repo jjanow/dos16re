@@ -845,7 +845,8 @@ with `push bp; mov bp,sp` and decodes cleanly.
 The last pass recovers calling conventions for functions without a signature. It uses `ret n` /
 `retf n` immediates, `add sp,n` or `pop` after calls, and argument reads through `[BP+n]` or
 `SS:[BX+n]`. Arguments loaded with `les` or `lds` become one far pointer. Each argument gets an explicit stack
-offset. `int 21h` sites with AH loaded in the same straight-line code become calls to stubs such as
+offset. The pass skips signatures that would require more than 256 bytes of inferred stack arguments.
+`int 21h` sites with AH loaded in the same straight-line code become calls to stubs such as
 `DOS::SeekFile` in a `dos_services` block. The carry flag reads as `extraout_CF` after the call.
 Re-export images made by older versions to include the relocation metadata.
 

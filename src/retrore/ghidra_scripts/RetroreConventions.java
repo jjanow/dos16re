@@ -93,6 +93,8 @@ public class RetroreConventions extends HeadlessScript {
         Map.entry(0x5b, "CX:attributes DX:name"));
     private static final Pattern FRAME_ACCESS = Pattern.compile("\\[(BP|BX) \\+ 0x([0-9a-fA-F]+)\\]");
     private static final Set<String> ARGUMENT_REGISTERS = Set.of("EAX", "EBX", "ECX", "EDX", "ESI", "EDI");
+    // A stray frame access or RET immediate can imply thousands of unobserved word slots.
+    private static final int MAX_INFERRED_STACK_BYTES = 256;
 
     private SegmentedAddressSpace space;
     private int farPointers;
@@ -391,6 +393,9 @@ public class RetroreConventions extends HeadlessScript {
             kind = size == 0 ? "no_stack_arguments" : cleanups.isEmpty() ? "accessed_arguments"
                 : variadic ? "caller_cleanup_variadic" : "caller_cleanup";
         }
+        if (size > MAX_INFERRED_STACK_BYTES) {
+            return null;  // Ghidra checks custom parameter storage for conflicts pairwise.
+        }
         if (size == 0 && frame.start() < 0) {
             return null;  // No frame and no stack arguments: leave register routines to the decompiler.
         }
@@ -488,7 +493,9 @@ public class RetroreConventions extends HeadlessScript {
                 if (frameDelta == null) {
                     continue;
                 }
-                int offset = Integer.parseInt(matcher.group(2), 16) + frameDelta - arguments;
+                // Ghidra can print negative 16-bit displacements as unsigned hex.
+                int displacement = (short) Integer.parseInt(matcher.group(2), 16);
+                int offset = displacement + frameDelta - arguments;
                 if (offset < 0) {
                     continue;
                 }
