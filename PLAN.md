@@ -14,16 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, added real-mode interrupt vector dispatch to `call` and interrupt edges to
-Ghidra trace import. Phantasie III's software vector installer populated three distinct
-handlers. Probes distinguished the caller's `FST` and `FSTP` destinations from the runtime's
-record pointer and reproduced a class-byte overwrite through a segment alias. Ghidra 12.2
-replayed the observed segment-override and WAIT edges from the shipped code. The standalone
-suite passed 517 tests with 131 skipped.
+On 2026-11-24, traced Phantasie III's parser, formatter, and LINK member 2 floating-point stores
+with the shipped software interrupt handlers. The traced writes stayed outside the 15-record
+allocation. The far-pointer callback was exercised through its installed entry with a supplied
+destination. The arithmetic probes covered all 16 class pairs for each of six operations and
+checked every observed write to a class byte. Four focused checks passed with Ghidra 12.2 and
+the original release. The standalone suite passed 517 tests with 132 skipped.
 
-Resume Phase 9 by tracing the shipped callers that supply floating-point store destinations.
-To establish a dispatch bound, prove that those destinations stay outside the record stack and
-account for the remaining unresolved transfers and internal class writes.
+Resume Phase 9 by finding or ruling out callers of the installed conversion callback and the
+unreached store paths. Finish the class invariant for internal copies, temporary records, and
+exception paths before applying an automatic dispatch bound.
 Microsoft LINK still needs a shipped executable with missing directory counts or a member whose first
 listed segment starts after the overlay window start. Expand Microsoft MOVE runtime views as more
 captured placements become available.
@@ -328,8 +328,31 @@ Continue with the analysis backlog below.
   `root:123be`. The real-mode harness runs them via the interrupt table. Structured traces
   can add observed interrupt edges to Ghidra. Tests exercise both `FST` and the original
   ES-prefixed `FSTP` with a separate buffer and with a segment alias that overwrites a
-  class byte with `0x7f`. Automatic dispatch bounds need disjoint destinations for the
-  shipped callers, complete control flow, and a proof of the internal class writers and copies.
+  class byte with `0x7f`.
+- **Validated shipped store paths.** `root:6815` supplies DGROUP:`2582` to the parser's
+  8-byte stores at `root:60f4` and `root:6254`. The first store was reached with a
+  base-16 argument. The formatter's 10-byte stores at
+  `root:6504` and `root:6560` write to DGROUP:`2538`. Probes also cover control and
+  status word stores, the integer conversion's `SS:[BP-0xc]`, and all four single-precision
+  store sites in LINK member 2, each at `SS:[BP-8]`. The member runs in its original overlay
+  window and the probes check physical write intervals against the full record allocation.
+  `root:6017` installs `root:6a12` at DGROUP:`1dd6`. That entry decodes its output
+  pointer through two `LES` instructions before the store at `root:6a5b`. The alternative
+  path copies eight bytes to the pointer at `root:6a38`. The probe supplies the argument
+  for the single-precision path. The listing has no resolved caller for that entry, or inbound
+  reference for the alternate store at `root:6386` or the compare entry at `root:68a4`.
+  Their reachability remains open.
+- **Validated arithmetic dispatch slots.** `root:12524` and `root:1253f` use the same
+  eight-word table at `root:1205e`. The `0x0e` mask and optional XOR with 2 keep BX
+  on those slots. At `root:126cf`, arithmetic uses three 16-word tables at `root:12106`,
+  `root:12126`, and `root:12146`, indexed by `4 * class(DI) + class(SI)`. The probes
+  exercise all 16 pairs for FADD, FMUL, FSUB, FSUBR, FDIV, and FDIVR. They watch the
+  class byte in every allocated slot and see writes of 0–3 only. The single, double, and
+  extended loaders write a class through DH at `root:12d47`, `root:12f6d`, and
+  `root:134f3`. Their classification branches set DH to 0, 1, or 2, or set bit 0 to
+  produce 1 or 3. The six-word copies and exchanges propagate their source class.
+  Automatic recovery still needs the invariant for all reachable sources, including
+  temporary records and paths that handle floating-point exceptions.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry

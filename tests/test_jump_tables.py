@@ -5,7 +5,7 @@ from pathlib import Path
 from struct import pack, pack_into, unpack_from
 
 import pytest
-from unicorn import x86_const as x86
+from unicorn import UC_HOOK_MEM_WRITE, x86_const as x86
 
 from retrore.cli import main
 from retrore.emulator import Emulator
@@ -584,8 +584,25 @@ def phantasie_iii_float_runtime(phantasie_iii_export):
 def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_runtime):
     emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
     stack_top = Address(data_segment, 0x10)
-    _, empty_stack, _ = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
+    bottom, empty_stack, last_record = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
+    records = Address(data_segment, bottom)
+    fields = set(range(records.linear + 11, Address(data_segment, last_record + 12).linear, 12))
+    written_classes = set()
+    arithmetic_pairs = set()
+    arithmetic_tables = dict.fromkeys((0xc1, 0xe1, 0xe9), 0x816) | {0xc9: 0x836, 0xf1: 0x856, 0xf9: 0x856}
     scratch = Address(0x7000, 0)
+
+    def audit_classes(cpu):
+        def record_write(_cpu, _access, address, size, value, _data):
+            for byte in range(address, address + size):
+                if byte in fields:
+                    field = (value >> (8 * (byte - address))) & 0xff
+                    assert 0 <= field <= 3
+                    written_classes.add(field)
+
+        hook = cpu.hook_add(UC_HOOK_MEM_WRITE, record_write, begin=records.linear, end=max(fields))
+        return lambda: cpu.hook_del(hook)
+
     def probe(load, operands, operation):
         dispatches = []
 
@@ -597,6 +614,14 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
             slot = 4 * classes[0] + classes[1] if comparison else classes[0]
             assert cpu.reg_read(x86.UC_X86_REG_BX) == 2 * slot
             dispatches.append(classes)
+
+        def observe_arithmetic(cpu):
+            segment = cpu.reg_read(x86.UC_X86_REG_DS) * 16
+            si, di = (cpu.reg_read(register) for register in (x86.UC_X86_REG_SI, x86.UC_X86_REG_DI))
+            left, right = (cpu.mem_read(segment + index + 11, 1)[0] for index in (di, si))
+            assert left < 4 and right < 4
+            assert cpu.reg_read(x86.UC_X86_REG_BX) == arithmetic_tables[operation] + 2 * (4 * left + right)
+            arithmetic_pairs.add((left, right))
 
         # FLDCW masks numeric exceptions. The trailing probes test, duplicate, exchange,
         # copy, and pop the result using the runtime's software interrupt encoding.
@@ -618,8 +643,9 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
             hooks={
                 runtime_address(0x13721): lambda cpu: observe(cpu, False),
                 runtime_address(0x1366d): lambda cpu: observe(cpu, True),
+                runtime_address(0x126cf): observe_arithmetic,
             },
-            limit=4000,
+            limit=4000, _setup=audit_classes,
         )
         result, duplicate, compared_copy, exchanged, compared_exchange, stored, popped = dispatches
         assert duplicate == result and compared_copy == result * 2
@@ -633,18 +659,21 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
         0x7F800001, 0x7F800000, 0xFF800000, 0x7F7FFFFF, 0x00800000,
     )
     # FADD, FMUL, FSUB, FSUBR, FDIV, FDIVR ST,ST(1).
-    for operation in (0xC1, 0xC9, 0xE1, 0xE9, 0xF1, 0xF9):
+    for operation in arithmetic_tables:
+        arithmetic_pairs.clear()
         classes = {
             probe("cd35060002 cd35060402", pack("<II", a, b), operation)
             for a, b in product(samples, repeat=2)
         }
         assert classes == {0, 1, 2, 3}
+        assert arithmetic_pairs == set(product(range(4), repeat=2))
 
     # Extended inputs reach result paths outside the exponent range of single-precision inputs.
     for exponent, operation, expected in ((0x7FFE, 0xC9, 3), (1, 0xC9, 1), (0, 0xF1, 2)):
         significand = 0x8000000000000000 if exponent else 0
         operands = pack("<QHQH", significand, exponent, significand, exponent)
         assert probe("cd372e0002 cd372e0a02", operands, operation) == expected
+    assert written_classes == {0, 1, 2, 3}
 
 
 def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
@@ -744,6 +773,169 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
         assert {(row["from"]["unit_address"], row["to"]["unit_address"]) for row in applied if row["kind"] == "flow"} == {
             ("root:6a5b", "root:123db"), ("root:6a5f", "root:123be"),
         }
+
+
+def test_phantasie_iii_shipped_float_store_destinations(phantasie_iii_export, phantasie_iii_float_runtime):
+    tmp_path, program = phantasie_iii_export
+    emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
+    bottom, _, limit = unpack_from("<HHH", dict(setup)[Address(data_segment, 0x0e)])
+    records_start = Address(data_segment, bottom).linear
+    records_end = Address(data_segment, limit + 12).linear
+    assert (bottom, limit) == (0xa0, 0x148)
+
+    # The C startup switches SS to DGROUP and adds 0x6c4e to SP at root:41f7.
+    base = program["units"][0]["segment"]
+    dgroup = base + 0x28c0
+    sp = program["stack"]["offset"] + 0x6c4e - 0x100  # Leave room for the test arguments.
+    args = Address(dgroup, sp)
+    regs = {"ds": dgroup, "ss": dgroup, "sp": sp}
+    code_segment = base + 0x3b2
+    # Use the same control word as the software path of the runtime startup.
+    control = emulator.call(
+        runtime_address(0x11e8d), regs={"ds": data_segment, "ax": 0x1332},
+        reads=[(Address(data_segment, 6), 6)],
+    )
+    setup = (*setup, *control.memory)
+
+    def root(offset):
+        return Address(code_segment, offset - 0x3b20)
+
+    operand_decoder = runtime_address(0x1249b)
+
+    def check(start, stores, *, arguments=b"", writes=(), reads=(), **registers):
+        observed = {}
+        current = None
+
+        def operand(cpu):
+            nonlocal current
+            # The handler has decoded the memory operand into ES:SI and has not
+            # yet replaced DS with its private data segment at root:124a1.
+            bp = cpu.reg_read(x86.UC_X86_REG_BP)
+            ss = cpu.reg_read(x86.UC_X86_REG_SS)
+            ip, cs = unpack_from("<HH", cpu.mem_read(Address(ss, bp + 0x14).linear, 4))
+            # The saved IP still points just past the two-byte INT.
+            site = Address(cs, (ip - 2) & 0xffff)
+            current = site if site in stores else None
+            if current is None:
+                return
+            destination = Address(cpu.reg_read(x86.UC_X86_REG_ES), cpu.reg_read(x86.UC_X86_REG_SI))
+            assert destination == stores[site][0]
+            assert site not in observed
+            observed[site] = set()
+
+        def returned(_cpu):
+            nonlocal current
+            current = None
+
+        def audit_writes(cpu):
+            def write(cpu, _access, address, size, _value, _data):
+                if current is None:
+                    return
+                assert address + size <= records_start or address >= records_end
+                destination, width = stores[current]
+                if cpu.reg_read(x86.UC_X86_REG_CS) == operand_decoder.segment and (
+                    destination.linear <= address < destination.linear + width
+                ):
+                    assert address + size <= destination.linear + width
+                    observed[current].update(range(address, address + size))
+
+            hook = cpu.hook_add(UC_HOOK_MEM_WRITE, write)
+            return lambda: cpu.hook_del(hook)
+
+        argument_writes = [(args, arguments)] if arguments else []
+        result = emulator.call(
+            start, far=True, regs={**regs, **registers}, writes=[*setup, *writes, *argument_writes],
+            reads=reads, hooks={operand_decoder: operand, runtime_address(0x125a2): returned},
+            ivt_interrupts=vectors, _setup=audit_writes,
+        )
+        assert observed == {
+            site: set(range(destination.linear, destination.linear + width))
+            for site, (destination, width) in stores.items()
+        }
+        return dict(result.memory)
+
+    text = Address(dgroup, 0x7000)
+    double = Address(dgroup, 0x2582)
+    ascii_number = b"1.25\0"
+    decimal_stores = {
+        root(0x606f): (Address(dgroup, 0x2533), 2),
+        root(0x6243): (Address(dgroup, 0x2531), 2),
+        root(0x6254): (double, 8),
+        root(0x6257): (Address(dgroup, 0x2531), 2),
+    }
+    converted = check(
+        root(0x502c), decimal_stores,
+        arguments=pack("<HH", text.offset, text.segment), writes=[(text, ascii_number)], reads=[(double, 8)],
+    )
+    assert converted[double] == pack("<d", 1.25)
+
+    integer = check(
+        root(0x67d6), {root(0x606f): (Address(dgroup, 0x2533), 2), root(0x60f4): (double, 8)},
+        arguments=pack("<HHHHH", text.offset, text.segment, 2, 0, 16),
+        writes=[(text, b"2a")], reads=[(double, 8)],
+    )
+    assert integer[double] == pack("<d", 42.0)
+
+    extended = Address(dgroup, 0x2538)
+    check(
+        root(0x6836), {
+            root(0x64ea): (Address(dgroup, 0x2569), 2), root(0x6504): (extended, 10),
+            root(0x6546): (Address(dgroup, 0x2567), 2), root(0x6560): (extended, 10),
+        },
+        arguments=pack("<d", 1.25),
+    )
+
+    check(
+        root(0x69f1), {root(0x688d): (Address(dgroup, sp - 14), 2)},
+        arguments=pack("<HH", text.offset, text.segment), writes=[(text, pack("<d", 1.25))],
+    )
+
+    # This callback uses two LES loads to find the caller's output slot.
+    # Recover its entry from the table populated by the shipped installer.
+    callback = Address(dgroup, 0x1dd6)
+    installed = check(root(0x6017), {}, reads=[(callback, 4)])
+    offset, segment = unpack_from("<HH", installed[callback])
+    assert Address(segment, offset) == root(0x6a12)
+    slot, output = Address(dgroup, 0x7010), Address(dgroup, 0x7020)
+    converted = check(
+        Address(segment, offset), {**decimal_stores, root(0x6a5b): (output, 4)},
+        arguments=pack("<5H", 0, slot.offset, slot.segment, text.offset, text.segment),
+        writes=[*installed.items(), (text, ascii_number), (slot, pack("<HH", output.offset, output.segment))],
+        reads=[(output, 4)],
+    )
+    assert converted[output] == pack("<f", 1.25)
+
+    # Place the LINK member in the original window and stop after each conversion call.
+    member = next(unit for unit in program["units"] if unit["name"] == "link_0002")
+    overlay_segment = member["runtime_linear"] // 16
+    image = (tmp_path / "export" / "image.bin").read_bytes()
+    start = member["image_offset"]
+    overlay_code = (Address(overlay_segment, 0), image[start:start + member["size"]])
+
+    def overlay(offset):
+        return Address(overlay_segment, offset)
+
+    bp = sp - 0x40
+    local = Address(dgroup, bp - 8)
+    conversion_stores = {
+        root(0x68c7): (Address(dgroup, sp - 12), 2),
+        root(0x68da): (Address(dgroup, sp - 22), 8),
+    }
+    check(
+        overlay(0x22a4), {**conversion_stores, overlay(0x22a7): (local, 4)},
+        writes=[overlay_code, (overlay(0x22b2), b"\xcb")], bp=bp,
+    )
+    far_data = base + 0x1820
+    for selector, next_store in ((2, 0x2708), (3, None), (4, 0x26c7), (5, 0x26c7)):
+        stores = {**conversion_stores, overlay(0x269b): (local, 4)}
+        if next_store is not None:
+            stores[overlay(next_store)] = (local, 4)
+        check(
+            overlay(0x2691), stores, writes=[
+                overlay_code, (overlay(0x2715), b"\xcb"), (Address(far_data, 0x9dfc), pack("<H", 64)),
+                (Address(far_data, 0x9e90), pack("<H", selector)),
+            ], bp=bp,
+        )
 
 
 def test_phantasie_iv_x68k_switches(tmp_path, capsys):

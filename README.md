@@ -1030,6 +1030,16 @@ the selected code range. Results depend on the listing and the segment analysis'
 entry assumptions. A project imported before write context was recorded still reports
 possible overlaps from the listing. Reimport to use tracked register values.
 
+With `RETRORE_PH3_DIR` set, the Phantasie III validation runs the shipped software floating-point
+handlers and checks writes from parser, formatter, conversion, and LINK overlay code against the
+record stack. It also checks the class bytes written by six arithmetic operations across all 16
+input class pairs. The conversion callback accepts a caller-supplied far pointer, so proof for that
+store depends on the caller.
+
+```sh
+.venv/bin/python -m pytest -q tests/test_jump_tables.py -k 'phantasie_iii and (float or arithmetic_and_stack)'
+```
+
 ### Limit Ghidra address query results
 
 On `xrefs`, `callers`, `callees`, and `func`, use `--limit N` and `--offset N` to page each reference
