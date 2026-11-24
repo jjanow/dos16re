@@ -358,8 +358,22 @@ def analysis_gaps(project: Path, *, timeout: float | None = QUERY_TIMEOUT) -> di
     return {"contract": CONTRACT_VERSION, **_report(project, "gaps", None, timeout)}
 
 
-def trace_coverage(project: Path, coverage: dict, *, timeout: float | None = QUERY_TIMEOUT) -> dict:
-    return _query_json(project, "trace", coverage, timeout=timeout)
+def trace_coverage(
+    project: Path, coverage: dict, *, timeout: float | None = QUERY_TIMEOUT,
+    apply: bool = False, program: str | None = None,
+) -> dict:
+    if not apply:
+        return _query_json(project, "trace", coverage, timeout=timeout, program=program)
+    from . import worker
+    selected = "image.bin" if program is None else program
+    _check_program_name(selected)
+    _require_project(project)
+    worker.stop(project)
+    with TemporaryDirectory() as temp:
+        input_file = Path(temp) / "input.json"
+        input_file.write_text(json.dumps(coverage), encoding="utf-8")
+        return _run(project, ["-process", selected, "-noanalysis"], "RetroreQuery.java", "trace-apply",
+                    str(input_file), timeout=timeout)
 
 
 def _query_json(project: Path, mode: str, request: object, *, timeout: float | None = QUERY_TIMEOUT,

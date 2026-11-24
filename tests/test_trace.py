@@ -6,6 +6,7 @@ from struct import pack_into
 import pytest
 
 from retrore.cli import main
+from retrore.trace import TraceError, import_trace
 
 
 def test_imports_dosbox_x_log_and_rebases_runtime_units(tmp_path, capsys):
@@ -103,3 +104,103 @@ def test_trace_attaches_execution_evidence_to_static_gaps(tmp_path, capsys):
         assert proof == report["mapped"][index]["export_evidence"]
         assert proof["loaded"] == proof["original"] == "00"
         assert proof["address"]["file"]["offset"] == 45 + index
+
+
+def test_structured_trace_maps_snapshots_and_bank_changes(tmp_path):
+    header = bytearray(32)
+    pack_into("<2s13H", header, 0, b"MZ", 64, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 28, 0)
+    exe = tmp_path / "sample.exe"
+    exe.write_bytes(header + b"\xc3" + bytes(31))
+    first, second = tmp_path / "OV1.ovr", tmp_path / "OV2.ovr"
+    first.write_bytes(b"\xcb" + bytes(15))
+    second.write_bytes(b"\xc3" + bytes(15))
+    export = tmp_path / "export"
+    assert main(["load", str(exe), "-o", str(export), "--overlay", f"{first}@1200",
+                 "--overlay", f"{second}@1400"]) == 0
+    trace = tmp_path / "emulator.json"
+    events = [
+        {"kind": "instruction", "address": "3000:0000", "count": 2},
+        {"kind": "memory", "access": "read", "pc": "3000:0000", "address": "3000:000f", "size": 2,
+         "bytes": "00ff"},
+        {"kind": "bank", "name": "slot", "placements": {"OV1": None, "ov2": "3000:0000"}},
+        {"kind": "edge", "from": "3000:0000", "from_state": 0, "to": 0x30000, "flow": "jump"},
+        {"kind": "snapshot", "name": "loaded", "pc": 0x30000, "registers": {"ax": 7},
+         "memory": [{"address": 0x30000, "bytes": "C300"}]},
+        {"kind": "overlay", "placements": {"OV2": None}},
+        {"kind": "instruction", "address": "3000:0000"},
+    ]
+    document = {"version": 1, "placements": {"ov1": "3000:0000"}, "events": events}
+    trace.write_text(json.dumps(document), encoding="utf-8")
+    report = import_trace(trace, export, evidence=True)
+    assert (report["instruction_records"], report["instructions"]) == (3, 4)
+    assert [(hit["unit_address"], hit["count"]) for hit in report["mapped"]] == [("OV1:0000", 2), ("OV2:0000", 1)]
+    assert report["unmapped"] == [{"runtime_linear": 0x30000, "runtime_address": "3000:0000", "count": 1}]
+    edge, = report["edges"]
+    assert edge["from"]["location"]["unit_address"] == "OV1:0000"
+    assert edge["to"]["location"]["unit_address"] == "OV2:0000"
+    assert edge["to"]["export_evidence"]["loaded"] == "c3"
+    assert edge["to"]["export_evidence"]["address"]["runtime"]["linear"] == 0x30000
+    assert report["transitions"][0]["previous"] == {"OV1": 0x30000, "OV2": None}
+    access, = report["memory"]
+    assert access["pc"]["location"]["unit_address"] == "OV1:0000"
+    left, right = access["spans"]
+    assert (left["location"]["unit_address"], left["size"]) == ("OV1:000f", 1)
+    assert (right["location"], right["runtime_linear"], right["size"]) == (None, 0x30010, 1)
+    snapshot, = report["snapshots"]
+    assert snapshot["registers"] == {"ax": 7}
+    assert snapshot["memory"][0]["bytes"] == "c300"
+    assert snapshot["memory"][0]["location"]["unit_address"] == "OV2:0000"
+
+    events[2]["placements"].pop("OV1")
+    trace.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(TraceError, match="event 3: runtime ranges overlap"):
+        import_trace(trace, export)
+
+
+@pytest.mark.skipif(not os.environ.get("GHIDRA_HOME"), reason="set GHIDRA_HOME to run the Ghidra integration test")
+def test_structured_flat_trace_previews_and_applies_only_observed_additions(tmp_path, capsys):
+    source = tmp_path / "demo.prg"
+    code = bytes.fromhex("d0046c0003ea60") + b"\xea" * 9 + bytes.fromhex("e860")
+    source.write_bytes(b"\x00\x08" + code)
+    export, project = tmp_path / "export", tmp_path / "project"
+    assert main(["load", str(source), "-o", str(export), "--c64", "--entry", "0800"]) == 0
+    assert main(["ghidra", "import", str(export), str(project)]) == 0
+    capsys.readouterr()
+    trace = tmp_path / "emulator.json"
+    events = [
+        {"kind": "edge", "from": "0800", "to": "0802", "flow": "fallthrough"},
+        {"kind": "edge", "from": "0802", "to": "0810", "flow": "jump"},
+        {"kind": "edge", "from": "0802", "to": "0810", "flow": "jump"},
+    ]
+    command = ["trace", str(trace), "--export", str(export), "--project", str(project), "--json"]
+
+    def write_events(rows):
+        trace.write_text(json.dumps({"version": 1, "events": rows}), encoding="utf-8")
+
+    def analyze(*options):
+        assert main([*command, *options]) == 0, capsys.readouterr().err
+        return json.loads(capsys.readouterr().out)["analysis"]
+
+    write_events([*events, {"kind": "instruction", "address": "0810", "bytes": "ea"}])
+    incompatible = analyze()
+    assert incompatible["additions"] == []
+    assert incompatible["missed"][0]["proposal_blocked"] == "runtime_bytes_differ"
+
+    write_events([*events, {"kind": "instruction", "address": "0810", "bytes": "e8"}])
+    preview = analyze()
+    assert [entry["reason"] for entry in preview["edge_gaps"]] == ["target_not_disassembled"] * 2
+    branch, = preview["unobserved_flows"]
+    assert (branch["from"]["linear"], branch["to"]["linear"], branch["kind"]) == (0x0800, 0x0806, "branch")
+    instruction, flow = preview["additions"]
+    assert (instruction["address"]["linear"], instruction["bytes"]) == (0x0810, "e8")
+    assert (flow["from"]["linear"], flow["to"]["linear"], flow["events"]) == (0x0802, 0x0810, [2, 3])
+
+    assert analyze() == preview
+    applied = analyze("--apply")
+    assert applied["applied"] == preview["additions"]
+    assert analyze("--apply")["applied"] == []
+    write_events([*events[:2], {"kind": "instruction", "address": "0811"}])
+    after = analyze()
+    assert after["edge_gaps"] == []
+    assert [hit["linear"] for hit in after["missed"]] == [0x0811]
+    assert [entry["address"]["linear"] for entry in after["additions"]] == [0x0811]

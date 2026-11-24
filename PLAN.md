@@ -14,15 +14,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-23, Phase 10 added byte-backed transfers for data and custom storage that moved in
-changed blocks, including renamed blocks. Address evidence gained physical disk offsets for
-extracted members, recovery for legacy DOS and Atari exports, and explicit runtime placement.
-`compare --semantics` added review candidates for unnamed routines across ports.
-The standalone suite passed 428 tests with 100 skipped. On Ghidra 12.2, the comparison,
-evidence, and layout suites passed 38 tests with 2 skipped. The final moved-storage and
-cross-port checks passed all four selected tests.
+On 2026-11-23, Phase 11 added routine fixtures with input matrices, replayable snapshots, and
+differential comparisons. Routine execution now covers x86, 68k, 6502, and Z80. Structured traces
+map snapshots, memory accesses, edges, and bank or overlay changes to static coverage and offer
+a Ghidra preview before changes are applied. The standalone suite passed 460 tests with 101
+skipped. Ghidra 12.2 verified preview and apply on synthetic traces, including runtime byte checks.
 
-Resume with Phase 11's declarative routine fixtures.
+Resume with Phase 12's DOS `.COM` and raw loads.
 
 ## Why
 
@@ -43,9 +41,10 @@ platforms used by the remaster projects, starting with AmigaDOS.
 
 ## Design
 
-- **Python 3 package + CLI** (`retrore`), standard library plus `capstone` and `unicorn`. Every command can print
-  JSON (`--json`) so agents can call it cheaply. The package and its default test suite run independently of
-  sibling projects. Game-specific addresses and expectations belong in opt-in validation tests.
+- **Python 3 package + CLI** (`retrore`), with Capstone for disassembly and Unicorn, py65, and z80 for
+  routine execution. Every command can print JSON (`--json`) so agents can call it cheaply. The
+  package and its default test suite run independently of sibling projects. Game-specific addresses
+  and expectations belong in opt-in validation tests.
 - **Ghidra integration through headless scripts**, not a full Ghidra extension at first: the loader writes a flat
   image + a JSON "program map" (segments, units, symbols, segment-register assumptions, functions, jump tables),
   and a Ghidra headless script imports it into a project. A real Ghidra loader
@@ -212,7 +211,7 @@ Tests skip when their inputs are unset. The default suite uses synthetic files.
 
 ## Setup
 
-- Python 3.12+, `pip install capstone unicorn` (in a venv, `.venv/`, gitignored).
+- Python 3.12+, `pip install -e .` (in a venv, `.venv/`, gitignored).
 - Ghidra 12.x (installed as a snap on the dev machine; `analyzeHeadless` path configurable via `GHIDRA_HOME`).
 - `pytest` for tests.
 
@@ -402,15 +401,16 @@ release. Continue with the analysis backlog below.
 
 ### Phase 11: repeatable dynamic analysis
 
-- Add declarative routine fixtures for register inputs, memory, expected outputs, OS calls, and I/O.
-  Report only relevant register and memory changes by default. Support input matrices, repeatable
-  snapshots, and differential comparisons with a reimplementation or another release.
-- Import emulator snapshots, executed edges, memory accesses, and overlay or bank changes. Correlate
-  them with static addresses and show gaps between observed and recovered control flow. Let an
-  analyst preview trace-backed additions before applying them to Ghidra.
-- Extend routine execution, trace mapping, and coverage queries through platform-specific backends.
-  Use a shared request and result shape for common operations, with machine-specific registers, OS
-  services, and hardware state available where they matter.
+- **Implemented.** `fixture` accepts declarative register and memory inputs, expected outputs,
+  scripted OS calls, and I/O. It runs input matrices from fresh state, reports relevant changes,
+  and captures repeatable snapshots. Compare with another export or a reference report.
+- **Implemented.** `trace` maps versioned emulator snapshots, executed edges, memory accesses, and
+  overlay or bank changes to exported units. Ghidra coverage reports gaps between observed and
+  recovered flow and previews trace-backed additions before explicit application.
+- **Implemented.** Routine execution uses a common request and result across x86, 68k, 6502, and
+  Z80 backends. CPU-specific registers and scripted service and I/O hooks are exposed through
+  fixtures. Structured traces provide static mapping and coverage across the supported exports.
+  Use a machine emulator for captures that require live banking or device behavior.
 
 ### Phase 12: loader depth on supported platforms
 
@@ -442,7 +442,7 @@ underlying analysis uses each machine's conventions and available emulator or tr
 | Focused C excerpts and backward p-code slices | Implemented | Implemented | Implemented | Implemented |
 | Runtime layout | MZ relocation and supported overlays | Resident sections and relocations, a fixed Macintosh A5 world, and a linear Genesis cartridge view | One selected bank or overlay snapshot per export | One selected real-mode RAM layout per export |
 | Calling conventions, runtime signatures, and indirect control flow | Stack conventions, `int 21h` services, switch patterns, and indirect-call candidates | X68000 DOS and FPACK, Amiga and Atari ST switch recovery, and Macintosh A5 jump targets and named Toolbox traps | Extend for relevant targets | Real-mode segment context and selected far-call conventions |
-| Routine emulation and trace coverage | Implemented for the DOS harness and DOSBox-X | Planned | Planned | Planned |
+| Routine emulation and trace coverage | x86 routines, structured emulator traces, and DOSBox-X | 68k routines and structured emulator traces | 6502 or Z80 routines and structured emulator traces | Real-mode x86 routines and structured emulator traces |
 
 For each new capability, use shared synthetic contract checks where possible and add fixtures for
 platform-specific behavior. Track missing capabilities so a platform's loader milestone is distinct

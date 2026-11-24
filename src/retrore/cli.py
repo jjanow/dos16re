@@ -17,9 +17,11 @@ from .x68k import X_MAGIC, XError, build_x_image
 from .c64 import DEFAULT_BANK, C64Error, D64Image, PrgUnit, build_c64_image
 from .compare import DEFAULT_LIMIT as DEFAULT_COMPARE_LIMIT, compare_projects
 from .d88 import D88_SUFFIXES, D88Disk, D88Error
-from .emulator import DEFAULT_INSTRUCTION_LIMIT, Emulator, EmulatorError
+from .dynamic import RoutineBackend, RoutineRequest
+from .emulator import DEFAULT_INSTRUCTION_LIMIT, EmulatorError
 from .errors import CONTRACT_VERSION, EXIT_FAILURE, error_record
 from .evidence import ADDRESS_SPACES, FILE_OFFSET_KINDS, MAX_BYTES, EvidenceError, evidence_bundle, inspect_bytes, map_address
+from .fixtures import FixtureError, load_fixture, load_report, run_fixture
 from .genesis import GenesisError, build_genesis_image, is_genesis
 from .ghidra import (
     BATCH_SECONDS_PER_QUERY, IMPORT_TIMEOUT, QUERY_TIMEOUT, GhidraError, analysis_gaps, check_timeout, decompile,
@@ -34,7 +36,7 @@ from .macintosh import MacintoshError, build_macintosh_image, is_macintosh
 from .msx2 import COM_ADDRESS, Msx2Error, Msx2Source, MsxDosDisk, build_msx2_image
 from .mz import DEFAULT_BASE_SEGMENT, Address, MZError, MZExecutable, UnsupportedPacker
 from .nes import NES_MAGIC, NesError, build_nes_image
-from .overlays import Overlay, address_record, build_image
+from .overlays import Overlay, build_image
 from .pc88 import (
     BOOT_ADDRESS as PC88_BOOT_ADDRESS, DISK_SUFFIXES as PC88_DISK_SUFFIXES, HIGH_BANKS, LOW_BANKS,
     Pc88Error, boot_source, build_pc88_image, copy_source, disk_source,
@@ -61,9 +63,9 @@ _PREVIEW_LIMIT = 10
 
 # Errors that commands report as coded error objects instead of tracebacks.
 HANDLED_ERRORS = (
-    Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, EvidenceError, GenesisError, GhidraError, HfsError, HunkError,
-    ImageError, MacintoshError, MZError, Msx2Error, NesError, Pc88Error, Pc98Error, PrgError, SearchError, TraceError,
-    X1Error, XError, OSError,
+    Apple2Error, Atari8Error, C64Error, D88Error, EmulatorError, EvidenceError, FixtureError, GenesisError, GhidraError,
+    HfsError, HunkError, ImageError, MacintoshError, MZError, Msx2Error, NesError, Pc88Error, Pc98Error, PrgError,
+    SearchError, TraceError, X1Error, XError, OSError,
 )
 
 
@@ -478,19 +480,60 @@ def _call(args: argparse.Namespace) -> None:
         limit = int(args.limit)
     except ValueError as error:
         raise EmulatorError(str(error)) from error
-    result = Emulator.from_export(args.export).call(
-        args.address, regs=regs, writes=writes, reads=reads, far=args.far, limit=limit,
-    )
+    backend = RoutineBackend.from_export(args.export)
+    result = backend.run(RoutineRequest(args.address, registers=regs, writes=writes, reads=reads, far=args.far,
+                                        limit=limit))
+    registers, memory = result.after.registers, result.after.memory
     if args.json:
         print(json.dumps({
-            "address": address_record(result.address),
-            "registers": result.registers,
-            "memory": [{"address": address_record(address), "data": data.hex()} for address, data in result.memory],
+            "address": backend.location(result.address),
+            "registers": registers,
+            "memory": [{"address": backend.location(address), "data": data.hex()} for address, data in memory],
         }))
     else:
-        print(f"Returned from {result.address}  AX={result.registers['ax']:04x} DX={result.registers['dx']:04x}")
-        for address, data in result.memory:
+        if backend.architecture == "x86":
+            print(f"Returned from {result.address}  AX={registers['ax']:04x} DX={registers['dx']:04x}")
+        else:
+            print(f"Returned from {args.address}  ({backend.architecture})")
+        for address, data in memory:
+            if isinstance(address, int):
+                address = f"{address:x}"
             print(f"{address}  {data.hex()}")
+
+
+def _fixture(args: argparse.Namespace) -> int:
+    report = run_fixture(
+        args.export, load_fixture(args.fixture), against_export=args.against_export,
+        against_fixture=load_fixture(args.against_fixture) if args.against_fixture else None,
+        against_report=load_report(args.against_report) if args.against_report else None, snapshots=args.snapshots,
+    )
+    if args.json:
+        print(json.dumps(report))
+    else:
+        status = "Passed" if report["passed"] else "Failed"
+        print(f"{status}  {len(report['cases'])} fixture cases")
+        rows = []
+        for case in report["cases"]:
+            changes = case["changes"]
+            if case["failures"]:
+                failure = case["failures"][0]
+                detail = failure.get("message") or f"{failure['name']} expected {failure['expected']}, got {failure['actual']}"
+                rows.append(f"{case['name']}  {detail[:120]}")
+            elif changes["registers"] or changes["memory"]:
+                registers = [f"{name} {value['before']:x} → {value['after']:x}"
+                             for name, value in changes["registers"].items()]
+                memory = []
+                for name, change in changes["memory"].items():
+                    first = change["ranges"][0]
+                    memory.append(f"{name}+{first['offset']:x} {first['before'][:16]} → {first['after'][:16]}")
+                rows.append(f"{case['name']}  {', '.join(registers + memory)[:120]}")
+        for row in rows[:_PREVIEW_LIMIT]:
+            print(f"  {row}")
+        if comparison := report.get("comparison"):
+            print(f"{len(comparison['differences'])} differences from reference")
+        if not report["passed"] or args.snapshots or len(rows) > _PREVIEW_LIMIT:
+            print("Use --json for the full fixture report.")
+    return 0 if report["passed"] else EXIT_FAILURE
 
 
 def _location(record: dict | str) -> str:
@@ -880,17 +923,24 @@ def _lookup(args: argparse.Namespace) -> None:
 def _trace(args: argparse.Namespace) -> None:
     try:
         overlay_segments = _overlay_segments(args.overlay_segment)
+        runtime_loads = _runtime_loads(args.runtime_load)
     except EvidenceError as error:
         raise TraceError(str(error)) from error
     report = import_trace(
         args.trace, args.export, runtime_base=args.runtime_base, overlay_segments=overlay_segments, project=args.project,
         timeout=args.timeout, classify_gaps=args.classify_gaps, evidence=args.evidence,
+        runtime_loads=runtime_loads, apply=args.apply, program=args.program,
     )
     if args.json:
         print(json.dumps(report))
         return
     mapped, unmapped = report["mapped"], report["unmapped"]
-    print(f"{report['instructions']} instruction records, {len(mapped)} mapped addresses, {len(unmapped)} unmapped")
+    structured = "trace_version" in report
+    counts = "observed visits" if structured else "instruction records"
+    print(f"{report['instructions']} {counts}, {len(mapped)} mapped addresses, {len(unmapped)} unmapped")
+    if structured:
+        print(f"{len(report['edges'])} edges, {len(report['memory'])} memory accesses, "
+              f"{len(report['snapshots'])} snapshots, {len(report['transitions'])} placement changes")
     analysis = report["analysis"]
     if analysis is None:
         rows = [f"{_location(hit)}  {hit['count']} hits" for hit in mapped[:_PREVIEW_LIMIT]]
@@ -900,6 +950,9 @@ def _trace(args: argparse.Namespace) -> None:
         print(f"{len(functions)} executed functions, {len(missed)} addresses missed by disassembly")
         if "observed_gaps" in analysis:
             print(f"{len(analysis['observed_gaps'])} undefined ranges contain executed addresses")
+        if "additions" in analysis:
+            print(f"{len(analysis.get('edge_gaps', ()))} flow gaps, {len(analysis['additions'])} proposed additions, "
+                  f"{len(analysis.get('applied', ()))} applied")
         rows = [f"{_location(hit)}  {hit['reason']}" for hit in missed[:_PREVIEW_LIMIT]]
         for entry in functions[:_PREVIEW_LIMIT - len(rows)]:
             function = entry["function"]
@@ -907,7 +960,8 @@ def _trace(args: argparse.Namespace) -> None:
         total = len(functions) + len(missed)
     for row in rows:
         print(f"  {row}")
-    if total > _PREVIEW_LIMIT or unmapped or report["ignored_lines"] or args.evidence:
+    if (structured or total > _PREVIEW_LIMIT or unmapped or report["ignored_lines"] or args.evidence
+            or (analysis and analysis.get("additions"))):
         print("Use --json for the full trace report.")
 
 
@@ -1466,10 +1520,10 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
         command.add_argument("--source-file", type=Path, help="verify and recover file offsets for an unpacked DOS MZ")
         command.add_argument("--json", action="store_true", help="print JSON")
-    call_parser = commands.add_parser("call", help="run a routine in an exported DOS image")
-    call_parser.add_argument("address", metavar="ADDR", help="hexadecimal seg:off or unit:offset")
+    call_parser = commands.add_parser("call", help="run a routine in an exported image")
+    call_parser.add_argument("address", metavar="ADDR", help="hexadecimal address, seg:off, or unit:offset")
     call_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
-    call_parser.add_argument("--far", action="store_true", help="expect RETF (default: near RET)")
+    call_parser.add_argument("--far", action="store_true", help="expect x86 RETF (default: near RET)")
     call_parser.add_argument("--regs", action="append", default=[], metavar="REG=HEX,...", help="set initial registers")
     call_parser.add_argument(
         "--mem", action="append", default=[], metavar="ADDR=HEXBYTES", help="write memory before call",
@@ -1481,8 +1535,18 @@ def main(argv: list[str] | None = None) -> int:
         "--limit", default=DEFAULT_INSTRUCTION_LIMIT, metavar="N",
         help=f"maximum instructions (default: {DEFAULT_INSTRUCTION_LIMIT})",
     )
-    trace_parser = commands.add_parser("trace", help="map a DOSBox-X CPU log to an exported DOS image")
-    trace_parser.add_argument("trace", metavar="LOGCPU.TXT", type=Path)
+    fixture_parser = commands.add_parser("fixture", help="run and compare declarative routine fixtures")
+    fixture_parser.add_argument("fixture", metavar="FIXTURE", type=Path, help="versioned JSON fixture")
+    fixture_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
+    comparison = fixture_parser.add_mutually_exclusive_group()
+    comparison.add_argument("--against-export", metavar="OUT", type=Path, help="compare with another exported program")
+    comparison.add_argument("--against-report", metavar="REPORT", type=Path, help="compare with a saved JSON report")
+    fixture_parser.add_argument("--against-fixture", metavar="FIXTURE", type=Path,
+                                help="fixture for the other export, if its addresses or inputs differ")
+    fixture_parser.add_argument("--snapshots", action="store_true",
+                                help="include registers and watched memory before and after")
+    trace_parser = commands.add_parser("trace", help="map emulator events or a DOSBox-X log to an exported image")
+    trace_parser.add_argument("trace", metavar="TRACE", type=Path)
     trace_parser.add_argument("--export", metavar="OUT", type=Path, required=True, help="directory from retrore load")
     trace_parser.add_argument("--project", metavar="PROJECT", type=Path, help="compare with the analyzed Ghidra project")
     trace_parser.add_argument("--classify-gaps", action="store_true",
@@ -1495,8 +1559,11 @@ def main(argv: list[str] | None = None) -> int:
     trace_parser.add_argument(
         "--overlay-segment", metavar="UNIT=HEX", action="append", default=[], help="map an overlay at its runtime segment",
     )
-    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, trace_parser,
-                    relocs_parser, lookup_parser):
+    trace_parser.add_argument("--runtime-load", metavar="UNIT=HEX|unmapped", action="append", default=[],
+                              help="place a unit at a linear runtime address or mark it unmapped")
+    trace_parser.add_argument("--apply", action="store_true", help="apply reviewed trace additions to the Ghidra project")
+    for command in (import_parser, decomp_parser, gaps_parser, batch_parser, search_parser, call_parser, fixture_parser,
+                    trace_parser, relocs_parser, lookup_parser):
         command.add_argument("--json", action="store_true", help="print JSON")
     for command in (import_parser, decomp_parser, gaps_parser, batch_parser, *map(commands.choices.get, address_queries),
                     *map(commands.choices.get, _REGISTRY_COMMANDS), trace_parser):
@@ -1507,7 +1574,7 @@ def main(argv: list[str] | None = None) -> int:
             "--timeout", type=_seconds, default=default, metavar="SECONDS",
             help=f"stop headless Ghidra after SECONDS (default: {described}; 0 disables the limit)",
         )
-        if command not in (import_parser, trace_parser):
+        if command is not import_parser:
             command.add_argument("--program", metavar="NAME", help="query an existing program at the Ghidra project root")
 
     args = parser.parse_args(argv)
@@ -1596,6 +1663,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "trace":
             _trace(args)
             return 0
+        if args.command == "fixture":
+            return _fixture(args)
         if args.command == "compare":
             report = compare_projects(args.before, args.after, before_program=args.before_program,
                                       after_program=args.after_program, limit=args.limit, offset=args.offset,

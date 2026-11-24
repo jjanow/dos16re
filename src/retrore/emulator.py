@@ -1,4 +1,4 @@
-"""Call routines from a relocated DOS image with Unicorn."""
+"""Call 16-bit x86 routines from an exported image with Unicorn."""
 
 import json
 import re
@@ -13,7 +13,7 @@ from capstone.x86 import X86_INS_RET, X86_INS_RETF
 from unicorn import UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_INTR, UC_HOOK_MEM_READ, UC_MODE_16
 from unicorn import Uc, UcError, x86_const as x86
 
-from .image import check_map_version
+from .image import PC98_FORMAT, PC98_RAM_END, check_map_version
 from .mz import Address
 
 DEFAULT_INSTRUCTION_LIMIT = 1_000_000
@@ -60,19 +60,21 @@ def _pc(uc: Uc) -> Address:
 
 
 class Emulator:
-    """Launch independent calls with a copy of an image built by `retrore load`."""
+    """Launch independent real-mode calls with a copy of an exported image."""
 
     def __init__(self, image: bytes, program_map: dict) -> None:
         self._image = bytes(image)
         self._units: dict[str, tuple[int, int]] = {}
         check_map_version(program_map)
         try:
-            if program_map.get("format", "MZ") != "MZ":
-                raise ValueError("routine emulation requires a DOS MZ image")
+            image_format = program_map.get("format", "MZ")
+            if image_format not in ("MZ", PC98_FORMAT):
+                raise ValueError("real-mode routine emulation requires a DOS MZ or PC-98 image")
             units = program_map["units"]
-            self._origin = units[0]["linear"]
-            if type(self._origin) is not int or not 0 <= self._origin <= self._origin + len(image) <= _IMAGE_LIMIT:
-                raise ValueError("image extends past the 1 MiB image limit")
+            self._origin = program_map["image_origin"] if image_format == PC98_FORMAT else units[0]["linear"]
+            limit = PC98_RAM_END if image_format == PC98_FORMAT else _IMAGE_LIMIT
+            if type(self._origin) is not int or not 0 <= self._origin <= self._origin + len(image) <= limit:
+                raise ValueError("image extends past the platform image limit")
             for unit in units:
                 segment, size, name = unit["segment"], unit["size"], unit["name"].casefold()
                 start = unit["image_offset"]
@@ -81,7 +83,8 @@ class Emulator:
                 if type(size) is not int or not 0 <= start <= start + size <= len(image):
                     raise ValueError(f"unit {name} extends outside the image")
                 self._units[name] = (segment, size)
-            self._stack = _map_address(program_map["stack"])
+            stack = program_map.get("stack") if image_format == PC98_FORMAT else program_map["stack"]
+            self._stack = Address(0x9000, 0xFFFE) if stack is None else _map_address(stack)
             self._stubs = {
                 _map_address(stub["address"]).linear: _map_address(stub["target"])
                 for stub in program_map.get("stubs", ())
@@ -134,6 +137,8 @@ class Emulator:
         on_in: PortIn | None = None,
         on_out: PortOut | None = None,
         hooks: Mapping[AddressInput, CodeHook] | None = None,
+        _capture: CodeHook | None = None,
+        _setup: Callable[[Uc], Callable[[], None]] | None = None,
     ) -> CallResult:
         """Set up state and run to a 16-bit RET or RETF. Hooks receive the live Unicorn CPU."""
         if type(limit) is not int or not 0 < limit < maxsize:
@@ -166,11 +171,16 @@ class Emulator:
             uc.mem_write(self._origin, self._image)
         for where, data in patches:
             uc.mem_write(where.linear, data)
-        io_error = self._install_io(uc, interrupts or {}, on_in, on_out)
-        returned = self._install_return(uc, start, initial, far, hooks or {})
         for name, value in initial.items():
             uc.reg_write(_REGISTERS[name], value)
         uc.reg_write(x86.UC_X86_REG_CS, start.segment)
+        uc.reg_write(x86.UC_X86_REG_IP, start.offset)
+        if _capture is not None:
+            _capture(uc)
+        io_error = self._install_io(uc, interrupts or {}, on_in, on_out)
+        returned = self._install_return(uc, start, initial, far, hooks or {})
+        uc.reg_write(x86.UC_X86_REG_SP, initial["sp"])
+        cleanup = _setup(uc) if _setup is not None else None
 
         try:
             uc.emu_start(start.linear, _MEMORY_SIZE, count=limit)
@@ -180,6 +190,8 @@ class Emulator:
             raise error
         if not returned() or _pc(uc) != start:
             raise EmulatorError(f"routine did not return within {limit} instructions (stopped at {_pc(uc)})")
+        if cleanup is not None:
+            cleanup()
 
         registers = {name: uc.reg_read(register) for name, register in _REGISTERS.items()}
         memory = tuple((where, bytes(uc.mem_read(where.linear, size))) for where, size in requests)

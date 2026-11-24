@@ -66,9 +66,11 @@ def test_amiga_export_and_search(tmp_path, capsys):
     assert main(["where-is", "--export", str(out), "--bytes", "00 00 00 00", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["count"] == 0
 
-    assert main(["call", "h0:0", "--export", str(out), "--json"]) == 1
-    assert "requires a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]["message"]
-    assert main(["trace", str(tmp_path / "log"), "--export", str(out), "--json"]) == 1
+    assert main(["call", "h0:0", "--export", str(out), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["registers"]["d0"] == 7
+    log = tmp_path / "log"
+    log.write_text("2000:0000\n", encoding="ascii")
+    assert main(["trace", str(log), "--export", str(out), "--json"]) == 1
     assert "require a DOS MZ image" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 

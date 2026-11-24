@@ -4,12 +4,14 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.ClangStatement;
 import ghidra.app.decompiler.ClangToken;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.decompiler.PrettyPrinter;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.util.PseudoDisassembler;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressOverflowException;
@@ -18,10 +20,15 @@ import ghidra.program.model.address.SegmentedAddressSpace;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.lang.InsufficientBytesException;
+import ghidra.program.model.lang.UnknownContextException;
+import ghidra.program.model.lang.UnknownInstructionException;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.PcodeOp;
 import ghidra.program.model.pcode.Varnode;
+import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolType;
 
@@ -142,7 +149,8 @@ public class RetroreQuery extends GhidraScript {
 
     private Map<String, Object> answer(String mode, com.google.gson.JsonElement input) throws Exception {
         return switch (mode) {
-            case "trace" -> trace(input.getAsJsonObject());
+            case "trace" -> trace(input.getAsJsonObject(), false);
+            case "trace-apply" -> trace(input.getAsJsonObject(), true);
             case "batch" -> batch(input.getAsJsonArray());
             case "single" -> query(input.getAsJsonObject());
             case "annotations" -> annotationQuery(input.getAsJsonObject());
@@ -321,7 +329,7 @@ public class RetroreQuery extends GhidraScript {
         return object;
     }
 
-    private Map<String, Object> trace(JsonObject trace) throws Exception {
+    private Map<String, Object> trace(JsonObject trace, boolean apply) throws Exception {
         if (!trace.get("sha256").getAsString().equals(currentProgram.getExecutableSHA256())) {
             throw new IllegalArgumentException("Ghidra project was imported from a different image.bin");
         }
@@ -329,23 +337,26 @@ public class RetroreQuery extends GhidraScript {
         for (var item : trace.getAsJsonArray("units")) {
             var unit = item.getAsJsonObject();
             var name = unit.get("name").getAsString();
+            long size = unit.get("size").getAsLong();
             var block = memory.getBlock(name);
-            if (block == null || !block.isInitialized() ||
-                    block.getStart().getOffset() != 16L * unit.get("segment").getAsInt() ||
-                    block.getSize() != unit.get("size").getAsLong()) {
+            if (size > 0 && (block == null || !block.isInitialized() ||
+                    block.getStart().getOffset() != unit.get("linear").getAsLong() || block.getSize() != size)) {
                 throw new IllegalArgumentException("Ghidra project has a different placement for unit " + name);
             }
         }
 
-        var space = currentProgram.getAddressFactory().getDefaultAddressSpace();
         var listing = currentProgram.getListing();
         var misses = new ArrayList<JsonObject>();
         var executed = new LinkedHashMap<Function, Long>();
+        var observed = new TreeSet<Address>();
+        var observations = trace.has("observed_bytes") ? trace.getAsJsonObject("observed_bytes") : new JsonObject();
         for (var item : trace.getAsJsonArray("hits")) {
             monitor.checkCancelled();
             var hit = item.getAsJsonObject();
-            var address = space.getAddress(hit.get("linear").getAsLong());
-            if (listing.getInstructionAt(address) == null) {
+            var address = traceAddress(hit);
+            observed.add(address);
+            var instruction = listing.getInstructionAt(address);
+            if (instruction == null) {
                 String reason = "undefined";
                 if (listing.getInstructionContaining(address) != null) {
                     reason = "instruction_offcut";
@@ -356,6 +367,11 @@ public class RetroreQuery extends GhidraScript {
                 misses.add(hit);
                 continue;
             }
+            if (!traceObservedBytesMatch(instruction, observations)) {
+                hit.addProperty("reason", "runtime_bytes_differ");
+                misses.add(hit);
+                continue;
+            }
             var function = getFunctionContaining(address);
             if (function != null) {
                 executed.merge(function, hit.get("count").getAsLong(), Long::sum);
@@ -363,18 +379,222 @@ public class RetroreQuery extends GhidraScript {
         }
         var functions = executed.entrySet().stream().map(entry ->
             Map.of("function", routine(entry.getKey(), false), "count", entry.getValue())).toList();
+        var report = new LinkedHashMap<String, Object>();
+        report.put("functions", functions);
+        report.put("missed", misses);
         if (trace.has("classify_gaps") && trace.get("classify_gaps").getAsBoolean()) {
-            return Map.of("functions", functions, "missed", misses, "observed_gaps", traceGaps(misses));
+            report.put("observed_gaps", traceGaps(misses));
         }
-        return Map.of("functions", functions, "missed", misses);
+        var expected = trace.has("expected_bytes") ? trace.getAsJsonObject("expected_bytes") : new JsonObject();
+        var instructions = traceInstructions(misses, observed, expected, observations);
+        var flows = new LinkedHashMap<TraceFlow, List<Integer>>();
+        if (trace.has("edges")) {
+            var edges = traceEdges(trace.getAsJsonArray("edges"), instructions, expected, observations, flows);
+            report.put("edge_gaps", edges.gaps());
+            report.put("unobserved_flows", edges.unobserved());
+        }
+        var additions = new ArrayList<Map<String, Object>>();
+        for (var entry : instructions.entrySet()) {
+            var instruction = entry.getValue();
+            additions.add(Map.of("kind", "instruction", "address", location(entry.getKey()),
+                "instruction", instruction.toString(), "bytes", HexFormat.of().formatHex(instruction.getBytes())));
+        }
+        for (var entry : flows.entrySet()) {
+            var flow = entry.getKey();
+            additions.add(Map.of("kind", "flow", "from", location(flow.from()), "to", location(flow.to()),
+                "type", flow.type().toString(), "events", entry.getValue()));
+        }
+        report.put("additions", additions);
+        if (apply) {
+            applyTrace(instructions, flows.keySet());
+            report.put("applied", additions);
+        }
+        return report;
+    }
+
+    private record TraceFlow(Address from, Address to, RefType type) {}
+    private record TraceEdges(List<Map<String, Object>> gaps, List<Map<String, Object>> unobserved) {}
+
+    private Address traceAddress(JsonObject record) {
+        return record == null ? null : linearAddress(record.get("linear").getAsLong());
+    }
+
+    private Map<Address, Instruction> traceInstructions(
+            List<JsonObject> misses, TreeSet<Address> observed, JsonObject expected, JsonObject observations)
+            throws Exception {
+        var results = new TreeMap<Address, Instruction>();
+        var pseudo = new PseudoDisassembler(currentProgram);
+        var listing = currentProgram.getListing();
+        for (var hit : misses) {
+            monitor.checkCancelled();
+            if (!hit.get("reason").getAsString().equals("undefined")) {
+                continue;
+            }
+            var address = traceAddress(hit);
+            if (results.containsKey(address)) {
+                continue;
+            }
+            var block = currentProgram.getMemory().getBlock(address);
+            if (block == null || !block.isExecute()) {
+                continue;
+            }
+            Instruction decoded;
+            try {
+                decoded = pseudo.disassemble(address);
+            } catch (InsufficientBytesException | UnknownInstructionException | UnknownContextException error) {
+                continue;
+            }
+            if (decoded == null || !block.contains(decoded.getMaxAddress()) || !traceBytesMatch(decoded, expected)) {
+                continue;
+            }
+            if (!traceObservedBytesMatch(decoded, observations)) {
+                hit.addProperty("proposal_blocked", "runtime_bytes_differ");
+                continue;
+            }
+            var next = observed.higher(address);
+            var span = new AddressSet(address, decoded.getMaxAddress());
+            if ((next != null && span.contains(next)) || listing.getInstructions(span, true).hasNext() ||
+                    listing.getDefinedData(span, true).hasNext()) {
+                continue;
+            }
+            results.put(address, decoded);
+        }
+        return results;
+    }
+
+    private static boolean traceBytesMatch(Instruction instruction, JsonObject expected) throws Exception {
+        var bytes = expected.get(Long.toString(instruction.getAddress().getOffset()));
+        return bytes != null && bytes.getAsString().startsWith(HexFormat.of().formatHex(instruction.getBytes()));
+    }
+
+    private static boolean traceObservedBytesMatch(Instruction instruction, JsonObject observed) throws Exception {
+        var samples = observed.getAsJsonArray(Long.toString(instruction.getAddress().getOffset()));
+        if (samples != null) {
+            String bytes = HexFormat.of().formatHex(instruction.getBytes());
+            for (var sample : samples) {
+                if (!bytes.equals(sample.getAsString())) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean traceFlowRecovered(Instruction instruction, Address target) {
+        return instruction != null &&
+            (target.equals(instruction.getFallThrough()) || Arrays.asList(instruction.getFlows()).contains(target));
+    }
+
+    private TraceEdges traceEdges(
+            JsonArray edges, Map<Address, Instruction> additions, JsonObject expected, JsonObject observations,
+            Map<TraceFlow, List<Integer>> flows) throws Exception {
+        var gaps = new ArrayList<Map<String, Object>>();
+        var measured = new TreeMap<Address, Set<Address>>();
+        var listing = currentProgram.getListing();
+        var refs = currentProgram.getReferenceManager();
+        for (var item : edges) {
+            monitor.checkCancelled();
+            var edge = item.getAsJsonObject();
+            int event = edge.get("event").getAsInt();
+            var from = traceAddress(edge.get("from").isJsonNull() ? null : edge.getAsJsonObject("from"));
+            var to = traceAddress(edge.get("to").isJsonNull() ? null : edge.getAsJsonObject("to"));
+            String flow = edge.get("flow").isJsonNull() ? "" : edge.get("flow").getAsString();
+            if (from != null && to != null) {
+                measured.computeIfAbsent(from, unused -> new HashSet<>()).add(to);
+            }
+            String reason;
+            if (from == null || to == null) {
+                reason = "unmapped_endpoint";
+            } else {
+                var source = listing.getInstructionAt(from);
+                var target = listing.getInstructionAt(to);
+                if (source == null) {
+                    reason = "source_not_disassembled";
+                } else if (target == null) {
+                    reason = "target_not_disassembled";
+                } else if (!traceObservedBytesMatch(source, observations) ||
+                        !traceObservedBytesMatch(target, observations)) {
+                    reason = "runtime_bytes_differ";
+                } else if (traceFlowRecovered(source, to)) {
+                    continue;
+                } else {
+                    reason = flow.equals("return") ? "dynamic_return" : "missing_flow";
+                }
+                Instruction instruction = source == null ? additions.get(from) : source;
+                Instruction destination = target == null ? additions.get(to) : target;
+                if (instruction != null && destination != null && !traceFlowRecovered(instruction, to) &&
+                        traceBytesMatch(instruction, expected) && traceObservedBytesMatch(instruction, observations) &&
+                        traceBytesMatch(destination, expected) && traceObservedBytesMatch(destination, observations)) {
+                    var type = instruction.getFlowType();
+                    if (type.isComputed() && (type.isCall() && (flow.isEmpty() || flow.equals("call")) ||
+                            type.isJump() && (flow.isEmpty() || flow.equals("jump"))) &&
+                            refs.getReference(from, to, Reference.MNEMONIC) == null) {
+                        flows.computeIfAbsent(new TraceFlow(from, to, type), unused -> new ArrayList<>()).add(event);
+                    }
+                }
+            }
+            gaps.add(Map.of("event", event, "count", edge.get("count").getAsLong(), "reason", reason));
+        }
+        var unobserved = new ArrayList<Map<String, Object>>();
+        for (var entry : measured.entrySet()) {
+            monitor.checkCancelled();
+            var from = entry.getKey();
+            var source = listing.getInstructionAt(from);
+            if (source == null || !traceObservedBytesMatch(source, observations)) {
+                continue;
+            }
+            for (var target : source.getFlows()) {
+                if (!entry.getValue().contains(target)) {
+                    unobserved.add(Map.of("from", location(from), "to", location(target),
+                        "kind", source.getFlowType().isCall() ? "call" : "branch"));
+                }
+            }
+            // A call's continuation is reached by a callee's return, rather than by a CPU edge from the call site.
+            var next = source.getFallThrough();
+            if (next != null && !source.getFlowType().isCall() && !entry.getValue().contains(next)) {
+                unobserved.add(Map.of("from", location(from), "to", location(next), "kind", "fallthrough"));
+            }
+        }
+        return new TraceEdges(gaps, unobserved);
+    }
+
+    private void applyTrace(Map<Address, Instruction> instructions, Set<TraceFlow> flows) throws Exception {
+        if (instructions.isEmpty() && flows.isEmpty()) {
+            return;
+        }
+        int transaction = currentProgram.startTransaction("Apply retrore trace evidence");
+        boolean commit = false;
+        try {
+            var listing = currentProgram.getListing();
+            for (var entry : instructions.entrySet()) {
+                monitor.checkCancelled();
+                var address = entry.getKey();
+                var proposed = entry.getValue();
+                var command = new DisassembleCommand(address, new AddressSet(address, proposed.getMaxAddress()), false);
+                command.enableCodeAnalysis(false);
+                if (!command.applyTo(currentProgram, monitor) || listing.getInstructionAt(address) == null ||
+                        listing.getInstructionAt(address).getLength() != proposed.getLength()) {
+                    throw new IllegalArgumentException("Could not disassemble the trace instruction at " + address +
+                        ": " + command.getStatusMsg());
+                }
+            }
+            var refs = currentProgram.getReferenceManager();
+            for (var flow : flows) {
+                monitor.checkCancelled();
+                refs.addMemoryReference(flow.from(), flow.to(), flow.type(), SourceType.IMPORTED, Reference.MNEMONIC);
+            }
+            commit = true;
+        } finally {
+            currentProgram.endTransaction(transaction, commit);
+        }
     }
 
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> traceGaps(List<JsonObject> misses) throws Exception {
-        var observed = new TreeMap<Long, JsonObject>();
+        var observed = new TreeMap<Long, List<JsonObject>>();
         for (var hit : misses) {
             if (hit.get("reason").getAsString().equals("undefined")) {
-                observed.put(hit.get("linear").getAsLong(), hit);
+                observed.computeIfAbsent(hit.get("linear").getAsLong(), unused -> new ArrayList<>()).add(hit);
             }
         }
         var result = new ArrayList<Map<String, Object>>();
@@ -392,10 +612,12 @@ public class RetroreQuery extends GhidraScript {
             }
             long count = 0;
             var examples = new ArrayList<JsonObject>();
-            for (var hit : hits) {
-                count += hit.get("count").getAsLong();
-                if (examples.size() < 4) {
-                    examples.add(hit);
+            for (var group : hits) {
+                for (var hit : group) {
+                    count += hit.get("count").getAsLong();
+                    if (examples.size() < 4) {
+                        examples.add(hit);
+                    }
                 }
             }
             gap.put("trace_evidence", Map.of("kind", "executed", "hits", count,

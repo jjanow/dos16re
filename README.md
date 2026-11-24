@@ -247,7 +247,8 @@ analysis. It records the requested Amiga memory flags and zero-fills BSS, unused
 allocation, symbols, and applied absolute 32-bit relocations, including the compact variant. Ghidra
 uses its big-endian 68k language, imports the symbols, and analyzes from the executable's entry in
 `h0`. Amiga Ghidra queries accept `hN:offset` or a flat hexadecimal address. `HUNK_OVERLAY` files
-produce an unsupported-format diagnostic. The `call` and `trace` commands are DOS-specific.
+produce an unsupported-format diagnostic. Use `call` for CPU-level routine execution and `trace`
+to map emulator events onto the exported hunks.
 [Amiga ROM Kernel Reference Manual, DOS, chapter 11](https://developer.amigaos3.net/sites/default/files/downloads/2024-10/Amiga_ROM_Kernel_Reference_Manual_DOS.pdf)
 
 ## Atari ST loader
@@ -1273,11 +1274,12 @@ a field, or changing its type or meaning, increments it.
 
 ## Emulator harness
 
-`call` runs a routine from an exported image with Unicorn. Each call starts with a fresh copy of the
-image and the exported `SS:SP`, which you can override through `--regs`. Supply the data segments,
-arguments, and memory the routine expects. The harness pushes a synthetic return frame below the
-configured `SP`, so stack arguments start at the configured `SS:SP`. Use `--far` for a routine that
-ends in `RETF`. The default is a near `RET`.
+`call` runs a routine from a fresh copy of an exported image. DOS and PC-98 use the x86 backend,
+Amiga, Atari ST, X68000, Macintosh, and Genesis use the 68k backend, C64, Apple II, Atari 8-bit, and
+NES use the 6502 backend, and MSX2, PC-88, and X1 use the Z80 backend. Each backend starts with the
+exported memory layout. Use `--regs` and `--mem` to supply the registers, arguments, and memory
+the routine expects. The harness sets up a synthetic return frame. On x86 it uses the configured
+`SS:SP` for stack arguments and defaults to a near `RET`. Use `--far` for routines ending in `RETF`.
 
 ```sh
 .venv/bin/retrore call root:1234 --export out/program --regs ax=10,ds=2000 \
@@ -1289,7 +1291,7 @@ Addresses and register values are hexadecimal. `--mem` writes literal bytes in t
 the resolved address, final registers as integers, and requested memory bytes as hex strings. The
 default instruction limit is one million. Set `--limit N` for another budget.
 
-The Python API supports interrupt handlers, port I/O, and execution hooks. For example, a routine
+The DOS `Emulator` Python API supports interrupt handlers, port I/O, and execution hooks. A routine
 that calls BIOS to read a key can receive a scripted Enter key.
 
 ```python
@@ -1314,6 +1316,103 @@ port write. Pass `hooks={address: callback}` to run `callback(cpu)` before execu
 at that address. These callbacks receive the live Unicorn CPU. Turbo Pascal stubs use the resident
 overlays, including when an original `INT 3Fh` stub is restored. Unhandled interrupts and port I/O
 stop the call with an error.
+
+`retrore.dynamic.RoutineBackend.from_export()` provides a shared Python routine interface. Pass a
+`RoutineRequest` to the backend's `run` method to get initial and final state and observed service
+and hardware events. The backends execute routines in a selected memory layout with scripted
+service responses. For a capture involving live bank switches or device emulation, use a machine
+emulator and import its events.
+
+## Routine fixtures
+
+A version 1 fixture names a routine and the inputs and outputs to check. Memory locations have
+stable labels, so a comparison can use different addresses in two releases. Input and expected
+register values accept JSON integers or `0x`-prefixed hexadecimal strings. Addresses follow the
+same hexadecimal conventions as `call`.
+
+```json
+{
+  "version": 1,
+  "address": "root:1234",
+  "registers": {"ds": "0x2000"},
+  "memory": {"output": {"address": "2000:0100", "data": "0000"}},
+  "watch": ["ax"],
+  "expect": {"registers": {"ax": 4660}, "memory": {"output": "3412"}},
+  "matrix": {"bx": [0, 1]}
+}
+```
+
+```sh
+.venv/bin/retrore fixture routine.json --export out/program --snapshots --json > baseline.json
+.venv/bin/retrore fixture baseline.json --export out/program --snapshots --json
+.venv/bin/retrore fixture routine.json --export out/program --against-report baseline.json --json
+.venv/bin/retrore fixture routine.json --export out/program --against-export out/other \
+  --against-fixture other-routine.json --json
+```
+
+Each combination of `matrix` register values runs in a fresh image. Optional named `cases` can
+override inputs, watched state, and expectations. Set a memory range's `size` to watch existing
+bytes, or set `data` to initialize it with hex bytes. Default results include register and memory
+changes, observed events, and any failed checks. `watch` selects which registers to report.
+Expected registers are always watched. Add `--snapshots` for before and after records and an
+embedded fixture that the same command can replay against the original export. A failed
+expectation or differential comparison returns an unsuccessful exit status.
+
+Use `services` for scripted OS calls. Each entry names a `kind` and `number`, can `match` input
+registers, and can set `registers` or write hex bytes to memory with `writes`. For example,
+`{"kind":"interrupt","number":"0x16","registers":{"ax":"0x1c0d"}}` supplies a BIOS key result.
+Use `interrupt` for x86, `trap` or `aline` for 68k trap instructions, `fline` for X68000 DOS
+calls, and `brk` for 6502 `BRK`. On 68k, 6502, and Z80, `call` identifies a scripted subroutine
+by its linear address.
+Use `hardware` for scripted reads and writes. An entry names the `space`, `operation`, `address`,
+`size` in bytes, and `value`. For example,
+`{"space":"port","operation":"read","address":"0x60","size":1,"value":28}` supplies a port byte.
+Use `memory` for memory-mapped I/O and `port` for x86 or Z80 port I/O. Each list is consumed in
+order. Missing events and mismatched reads or writes fail the case.
+
+Use a saved snapshot report or a reference implementation's JSON as the comparison target.
+A reference implementation can supply a `cases` array of `name` and `after` records, with
+`registers` keyed by register and `memory` keyed by fixture label. The supplied fields are checked
+against the matching case.
+
+## Emulator event traces
+
+`trace` also imports a version 1 JSON document from any supported platform. The `events` array
+records events in capture order. Addresses are integers or hexadecimal strings and may use
+`seg:off` on DOS or PC-98. Optional top-level `placements` assign exported units to linear
+runtime addresses. Set a placement to `null` to mark that unit unmapped.
+
+```json
+{
+  "version": 1,
+  "events": [
+    {"kind": "instruction", "address": "0800", "bytes": "201008"},
+    {"kind": "edge", "from": "0800", "to": "0810", "flow": "call"},
+    {"kind": "memory", "pc": "0810", "access": "write", "address": "2000", "size": 1, "bytes": "2a"},
+    {"kind": "snapshot", "name": "after", "pc": "0810", "registers": {"a": 42},
+     "memory": [{"address": "2000", "bytes": "2a"}]}
+  ]
+}
+```
+
+Use `bank` or `overlay` events with a `placements` object to update the active layout for
+subsequent events. An edge across a layout change can set `from_state` and `to_state` to the
+1-based event numbers of the two transitions. State `0` is the initial placement. A snapshot can
+also include a `state` object for device state captured by the emulator.
+
+Inspect the mapped coordinates and coverage with `--project`. The report shows observed
+addresses that lack instruction starts, edges missing from recovered flow, unobserved branches
+from measured sites, and proposed additions. Review the JSON preview before rerunning with
+`--apply` to change the project.
+When an instruction record includes `bytes`, the preview checks those runtime bytes against the
+static instruction before proposing additions.
+`--runtime-load UNIT=HEX|unmapped` sets explicit initial placement and `--program NAME` selects
+an existing program in the project.
+
+```sh
+.venv/bin/retrore trace capture.json --export out/program --project out/project --json
+.venv/bin/retrore trace capture.json --export out/program --project out/project --apply --json
+```
 
 ## DOSBox-X traces
 
