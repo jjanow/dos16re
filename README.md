@@ -355,6 +355,11 @@ Ghidra's `--load-views` puts the visible portions of each state in its own addre
 blocks show the exported bytes, including analysis-time relocations. The primary address space
 remains the starting point for decompilation and static references.
 
+Phantasie III's Pendragon menu calls code in the surviving tail of LINK member 2 after member 3
+overwrites the start of the same window. A captured state lists `root`, `link_0002`, and
+`link_0003` in that order, with both members at the observed window address and
+`"replace": true`. The opt-in DOS validation replays five computed menu calls from that state.
+
 ## Amiga loader
 
 `info` and `load` detect classic AmigaDOS Hunk executables by their header. If starting from an ADF,
@@ -1658,7 +1663,8 @@ U.S./Europe `Buck Rogers: Countdown to Doomsday` Genesis cartridge image. The Gh
 supported platforms. Tests skip when their input variables are unset.
 
 The Phantasie III DOS tests exercise floating-point arithmetic and register-stack copies in Unicorn.
-The Ghidra test replays the observed `FTST`, `FCOM`, and `FCOMP` successors.
+The Ghidra test audits computed targets across the root and four LINK members, then replays
+observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
 
 Phase 12 has optional checks against original tool outputs and releases.
 

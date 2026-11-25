@@ -11,6 +11,7 @@ from retrore.cli import main
 from retrore.emulator import Emulator
 from retrore.evidence import evidence_bundle
 from retrore.jump_tables import JumpTable, M68kJumpTable, recover_jump_tables, recover_m68k_jump_tables
+from retrore.load_manifest import apply_load_manifest
 from retrore.mz import Address, LoadedMZ, MZExecutable
 from retrore.overlays import Overlay, build_image
 
@@ -447,6 +448,63 @@ def phantasie_iii_export(tmp_path, capsys):
     return tmp_path, json.loads(capsys.readouterr().out)
 
 
+def _phantasie_iii_town_dispatch(tmp_path, program):
+    export = tmp_path / "export"
+    emulator = Emulator.from_export(export)
+    image = (export / "image.bin").read_bytes()
+    units = {unit["name"]: unit for unit in program["units"]}
+    base = units["root"]["segment"]
+    code, dgroup = base + 0x3b2, base + 0x28c0
+    selection = Address(base + 0x1820, 0xb5a8)
+    menu_site = Address(code, 0x724f - 0x3b20)
+    window = units["link_0002"]["runtime_linear"]
+    overlays = []
+    loads = [{"unit": "root"}]
+    for name in ("link_0002", "link_0003"):
+        unit = units[name]
+        assert unit["runtime_linear"] == window
+        start = unit["image_offset"]
+        overlays.append((Address(window // 16, 0), image[start:start + unit["size"]]))
+        loads.append({"unit": name, "linear": window, "replace": True})
+
+    # An original boot loaded member 2, then members 1 and 3 over its prefix. Member 3
+    # covers member 1, and five handlers remain in the tail of member 2. Start at the
+    # menu's selection lookup and stop at each entry before executing overlay code.
+    class HandlerReached(Exception):
+        pass
+
+    def observe(cpu):
+        ss, sp = (cpu.reg_read(register) for register in (x86.UC_X86_REG_SS, x86.UC_X86_REG_SP))
+        assert cpu.mem_read(Address(ss, sp).linear, 4) == pack("<HH", 0x7253 - 0x3b20, code)
+        assert cpu.mem_read(target.linear, 8) == overlays[0][1][target.offset:target.offset + 8]
+        raise HandlerReached
+
+    targets = (0x4112, 0x4152, 0x4192, 0x4259, 0x4308)  # Bank, Mystic, Exit, Armor, Inn.
+    events = [{"kind": "overlay", "state": "town"}]
+    for selected, handler in zip(range(0x83e, 0x867, 10), targets, strict=True):
+        target = Address(window // 16, handler)
+        assert len(overlays[1][1]) <= handler < len(overlays[0][1]) - 7
+        with pytest.raises(HandlerReached):
+            emulator.call(
+                Address(code, 0x7242 - 0x3b20), regs={"ds": dgroup, "ss": dgroup, "sp": 0x7600},
+                writes=[*overlays, (selection, pack("<HH", selected, dgroup))],
+                hooks={target: observe}, limit=20,
+            )
+        events.append({"kind": "edge", "from": menu_site.linear, "to": target.linear, "flow": "call"})
+
+    manifest = tmp_path / "town-loads.json"
+    manifest.write_text(json.dumps({
+        "version": 1, "initial": "root",
+        "states": [{"name": "root", "loads": [{"unit": "root"}]}, {"name": "town", "loads": loads}],
+        "transitions": [{"from": "root", "to": "town", "kind": "overlay"}],
+    }), encoding="utf-8")
+    map_path = export / "map.json"
+    program_map = json.loads(map_path.read_text(encoding="utf-8"))
+    apply_load_manifest(manifest, image, program_map)
+    map_path.write_text(json.dumps(program_map), encoding="utf-8")
+    return events, {f"link_0002:{handler:04x}" for handler in targets}
+
+
 def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_startup, capsys):
     tmp_path, program = phantasie_iii_export
     export = tmp_path / "export"
@@ -474,6 +532,14 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
         assert main(["where-is", "--export", str(export), "--pointer", target, "--pointer-kind", "near", "--json"]) == 0
         assert json.loads(capsys.readouterr().out)["matches"] == []
 
+    town_events, town_targets = _phantasie_iii_town_dispatch(tmp_path, program)
+    town_trace = tmp_path / "town-dispatch.json"
+    town_trace.write_text(json.dumps({"version": 1, "events": town_events}), encoding="utf-8")
+    assert main(["trace", str(town_trace), "--export", str(export), "--json"]) == 0, capsys.readouterr().err
+    town_edges = json.loads(capsys.readouterr().out)["edges"]
+    assert {(edge["from"]["location"]["unit_address"], edge["to"]["location"]["unit_address"])
+            for edge in town_edges} == {("root:724f", target) for target in town_targets}
+
     if not os.environ.get("GHIDRA_HOME"):
         return
     project = tmp_path / "ph3"
@@ -499,6 +565,7 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     requests = [
         {"command": "indirect", "at": address, "compact": True} for address in ("root:42df", "root:13721")
     ]
+    requests.append({"command": "indirect", "limit": 1000, "compact": True})
     requests.append({
         "command": "record-writes", "address": "280a:00ab", "stride": 12, "count": 15, "compact": True,
         "code_start": "root:1241c", "code_end": "root:13721", "limit": 1000,
@@ -509,7 +576,7 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     batch = tmp_path / "queries.json"
     batch.write_text(json.dumps(requests), encoding="utf-8")
     assert main(["batch", str(batch), "--project", str(project), "--evidence", "--json"]) == 0
-    callback_result, dispatch_result, writes_result, *references = [
+    callback_result, dispatch_result, inventory, writes_result, *references = [
         row["result"] for row in json.loads(capsys.readouterr().out)["results"]
     ]
     callback, = callback_result["sites"]
@@ -520,6 +587,14 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     candidate, = callback["candidates"]
     assert candidate["target"] == "root:11914" and "relocated" in candidate["evidence"]
     assert dispatch["status"] == "unresolved" and dispatch["reason"] == "no_valid_entries"
+    # Audit Ghidra's targets and candidates across the root and all four LINK members.
+    assert inventory["pagination"]["sites"]["next_offset"] is None
+    detached = {"root:6383", "root:68a4", "root:6a12"}
+    observed_targets = {
+        target for site in inventory["sites"]
+        for target in (*site["targets"], *(row["target"] for row in site.get("candidates", ())))
+    }
+    assert detached.isdisjoint(observed_targets)
     # The listing shows the integer-parser call but has no incoming reference for these paths.
     assert [report["incoming"] for report in references[:-1]] == [[], [], [], []]
     parser_call, = references[-1]["incoming"]
@@ -535,35 +610,45 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     assert writes["root:1271c"]["source"]["register"] == "CS"
     assert writes["root:1273c"]["source"]["register"] == "DS"
 
-    # Replay the observed initializer call and the validated FCOM/FCOMP and FTST successors.
-    runtime_base = 0x0824
-    (initializer_call, installer), _ = phantasie_iii_float_startup
-    image_delta = (program["units"][0]["segment"] - runtime_base) * 16
+    # Replay the observed initializer and dispatcher calls and the validated FCOM/FCOMP and FTST successors.
+    root_linear = program["units"][0]["linear"]
+    startup_edges, _ = phantasie_iii_float_startup
     dispatch_targets = {
         0x1366D: (0x13672, 0x13699, 0x136AE, 0x136B5, 0x136BC, 0x136C2, 0x136C9, 0x136D0),
         0x13721: (0x136BC, 0x13699, 0x136AE, 0x136B5),
     }
     trace = tmp_path / "float_dispatch.json"
     events = [
-        {"kind": "edge", "from": initializer_call.linear - image_delta,
-         "to": installer.linear - image_delta, "flow": "call"},
+        {"kind": "edge", "from": caller.linear, "to": target.linear, "flow": "call"}
+        for caller, target in startup_edges
     ] + [
-        {"kind": "edge", "from": runtime_base * 16 + site, "to": runtime_base * 16 + target, "flow": "jump"}
+        {"kind": "edge", "from": root_linear + site, "to": root_linear + target, "flow": "jump"}
         for site, targets in dispatch_targets.items() for target in targets
-    ]
+    ] + town_events
     trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
-    assert main(["trace", str(trace), "--export", str(export), "--runtime-base", f"{runtime_base:x}",
+    assert main(["trace", str(trace), "--export", str(export),
                  "--project", str(project), "--apply", "--json"]) == 0, capsys.readouterr().err
     applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
     assert any(row["address"]["unit_address"] == "root:1366d" for row in applied if row["kind"] == "instruction")
     assert {(row["from"]["unit_address"], row["to"]["unit_address"]) for row in applied if row["kind"] == "flow"} == {
         (f"root:{site:x}", f"root:{target:x}") for site, targets in dispatch_targets.items() for target in targets
-    } | {("root:4405", "root:6017")}
-    for site, targets in {0x4405: (0x6017,), **dispatch_targets}.items():
-        assert main(["indirect", "--at", f"root:{site:x}", "--project", str(project), "--compact", "--json"]) == 0
-        recovered, = json.loads(capsys.readouterr().out)["sites"]
+    } | {(f"root:{caller.linear - root_linear:04x}", f"root:{target.linear - root_linear:04x}")
+         for caller, target in startup_edges} | {("root:724f", target) for target in town_targets}
+    expected = {
+        "root:42df": {"root:11914"}, "root:42f5": {"root:11914"}, "root:4405": {"root:6017"},
+        "root:1191c": {"root:1192a", "root:11a2a"}, "root:724f": town_targets,
+        **{f"root:{site:x}": {f"root:{target:x}" for target in targets} for site, targets in dispatch_targets.items()},
+    }
+    batch.write_text(json.dumps([
+        {"command": "indirect", "at": site, "compact": True} for site in expected
+    ]), encoding="utf-8")
+    assert main(["batch", str(batch), "--project", str(project), "--json"]) == 0
+    reports = json.loads(capsys.readouterr().out)["results"]
+    for report, (site, targets) in zip(reports, expected.items(), strict=True):
+        recovered, = report["result"]["sites"]
+        assert recovered["address"] == site
         assert recovered["status"] == "resolved"
-        assert set(recovered["targets"]) == {f"root:{target:x}" for target in targets}
+        assert set(recovered["targets"]) == targets
 
 
 def _dos_vector(cpu, _number):
@@ -603,12 +688,28 @@ def phantasie_iii_float_startup(phantasie_iii_export):
         cpu.reg_write(x86.UC_X86_REG_EFLAGS, cpu.reg_read(x86.UC_X86_REG_EFLAGS) & ~1)
 
     site, installer = root(0x4405), root(0x6017)
+    emu_code = base + 0x118f
+    dispatcher = Address(emu_code, 0x24)
+    table_call = Address(emu_code, 0x2c)
     edges = []
 
-    def observe_installer(cpu):
+    def stack_bytes(cpu, size):
         ss, sp = (cpu.reg_read(register) for register in (x86.UC_X86_REG_SS, x86.UC_X86_REG_SP))
-        ip, cs = unpack_from("<HH", cpu.mem_read(Address(ss, sp).linear, 4))
-        assert Address(cs, ip) == root(0x4407)  # Return to the initializer loop.
+        return cpu.mem_read(Address(ss, sp).linear, size)
+
+    def observe_dispatcher(cpu):
+        service = cpu.reg_read(x86.UC_X86_REG_BX)
+        caller = root({0: 0x42df, 3: 0x42f5}[service])
+        assert stack_bytes(cpu, 4) == pack("<HH", caller.offset + 5, caller.segment)
+        edges.append((caller, dispatcher))
+
+    def observe_service(cpu, service, target):
+        assert cpu.reg_read(x86.UC_X86_REG_BX) == service * 2
+        assert stack_bytes(cpu, 2) == pack("<H", 0x31)  # Near return from the table call.
+        edges.append((table_call, target))
+
+    def observe_installer(cpu):
+        assert stack_bytes(cpu, 4) == pack("<HH", root(0x4407).offset, code)
         assert cpu.mem_read(site.linear, 2) == bytes.fromhex("ff1d")  # CALL FAR [DI]
         ds, di = (cpu.reg_read(register) for register in (x86.UC_X86_REG_DS, x86.UC_X86_REG_DI))
         assert (ds, di) == (dgroup, 0x2630)
@@ -618,16 +719,25 @@ def phantasie_iii_float_startup(phantasie_iii_export):
 
     # Enter the shipped C initialization subroutine with the PSP and software-FPU setting.
     callback = Address(dgroup, 0x1dd6)
+    initialize, register = Address(emu_code, 0x3a), Address(emu_code, 0x13a)
     installed = emulator.call(
         root(0x42a8), far=True, regs={"ds": dgroup, "ss": dgroup, "sp": 0x7600},
         writes=[(Address(dgroup, 0x1d5f), pack("<H", psp)), (Address(psp, 0x2c), pack("<H", environment)),
                 (Address(environment, 0), b"NO87=\0\0")],
-        reads=[(callback, 4)], interrupts={0x21: dos}, hooks={installer: observe_installer},
+        reads=[(callback, 4)], interrupts={0x21: dos}, hooks={
+            dispatcher: observe_dispatcher,
+            initialize: lambda cpu: observe_service(cpu, 0, initialize),
+            register: lambda cpu: observe_service(cpu, 3, register),
+            installer: observe_installer,
+        },
     )
-    edge, = edges
+    assert edges == [
+        (root(0x42df), dispatcher), (table_call, initialize),
+        (root(0x42f5), dispatcher), (table_call, register), (site, installer),
+    ]
     offset, segment = unpack_from("<HH", dict(installed.memory)[callback])
     assert Address(segment, offset) == root(0x6a12)
-    return edge, installed.memory
+    return edges, installed.memory
 
 
 @pytest.fixture

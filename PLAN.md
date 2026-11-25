@@ -14,17 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, traced Phantasie III's computed startup call from `root:4405` to the
-floating-point callback installer at `root:6017` and replayed the edge in Ghidra. A Unicorn
-run of the unpacked game through Pendragon's character roll reached all four LINK member 2
-floating-point stores. The observed destinations were outside the record allocation, and the
-three detached entries had zero hits. Five checks passed against the original release with
-Ghidra 12.2. The standalone suite passed 517 tests with 133 skipped.
+On 2026-11-24, audited computed transfers in Phantasie III's root and four LINK members. Unicorn
+traces identified the FPU startup and shutdown routes, the stack-built interrupt thunk, and five
+Pendragon calls into the tail of member 2 after member 3 replaced its prefix. Ghidra replayed the
+startup and menu calls using an ordered load manifest. The audit found no callers of the three
+detached floating-point entries. Five opt-in checks passed with Ghidra 12.2. The standalone suite
+passed 517 tests with 133 skipped.
 
-Resume Phase 9 by checking the remaining computed flow in the root and other LINK members for
-callers of the conversion, alternate parser, and comparison entries. The conversion callback's
-far output pointer still needs caller provenance. An automatic dispatch bound requires coverage
-of reachable stores and record sources.
+Resume Phase 9 with deeper dungeon and other untraced game paths. The conversion callback's far output
+pointer still needs caller provenance, and the alternate parser and comparison entries still need
+reachability evidence. An automatic dispatch bound requires coverage of reachable stores and
+record sources.
 Microsoft LINK still needs a shipped executable with missing directory counts or a member whose first
 listed segment starts after the overlay window start. Expand Microsoft MOVE runtime views as more
 captured placements become available.
@@ -354,6 +354,23 @@ Continue with the analysis backlog below.
   `link_0002:22a7`, `:269b`, `:26c7`, and `:2708`. All four stored at DGROUP:`764c`,
   and the control word and integer stores used DGROUP:`761e` and `7614`. The detached entries
   had zero hits in those runs. Caller provenance and reachability for them remain open.
+- **Audited computed callers in the shipped DOS release.** Ghidra's `indirect` inventory of the
+  root and all four LINK members lists no target or candidate for `root:6a12`, `root:6383`, or
+  `root:68a4`. Unicorn traces through startup, Pendragon menus, the town archives, and
+  ordinary quit logged zero hits at those entries and zero reads of the installed callback table.
+  Startup calls at `root:42df` and `root:42f5` and shutdown at `root:43d3` reach
+  `root:11914`. Its table call at `root:1191c` selects `root:1192a`, `root:11a2a`, and
+  `root:119f9` for services 0, 3, and 2 respectively. The startup jump at `root:4621` returns
+  to `root:4264` through the address saved by the argument builder. The call at `root:52c2`
+  executes the `INT` thunk built on its own stack.
+  In Pendragon, `root:724f` reads five far pointers from the Bank, Mystic, Exit, Armor, and Inn
+  descriptors. Their handlers at `link_0002:4112`, `:4152`, `:4192`, `:4259`, and `:4308`
+  survive the load of member 3 into the same window. At base `1000`, both members load at
+  `23d5:0000`. An ordered load manifest preserves member 2's visible tail and Ghidra 12.2
+  replays all five calls against the member's analysis block. In the town archives, member 4
+  entered at `link_0004:062d` and its tile dispatch at `:05c1` reached `:05c6` and `:05e9`.
+  The DOS read shim invalidates Unicorn's translation cache for the overlay window when it writes
+  a member, so execution uses the newly loaded code.
 - **Validated arithmetic dispatch slots.** `root:12524` and `root:1253f` use the same
   eight-word table at `root:1205e`. The `0x0e` mask and optional XOR with 2 keep BX
   on those slots. At `root:126cf`, arithmetic uses three 16-word tables at `root:12106`,
