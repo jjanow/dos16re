@@ -7,6 +7,7 @@ import com.google.gson.JsonParser;
 
 import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.util.headless.HeadlessScript;
+import ghidra.program.database.SpecExtension;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.SegmentedAddress;
 import ghidra.program.model.address.SegmentedAddressSpace;
@@ -16,6 +17,7 @@ import ghidra.program.model.data.CharDataType;
 import ghidra.program.model.data.DWordDataType;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.LongDataType;
+import ghidra.program.model.data.MutabilitySettingsDefinition;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.QWordDataType;
 import ghidra.program.model.data.ShortDataType;
@@ -26,6 +28,7 @@ import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.CommentType;
+import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Parameter;
@@ -64,6 +67,7 @@ public class RetroreSegments extends HeadlessScript {
     private static final int CONTEXT_ROUNDS = 4;
     private static final int PASCAL_FRAME_ROUNDS = 8;
     private static final int PASCAL_FRAME_HELPER_SIZE = 31;
+    static final String PASCAL_FRAME_FIXUP = "retrore_microsoft_pascal_frame";
     // Read the size at CS:[return IP], save BP, check the stack, and jump past the size word.
     private static final Pattern PASCAL_FRAME_HELPER = Pattern.compile(
         "5e2e8b0c4646558bec2be972063b2e[0-9a-f]{4}7706569a[0-9a-f]{8}8be503e9ffe6");
@@ -274,9 +278,10 @@ public class RetroreSegments extends HeadlessScript {
         var listing = currentProgram.getListing();
         var memory = currentProgram.getMemory();
         var helperMatches = new HashMap<Address, Boolean>();
-        int recovered = 0;
+        var recoveredSites = new HashSet<Address>();
+        var recoveredHelpers = new HashSet<Address>();
         for (int round = 0; round < PASCAL_FRAME_ROUNDS; round++) {
-            var sites = new ArrayList<Address>();
+            var sites = new LinkedHashMap<Address, Address>();
             for (var instruction : listing.getInstructions(true)) {
                 monitor.checkCancelled();
                 if (instruction.getLength() != 3 || !instruction.getFlowType().isCall() ||
@@ -299,11 +304,12 @@ public class RetroreSegments extends HeadlessScript {
                     helperMatches.put(target, PASCAL_FRAME_HELPER.matcher(HexFormat.of().formatHex(bytes)).matches());
                 }
                 if (helperMatches.get(target)) {
-                    sites.add(instruction.getAddress());
+                    sites.put(instruction.getAddress(), target);
                 }
             }
-            int previous = recovered;
-            for (Address site : sites) {
+            int previous = recoveredSites.size();
+            for (var candidate : sites.entrySet()) {
+                Address site = candidate.getKey();
                 var call = getInstructionAt(site);
                 if (call == null) {
                     continue;
@@ -318,21 +324,70 @@ public class RetroreSegments extends HeadlessScript {
                 var function = getFunctionContaining(site);
                 call.setFallThrough(resume);
                 listing.clearCodeUnits(word, word.next(), false);
-                listing.createData(word, WordDataType.dataType);
+                var size = listing.createData(word, WordDataType.dataType);
+                MutabilitySettingsDefinition.DEF.setChoice(size, MutabilitySettingsDefinition.CONSTANT);
                 listing.setComment(word, CommentType.EOL,
                     "Microsoft Pascal local frame size: " + (memory.getShort(word) & WORD_MASK) + " bytes");
                 disassemble(resume);
                 if (function != null) {
                     CreateFunctionCmd.fixupFunctionBody(currentProgram, function, monitor);
                 }
-                recovered++;
+                recoveredHelpers.add(candidate.getValue());
+                recoveredSites.add(site);
             }
-            if (recovered == previous) {
+            if (recoveredSites.size() == previous) {
                 break;
             }
             analyzeChanges(currentProgram);
         }
-        return recovered;
+        var helpers = new ArrayList<Function>();
+        for (Address target : recoveredHelpers) {
+            var helper = getFunctionAt(target);
+            // The fixup is attached to the callee. Every known caller needs the recovered continuation.
+            if (helper != null && hasOnlyRecoveredFrameCalls(target, recoveredSites)) {
+                helpers.add(helper);
+            }
+        }
+        if (!helpers.isEmpty()) {
+            addPascalFrameFixup(helpers);
+        }
+        return recoveredSites.size();
+    }
+
+    private boolean hasOnlyRecoveredFrameCalls(Address helper, HashSet<Address> recoveredSites) {
+        for (var reference : currentProgram.getReferenceManager().getReferencesTo(helper)) {
+            if (reference.getReferenceType().isCall() && !recoveredSites.contains(reference.getFromAddress())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void addPascalFrameFixup(List<Function> helpers) throws Exception {
+        // Model the successful path. The near CALL already pushed its return IP, and the helper
+        // replaces that word with the saved BP. inst_next points at the inline size before the
+        // fall-through override. The helper's final ADD restores BP and sets the arithmetic flags.
+        var extension = new SpecExtension(currentProgram);
+        extension.addReplaceCompilerSpecExtension("<callfixup name=\"" + PASCAL_FRAME_FIXUP + "\">" + """
+            <pcode><body><![CDATA[
+                local slot:4 = segment(SS, SP);
+                local sizeWord:4 = &:4 inst_next;
+                SI = *:2 slot + 2;
+                CX = *:2 sizeWord;
+                *:2 slot = BP;
+                BP = SP;
+                SP = SP - CX;
+                CF = carry(SP, CX);
+                OF = scarry(SP, CX);
+                AF = ((SP ^ CX ^ BP) & 0x10) != 0;
+                SF = BP s< 0;
+                ZF = BP == 0;
+                PF = (popcount(BP & 0xff) & 1:1) == 0;
+            ]]></body></pcode></callfixup>
+            """, monitor);
+        for (Function helper : helpers) {
+            helper.setCallFixup(PASCAL_FRAME_FIXUP);
+        }
     }
 
     private boolean hasOtherFrameWordEntry(Address call, Address wordByte) {

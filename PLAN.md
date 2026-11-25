@@ -14,15 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, added Microsoft Pascal 3.20 DGROUP placement evidence and recovered the
-frame helper's inline size word in Ghidra. Unicorn verified a relocated literal and the stack
-switch at two allocation limits per LINK build. The LINK overlay probes verified the copy bounds
-through a preloader, and Ghidra 12.2 recovered 39 frame calls in each overlay probe. The default
-suite passed 520 tests. The runtime, segment, and DOS suites passed 54 tests with Ghidra enabled.
+On 2026-11-25, modeled the Microsoft Pascal 3.20 frame helper's normal BP and SP effects in
+Ghidra. A synthetic probe covered zero-byte and 260-byte frames and agreed with Unicorn. The
+original LINK 2.40 and 2.45 builds decompiled the heap routine with its recovered stack argument.
+Ghidra 12.2 identified 39 frame calls in each LINK overlay probe and resolved a constant stack
+argument in file initialization. The default suite passed 520 tests. The runtime, segment, and
+DOS suites passed 55 tests with Ghidra enabled.
 
-Resume with Microsoft Pascal's BP and SP effects in the decompiler or with original X1turbo
-media when available. The [platform parity table](#platform-capability-parity) tracks other
-extensions.
+Resume with mapping captured Microsoft Pascal DGROUP into Ghidra or with original X1turbo media
+when available. The [platform parity table](#platform-capability-parity) tracks other extensions.
 
 ## Why
 
@@ -143,8 +143,9 @@ through a relocated far jump. The loader reports the fixed DGROUP copy bounds, s
 maximal shift, and new stack offset. Unicorn verified the resulting DS and SS and the relocated
 string literal under two DOS allocation limits per build. Ghidra preserves frame-helper calls and
 marks their inline local size words as data, with fall-through at the following instruction.
-Version detection, mapping captured runtime DGROUP into Ghidra, and modeling the helper's BP and SP
-effects in the decompiler remain open.
+A call fixup uses each inline size to model BP and SP on the normal return path. The decompiler
+recovers the heap routine's argument and local stack slot on both LINK builds. Version detection
+and mapping captured runtime DGROUP into Ghidra remain open.
 [Probe build steps](README.md#microsoft-pascal-runtime-probe)
 
 ### Phase 6: emulator harness

@@ -322,8 +322,9 @@ receive `(biased_segment + shift) & 0xffff` and SP receives `stack_offset`. The 
 pre-copy layout. [Microsoft Pascal manual, section 8.3.2](https://bitsavers.org/pdf/victor/victor9000/MS-PASCAL_Volume_I.pdf)
 
 For recognized frame-helper calls, Ghidra marks the inline local size as a two-byte data word and
-resumes disassembly after it. The listing retains the original call and bytes. The helper's BP and
-SP changes still need decompiler modeling.
+resumes disassembly after it. The listing retains the original call and bytes. A decompiler call
+fixup models normal returns by saving BP, setting BP to the frame base, and subtracting that
+call's inline local size from SP. Import the export into a new Ghidra project to apply the fixup.
 
 ### Linker maps and signature catalogs
 

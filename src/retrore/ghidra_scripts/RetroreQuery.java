@@ -8,6 +8,7 @@ import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.ClangStatement;
 import ghidra.app.decompiler.ClangToken;
 import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.decompiler.PrettyPrinter;
 import ghidra.app.script.GhidraScript;
@@ -20,6 +21,7 @@ import ghidra.program.model.address.SegmentedAddressSpace;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.lang.InjectPayload;
 import ghidra.program.model.lang.InsufficientBytesException;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.lang.UnknownContextException;
@@ -2393,6 +2395,13 @@ public class RetroreQuery extends GhidraScript {
     private DecompileResults decompile(Function function) throws Exception {
         if (decompiler == null) {
             decompiler = new DecompInterface();
+            var injections = currentProgram.getCompilerSpec().getPcodeInjectLibrary();
+            if (injections.getPayload(InjectPayload.CALLFIXUP_TYPE, RetroreSegments.PASCAL_FRAME_FIXUP) != null) {
+                // Fold the inline frame size marked constant by the DOS importer.
+                var options = new DecompileOptions();
+                options.setRespectReadOnly(true);
+                decompiler.setOptions(options);
+            }
             if (!decompiler.openProgram(currentProgram)) {
                 String message = decompiler.getLastMessage();
                 decompiler.dispose();

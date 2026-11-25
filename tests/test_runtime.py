@@ -168,13 +168,16 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
     requests = tmp_path / "queries.json"
     requests.write_text(json.dumps([
         {"command": "decomp", "address": f"root:{publics['ENTGQQ'] - origin:04x}"},
+        {"command": "decomp", "address": f"root:{publics['GETHQQ'] - origin:04x}"},
         *({"command": "disasm", "address": f"root:{publics[symbol] - origin:04x}", "limit": 8}
           for symbol in ("INIFQQ", "GETHQQ", "WTLFQQ")),
     ]), encoding="utf-8")
     assert main(["batch", str(requests), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    entry, *frames = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+    entry, heap, *frames = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
     decompilation = entry["decompilation"]
     assert all(call in decompilation for call in ("INIFQQ();", "GETHQQ(2);", "WTLFQQ("))
+    assert "(size);" in heap["decompilation"]  # The allocator receives the recovered stack parameter.
+    assert "WORD_" not in heap["decompilation"]  # The local size folds to a constant stack adjustment.
     image = (export / "image.bin").read_bytes()
     for frame, size in zip(frames, ("0000", "0200", "0000"), strict=True):
         call, word, continuation = frame["rows"]
@@ -187,6 +190,52 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
         assert refs["FALL_THROUGH"] == continuation["address"]["linear"] == call["address"]["linear"] + 5
         helper = refs["UNCONDITIONAL_CALL"] - origin
         assert image[helper:helper + 4] == bytes.fromhex("5e 2e 8b 0c")
+
+
+def test_ghidra_microsoft_pascal_frame_uses_each_inline_size(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    caller = bytes.fromhex("0e 1f b8 34 12 50 e8 17 00 a3 80 01 e8 31 00 a3 82 01 c3")
+    # The first frame reads a parameter. The second stores at BP-0x104 and pops from SS:SP.
+    zero_frame = bytes.fromhex("e8 3d 00 00 00 8b 46 04 5d c2 02 00")
+    large_frame = bytes.fromhex("e8 1d 00 04 01 c7 86 fc fe 67 45 58 8b e5 5d c3")
+    helper = bytes.fromhex("5e 2e 8b 0c 46 46 55 8b ec 2b e9 72 06 3b 2e 90 01 77 06 56"
+                           " 9a 7f 00 45 23 8b e5 03 e9 ff e6")
+    image = caller.ljust(0x20, b"\xcc") + zero_frame
+    image = image.ljust(0x40, b"\xcc") + large_frame
+    image = image.ljust(0x60, b"\xcc") + helper + b"\xf4"
+    image = image.ljust(0x190, b"\0") + pack("<H", 0x100)
+    origin, stack_segment = 0x23450, 0x2365
+    header = pack("<2s13H", b"MZ", 32 + len(image), 1, 0, 2, 0x40, 0x40, 0x20, 0x400,
+                  0, 0, 0, 28, 0).ljust(32, b"\0")
+    source, export, project = (tmp_path / name for name in ("sample.exe", "export", "project"))
+    source.write_bytes(header + image)
+    assert main(["load", str(source), "--base-segment", "0x2345", "-o", str(export), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    # Compiler detection is tested separately. Start this fixture directly at the caller.
+    program["compiler"] = {"family": "Microsoft Pascal"}
+    (export / "map.json").write_text(json.dumps(program), encoding="utf-8")
+
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["microsoft_pascal_frame_calls"] == 2
+    requests = tmp_path / "queries.json"
+    requests.write_text(json.dumps([
+        {"command": "decomp", "address": address} for address in ("root:0020", "root:0040")
+    ]), encoding="utf-8")
+    assert main(["batch", str(requests), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    zero, large = (row["result"]["decompilation"] for row in json.loads(capsys.readouterr().out)["results"])
+    assert "return param_1;" in zero
+    assert "return 0x4567;" in large
+
+    uc = Uc(UC_ARCH_X86, UC_MODE_16)
+    uc.mem_map(0, 0x100000)
+    uc.mem_write(origin, image)
+    for register, value in ((UC_X86_REG_CS, 0x2345), (UC_X86_REG_SS, stack_segment), (UC_X86_REG_SP, 0x400)):
+        uc.reg_write(register, value)
+    uc.emu_start(origin, origin + 0x12, count=100)  # Stop at the caller's final RET.
+    assert uc.reg_read(UC_X86_REG_IP) == 0x12
+    assert uc.reg_read(UC_X86_REG_SP) == 0x400
+    assert uc.mem_read(origin + 0x180, 4) == pack("<HH", 0x1234, 0x4567)
 
 
 CONVENTIONS = bytes.fromhex(
