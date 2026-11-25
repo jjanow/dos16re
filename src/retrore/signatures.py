@@ -157,6 +157,9 @@ _PUTS = Prototype("puts", "int", (Parameter("s", "char*"),))
 _PRINTF = Prototype("printf", "int", (Parameter("format", "char*"),), variadic=True)
 _MALLOC = Prototype("malloc", "void*", (Parameter("size", "uint"),))
 _FREE = Prototype("free", "void", (Parameter("memory", "void*"),))
+_MEMCPY = Prototype("memcpy", "void*", (Parameter("destination", "void*"), Parameter("source", "void*"),
+                                        Parameter("size", "uint")))
+_ISATTY = Prototype("isatty", "int", (Parameter("handle", "int"),))
 
 _BORLAND_C = (
     (_STRCPY, "55 8b ec 56 57 1e 07 fc 8b 7e 06 8b f7 32 c0 b9 ff ff f2 ae f7 d1 8b 7e 04 f3 a4 8b 46 04"),
@@ -172,6 +175,10 @@ _BORLAND_C = (
 )
 
 _MICROSOFT_C = (
+    (_MEMCPY, "55 8b ec 8b d7 8b de 8c d8 8e c0 8b 76 06 8b 7e 04 8b c7 8b 4e 08 e3 0e a8 01 74 02 a4 49 "
+              "d1 e9 f3 a5 13 c9 f3 a4 8b f3 8b fa 5d c3"),
+    (_ISATTY, "55 8b ec 8b 5e 04 3b 1e ?? ?? 7d 11 83 fb 00 7c 0c f6 87 ?? ?? 40 74 05 b8 01 00 eb 02 33 c0 "
+              "8b e5 5d c3"),
     (_STRCPY, "55 8b ec 8b d7 8b de 8b 76 06 8b fe 8c d8 8e c0 33 c0 b9 ff ff f2 ae f7 d1 8b 7e 04 8b c7"),
     (_STRLEN, "55 8b ec 8b d7 8c d8 8e c0 8b 7e 04 33 c0 b9 ff ff f2 ae f7 d1 49 91 8b fa 5d c3"),
     (_PUTS, "55 8b ec 83 ec 08 57 56 be ?? ?? ff 76 04 e8 ?? ?? 83 c4 02 8b f8 56 e8 ?? ?? 83 c4 02 89 46 fe"),
@@ -194,6 +201,10 @@ def _medium(prototype: Prototype) -> Prototype:
 # Microsoft C 5.1 /AM probes linked against MLIBCR. Medium model keeps data pointers near and uses
 # far calls for public functions. Offsets and selectors resolved by the linker are wildcarded.
 _MICROSOFT_C_MEDIUM = (
+    (_medium(_MEMCPY), "55 8b ec 8b d7 8b de 8c d8 8e c0 8b 76 08 8b 7e 06 8b c7 8b 4e 0a e3 0e a8 01 74 02 a4 49 "
+                      "d1 e9 f3 a5 13 c9 f3 a4 8b f3 8b fa 5d cb"),
+    (_medium(_ISATTY), "55 8b ec 8b 5e 06 3b 1e ?? ?? 7d 11 83 fb 00 7c 0c f6 87 ?? ?? 40 74 05 b8 01 00 eb 02 33 c0 "
+                      "8b e5 5d cb"),
     (_medium(_STRCPY),
      "55 8b ec 8b d7 8b de 8b 76 08 8b fe 8c d8 8e c0 33 c0 b9 ff ff f2 ae f7 d1 8b 7e 06 8b c7"),
     (_medium(_STRLEN), "55 8b ec 8b d7 8c d8 8e c0 8b 7e 06 33 c0 b9 ff ff f2 ae f7 d1 49 91 8b fa 5d cb"),

@@ -298,8 +298,9 @@ and prototypes. Patterns wildcard relocated segment words and link-dependent ope
 
 The catalog covers Turbo Pascal 5.5, 6.0, and 7.0 helpers for Real48 addition, strings, sets, text output, heap
 allocation, and overlays. It also covers selected small-model C routines from Turbo C 2.01, Turbo C++ 1.01,
-Borland C++ 2.0, and Microsoft C 5.1 and 6.0a. The compiler report identifies the linked runtime and only
-includes a version when supported by the evidence. See the validation notes in [PLAN.md](PLAN.md#phase-5-runtime-signatures).
+Borland C++ 2.0, and Microsoft C 5.1 and 6.0a. Microsoft C signatures include near and far variants of
+`memcpy` and `isatty` from small- and medium-model probes. The compiler report identifies the linked runtime
+and includes a version when supported by the evidence. See the validation notes in [PLAN.md](PLAN.md#phase-5-runtime-signatures).
 
 ### Linker maps and signature catalogs
 
@@ -852,6 +853,9 @@ The last pass recovers calling conventions for functions without a signature. It
 `retf n` immediates, `add sp,n` or `pop` after calls, and argument reads through `[BP+n]` or
 `SS:[BX+n]`. Arguments loaded with `les` or `lds` become one far pointer. Each argument gets an explicit stack
 offset. The pass skips signatures that would require more than 256 bytes of inferred stack arguments.
+For short straight-line routines, agreeing direct callers can establish register arguments or joined
+`DX:AX` and `DX:BX:AX` return storage. The latter uses a six-byte type unless a runtime signature identifies
+the value as Real48.
 `int 21h` sites with AH loaded in the same straight-line code become calls to stubs such as
 `DOS::SeekFile` in a `dos_services` block. The carry flag reads as `extraout_CF` after the call.
 Re-export images made by older versions to include the relocation metadata.
@@ -928,7 +932,8 @@ text containing bytes above `0x7f`.
 Each match reports whether a loader relocation backs it (`relocated`, `null` where the format has none).
 `--pointer-kind` also enables `absolute-short` for aligned 68k words or `split` for 6502 low/high
 tables whose indexed loads and stores assemble a pointer. The split result includes both bytes
-and the instructions that pair them.
+and the instructions that pair them, including entries read through a biased table base and writes
+into a self-modified instruction operand.
 
 `relocs` lists loader relocations from the export, filtered by `--unit`, by site (`--at` and `--size`),
 or by `--target`. DOS targets match on segment, and 68k targets on the value range. Results are paged
@@ -1032,15 +1037,15 @@ register values for that instruction. Use `--status` to filter the page and
 `--code-start` with `--code-end` to limit the instruction range.
 
 The report gives the count of undefined bytes and computed transfers with no listed target in
-the selected code range. Results depend on the listing and the segment analysis's caller and
-entry assumptions. A project imported before write context was recorded still reports
-possible overlaps from the listing. Reimport to use tracked register values.
+the selected code range. Write analysis starts detached routines with unknown segment registers
+and joins context at shared tails. Applied interrupt edges carry caller context into the handler,
+and trace replay refreshes the write analysis. Older projects report possible overlaps using the
+listing alone. Reimport to use tracked register values.
 
 The Phantasie III check compares this report with Unicorn observations of the single-precision
-output words and class words. The query flags the output stores, constant copy, and register
-copy as possible overlaps. Changing the caller's segment and offset can make an output store
-overwrite an internal class byte. The query misses the two writes from the register exchange
-because detached-function analysis assigns DGROUP to the destination registers.
+output words and class words. The query flags the output stores, constant copy, register copy,
+and both register exchange writes as possible overlaps. Changing the caller's segment and offset
+can make an output store overwrite an internal class byte.
 
 With `RETRORE_PH3_DIR` set, the Phantasie III validation runs the shipped software floating-point
 handlers and checks writes from parser, formatter, conversion, and LINK overlay code against the
@@ -1602,6 +1607,10 @@ an existing program in the project. For a DOS MZ capture, `--runtime-base HEX` s
 where DOS loaded the root. Applied computed edges are visible in `indirect` and `xrefs`.
 For a real-mode x86 `INT imm8`, use `"flow": "interrupt"` on the edge from the instruction to
 the observed handler entry. Apply the trace to add the call reference to `xrefs`.
+Use `"flow": "interrupt_resume"` from the same instruction to the observed continuation when
+the handler consumes inline operand bytes. Include a byte sample at each `INT` in that chain.
+The preview lists any instructions to clear and the continuation addresses to set. Competing
+executed starts, defined data, functions, symbols, or references can prevent a repair.
 Each edge records a successor observed in the capture. Checking the index range requires
 inputs that exercise the dispatch.
 

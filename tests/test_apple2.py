@@ -1,11 +1,13 @@
 import json
 import os
+from pathlib import Path
 from struct import pack, pack_into
 
 import pytest
 
 from retrore.apple2 import Apple2Error, SectorImage, memory_map
 from retrore.cli import main
+from retrore.dynamic import RoutineBackend, RoutineRequest
 
 
 def _high_ascii(name, width):
@@ -174,3 +176,27 @@ def test_apple2_ghidra_import_and_queries(tmp_path, capsys):
     read, = query("xrefs", "d000")["outgoing"]
     assert (read["type"], read["to"]["unit_address"]) == ("READ", "apple2_soft_switches:0030")
     assert "SPKR" in query("decomp", "worker:0000")["decompilation"]
+
+
+def test_phantasie_iii_picplot_rebuilds_the_screen_pointer(tmp_path, capsys):
+    directory = os.environ.get("RETRORE_PH3_APPLE2_DIR")
+    if not directory:
+        pytest.skip("set RETRORE_PH3_APPLE2_DIR to the Phantasie III disk directory")
+    disk, = Path(directory).glob("*Disk_1_of_3_Side_A.dsk")
+    export = tmp_path / "picplot"
+    assert main(["load", str(disk), "--apple2", "--disk-file", "PICPLOT", "--entry", "6e8c", "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["where-is", "--export", str(export), "--pointer", "2228", "--pointer-kind", "split", "--json"]) == 0
+    match, = json.loads(capsys.readouterr().out)["matches"]
+    evidence, = match["evidence"]
+    assert (match["address"], match["high"]["address"], evidence["index_register"], evidence["index"]) == (
+        "6e24", "6dc0", "y", 0x60,
+    )
+    assert evidence["high_table"]["unit_address"] is None
+    assert (evidence["instruction"]["linear"], evidence["destination"]["linear"]) == (0x6e8e, 0x6ea0)
+
+    panel = bytes(range(12)) + bytes(range(12, 24)) + bytes(94 * 12)
+    result = RoutineBackend.from_export(export).run(RoutineRequest(
+        "6e8c", writes=((0x7530, panel),), reads=((0x2228, 12), (0x2628, 12), (0x6e9d, 2)),
+    ))
+    assert dict(result.after.memory) == {0x2228: panel[:12], 0x2628: panel[12:24], 0x6e9d: pack("<H", 0x79b0)}

@@ -231,6 +231,7 @@ def test_x68k_dos_prototypes_in_map():
         "result": "int",
     }
     assert iocs["21"]["parameters"] == [{"name": "text", "type": "char*", "register": "A1"}]
+    assert [parameter["register"] for parameter in iocs["45"]["parameters"]] == ["D1", "D2", "D3", "A1"]
     assert [parameter["register"] for parameter in iocs["77"]["parameters"]] == ["D1u", "D1w", "D2u", "D2w"]
 
 

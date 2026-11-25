@@ -389,12 +389,20 @@ public class RetroreQuery extends GhidraScript {
         var expected = trace.has("expected_bytes") ? trace.getAsJsonObject("expected_bytes") : new JsonObject();
         var instructions = traceInstructions(misses, observed, expected, observations);
         var flows = new LinkedHashMap<TraceFlow, List<Integer>>();
+        var resumes = new TreeMap<Address, Address>();
+        var replaced = new ArrayList<Instruction>();
         if (trace.has("edges")) {
-            var edges = traceEdges(trace.getAsJsonArray("edges"), instructions, expected, observations, flows);
+            var events = trace.getAsJsonArray("edges");
+            traceInterruptResumes(events, observed, expected, observations, instructions, resumes, replaced);
+            var edges = traceEdges(events, instructions, expected, observations, flows);
             report.put("edge_gaps", edges.gaps());
             report.put("unobserved_flows", edges.unobserved());
         }
         var additions = new ArrayList<Map<String, Object>>();
+        for (var instruction : replaced) {
+            additions.add(Map.of("kind", "clear_instruction", "address", location(instruction.getAddress()),
+                "instruction", instruction.toString(), "bytes", HexFormat.of().formatHex(instruction.getBytes())));
+        }
         for (var entry : instructions.entrySet()) {
             var instruction = entry.getValue();
             additions.add(Map.of("kind", "instruction", "address", location(entry.getKey()),
@@ -405,9 +413,11 @@ public class RetroreQuery extends GhidraScript {
             additions.add(Map.of("kind", "flow", "from", location(flow.from()), "to", location(flow.to()),
                 "type", flow.type().toString(), "events", entry.getValue()));
         }
+        resumes.forEach((from, to) -> additions.add(Map.of("kind", "interrupt_resume", "from", location(from),
+            "to", location(to))));
         report.put("additions", additions);
         if (apply) {
-            applyTrace(instructions, flows.keySet());
+            applyTrace(instructions, flows.keySet(), resumes, replaced, trace.getAsJsonObject("segment_map"));
             report.put("applied", additions);
         }
         return report;
@@ -486,6 +496,119 @@ public class RetroreQuery extends GhidraScript {
             (target.equals(instruction.getFallThrough()) || Arrays.asList(instruction.getFlows()).contains(target));
     }
 
+    /** An interrupt handler can consume bytes following INT imm8 before resuming the caller. */
+    private void traceInterruptResumes(JsonArray events, TreeSet<Address> observed, JsonObject expected,
+            JsonObject observations, Map<Address, Instruction> additions, Map<Address, Address> resumes,
+            List<Instruction> replaced) throws Exception {
+        if (!currentProgram.getLanguageID().getIdAsString().equals("x86:LE:16:Real Mode")) {
+            return;
+        }
+        var destinations = new TreeMap<Address, Set<Address>>();
+        for (var item : events) {
+            monitor.checkCancelled();
+            var edge = item.getAsJsonObject();
+            if (!edge.get("flow").isJsonNull() && edge.get("flow").getAsString().equals("interrupt_resume") &&
+                    !edge.get("from").isJsonNull()) {
+                var from = traceAddress(edge.getAsJsonObject("from"));
+                var to = edge.get("to").isJsonNull() ? null : traceAddress(edge.getAsJsonObject("to"));
+                destinations.computeIfAbsent(from, unused -> new HashSet<>()).add(to);
+            }
+        }
+        var listing = currentProgram.getListing();
+        var pseudo = new PseudoDisassembler(currentProgram);
+        var verified = new TreeMap<Address, Instruction>();
+        var ranges = new AddressSet();
+        for (var entry : destinations.entrySet()) {
+            monitor.checkCancelled();
+            var from = entry.getKey();
+            var to = entry.getValue().iterator().next();
+            var block = currentProgram.getMemory().getBlock(from);
+            if (entry.getValue().size() != 1 || to == null || block == null || !block.isExecute() ||
+                    !block.contains(to) || to.subtract(from) < 2 || to.subtract(from) > 15 ||
+                    !observations.has(Long.toString(from.getOffset()))) {
+                continue;
+            }
+            Instruction instruction = listing.getInstructionAt(from);
+            if (instruction == null) {
+                try {
+                    instruction = pseudo.disassemble(from);
+                } catch (InsufficientBytesException | UnknownInstructionException | UnknownContextException error) {
+                    continue;
+                }
+            }
+            if (instruction != null && traceFlowType(instruction, "interrupt") != null &&
+                    (!instruction.isFallThroughOverridden() || to.equals(instruction.getFallThrough())) &&
+                    traceBytesMatch(instruction, expected) && traceObservedBytesMatch(instruction, observations)) {
+                verified.put(from, instruction);
+                ranges.addRange(from, to.previous());
+            }
+        }
+        for (var range : ranges) {
+            monitor.checkCancelled();
+            var first = range.getMinAddress();
+            var end = range.getMaxAddress();
+            var next = end.next();
+            var sources = verified.subMap(first, true, end, true);
+            var continuation = first;
+            for (var source : sources.keySet()) {
+                if (!source.equals(continuation)) {
+                    break;
+                }
+                continuation = destinations.get(source).iterator().next();
+            }
+            var destination = listing.getInstructionAt(next);
+            if (destination == null) {
+                destination = additions.get(next);
+            }
+            if (!next.equals(continuation) || destination == null || !traceBytesMatch(destination, expected) ||
+                    !traceObservedBytesMatch(destination, observations) ||
+                    !sources.keySet().containsAll(observed.subSet(first, true, end, true)) ||
+                    listing.getDefinedDataContaining(first) != null ||
+                    listing.getDefinedData(new AddressSet(first, end), true).hasNext()) {
+                continue;
+            }
+            var clear = new ArrayList<Instruction>();
+            var current = listing.getInstructionContaining(first);
+            if (current == null) {
+                current = listing.getInstructionAfter(first);
+            }
+            while (current != null && current.getAddress().compareTo(end) <= 0) {
+                if (!sources.containsKey(current.getAddress())) {
+                    clear.add(current);
+                }
+                current = listing.getInstructionAfter(current.getAddress());
+            }
+            if (clear.stream().anyMatch(old -> old.getMinAddress().compareTo(first) < 0 ||
+                    old.getMaxAddress().compareTo(end) > 0 || traceProtectedInstruction(old))) {
+                continue;
+            }
+            replaced.addAll(clear);
+            for (var source : sources.entrySet()) {
+                var from = source.getKey();
+                var to = destinations.get(from).iterator().next();
+                if (listing.getInstructionAt(from) == null) {
+                    additions.put(from, source.getValue());
+                }
+                if (!to.equals(source.getValue().getFallThrough())) {
+                    resumes.put(from, to);
+                }
+            }
+        }
+    }
+
+    private boolean traceProtectedInstruction(Instruction instruction) {
+        var address = instruction.getAddress();
+        var refs = currentProgram.getReferenceManager();
+        if (Arrays.stream(refs.getReferencesFrom(address)).anyMatch(ref ->
+                ref.getSource() == SourceType.USER_DEFINED || ref.getSource() == SourceType.IMPORTED)) {
+            return true;
+        }
+        var span = new AddressSet(address, instruction.getMaxAddress());
+        var symbols = currentProgram.getSymbolTable().getSymbolIterator(address, true);
+        return getFunctionAt(address) != null || refs.getReferenceDestinationIterator(span, true).hasNext() ||
+            symbols.hasNext() && span.contains(symbols.next().getAddress());
+    }
+
     private RefType traceFlowType(Instruction instruction, String flow) throws Exception {
         var type = instruction.getFlowType();
         if (flow.equals("interrupt")) {
@@ -511,6 +634,15 @@ public class RetroreQuery extends GhidraScript {
             var from = traceAddress(edge.get("from").isJsonNull() ? null : edge.getAsJsonObject("from"));
             var to = traceAddress(edge.get("to").isJsonNull() ? null : edge.getAsJsonObject("to"));
             String flow = edge.get("flow").isJsonNull() ? "" : edge.get("flow").getAsString();
+            if (flow.equals("interrupt_resume")) {
+                var source = from == null ? null : listing.getInstructionAt(from);
+                if (source == null || to == null || !to.equals(source.getFallThrough()) ||
+                        traceFlowType(source, "interrupt") == null || !traceObservedBytesMatch(source, observations)) {
+                    gaps.add(Map.of("event", event, "count", edge.get("count").getAsLong(),
+                        "reason", "interrupt_resume_differs"));
+                }
+                continue;
+            }
             if (from != null && to != null) {
                 measured.computeIfAbsent(from, unused -> new HashSet<>()).add(to);
             }
@@ -569,14 +701,19 @@ public class RetroreQuery extends GhidraScript {
         return new TraceEdges(gaps, unobserved);
     }
 
-    private void applyTrace(Map<Address, Instruction> instructions, Set<TraceFlow> flows) throws Exception {
-        if (instructions.isEmpty() && flows.isEmpty()) {
+    private void applyTrace(Map<Address, Instruction> instructions, Set<TraceFlow> flows,
+            Map<Address, Address> resumes, List<Instruction> replaced, JsonObject segmentMap) throws Exception {
+        if (instructions.isEmpty() && flows.isEmpty() && resumes.isEmpty() && replaced.isEmpty()) {
             return;
         }
         int transaction = currentProgram.startTransaction("Apply retrore trace evidence");
         boolean commit = false;
         try {
             var listing = currentProgram.getListing();
+            for (var old : replaced) {
+                monitor.checkCancelled();
+                listing.clearCodeUnits(old.getMinAddress(), old.getMaxAddress(), false, monitor);
+            }
             for (var entry : instructions.entrySet()) {
                 monitor.checkCancelled();
                 var address = entry.getKey();
@@ -589,10 +726,23 @@ public class RetroreQuery extends GhidraScript {
                         ": " + command.getStatusMsg());
                 }
             }
+            for (var entry : resumes.entrySet()) {
+                monitor.checkCancelled();
+                listing.getInstructionAt(entry.getKey()).setFallThrough(entry.getValue());
+            }
             var refs = currentProgram.getReferenceManager();
             for (var flow : flows) {
                 monitor.checkCancelled();
                 refs.addMemoryReference(flow.from(), flow.to(), flow.type(), SourceType.IMPORTED, Reference.MNEMONIC);
+            }
+            if (segmentMap != null && currentProgram.getLanguageID().getIdAsString().equals("x86:LE:16:Real Mode")) {
+                var map = Files.createTempFile("retrore-segment-map", ".json");
+                try {
+                    Files.writeString(map, segmentMap.toString());
+                    runScript("RetroreSegments.java", new String[] {map.toString()});
+                } finally {
+                    Files.deleteIfExists(map);
+                }
             }
             commit = true;
         } finally {
@@ -1555,7 +1705,7 @@ public class RetroreQuery extends GhidraScript {
             scope = scope.intersect(new AddressSet(first, last));
         }
         String filter = request.has("status") ? request.get("status").getAsString() : null;
-        var contexts = currentProgram.getUsrPropertyManager().getStringPropertyMap("RetroreWriteContext");
+        var contexts = currentProgram.getUsrPropertyManager().getStringPropertyMap("RetroreWriteContextV2");
         var listing = currentProgram.getListing();
         var rows = new ArrayList<Map<String, Object>>();
         var counts = new LinkedHashMap<String, Integer>();

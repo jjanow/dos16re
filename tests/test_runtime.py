@@ -127,6 +127,34 @@ def test_ghidra_dos_conventions_and_services(tmp_path, capsys):
     assert site["from"]["unit_address"] == "root:0008"
 
 
+def test_ghidra_dos_recovers_caller_verified_register_storage(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    image = bytes.fromhex(
+        "b9 03 00 be 04 00 e8 1b 00 a3 80 00 89 1e 82 00 89 16 84 00"
+        " e8 1b 00 a3 86 00 89 16 88 00 c3"
+    ).ljust(0x24, b"\xcc") + bytes.fromhex("89 c8 89 f3 ba 34 12 c3")
+    image = image.ljust(0x32, b"\xcc") + bytes.fromhex("b8 11 00 ba 22 00 c3")
+    header = bytearray(32)
+    pack_into("<2s13H", header, 0, b"MZ", len(header) + len(image), 1, 0, 2, 32, 32, 2, 0x200, 0, 0, 0, 28, 0)
+    source, export, project = (tmp_path / name for name in ("registers.exe", "export", "project"))
+    source.write_bytes(header + image)
+    assert main(["load", str(source), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)["calling_conventions"]
+    assert report["register_arguments"] == 1 and report["joined_returns"] == 2
+    requests = tmp_path / "queries.json"
+    requests.write_text(json.dumps([
+        {"command": "context", "address": "root:0024"}, {"command": "context", "address": "root:0032"},
+    ]), encoding="utf-8")
+    assert main(["batch", str(requests), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    wide, pair = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+    assert (wide["return_type"], pair["return_type"]) == ("undefined6", "undefined4")
+    assert [parameter["storage"] for parameter in wide["parameters"]] == ["CX:2", "SI:2"]
+    assert pair["parameters"] == []
+
+
 def test_ghidra_dos_conventions_bound_inferred_stack_arguments(tmp_path, capsys):
     if not os.environ.get("GHIDRA_HOME"):
         pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")

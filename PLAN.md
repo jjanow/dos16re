@@ -14,16 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, traced seven software FPU interrupt call sites in Phantasie III DOS and
-replayed six edges in Ghidra 12.2. Compared `record-writes` with live output stores and class
-copies and found two missed exchange stores. Verified the archives' computed jumps against
-the table words they read. All 12 focused checks passed using the original DOS media and
-Ghidra. The standalone suite passed 518 tests with 143 skipped.
+On 2026-11-25, replayed all seven observed Phantasie III DOS FPU interrupt edges in Ghidra 12.2.
+Interrupt continuations recovered the instruction at `root:688d`. Refreshed write analysis follows
+the observed handler edges and reports both register exchange writes as possible aliases. Added
+caller-verified x86 register arguments and joined return storage, two Microsoft C runtime signatures,
+and 11 IOCS prototypes. Recovered Apple II PICPLOT's biased split table and verified its writes in py65.
+The standalone suite passed 518 tests with 146 skipped. The focused recovery suite passed 111 checks
+with Ghidra and original media. All six Phantasie III archives and wilderness playthroughs passed.
 
-Resume Phase 9 by keeping assumed DGROUP values from excluding writes in `record-writes`.
-Recover the instruction boundary at `root:688d` so its observed interrupt edge can be
-imported. Follow segment context through the handlers and dispatches to narrow possible store
-aliases. Trace the conversion output pointer if a played route reaches the detached callback.
+Resume with runtime observations for the detached DOS conversion entries and dynamic heap pointers.
+Additional calling-convention evidence and the DOS `swi(0x21)` decompiler behavior remain in the
+Phase 9 follow-up notes.
 
 ## Why
 
@@ -210,8 +211,8 @@ Phases 1–7 are implemented for the initial DOS scope, including the optional D
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
 Sharp X1, Sharp X68000, Classic Macintosh, Nintendo NES / Famicom, and Sega Genesis / Mega Drive
 milestones are complete for the validated releases. X1turbo validation awaits original media.
-Phase 9 has the remaining work in the numbered phases. Additional platform capabilities are
-listed in the parity table and platform milestones below.
+Phase 9 covers the code and data recovery workflows below and records open research separately.
+Additional platform capabilities are listed in the parity table and platform milestones below.
 
 ## Analysis backlog
 
@@ -288,8 +289,8 @@ listed in the parity table and platform milestones below.
   Known BP indexes update frame slots. Unknown writes with evidence that they address SS invalidate
   the affected stack state. Detached MZ functions can inherit the loader SS when the analyzed code never
   changes it. The pass removes Ghidra analysis-only data references on operands that use unknown ES.
-  Open: unknown-segment aliases, detached functions when analyzed code can change SS, and dynamic
-  heap pointers such as Pool of Radiance's.
+  Write audits also follow shared tails, discard uncertain segment values through calls, and seed detached
+  entries with unknown segments. The alias check includes real-mode selector aliases and 20-bit wrap.
 - **Implemented.** More switch patterns: `jbe`/`jb` bounds, `sub` bias, mask bounds, byte indexes, and
   near call tables. A root switch is read against the nearest relocated code segment. The XC 68k switch is
   recognized on X68000. A pass after segment analysis keeps candidate targets for unresolved indirect calls
@@ -350,7 +351,7 @@ listed in the parity table and platform milestones below.
   the Guild handler at `root:ac21`. The game loaded LINK member 2 and reached
   `link_0002:22a7`, `:269b`, `:26c7`, and `:2708`. All four stored at DGROUP:`764c`,
   and the control word and integer stores used DGROUP:`761e` and `7614`. The detached entries
-  had zero hits in those runs. Caller provenance and reachability for them remain open.
+  had zero hits in those runs. The direct probes establish each routine's pointer or stack contract.
 - **Audited computed callers in the shipped DOS release.** Ghidra's `indirect` inventory of the
   root and all four LINK members lists no target or candidate for `root:6a12`, `root:6383`, or
   `root:68a4`. Unicorn traces through startup, Pendragon menus, the town archives, and
@@ -380,8 +381,7 @@ listed in the parity table and platform milestones below.
   within the floating-point runtime's CS `218f`, above the three detached entries. A scan
   at every byte alignment of the five loaded units, including segment aliases and 20-bit wrap,
   found only the relocated template pointer at `root:2b0d4`. The observed menu selections
-  and initialized pointers cover the audited paths. Reachability via runtime writes, untraced
-  selections, and undefined code remains open.
+  and initialized pointers cover the audited paths.
 - **Traced an archives event and combat in the shipped DOS release.** An opt-in Unicorn
   playthrough creates and adds a fighter in Pendragon, loads the first `DNGS.DAT` record, keeps
   the scroll in the west room, and completes a round against a wandering group. Member 4
@@ -436,8 +436,7 @@ listed in the parity table and platform milestones below.
   one record past the limit. A supplied returning exception callback lets the probes observe
   these results. The game's startup at `root:42f5` selects service 3 of the `root:11914`
   dispatcher, which registers the handler at `root:602b`. That handler reaches DOS process
-  termination with exit codes `0x83`, `0x8b`, and `0x8a` for these cases. Automatic recovery
-  still needs to account for unresolved store aliases.
+  termination with exit codes `0x83`, `0x8b`, and `0x8a` for these cases.
 - **Traced FPU output destinations and class-copy sources.** The software output probes cover
   `FSTP` to single, double, and extended formats for all four record classes, plus integer,
   control-word, and status-word stores. The traces check each word's physical destination against
@@ -447,16 +446,14 @@ listed in the parity table and platform milestones below.
   `ffff` at `root:12e94` and `:12e99`. The traces observe classes 1–3 from arithmetic
   templates at `root:12726` and classes 0 and 1 from constant loads at `root:1376b`.
   The register copy at `root:1273c` and both writes of the exchange at `root:137ac` and
-  `:137ad` propagate all four source classes. The static listing still has unknown
-  destinations and undefined code in the floating-point runtime.
+  `:137ad` propagate all four source classes.
 - **Replayed shipped FPU interrupt edges.** The saved interrupt frames and live vector table
-  identify seven call sites. Ghidra 12.2 imports six across `root:1241c`, `root:123db`,
-  and `root:123be`. It reports the `INT 39h` at `root:688d` inside a listed instruction.
-  `record-writes` classifies the two single-precision output words, the constant and register
-  copies at `root:1376b` and `:1273c` as possible overlaps. The reported source and
-  destination registers agree with Unicorn. It omits the exchange at `root:137ac` and
-  `:137ad` from the record query because its detached-entry assumptions assign DGROUP
-  `38c0` to ES and DS. Both stores use `280a` at runtime and update record class bytes.
+  identify seven call sites across `root:1241c`, `root:123db`, and `root:123be`. Observed
+  interrupt continuations at `root:6887`, `:688a`, and `:688d` recover the `INT 39h` at
+  `root:688d` and skip its inline operands. Ghidra 12.2 replays all seven edges. The write
+  audit refreshes its context after replay and propagates registers into the observed handlers.
+  `record-writes` reports the two single-precision output words, both copies, and both exchange
+  writes as possible overlaps. Unicorn shows the exchange uses `280a` for ES and DS.
   Archives playthroughs check the live CS-relative table entries for tile, event, combat,
   and spell dispatch against the export and the observed successors.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
@@ -468,12 +465,11 @@ listed in the parity table and platform milestones below.
   `uVar2 % param_1 + 1` in `_rand`, and `(dVar2 + dVar1) / local_24` in `_avg_attr`. Pool of Radiance
   names 35 `int 21h` sites. It recovers 564 callee-cleanup functions and 445 far pointer arguments, and
   Seek at `root:c4e3` tests `extraout_CF` instead of a multiply's carry.
-  MSC 5.1 medium-model signatures recognized eight routines in a compiler probe, including the
-  DX:AX `lseek` return. The Phantasie III export matches four, and Ghidra applies three to analyzed
-  functions. X68000 IOCS stubs have register prototypes for 32 services, covering 25 sites in
-  `P4.X`. Caller-validated XC stack parameters restore the `_rand(100)` argument in `_frand`.
-  Open: additional runtimes and generic DX:AX, Real48, and register-argument recovery; the
-  separate `swi(0x21)` in Ghidra's p-code; and more IOCS prototypes.
+  Microsoft C signatures cover the medium-model DX:AX `lseek` return and the near and far variants
+  of `memcpy` and `isatty` from the compiler probes. Short straight-line routines can infer register
+  parameters and `DX:AX` or `DX:BX:AX` return storage from direct callers. Real48 signatures retain
+  their type. X68000 IOCS stubs have register prototypes for 43 services. Caller-validated XC stack
+  parameters restore the `_rand(100)` argument in `_frand`.
 - **Implemented.** Searches without Ghidra: `where-is --string` tries each platform's encodings
   (PETSCII and screen codes, high-bit Apple II, ATASCII, Shift-JIS, and others), `--pointer` finds
   stored near, far, or absolute pointers and marks relocated ones, `relocs` filters relocations, and
@@ -486,7 +482,15 @@ listed in the parity table and platform milestones below.
   Apple II high-bit strings were also validated on original input. Pointer search supports opt-in
   aligned 68k short addresses and 6502 split tables with file-backed low and high bytes. `layout`
   reports omitted functions and previews defined data in the proposal range. Replacing defined data
-  requires `--apply --replace`. Runtime-generated split tables such as Apple II PICPLOT still need traces.
+  requires `--apply --replace`. Apple II Phantasie III's PICPLOT combines two table bytes at index
+  `$60` to write `$2228` into its screen-store operand. Pointer search finds both bytes even though
+  the high-byte operand base is outside the export. The original routine copies the first two rows
+  of a supplied panel into the predicted HGR locations in py65.
+
+**Follow-up research.** Heap pointers that only exist at runtime, unresolved floating-point stores,
+and callers for the detached DOS conversion entries require more runtime observations. Continue
+extending runtime and IOCS signature coverage as new binaries are validated. Ghidra still emits a
+separate `swi(0x21)` operation alongside recognized DOS service calls.
 
 ### Phase 10: inspectable evidence and reusable analysis
 

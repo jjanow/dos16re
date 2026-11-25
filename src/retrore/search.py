@@ -335,7 +335,7 @@ def _relocation_sites(program: dict, units: list[ImageUnit]) -> set[tuple[int, i
 _SPLIT_LOADS = re.compile(rb"(?=([\xbd\xb9])(..)(?:\x85(.)|\x8d(..))\1(..)(?:\x85(.)|\x8d(..)))", re.DOTALL)
 
 
-def _split_pointers(image: bytes, units: list[ImageUnit], linear: int) -> dict[tuple[int, int], dict]:
+def _split_pointers(image: bytes, program: dict, units: list[ImageUnit], linear: int) -> dict[tuple[int, int], dict]:
     """Match 6502 low/high table entries backed by indexed loads that assemble a pointer."""
     hits: dict[tuple[int, int], dict] = {}
     if not 0 <= linear < 0x10000:
@@ -351,26 +351,29 @@ def _split_pointers(image: bytes, units: list[ImageUnit], linear: int) -> dict[t
             if first_store > second_store:
                 first, second = second, first
             low, high = int.from_bytes(first, "little"), int.from_bytes(second, "little")
-            low_unit, high_unit = _unit_at(units, low), _unit_at(units, high)
-            if low_unit is None or high_unit is None:
-                continue
-            low_offset, high_offset = low - low_unit.linear, high - high_unit.linear
-            low_position = low_unit.image_offset + low_offset
-            high_position = high_unit.image_offset + high_offset
-            # X and Y are bytes. The table lengths are unknown, so stop before the planes overlap,
-            # or the first entry leaves a file-backed unit.
-            count = min(0x100, abs(low - high), low_unit.file_size - low_offset, high_unit.file_size - high_offset)
+            # The operand can be biased for a loop that starts at a nonzero index. Require
+            # file-backed bytes at each actual read, including indexed address wraparound.
+            distance = (low - high) & 0xFFFF
+            count = min(0x100, distance, 0x10000 - distance)
             for index in range(count):
-                if image[low_position + index] | image[high_position + index] << 8 != linear:
+                low_address, high_address = (low + index) & 0xFFFF, (high + index) & 0xFFFF
+                low_unit, high_unit = _unit_at(units, low_address), _unit_at(units, high_address)
+                if low_unit is None or high_unit is None:
                     continue
-                low_entry, high_entry = low_position + index, high_position + index
+                low_offset, high_offset = low_address - low_unit.linear, high_address - high_unit.linear
+                if low_offset >= low_unit.file_size or high_offset >= high_unit.file_size:
+                    continue
+                low_entry, high_entry = low_unit.image_offset + low_offset, high_unit.image_offset + high_offset
+                if image[low_entry] | image[high_entry] << 8 != linear:
+                    continue
                 row = hits.setdefault((low_entry, high_entry), {
-                    "high": high_unit.location(high_offset + index), "evidence": [],
+                    "high": high_unit.location(high_offset), "evidence": [],
                 })
                 row["evidence"].append({
                     "instruction": code.location(match.start() - start),
                     "index_register": "x" if opcode == b"\xbd" else "y", "index": index,
-                    "low_table": low_unit.location(low_offset), "high_table": high_unit.location(high_offset),
+                    "low_table": locate(program, units, low), "high_table": locate(program, units, high),
+                    "destination": locate(program, units, min(first_store, second_store)),
                 })
     return hits
 
@@ -439,7 +442,7 @@ def find_pointers(export: Path, target: str, *, kinds: tuple[str, ...] | None = 
                     hits.append((position, width, kind, f"{value:0{width * 2}x}", backed, None))
                 position = image.find(pattern, position + 1, end)
     if "split" in kinds:
-        split = _split_pointers(image, units, linear)
+        split = _split_pointers(image, program, units, linear)
         hits.extend((low, 2, "split", f"{linear:04x}", None, details) for (low, _), details in sorted(split.items()))
     hits.sort(key=lambda hit: (hit[0], -hit[1]))
     unit_starts = [unit.image_offset for unit in units]

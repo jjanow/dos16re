@@ -62,7 +62,7 @@ public class RetroreSegments extends HeadlessScript {
     private static final String LOSS_MAP = "RetroreSegmentLosses";
     // Per origin: one "REG\treason\tdetail" line for each segment register lost there.
     private static final String LOSS_ORIGIN_MAP = "RetroreSegmentLossOrigins";
-    private static final String WRITE_CONTEXT_MAP = "RetroreWriteContext";
+    private static final String WRITE_CONTEXT_MAP = "RetroreWriteContextV2";
     private SegmentedAddressSpace space;
     private Register cs, ds, es, ss, sp, bp;
     private List<Register> segmentRegisters;
@@ -78,6 +78,7 @@ public class RetroreSegments extends HeadlessScript {
     private final Map<Address, Summary> symbolicSummaries = new HashMap<>();
     private Map<Address, Summary> contextSummaries = new HashMap<>();
     private Startup startup;
+    private boolean auditingWrites;
     private int skippedJumps;
     private final Map<String, Object> segmentStats = new LinkedHashMap<>();
 
@@ -221,15 +222,19 @@ public class RetroreSegments extends HeadlessScript {
 
     @Override
     public void run() throws Exception {
-        setHeadlessContinuationOption(HeadlessContinuationOption.ABORT_AND_DELETE);
         String[] args = getScriptArgs();
+        space = (SegmentedAddressSpace) currentProgram.getAddressFactory().getDefaultAddressSpace();
+        if (args.length == 1) {
+            applySegments(JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject(), true);
+            return;
+        }
+        setHeadlessContinuationOption(HeadlessContinuationOption.ABORT_AND_DELETE);
         Path result = Path.of(args[1]);
         try {
             JsonObject map = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
-            space = (SegmentedAddressSpace) currentProgram.getAddressFactory().getDefaultAddressSpace();
             int farProcedures = recoverFarProcedures();
             int runtimeSignatures = applyRuntimeSignatures(map.getAsJsonArray("runtime_signatures"));
-            applySegments(map);
+            applySegments(map, false);
             var report = new HashMap<String, Object>(Map.of(
                 "program", currentProgram.getName(), "units", map.getAsJsonArray("units").size(),
                 "far_procedures", farProcedures, "runtime_signatures", runtimeSignatures
@@ -389,7 +394,7 @@ public class RetroreSegments extends HeadlessScript {
     }
 
 
-    private void applySegments(JsonObject map) throws Exception {
+    private void applySegments(JsonObject map, boolean onlyWrites) throws Exception {
         cs = currentProgram.getRegister("CS");
         ds = currentProgram.getRegister("DS");
         es = currentProgram.getRegister("ES");
@@ -456,8 +461,6 @@ public class RetroreSegments extends HeadlessScript {
         if (map.has("stack")) {
             initial.set(ss, map.getAsJsonObject("stack").get("segment").getAsInt());
         }
-        Integer detachedSS = pc98 ? null : unchangedStackSegment(initial.registers.get(ss));
-        startup = findStartup(entry, initial, 2);
         var entryStates = new LinkedHashMap<Address, State>();
         entryStates.put(entry, initial);
         if (pc98) {
@@ -474,6 +477,22 @@ public class RetroreSegments extends HeadlessScript {
             }
         }
 
+        if (!onlyWrites) {
+            Integer detachedSS = pc98 ? null : unchangedStackSegment(initial.registers.get(ss));
+            startup = findStartup(entry, initial, 2);
+            recoverListingContext(entryStates, detachedSS);
+        }
+        // Listing references benefit from compiler conventions and DGROUP guesses. A write
+        // audit must also admit addresses that those guesses would have ruled out.
+        auditingWrites = true;
+        symbolicSummaries.clear();
+        contextSummaries.clear();
+        summarize(symbolicSummaries, false);
+        analyzeProgram(entryStates, null);
+        writeStoreContext();
+    }
+
+    private void recoverListingContext(Map<Address, State> entryStates, Integer detachedSS) throws Exception {
         // Summaries say which registers each function preserves, sets, or changes. Summaries computed
         // under the entry values the whole-program pass found apply only where a call matches them.
         summarize(symbolicSummaries, false);
@@ -536,7 +555,7 @@ public class RetroreSegments extends HeadlessScript {
                     }
                     State detached = new State();
                     Loss none = new Loss(start, "entry", "no analyzed caller reaches this function");
-                    if (startup == null) {
+                    if (startup == null || auditingWrites) {
                         detached.lose(ds, none);
                     } else {
                         detached.set(ds, startup.dgroup());
@@ -547,7 +566,9 @@ public class RetroreSegments extends HeadlessScript {
                     } else {
                         detached.set(ss, detachedSS);
                     }
-                    detached.set(cs, overlaySegments.get(memory.getBlock(start).getName()));
+                    if (!auditingWrites) {
+                        detached.set(cs, overlaySegments.get(memory.getBlock(start).getName()));
+                    }
                     offer(start, detached);
                     follow();
                 }
@@ -626,11 +647,18 @@ public class RetroreSegments extends HeadlessScript {
             State input = states.get(address);
             var flow = instruction.getFlowType();
             State output = transfer(instruction, input);
-            if (flow.isCall()) {
+            boolean interrupt = auditingWrites && instruction.getMnemonicString().equals("INT");
+            if (interrupt) {
+                for (var ref : currentProgram.getReferenceManager().getReferencesFrom(address)) {
+                    if (ref.getReferenceType() == RefType.COMPUTED_CALL && ref.getSource() == SourceType.IMPORTED) {
+                        offer(ref.getToAddress(), callState(instruction, input, ref.getToAddress()));
+                    }
+                }
+            } else if (flow.isCall()) {
                 for (Address target : instruction.getFlows()) {
                     offer(target, callState(instruction, input, target));
                 }
-                if (startup != null && address.equals(startup.call())) {
+                if (!auditingWrites && startup != null && address.equals(startup.call())) {
                     output.set(ds, startup.dgroup());
                 }
             } else if (flow.isJump()) {
@@ -641,7 +669,7 @@ public class RetroreSegments extends HeadlessScript {
                 var source = getFunctionContaining(address);
                 for (Address target : instruction.getFlows()) {
                     var owner = getFunctionContaining(target);
-                    if (source != null && owner != null && !owner.equals(source) &&
+                    if (!auditingWrites && source != null && owner != null && !owner.equals(source) &&
                             !owner.getEntryPoint().equals(target)) {
                         skippedJumps++;
                         continue;
@@ -657,17 +685,18 @@ public class RetroreSegments extends HeadlessScript {
     private State callState(Instruction instruction, State input, Address target) throws Exception {
         State callee = new State();
         callee.set(cs, targetCS(instruction, input, target));
-        for (Register segment : segmentRegisters) {
-            Integer value = input.registers.get(segment);
+        for (Register register : auditingWrites ? summarized : segmentRegisters) {
+            Integer value = input.registers.get(register);
             if (value == null) {
-                callee.lose(segment, input.losses.get(segment));
+                callee.lose(register, input.losses.get(register));
             } else {
-                callee.set(segment, value);
+                callee.set(register, value);
             }
         }
         // The callee sees the caller's pushed arguments below its return address.
         callee.stack.addAll(input.stack);
-        for (int word = farCall(instruction) ? 2 : 1; word > 0; word--) {
+        int returnWords = instruction.getMnemonicString().equals("INT") ? 3 : farCall(instruction) ? 2 : 1;
+        for (int word = 0; word < returnWords; word++) {
             callee.push(null);
         }
         callee.height = 0;
@@ -679,6 +708,9 @@ public class RetroreSegments extends HeadlessScript {
     }
 
     private Integer targetCS(Instruction instruction, State input, Address target) throws Exception {
+        if (instruction.getMnemonicString().equals("INT")) {
+            return null;  // A linear handler address alone does not establish the IVT selector.
+        }
         byte[] bytes = instruction.getBytes();
         int opcode = bytes[0] & 0xff;
         if (bytes.length == 5 && (opcode == 0x9a || opcode == 0xea)) {
@@ -844,7 +876,7 @@ public class RetroreSegments extends HeadlessScript {
         Address[] targets = instruction.getFlows();
         String callee = targets.length == 1 ? targets[0].toString() : "an indirect target";
         for (Register register : summarized) {
-            boolean conventional = register.equals(ds) || register.equals(ss);
+            boolean conventional = !auditingWrites && (register.equals(ds) || register.equals(ss));
             Integer exit = summary == null ? null : summary.exits().get(register);
             if (exit == null) {
                 if (!conventional) {
@@ -866,7 +898,8 @@ public class RetroreSegments extends HeadlessScript {
                 output.set(register, exit);
             }
         }
-        boolean keepFrame = summary == null || Integer.valueOf(SYMBOL + summarized.indexOf(bp)).equals(summary.exits().get(bp));
+        boolean keepFrame = summary == null ? !auditingWrites :
+            Integer.valueOf(SYMBOL + summarized.indexOf(bp)).equals(summary.exits().get(bp));
         if (summary != null && summary.purge() != null) {
             // PUSH CS / CALL near / RETF also removes the pushed CS.
             output.drop(summary.purge() + (summary.far() && !farCall(instruction) ? 1 : 0));
@@ -925,9 +958,14 @@ public class RetroreSegments extends HeadlessScript {
         } else if (op.equals("INT") || op.equals("INTO")) {
             // Assume interrupt handlers keep DS, SS, and the stack; ES and general registers can change.
             for (Register register : summarized) {
-                if (!register.equals(ds) && !register.equals(ss)) {
+                if (auditingWrites || !register.equals(ds) && !register.equals(ss)) {
                     output.lose(register, new Loss(at, "interrupt", instruction.toString()));
                 }
+            }
+            if (auditingWrites) {
+                output.forgetStackValues();
+                output.frame = null;
+                output.frameHeight = UNKNOWN_HEIGHT;
             }
             stackHandled = true;
         } else if (instruction.getFlowType().isCall()) {
@@ -1039,6 +1077,13 @@ public class RetroreSegments extends HeadlessScript {
         }
         Integer destination = state.registers.get(segment);
         Integer stackSegment = state.registers.get(ss);
+        if (auditingWrites) {
+            if (destination == null || stackSegment == null || destination >= SYMBOL || stackSegment >= SYMBOL) {
+                return true;
+            }
+            int distance = (destination - stackSegment) & WORD_MASK;
+            return Math.min(distance, 0x10000 - distance) <= 0x1000;
+        }
         return destination != null && destination.equals(stackSegment);
     }
 
@@ -1330,11 +1375,8 @@ public class RetroreSegments extends HeadlessScript {
         var properties = currentProgram.getUsrPropertyManager();
         properties.removePropertyMap(LOSS_MAP);
         properties.removePropertyMap(LOSS_ORIGIN_MAP);
-        properties.removePropertyMap(WRITE_CONTEXT_MAP);
         var lossMap = properties.createStringPropertyMap(LOSS_MAP);
         var originMap = properties.createStringPropertyMap(LOSS_ORIGIN_MAP);
-        var writeContext = properties.createStringPropertyMap(WRITE_CONTEXT_MAP);
-        var gson = new Gson();
         var origins = new TreeMap<Address, Map<String, Loss>>();
         int direct = 0;
         int based = 0;
@@ -1344,15 +1386,6 @@ public class RetroreSegments extends HeadlessScript {
             monitor.checkCancelled();
             Instruction instruction = getInstructionAt(entry.getKey());
             State state = entry.getValue();
-            if (java.util.Arrays.stream(instruction.getPcode()).anyMatch(op -> op.getOpcode() == PcodeOp.STORE)) {
-                var registers = new TreeMap<String, Integer>();
-                state.registers.forEach((register, value) -> {
-                    if (value < SYMBOL) {
-                        registers.put(register.getName(), value);
-                    }
-                });
-                writeContext.add(entry.getKey(), gson.toJson(registers));
-            }
             var lost = new StringBuilder();
             for (Register segment : segmentRegisters) {
                 Integer value = state.registers.get(segment);
@@ -1447,6 +1480,28 @@ public class RetroreSegments extends HeadlessScript {
         segmentStats.put("functions", functionCount);
         segmentStats.put("entry_known", known);
         segmentStats.put("entry_losses", entryLosses);
+    }
+
+    private void writeStoreContext() throws Exception {
+        var properties = currentProgram.getUsrPropertyManager();
+        properties.removePropertyMap("RetroreWriteContext");
+        properties.removePropertyMap(WRITE_CONTEXT_MAP);
+        var writeContext = properties.createStringPropertyMap(WRITE_CONTEXT_MAP);
+        var gson = new Gson();
+        for (var entry : states.entrySet()) {
+            monitor.checkCancelled();
+            var instruction = getInstructionAt(entry.getKey());
+            if (java.util.Arrays.stream(instruction.getPcode()).noneMatch(op -> op.getOpcode() == PcodeOp.STORE)) {
+                continue;
+            }
+            var registers = new TreeMap<String, Integer>();
+            entry.getValue().registers.forEach((register, value) -> {
+                if (value < SYMBOL) {
+                    registers.put(register.getName(), value);
+                }
+            });
+            writeContext.add(entry.getKey(), gson.toJson(registers));
+        }
     }
 
 

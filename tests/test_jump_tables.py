@@ -5,7 +5,7 @@ from pathlib import Path
 from struct import pack, pack_into, unpack_from
 
 import pytest
-from unicorn import UC_HOOK_MEM_WRITE, x86_const as x86
+from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_WRITE, x86_const as x86
 
 from retrore.cli import main
 from retrore.emulator import Emulator
@@ -1198,13 +1198,25 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
     operand = Address(scratch.segment, 0x200)
     args = Address(scratch.segment, regs["sp"])
     handlers = (runtime_address(0x123db), runtime_address(0x1241c))
+    origin = program["units"][0]["linear"]
+    conversion_instructions = []
+
+    def audit_conversion(cpu):
+        def execute(cpu, address, size, _data):
+            conversion_instructions.append((address, cpu.mem_read(address, size).hex()))
+
+        hook = cpu.hook_add(UC_HOOK_CODE, execute, begin=origin + 0x6887, end=origin + 0x6891)
+        return lambda: cpu.hook_del(hook)
+
     converted = emulator.call(
         conversion, far=True, regs=regs, ivt_interrupts=vectors,
         writes=[*setup, (args, pack("<HH", operand.offset, operand.segment)), (operand, pack("<d", 1.25))],
-        hooks={target: lambda cpu, target=target: entry(cpu, target) for target in handlers},
+        hooks={target: lambda cpu, target=target: entry(cpu, target) for target in handlers}, _setup=audit_conversion,
     )
     assert converted.registers["ax"] == 1
-    origin = program["units"][0]["linear"]
+    assert [(address - origin, data) for address, data in conversion_instructions] == [
+        (0x6887, "cd35"), (0x688a, "cd3a"), (0x688d, "cd39"), (0x6891, "cd3d"), (0x6891, "89c0"),
+    ]
     assert edges == {
         (origin + 0x69f7, runtime_address(0x123db).linear, "cd3c"),
         (origin + 0x69fb, runtime_address(0x1241c).linear, "cd39"),
@@ -1259,53 +1271,44 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
             for event in ({"kind": "instruction", "address": caller, "bytes": data},
                           {"kind": "edge", "from": caller, "to": target, "flow": "interrupt"})
         ]
-        trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
         command = ["trace", str(trace), "--export", str(export), "--project", str(project), "--json"]
+        trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
+        assert main(command) == 0, capsys.readouterr().err
+        preview = json.loads(capsys.readouterr().out)["analysis"]
+        miss, = (hit for hit in preview["missed"] if hit["linear"] == origin + 0x688d)
+        assert (miss["linear"], miss["reason"], miss["observed_bytes"]) == (
+            origin + 0x688d, "instruction_offcut", ["cd39"],
+        )
+        events.extend({"kind": "edge", "from": caller, "to": continuation, "flow": "interrupt_resume"}
+                      for (caller, _), (continuation, _) in zip(conversion_instructions[:3], conversion_instructions[1:4]))
+        trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
         assert main([*command, "--apply"]) == 0, capsys.readouterr().err
         applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
-        offcut = origin + 0x688d
         assert {
             (row["from"]["linear"], row["to"]["linear"], row["type"]) for row in applied if row["kind"] == "flow"
-        } == {(caller, target, "COMPUTED_CALL") for caller, target, _ in edges if caller != offcut}
+        } == {(caller, target, "COMPUTED_CALL") for caller, target, _ in edges}
+        assert {row["address"]["linear"] - origin for row in applied if row["kind"] == "clear_instruction"} == {
+            0x6889, 0x688c, 0x688e,
+        }
         assert main(command) == 0, capsys.readouterr().err
         replay = json.loads(capsys.readouterr().out)
-        miss, = replay["analysis"]["missed"]
-        assert (miss["linear"], miss["reason"], miss["observed_bytes"]) == (offcut, "instruction_offcut", ["cd39"])
-        gap, = replay["analysis"]["edge_gaps"]
-        assert gap["reason"] == "source_not_disassembled"
-        assert gap["event"] == next(
-            edge["event"] for edge in replay["edges"] if edge["from"]["runtime_linear"] == offcut
-        )
+        assert replay["analysis"]["missed"] == replay["analysis"]["edge_gaps"] == []
         assert replay["analysis"]["additions"] == []
 
-        dgroup = program["units"][0]["segment"] + 0x28c0
         request = {"command": "record-writes", "stride": 12, "count": 15, "limit": 1000, "compact": True}
         batch = tmp_path / "float_writes.json"
         batch.write_text(json.dumps([
             {**request, "address": str(Address(data_segment, bottom + 11)),
              "code_start": "root:1273c", "code_end": "root:137ad"},
-            {**request, "address": str(Address(dgroup, bottom + 11)),
-             "code_start": "root:137ac", "code_end": "root:137ad"},
         ]), encoding="utf-8")
         assert main(["batch", str(batch), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-        report, exchange_report = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+        result, = json.loads(capsys.readouterr().out)["results"]
+        report = result["result"]
         assert report["pagination"]["writes"]["next_offset"] is None
         assert report["undefined_bytes"] > 0 and report["unresolved_transfers"] > 0
         rows = {row["address"]: row for row in report["writes"]}
-        # The detached-entry DGROUP assumption reaches both exchange stores. It
-        # excludes the physical record stack despite the observed DS and ES values.
-        exchange = {row["address"]: row for row in exchange_report["writes"]}
-        assert set(exchange) == {"root:137ac", "root:137ad"}
-        assert rows.keys().isdisjoint(exchange)
         for address, selector, destination, source_register, source in observed_writes:
             site = f"root:{address - origin:x}"
-            if site in exchange:
-                row = exchange[site]
-                assert row["context"] and row["width"] == 2 and row["status"] == "possible"
-                assert row["destination"] == {"register": selector, "segment": dgroup, "offset": None,
-                                              "linear": None}
-                assert destination.segment == data_segment != dgroup
-                continue
             row = rows[site]
             assert row["context"]
             assert row["width"] == 2 and row["destination"]["register"] == selector

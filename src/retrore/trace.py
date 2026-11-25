@@ -307,6 +307,7 @@ def _structured_trace(image: ExportEvidence, document: dict, evidence: bool) -> 
         raise TraceError("trace contains no events")
 
     explicit, departures, arrivals = Counter(), Counter(), Counter()
+    resume_departures, resume_arrivals = Counter(), Counter()
     locations = {}
     observed_bytes: dict[tuple[int, str], set[str]] = {}
     edges, memory, snapshots, transitions = [], [], [], []
@@ -332,12 +333,12 @@ def _structured_trace(image: ExportEvidence, document: dict, evidence: bool) -> 
                     observe(runtime.point(event.get("address")), explicit, count, data)
                     continue
                 flow = event.get("flow")
-                if flow not in (None, "call", "jump", "return", "fallthrough", "interrupt"):
-                    raise TraceError("edge flow must be call, jump, return, fallthrough, or interrupt")
+                if flow not in (None, "call", "jump", "return", "fallthrough", "interrupt", "interrupt_resume"):
+                    raise TraceError("edge flow must be call, jump, return, fallthrough, interrupt, or interrupt_resume")
                 source = runtime.endpoint(event, "from")
                 destination = runtime.endpoint(event, "to")
-                observe(source, departures, count)
-                observe(destination, arrivals, count)
+                observe(source, resume_departures if flow == "interrupt_resume" else departures, count)
+                observe(destination, resume_arrivals if flow == "interrupt_resume" else arrivals, count)
                 states = {key: event[key] for key in ("from_state", "to_state") if key in event}
                 edges.append({"event": index, "from": source, "to": destination, "count": count, "flow": flow, **states})
             elif kind == "memory":
@@ -358,13 +359,13 @@ def _structured_trace(image: ExportEvidence, document: dict, evidence: bool) -> 
             raise TraceError(f"trace event {index}: {error}") from error
 
     # An edge-only trace establishes a lower bound on visits. Explicit records
-    # can describe the same visits and therefore must not be added to that bound.
+    # and interrupt continuations can describe the same visits as CPU edges.
     mapped, unmapped = [], []
     visits = 0
     for key, where in sorted(locations.items()):
         location = where["location"]
         hit = {name: value for name, value in where.items() if name != "location"}
-        hit["count"] = max(explicit[key], departures[key], arrivals[key])
+        hit["count"] = max(explicit[key], departures[key], arrivals[key], resume_departures[key], resume_arrivals[key])
         visits += hit["count"]
         if key in observed_bytes:
             hit["observed_bytes"] = sorted(observed_bytes[key])
@@ -403,6 +404,10 @@ def _analyze(report: dict, image: ExportEvidence, project: Path, *, timeout: flo
     coverage = {"sha256": identity["image_sha256"], "units": [asdict(unit) for unit in image.units],
                 "hits": hits, "expected_bytes": expected, "classify_gaps": classify_gaps,
                 "observed_bytes": {linear: sorted(values) for linear, values in observations.items()}}
+    if apply and image.format in ("MZ", "PC98"):
+        coverage["segment_map"] = {key: image.program[key] for key in (
+            "format", "units", "entry", "entries", "stack", "initial_segments", "image_origin", "relocations", "jump_tables",
+        ) if key in image.program}
     if "edges" in report:
         coverage["edges"] = [
             {**{key: edge[key] for key in ("event", "flow", "count")},

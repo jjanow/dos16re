@@ -14,6 +14,7 @@ import ghidra.program.model.data.ByteDataType;
 import ghidra.program.model.data.CharDataType;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.PointerDataType;
+import ghidra.program.model.data.Undefined;
 import ghidra.program.model.data.Undefined2DataType;
 import ghidra.program.model.data.Undefined4DataType;
 import ghidra.program.model.data.VoidDataType;
@@ -93,6 +94,9 @@ public class RetroreConventions extends HeadlessScript {
         Map.entry(0x5b, "CX:attributes DX:name"));
     private static final Pattern FRAME_ACCESS = Pattern.compile("\\[(BP|BX) \\+ 0x([0-9a-fA-F]+)\\]");
     private static final Set<String> ARGUMENT_REGISTERS = Set.of("EAX", "EBX", "ECX", "EDX", "ESI", "EDI");
+    private static final List<String> WORD_REGISTERS = List.of("AX", "BX", "CX", "DX", "SI", "DI");
+    private static final Pattern WORD_DESTINATION = Pattern.compile(
+        "(?:word ptr )?\\[(?:(BX|BP|SI|DI)(?: ([+-]) )?)?(0x[0-9a-fA-F]+)?\\]");
     // A stray frame access or RET immediate can imply thousands of unobserved word slots.
     private static final int MAX_INFERRED_STACK_BYTES = 256;
 
@@ -328,9 +332,192 @@ public class RetroreConventions extends HeadlessScript {
             if (kind != null) {
                 counts.merge(kind, 1, Integer::sum);
             }
+            recoverRegisterStorage(function, kind == null || kind.equals("no_stack_arguments"), counts);
         }
         counts.put("far_pointer_arguments", farPointers);
         return counts;
+    }
+
+    private record WordDestination(String base, int offset) {}
+
+    // Require one straight-line callee and agreement across its direct callers. A register
+    // being live on return is insufficient evidence that it is part of a multiword result.
+    private void recoverRegisterStorage(Function function, boolean allowInputs, Map<String, Integer> counts)
+            throws Exception {
+        var body = function.getBody();
+        if (body.getNumAddressRanges() != 1 || body.getNumAddresses() > 128) {
+            return;
+        }
+        var inputs = new HashSet<String>();
+        var written = new HashSet<String>();
+        var outputs = new HashSet<String>();
+        boolean stackBased = false;
+        var listing = currentProgram.getListing();
+        var entry = function.getEntryPoint();
+        for (var instruction : listing.getInstructions(body, true)) {
+            if (instruction.getFlowType().isTerminal()) {
+                if (!instruction.getMaxAddress().equals(body.getMaxAddress()) ||
+                        !instruction.getMnemonicString().startsWith("RET")) {
+                    return;
+                }
+                break;
+            }
+            if (instruction.getFlowType().isCall() || instruction.getFlowType().isJump() ||
+                    !instruction.getMaxAddress().next().equals(instruction.getFallThrough())) {
+                return;
+            }
+            String mnemonic = instruction.getMnemonicString();
+            Register dest = instruction.getNumOperands() < 1 ? null : instruction.getRegister(0);
+            boolean clears = (mnemonic.equals("XOR") || mnemonic.equals("SUB")) && dest != null &&
+                dest.equals(instruction.getRegister(1));
+            if (!clears && !mnemonic.equals("PUSH")) {
+                for (Object operand : instruction.getInputObjects()) {
+                    if (operand instanceof Register register && !written.contains(base(register)) &&
+                            WORD_REGISTERS.contains(register.getName())) {
+                        inputs.add(register.getName());
+                    }
+                }
+            }
+            // A potential stack argument rules out inferring a register-only signature.
+            stackBased |= FRAME_ACCESS.matcher(instruction.toString()).find();
+            for (Object operand : instruction.getResultObjects()) {
+                if (operand instanceof Register register) {
+                    written.add(base(register));
+                    if (WORD_REGISTERS.contains(register.getName())) {
+                        if (mnemonic.equals("POP")) {
+                            outputs.remove(register.getName());
+                        } else {
+                            outputs.add(register.getName());
+                        }
+                    }
+                }
+            }
+        }
+        var end = listing.getInstructionContaining(body.getMaxAddress());
+        if (end == null || !end.getMnemonicString().startsWith("RET")) {
+            return;
+        }
+        int opcode = end.getByte(0) & 0xff;
+        boolean far = opcode == 0xca || opcode == 0xcb;
+        var immediate = end.getScalar(0);
+        if (opcode != 0xc3 && opcode != 0xcb && (!far && opcode != 0xc2 || immediate == null)) {
+            return;
+        }
+        int purge = immediate == null ? 0 : (int) immediate.getUnsignedValue();
+        if (purge > 0 && function.getStackPurgeSize() != purge) {
+            return;
+        }
+        var callers = new ArrayList<Instruction>();
+        for (var ref : currentProgram.getReferenceManager().getReferencesTo(entry)) {
+            if (!ref.getReferenceType().isCall() || ref.getReferenceType().isComputed()) {
+                return;
+            }
+            var call = listing.getInstructionAt(ref.getFromAddress());
+            if (call == null || !call.getFlowType().isCall()) {
+                return;
+            }
+            callers.add(call);
+        }
+        if (callers.isEmpty()) {
+            return;
+        }
+        var wide = List.of(List.of("DX", "BX", "AX"), List.of("DX", "AX")).stream()
+            .filter(outputs::containsAll).filter(registers -> callersStoreResult(callers, registers))
+            .findFirst().orElse(List.of());
+        var parameters = new ArrayList<Parameter>(List.of(function.getParameters()));
+        boolean registerInputs = allowInputs && !stackBased && end.getLength() == 1 && !inputs.isEmpty() &&
+            parameters.isEmpty() && callers.stream().allMatch(call -> setsInputs(call, inputs));
+        if (!registerInputs && wide.isEmpty()) {
+            return;
+        }
+        if (registerInputs) {
+            for (String name : WORD_REGISTERS) {
+                if (inputs.contains(name)) {
+                    parameters.add(new ParameterImpl(null, Undefined2DataType.dataType,
+                        currentProgram.getRegister(name), currentProgram));
+                }
+            }
+            counts.merge("register_arguments", 1, Integer::sum);
+        }
+        var result = function.getReturn();
+        if (!wide.isEmpty()) {
+            var registers = wide.stream().map(currentProgram::getRegister).toArray(Register[]::new);
+            result = new ReturnParameterImpl(Undefined.getUndefinedDataType(registers.length * 2),
+                new VariableStorage(currentProgram, registers), currentProgram);
+            counts.merge("joined_returns", 1, Integer::sum);
+        }
+        String convention = end.getLength() > 1 ? (far ? "__stdcall16far" : "__stdcall16near") :
+            (far ? "__cdecl16far" : "__cdecl16near");
+        function.updateFunction(convention, result, parameters, FunctionUpdateType.CUSTOM_STORAGE,
+            true, SourceType.ANALYSIS);
+        function.setStackPurgeSize(purge);
+    }
+
+    private boolean setsInputs(Instruction call, Set<String> inputs) {
+        var missing = new HashSet<>(inputs);
+        var instruction = call;
+        for (int step = 0; step < WORD_REGISTERS.size() && !missing.isEmpty(); step++) {
+            var previous = instruction.getFallFrom();
+            if (previous == null || jumpedTo(instruction) || (instruction = getInstructionAt(previous)) == null) {
+                return false;
+            }
+            if (instruction.toString().equals("PUSH CS")) {
+                continue;
+            }
+            if (!Set.of("MOV", "LEA").contains(instruction.getMnemonicString()) || instruction.getRegister(0) == null) {
+                return false;
+            }
+            missing.remove(instruction.getRegister(0).getName());
+        }
+        return missing.isEmpty();
+    }
+
+    private boolean callersStoreResult(List<Instruction> callers, List<String> registers) {
+        try {
+            for (var call : callers) {
+                if (!storesResult(call, registers)) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (ghidra.program.model.mem.MemoryAccessException error) {
+            return false;
+        }
+    }
+
+    private boolean storesResult(Instruction call, List<String> registers)
+            throws ghidra.program.model.mem.MemoryAccessException {
+        WordDestination first = null;
+        var instruction = call;
+        for (int word = 0; word < registers.size(); word++) {
+            var next = instruction.getFallThrough();
+            if (next == null || (instruction = getInstructionAt(next)) == null || jumpedTo(instruction) ||
+                    !instruction.getMnemonicString().equals("MOV") || instruction.getRegister(1) == null ||
+                    !instruction.getRegister(1).getName().equals(registers.get(registers.size() - word - 1))) {
+                return false;
+            }
+            var match = WORD_DESTINATION.matcher(instruction.getDefaultOperandRepresentation(0));
+            if (!match.matches()) {
+                return false;
+            }
+            String base = match.group(1);
+            int offset = match.group(3) == null ? 0 : Integer.decode(match.group(3));
+            if ("-".equals(match.group(2))) {
+                offset = -offset;
+            }
+            int opcode = instruction.getByte(0) & 0xff;
+            if (opcode != 0xa3 && opcode != 0x89) {
+                return false;  // Unprefixed stores use the same default segment for the same addressing form.
+            }
+            var destination = new WordDestination(base, offset & 0xffff);
+            if (first == null) {
+                first = destination;
+            } else if (!new WordDestination(first.base(), (first.offset() + 2 * word) & 0xffff)
+                    .equals(destination)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // Returns the recovered kind, or null when the evidence is missing or conflicting.

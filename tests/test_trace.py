@@ -235,3 +235,49 @@ def test_trace_recovers_a_real_mode_software_interrupt_entry(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)["analysis"]
     assert report["additions"] == []
     assert [edge["event"] for edge in report["edge_gaps"]] == [2]
+
+
+def test_interrupt_resume_repairs_only_unobserved_inline_operand_disassembly(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    image = bytes.fromhex("b8 20 10 8e d8 bf 20 01 cd 60 d9 cd 39 7e fe c3")
+    image = image.ljust(0x20, b"\0") + bytes.fromhex("c6 05 7f cf")
+    image = (image.ljust(0x30, b"\0") + b"\xcf").ljust(0x321, b"\0")
+    header = bytearray(32)
+    pack_into("<2s13H", header, 0, b"MZ", (len(header) + len(image)) % 512, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 28, 0)
+    exe, export, project = (tmp_path / name for name in ("test.exe", "export", "interrupt"))
+    exe.write_bytes(header + image)
+    assert main(["load", str(exe), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+
+    trace = tmp_path / "interrupt.json"
+    events = [
+        {"kind": "instruction", "address": 0x10008, "bytes": "cd60"},
+        {"kind": "edge", "from": 0x10008, "to": 0x10020, "flow": "interrupt"},
+        {"kind": "edge", "from": 0x10008, "to": 0x1000b, "flow": "interrupt_resume"},
+        {"kind": "instruction", "address": 0x1000b, "bytes": "cd39"},
+        {"kind": "edge", "from": 0x1000b, "to": 0x10030, "flow": "interrupt"},
+        {"kind": "edge", "from": 0x1000b, "to": 0x1000f, "flow": "interrupt_resume"},
+    ]
+    command = ["trace", str(trace), "--export", str(export), "--project", str(project), "--json"]
+
+    def replay(events, *options):
+        trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
+        assert main([*command, *options]) == 0, capsys.readouterr().err
+        report = json.loads(capsys.readouterr().out)
+        assert all(hit["count"] == 1 for hit in report["mapped"])
+        return report["analysis"]
+
+    competing = replay([*events, {"kind": "instruction", "address": 0x1000a, "bytes": "d9cd"}])
+    assert not ({"clear_instruction", "interrupt_resume"} & {row["kind"] for row in competing["additions"]})
+    applied = replay(events, "--apply")["applied"]
+    assert [row["address"]["linear"] for row in applied if row["kind"] == "clear_instruction"] == [0x1000a, 0x1000c]
+    assert [row["from"]["linear"] for row in applied if row["kind"] == "interrupt_resume"] == [0x10008, 0x1000b]
+    after = replay(events, "--apply")
+    assert after["applied"] == after["edge_gaps"] == after["missed"] == []
+    assert main(["record-writes", "root:320", "--code-start", "root:20", "--code-end", "root:20",
+                 "--project", str(project), "--compact", "--json"]) == 0, capsys.readouterr().err
+    write, = json.loads(capsys.readouterr().out)["writes"]
+    assert write["status"] == "overlap" and write["hits"] == [{"address": "root:0320", "value": 0x7f}]
