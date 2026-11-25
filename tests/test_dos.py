@@ -701,7 +701,8 @@ def test_original_link_2x_padded_member(filename, count_offset, selector_count, 
     runtime = (0x1000 + window) * 16
     assert "diagnostics" not in program
     assert program["compiler"] == {
-        "family": "Microsoft Pascal", "version": None, "evidence": "relocated entry jump to ENTXQQ startup",
+        "family": "Microsoft Pascal", "version": "3.20",
+        "evidence": "relocated entry jump to ENTXQQ startup and DGROUP copy",
     }
     dgroup = program["microsoft_pascal_dgroup"]
     assert dgroup["startup_linear"] == 0x115B9

@@ -98,6 +98,54 @@ def test_microsoft_pascal_startup_requires_relocations(preloader):
         assert build_image(incomplete, "test.exe", [])[1]["compiler"] is None
 
 
+def test_microsoft_pascal_330_requires_pascal_initialization():
+    base = 0x2000
+    startup = bytes.fromhex(
+        "bf 38 24 8b 36 02 00 2b f7 81 fe 00 10 72 03 be 00 10 fa 8e d7 81 c4 1e 0e fb"
+        " 73 03 e9 56 01 81 e4 fe ff 36 89 26 a4 0b 36 89 26 a2 0b 8b c6 b1 04 d3 e0 48"
+        " 36 a3 a0 0b b4 30 cd 21"
+    )
+    init = bytes.fromhex(
+        "bb 68 0c 81 fb 6c 0c 73 09 53 ff 1f 5b 83 c3 04 eb f1 b9 0a 00 2b e1 be da 07"
+        " 8b fc 16 07 f3 a4 9a 00 00 2c 24 33 ed 9a 63 10 06 20 50 9a 02 00 93 22"
+    )
+    image = startup.ljust(0x104, b"\xcc") + init
+    entry, stack = Address(base, 0), Address(base + 0x51A, 0x800)
+    relocations = tuple(Address(0, offset) for offset in (1, 0x127, 0x12E, 0x134))
+    root = LoadedMZ(base, image, entry, stack, relocations)
+    _, report = build_image(root, "test.exe", [])
+    assert report["compiler"] == {
+        "family": "Microsoft Pascal", "version": "3.30",
+        "evidence": "fixed-stack startup and Pascal initialization",
+    }
+    assert "microsoft_pascal_dgroup" not in report
+
+    for missing in relocations:
+        incomplete = LoadedMZ(base, image, entry, stack, tuple(r for r in relocations if r != missing))
+        assert build_image(incomplete, "test.exe", [])[1]["compiler"] is None
+    startup_only = LoadedMZ(base, startup.ljust(len(image), b"\xcc"), entry, stack, relocations)
+    assert build_image(startup_only, "test.exe", [])[1]["compiler"] is None
+
+
+@pytest.mark.parametrize("name", ["PROBE", "EMPTY", "VARSTCK"])
+def test_original_microsoft_pascal_330_version(name, tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_MS_PASCAL_330_DIR")):
+        pytest.skip("set RETRORE_MS_PASCAL_330_DIR to the Microsoft Pascal 3.30 runtime probes")
+    source = Path(directory) / f"{name}.EXE"
+    assert main(["info", str(source), "--base-segment", "2000", "--json"]) == 0
+    info = json.loads(capsys.readouterr().out)
+    assert info["compiler"] == {
+        "family": "Microsoft Pascal", "version": "3.30",
+        "evidence": "fixed-stack startup and Pascal initialization",
+    }
+    assert "microsoft_pascal_dgroup" not in info
+    export = tmp_path / "export"
+    assert main(["load", str(source), "-o", str(export), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    assert program["compiler"] == info["compiler"]
+    assert "microsoft_pascal_dgroup" not in program
+
+
 def _verify_microsoft_pascal_startup(source, program, main_linear):
     origin = program["units"][0]["linear"]
     root = MZExecutable.parse(source.read_bytes()).load(origin // 16)
@@ -149,7 +197,7 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
     assert main(["load", str(source), "-o", str(export), "--json"]) == 0
     program = json.loads(capsys.readouterr().out)
     assert program["compiler"] == {
-        "family": "Microsoft Pascal", "version": None, "evidence": "ENTXQQ startup",
+        "family": "Microsoft Pascal", "version": "3.20", "evidence": "ENTXQQ startup and DGROUP copy",
     }
     # Use the LINK listing as independent evidence, without adding its labels to the export.
     import_linker_map(directory / f"{name}.MAP", program)
@@ -243,6 +291,9 @@ def test_microsoft_pascal_capture_export(pascal_capture_inputs, tmp_path, capsys
     assert main(["load", str(source), "--pascal-dgroup", f"{capture}@001c", "--overlay", str(overlay),
                  "-o", str(export), "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)
+    assert report["compiler"] == {
+        "family": "Microsoft Pascal", "version": "3.20", "evidence": "ENTXQQ startup and DGROUP copy",
+    }
     record = report["microsoft_pascal_capture"]
     assert (record["segment"], record["shift_paragraphs"], record["linear"], record["size"]) == (0x1C, 4, 0x10140, 0x80)
     assert (export / "pascal-dgroup.bin").read_bytes() == capture.read_bytes()

@@ -308,9 +308,11 @@ The catalog covers Turbo Pascal 5.5, 6.0, and 7.0 helpers for Real48 addition, s
 allocation, and overlays. It also covers selected small-model C routines from Turbo C 2.01, Turbo C++ 1.01,
 Borland C++ 2.0, and Microsoft C 5.1 and 6.0a. Microsoft C signatures include near and far variants of
 `memcpy` and `isatty` from small- and medium-model probes. Microsoft Pascal startup detection recognizes
-`ENTXQQ` directly or through a relocated LINK overlay startup jump. The 3.20 catalog identifies file
-initialization (`INIFQQ`), heap allocation (`GETHQQ`), and newline output (`WTLFQQ`). The startup bytes
-identify the Microsoft Pascal family and leave `compiler.version` null. See the validation notes in
+`ENTXQQ` directly or through a relocated LINK overlay startup jump. A matching DGROUP copy supplies
+evidence for the 3.20 runtime. An `ENTXQQ` match alone leaves `compiler.version` null. For 3.30,
+the detector requires the fixed-stack `__astart` and its Pascal initialization sequence. The 3.20
+catalog identifies file initialization (`INIFQQ`), heap allocation (`GETHQQ`), and newline output
+(`WTLFQQ`). See the validation notes in
 [PLAN.md](PLAN.md#phase-5-runtime-signatures).
 
 For the recognized Microsoft Pascal 3.20 DGROUP copy, `info --json` and `map.json` report
@@ -1770,6 +1772,7 @@ Phase 12 has optional checks against original tool outputs and releases.
 | `RETRORE_DOS_NATIVE_OVERLAY_DIR` | LINK 3.65 and 5.01.21 `TAIL365.EXE`, `TAIL501.EXE`, `BSS365.EXE`, and `BSS501.EXE` plus TLINK 3.01 and 4.0 `INSEG.EXE` and `INSEG4.EXE`. See the [build steps](#trailing-link-segments-and-flagged-tlink-pointers). |
 | `RETRORE_BORLAND_COMPILERS_DIR` | Original `TCC.EXE` from [Turbo C++ 1.01](https://altd.embarcadero.com/download/museum/tcpp101.zip) and `BCC.EXE` from [Borland C++ 2.0](https://winworldpc.com/product/borland-c/20) |
 | `RETRORE_MS_PASCAL_DIR` | `PROBE.EXE`, `PROBE.MAP`, `ALT.EXE`, and `ALT.MAP` from the [Microsoft Pascal runtime probe](#microsoft-pascal-runtime-probe). Checks startup detection, DGROUP placement, helper addresses, and captured DGROUP context and call flow in Ghidra. |
+| `RETRORE_MS_PASCAL_330_DIR` | `PROBE.EXE`, `EMPTY.EXE`, and `VARSTCK.EXE` from the [Microsoft Pascal 3.30 probes](#microsoft-pascal-330-probes). Checks version detection in inspection and export. |
 | `RETRORE_PKLITE_TESTEXE_DIR` | The `compress` directory with `t10fr` and `h10fr` EXE and UNC pairs from [testexe](https://github.com/camoto-project/testexe) |
 | `RETRORE_PKLITE_SFX_DIR` | The [PKZIP 2.04g installer](https://www.hpcalc.org/details/3882) as `pk204g.exe` and its [Deark](https://github.com/jsummers/deark) reference produced by `deark -m pklite -o pk204g-unpacked pk204g.exe` |
 | `RETRORE_AMIGA_OVERLAY_DIR` | An original hierarchical executable named `overlay` |
@@ -1806,6 +1809,34 @@ lp1 probe,alt,alt/map,pascal+math;
 probe
 alt
 ```
+
+### Microsoft Pascal 3.30 probes
+
+Use `PAS1.EXE`, `PAS2.EXE`, `PASCAL.LIB`, `MATH.LIB`, `LVARSTCK.OBJ`, and `LINK.EXE`
+(3.02) from the 3.30 distribution in a separate directory. Reuse `PROBE.PAS` and save
+`EMPTY.PAS` with DOS line endings. [Microsoft Pascal 3.30 disks](https://www.pcjs.org/software/pcx86/lang/microsoft/pascal/compiler/3.30/)
+
+```pascal
+program empty;
+begin
+end.
+```
+
+```bat
+pas1 probe;
+pas2
+link probe,probe,probe/map,pascal+math;
+link probe+lvarstck,varstck,varstck/map,pascal+math;
+pas1 empty;
+pas2
+link empty,empty,empty/map,pascal+math;
+probe
+varstck
+empty
+```
+
+`PROBE` and `VARSTCK` print `VALUE 42`. The empty program omits the file and heap helpers,
+and the variable-stack object shifts the startup and its data references.
 
 ### Microsoft LINK 2.x probes
 

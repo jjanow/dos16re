@@ -33,7 +33,7 @@ _PASCAL_STARTUPS = (
     ("6.0", _pattern(_PASCAL_ENTRY + _PASCAL_HEAP + "a3 ?? ?? 26 8b 16 02 00")),
     ("7.0", _pattern(_PASCAL_ENTRY + "e8 ?? ?? e8 ?? ?? " + _PASCAL_HEAP)),
 )
-_MICROSOFT_PASCAL_START = _pattern(
+_MICROSOFT_PASCAL_ENTXQQ = _pattern(
     "ba ?? ?? b4 25 b0 00 8c c9 8e d9 cd 21 ba ?? ?? d1 ea b9 00 80 2b ca d1 ea d1 ea d1 ea 42 "
     "26 a1 02 00 8b e8 2d ?? ?? 72 ?? 33 db 2b c2 73 02 2b d8 2b d3 "
     "b8 ?? ?? 8e d8 8c 06 ?? ?? be ?? ?? 2b f0 d1 e6 d1 e6 d1 e6 d1 e6"
@@ -46,6 +46,17 @@ _MICROSOFT_PASCAL_DGROUP = _pattern(
     "2d 00 10 76 13 b9 00 80 f3 a5 8c c1 81 e9 00 10 8e c1 2b ca 8e d9 eb e8 "
     "05 00 10 8b c8 d1 e1 d1 e1 d1 e1 f3 a5 fc 81 c2 ?? ?? 8e da fa 8e d2 bc ?? ?? fb"
 )
+# Pascal 3.30's __astart sets SS from a relocated DGROUP selector, then runs the
+# Pascal initializer table and passes a ten-byte startup record on the stack.
+_MICROSOFT_PASCAL_330_START = _pattern(
+    "bf ?? ?? 8b 36 02 00 2b f7 81 fe 00 10 72 03 be 00 10 fa 8e d7 81 c4 ?? ?? fb "
+    "73 03 e9 ?? ?? 81 e4 fe ff 36 89 26 ?? ?? 36 89 26 ?? ?? 8b c6 b1 04 d3 e0 48 "
+    "36 a3 ?? ?? b4 30 cd 21"
+)
+_MICROSOFT_PASCAL_330_INIT = _pattern(
+    "bb ?? ?? 81 fb ?? ?? 73 09 53 ff 1f 5b 83 c3 04 eb f1 b9 0a 00 2b e1 be ?? ?? "
+    "8b fc 16 07 f3 a4 9a ?? ?? ?? ?? 33 ed 9a ?? ?? ?? ?? 50 9a ?? ?? ?? ??"
+)
 _BORLAND_C_START = _pattern("ba ?? ?? 2e 89 16 ?? ?? b4 30 cd 21 8b 2e 02 00 8b 1e 2c 00 8e da")
 _BORLAND_C_MARKERS = (
     (b"Turbo-C - Copyright (c) 1988 Borland Intl.", "Turbo C", "2.x"),
@@ -57,6 +68,12 @@ _MICROSOFT_C_STARTUPS = (
     ("6.x", 14, _pattern("b4 30 cd 21 3c 02 73 05 33 c0 06 50 cb bf ?? ?? 8b 36 02 00 2b f7 81 fe 00 10")),
 )
 _MICROSOFT_C_FAR_START = _pattern("72 03 be 00 10 fa 8e d7 81 c4 ?? ?? fb 73 14 16 1f 9a ?? ??")
+
+
+def _matches_pascal_dgroup(image: bytes, start: int, relocations: set[int]) -> bool:
+    return ({start + 0x58, start + 0x67, start + 0x97} <= relocations
+            and start + 0x0E not in relocations
+            and _MICROSOFT_PASCAL_DGROUP.match(image, start + 0x49) is not None)
 
 
 def _microsoft_startup(image: bytes, entry: int, origin: int, relocations: set[int]) -> Compiler | None:
@@ -73,8 +90,16 @@ def _microsoft_startup(image: bytes, entry: int, origin: int, relocations: set[i
     for start, prefix in starts:
         # ENTXQQ uses an absolute DGROUP selector, a biased selector, and the COMADS selector.
         if ({start + 0x25, start + 0x34, start + 0x3D} <= relocations
-                and _MICROSOFT_PASCAL_START.match(image, start)):
+                and _MICROSOFT_PASCAL_ENTXQQ.match(image, start)):
+            if _matches_pascal_dgroup(image, start, relocations):
+                return Compiler("microsoft_pascal", "Microsoft Pascal", "3.20",
+                                prefix + "ENTXQQ startup and DGROUP copy", start)
             return Compiler("microsoft_pascal", "Microsoft Pascal", None, prefix + "ENTXQQ startup", start)
+        if ({start + 1, start + 0x127, start + 0x12E, start + 0x134} <= relocations
+                and _MICROSOFT_PASCAL_330_START.match(image, start)
+                and _MICROSOFT_PASCAL_330_INIT.match(image, start + 0x104)):
+            return Compiler("microsoft_pascal", "Microsoft Pascal", "3.30",
+                            prefix + "fixed-stack startup and Pascal initialization", start)
         for version, relocation, pattern in _MICROSOFT_C_STARTUPS:
             match = pattern.match(image, start)
             if match is None or start + relocation not in relocations:
@@ -123,10 +148,8 @@ def microsoft_pascal_dgroup(root: LoadedMZ, compiler: Compiler) -> dict[str, int
     if compiler.group != "microsoft_pascal" or start is None:
         return None
     image = root.image
-    if not _MICROSOFT_PASCAL_DGROUP.match(image, start + 0x49):
-        return None
     relocations = {address.linear for address in root.relocations}
-    if not {start + 0x58, start + 0x67, start + 0x97} <= relocations or start + 0x0E in relocations:
+    if not _matches_pascal_dgroup(image, start, relocations):
         return None
     shift_word, = unpack_from("<H", image, start + 0x0E)
     end, = unpack_from("<H", image, start + 0x25)

@@ -14,15 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, added `--pascal-dgroup FILE@SEG` to map a captured Microsoft Pascal DGROUP in
-Ghidra. A synthetic probe verified overlapping root bytes, DS- and SS-relative globals, and
-the pre-copy manifest view. Original LINK 2.40 and 2.45 probes propagated the selectors observed
-in Unicorn and retained the recovered heap argument. The default suite passed 521 tests. The
-runtime, segment, and DOS suites passed 57 tests with Ghidra 12.2 enabled.
+On 2026-11-25, added evidence-backed Microsoft Pascal 3.20 and 3.30 version detection to
+`info` and `load`. Original 3.20 probes covered LINK 2.40 and 2.45 with and without overlays.
+Original 3.30 probes covered ordinary, empty, and variable-stack programs built with LINK 3.02
+and run in DOSBox. The default suite passed 522 tests. The runtime, DOS, and segment suites
+passed 61 tests with Ghidra 12.2 and the original Pascal and LINK probes enabled.
 
-Resume with corroborating Microsoft Pascal version detection using another toolchain release,
-or with X1turbo validation when original media is available. The
-[platform parity table](#platform-capability-parity) tracks other extensions.
+Resume with X1turbo bank and device support when original media is available for validation.
+PC-98 FAT12 member loading is the next item that can proceed while waiting for that media.
+The [platform parity table](#platform-capability-parity) tracks the wider extensions.
 
 ## Why
 
@@ -121,8 +121,8 @@ targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of
 2. **Implemented.** Ghidra names and types matches at analyzed function entries. The Pascal catalog includes
    Real48 addition, string copy and concatenation, set union, `Write` for strings, `WriteLn`, `GetMem`,
    `FreeMem`, and `OvrInit`. The C catalog covers selected string, output, and heap routines.
-3. **Implemented.** `retrore info` identifies runtimes from startup code and corroborating runtime strings or
-   a recognized Turbo Pascal overlay directory. JSON records the evidence and any identified version.
+3. **Implemented.** `retrore info` identifies runtimes from startup code, corroborating runtime code or
+   strings, or a recognized Turbo Pascal overlay directory. JSON records the evidence and any identified version.
 
 **Validated.** The signatures come from original toolchains and purpose-built DOS probes. The Pascal probe
 uses `Overlay`, adds two `Real` values, copies and concatenates short strings, unions two `set of byte`
@@ -147,8 +147,15 @@ A call fixup uses each inline size to model BP and SP on the normal return path.
 recovers the heap routine's argument and local stack slot on both LINK builds. With an explicit
 capture, Ghidra maps the copied bytes at their runtime addresses and propagates DS and SS from
 the recognized startup switch. The LINK 2.40 probe validated overlapping source and destination
-ranges, and the LINK 2.45 probe validated the capped shift. Runtime version detection remains open.
+ranges, and the LINK 2.45 probe validated the capped shift. The relocated DGROUP copy
+corroborates version 3.20. An `ENTXQQ` prefix with no matching copy reports only the family.
 [Probe build steps](README.md#microsoft-pascal-runtime-probe)
+
+**Validated with Microsoft Pascal 3.30.** LINK 3.02 maps the entry to `__astart`. Its relocated
+DGROUP selector and stack setup, Pascal initializer table loop, and far calls distinguish it
+from 3.20. The same evidence identifies the empty program and a build linked with `LVARSTCK.OBJ`.
+The 3.20 DGROUP copy and inline frame size handling remain specific to their original patterns.
+[Probe build steps](README.md#microsoft-pascal-330-probes)
 
 ### Phase 6: emulator harness
 
