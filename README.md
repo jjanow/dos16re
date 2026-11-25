@@ -268,7 +268,8 @@ Inspect `diagnostics` in JSON for unmatched trailers, unresolved VROOMM function
 and unidentified or ambiguous LINK directories.
 
 MOVE verifies its resident directory against member file offsets and allocation sizes. It
-applies member-relative fixups using the resident load segment and follows relocated pointers
+skips unused directory slots and preserves the original member numbers, including IDs above 255.
+It applies member-relative fixups using the resident load segment and follows relocated pointers
 to resident dispatch stubs. Verified stubs become far jumps to selected members in the analysis
 image. Ghidra backs any allocation beyond the file bytes with uninitialized memory. MOVE chooses
 physical placements at runtime. Supply segments from a capture with `--runtime-base` and
@@ -1679,8 +1680,10 @@ Phase 12 has optional checks against original tool outputs and releases.
 | `RETRORE_DOS_LINK_2X_DIR` | Microsoft LINK 2.40 `PAD240.EXE` and 2.45 `PAD245.EXE` with a relocated, padded overlay member. See the [build steps](#microsoft-link-2x-probes). |
 | `RETRORE_DOS_LINK_LAYOUT_DIR` | LINK 3.65 `LIVE365.EXE` with a 16-byte uninitialized CODE segment before a page-aligned routine in member 2. The test also checks a copy with the directory counts cleared. |
 | `RETRORE_CIV_DOS_DIR` | `CIV.EXE` from Civilization for DOS 474.03 (SHA-256 `31e35b01f4d00df81685dfcb81e6de196a3876bd2afff6e39cbbfd964f5852ad`). Checks EXEPACK and 23 embedded Microsoft LINK members. |
-| `RETRORE_NETHACK_30J_DIR` | `NETHACK.EXE`, `NETHACK1.OVL`, and `NETHACK2.OVL` from [NetHack 3.0j for DOS](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH_older/). Checks the external LINK directory and file provenance. |
+| `RETRORE_NETHACK_30J_DIR` | `NETHACK.EXE`, `NETHACK1.OVL`, and `NETHACK2.OVL` from [NetHack 3.0j for DOS](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH_older/). Checks the external LINK directory and file provenance with native counts and with the counts cleared in a copy. |
 | `RETRORE_NETHACK_313_DIR` | `NETHACK.EXE` from [NetHack 3.1.3 for DOS](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH31/). Checks the MOVE catalog, selected member fixups, and resident stubs. |
+| `RETRORE_NETHACK_331_DIR` | `nethack.exe` from the [NetHack 3.3.1 real-mode DOS release](https://www.nethack.org/v331/ports/download-msdos.html). Checks unused MOVE slots and member IDs above 255. |
+| `RETRORE_DOS_MOVE_DIR` | `PROBE.EXE`, `TIGHT.OUT`, and `TIGHT.TXT` from the [Microsoft MOVE heap probe](#microsoft-move-heap-probe). Checks concurrent placement, eviction, and reuse of physical addresses. |
 | `RETRORE_VROOMM_DIR` | The TLINK 4.0 three-overlay `VROOMM.EXE` probe |
 | `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
 | `RETRORE_DOS_NATIVE_OVERLAY_DIR` | LINK 3.65 and 5.01.21 `TAIL365.EXE`, `TAIL501.EXE`, `BSS365.EXE`, and `BSS501.EXE` plus TLINK 3.01 and 4.0 `INSEG.EXE` and `INSEG4.EXE`. See the [build steps](#trailing-link-segments-and-flagged-tlink-pointers). |
@@ -1881,6 +1884,95 @@ masm inseg,inseg;
 tlink /m c0m+main+check+/o+inseg+/o-,inseg,inseg,overlay+emu+mathm+cm
 tlink4 /m c0m+main+check+/o+inseg+/o-,inseg4,inseg4,overlay+emu+mathm+cm
 ```
+
+### Microsoft MOVE heap probe
+
+Use Microsoft C 7, LINK 5.30, MASM 5.10, and the `MOVETR.LIB` and `TRACE.EXE` from the C 7
+distribution. In DOSBox, enable extended memory so the evicted members can reload from the XMS
+cache. Save each source with DOS line endings. [Microsoft C 7 distribution](https://www.pcjs.org/software/pcx86/lang/microsoft/c/7.00/)
+
+```c
+/* MAIN.C */
+extern int printf(const char *, ...);
+extern int first(void), second(void), third(void);
+extern unsigned root_cs(void);
+int main(void) {
+    int a, b, c, d;
+    printf("root %04X\n", root_cs());
+    a = first(); b = third(); c = second(); d = first();
+    printf("%d %d %d %d\n", a, b, c, d);
+    return a != 10 || b != 5 || c != 9 || d != 10;
+}
+```
+
+```c
+/* FIRST.C */
+extern int second(void);
+int first(void) { return second() + 1; }
+```
+
+```c
+/* SECOND.C */
+int second(void) { return 9; }
+```
+
+```c
+/* THIRD.C */
+int third(void) { return 5; }
+```
+
+```asm
+; ROOTCS.ASM
+ROOTCODE segment para public 'CODE'
+public _root_cs
+_root_cs proc far
+    mov ax,cs
+    ret
+_root_cs endp
+ROOTCODE ends
+end
+```
+
+```asm
+; TAIL.ASM
+TAIL_TEXT segment page public 'CODE'
+db 16 dup (?)
+TAIL_TEXT ends
+end
+```
+
+`PROBE.DEF` assigns the segments to three overlays and the resident program.
+
+```text
+EXETYPE DOS
+SEGMENTS
+  MAIN_TEXT OVL:0
+  FIRST_TEXT OVL:1
+  SECOND_TEXT OVL:2
+  TAIL_TEXT OVL:2
+  THIRD_TEXT OVL:3
+  ROOTCODE OVL:0
+```
+
+Put the following on one line in `PROBE.RSP`.
+
+```text
+/batch /dynamic /ov:62 /nofarcall /map /nod main+first+second+third+tail+rootcs,probe,probe,llibcr+llibfp+movetr+oldnames,probe.def
+```
+
+```bat
+cl /AL /c main.c first.c second.c third.c
+masm tail,tail;
+masm rootcs,rootcs;
+link @probe.rsp
+set MOVE_HEAP=0013
+probe > TIGHT.OUT
+trace MOVE.TRC > TIGHT.TXT
+```
+
+`TIGHT.OUT` ends with `10 5 9 10`. The trace shows member 3 replacing member 2 and member 1
+reloading at a different segment. Changing `MOVE_HEAP` to `0060` gives all three members room
+to stay loaded after the first call to each.
 
 The roadmap tracks upcoming work. [PLAN.md](PLAN.md)
 

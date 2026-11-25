@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from struct import pack, pack_into, unpack_from
 
@@ -174,27 +175,44 @@ def test_link_external_members_keep_their_source_files(tmp_path, capsys):
                     link_files=((first.name, first.read_bytes()), (second.name, first.read_bytes())))
 
 
-def test_move_selects_members_and_rewrites_verified_stubs(tmp_path, capsys):
+@pytest.mark.parametrize("second_number", [2, 3])
+def test_move_selects_members_and_rewrites_verified_stubs(second_number, tmp_path, capsys):
     root = bytearray(0x80)
     root[:11] = bytes.fromhex("9a00000200 9a06000200 cb")
     root[0x20:0x2C] = bytes.fromhex("cd3e01000200 cd3e02000000")
     root[0x30:0x36] = bytes.fromhex("cd3e01000200")  # No relocated pointer names this copy.
+    relocations = [(3, 0), (8, 0)]
+    adjustments, numbers = [0, 2, 0], [0, 1, second_number]
+    offsets, sizes = [0, 0x200, 0x400], [0, 0x12, 1]
+    if second_number == 3:
+        # An unused slot still appears in the segment directory. A relocated
+        # pointer to its stub cannot be resolved to a file-backed target.
+        adjustments.append(0)
+        numbers.append(2)
+        offsets.insert(2, 0)
+        sizes.insert(2, 0)
+        root[10:16] = bytes.fromhex("9a16000200 cb")
+        root[0x36:0x3C] = bytes.fromhex("cd3e03000000")
+        relocations.append((13, 0))
     # Two word arrays give offset adjustments and member IDs. The directory also names
     # the original header offsets, paragraph counts, and interrupt vector.
-    directory = pack("<8H6IB", 3, 3, 0, 2, 0, 0, 1, 2, 0, 0x200, 0x400, 0, 0x12, 1, 0x3E)
+    directory = pack(f"<2H{len(numbers) * 2}H{len(offsets) * 2}IB", len(numbers), len(offsets),
+                     *adjustments, *numbers, *offsets, *sizes, 0x3E)
     root[0x40:0x40 + len(directory)] = directory
     first = _mz(bytes.fromhex("90909090 b80300cb"), relocations=[(5, 0)], member=1, min_alloc=0x11)
-    second = _mz(b"\xcb", member=2)
+    second = _mz(b"\xcb", member=second_number)
     source = tmp_path / "demo.exe"
-    source.write_bytes(_align(_mz(root, relocations=[(3, 0), (8, 0)])) + _align(first) + second)
+    source.write_bytes(_align(_mz(root, relocations=relocations)) + _align(first) + second)
 
     catalog = _command(capsys, "members", source)
     assert [row["details"]["overlay_format"] for row in catalog["members"]] == ["MS_MOVE", "MS_MOVE"]
+    assert [row["details"]["overlay_number"] for row in catalog["members"]] == [1, second_number]
     assert [row["container_offset"] for row in catalog["members"]] == [0x220, 0x420]
     full = _command(capsys, "info", source)
     _, first_unit, second_unit = full["units"]
     assert first_unit["allocation_size"] == 0x120
     assert second_unit["linear"] == first_unit["linear"] + 0x120
+    assert [row["address"]["linear"] for row in full["stubs"]] == [0x10020, 0x10026]
     out = tmp_path / "out"
     report = _command(capsys, "load", source, "--base-segment", "2000", "--member", "id:move_0001", "-o", out)
     resident, overlay = report["units"]
@@ -206,7 +224,7 @@ def test_move_selects_members_and_rewrites_verified_stubs(tmp_path, capsys):
     call, = report["calls"]
     assert call["linear"] == resident["linear"]
 
-    assert (out / "image.bin").read_bytes()[0x26:0x36] == root[0x26:0x36]
+    assert (out / "image.bin").read_bytes()[0x26:0x3C] == root[0x26:0x3C]
     proof = _command(capsys, "bytes", "move_0001:4", "--export", out, "--size", 4)
     assert (proof["original"], proof["loaded"]) == ("b80300cb", "b80320cb")
     unmapped = _command(capsys, "address-map", "move_0001:4", "--export", out)["matches"][0]
@@ -533,10 +551,17 @@ def test_shipped_exepacked_link_overlays_when_available(tmp_path, capsys):
     assert int.from_bytes(bytes.fromhex(proof["loaded"]), "little") == 0x2FC3
 
 
-def test_shipped_link_overlay_files_when_available(tmp_path, capsys):
+@pytest.mark.parametrize("clear_counts", [False, True])
+def test_shipped_link_overlay_files_when_available(clear_counts, tmp_path, capsys):
     if not (directory := os.environ.get("RETRORE_NETHACK_30J_DIR")):
         pytest.skip("set RETRORE_NETHACK_30J_DIR to NetHack 3.0j for DOS")
     source, first, second = (Path(directory) / name for name in ("NETHACK.EXE", "NETHACK1.OVL", "NETHACK2.OVL"))
+    original = source.read_bytes()
+    count_site = read_mz_header(original).header_size + 0x43440
+    assert unpack_from("<2H", original, count_site) == (162, 64)
+    if clear_counts:
+        source = tmp_path / source.name
+        source.write_bytes(original[:count_site] + bytes(4) + original[count_site + 4:])
     out = tmp_path / "static"
     program = _command(capsys, "load", source, "--overlay", first, "--overlay", second, "-o", out)
     overlays = program["units"][1:]
@@ -572,6 +597,90 @@ def test_shipped_move_members_when_available(tmp_path, capsys):
     proof = _command(capsys, "bytes", "move_0001:0", "--export", out, "--size", 32)
     start = first["file_offset"]
     assert bytes.fromhex(proof["original"]) == source.read_bytes()[start:start + 32]
+
+
+def test_original_move_heap_capture_when_available(tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_DOS_MOVE_DIR")):
+        pytest.skip("set RETRORE_DOS_MOVE_DIR to the Microsoft MOVE heap probe and TRACE output")
+    probe = Path(directory)
+    source = probe / "PROBE.EXE"
+    capture = (probe / "TIGHT.TXT").read_text()
+    main_cs, = re.findall(r"\(0000\) ([0-9a-f]{4}):[0-9a-f]{4} - Load from disk", capture)
+    # The link map places the independent CS probe 8 paragraphs after MAIN_TEXT.
+    assert (probe / "TIGHT.OUT").read_text().splitlines() == [f"root {int(main_cs, 16) + 8:04X}", "10 5 9 10"]
+    transactions = re.findall(
+        r" - (Load from disk|Load from extended memory|Discard from heap) +- \(([0-9a-f]{4})\) \[([0-9a-f]{4})\]",
+        capture,
+    )
+    catalog = _command(capsys, "members", source)["members"]
+    active = {"root": int(main_cs, 16) * 16}
+    states = [{"name": "root", "loads": [{"unit": "root", "linear": active["root"]}]}]
+    transitions, events, expected = [], [], []
+    loaded = []
+    for action, number, segment in transactions:
+        member = catalog[int(number, 16) - 1]
+        unit = member["name"]
+        linear = int(segment, 16) * 16
+        if action == "Discard from heap":
+            assert active.pop(unit) == linear
+        else:
+            assert unit not in active
+            active[unit] = linear
+            loaded.append((unit, linear))
+        state = f"heap_{len(states)}"
+        transitions.append({"from": states[-1]["name"], "to": state, "kind": "overlay"})
+        states.append({"name": state, "loads": [{"unit": name, "linear": at} for name, at in active.items()]})
+        events.append({"kind": "overlay", "state": state})
+        if action != "Discard from heap":
+            events.append({"kind": "instruction", "address": linear})
+            expected.append((f"{unit}:0000", linear, member["container_offset"]))
+    assert [unit for unit, _ in loaded] == ["move_0001", "move_0002", "move_0003", "move_0002", "move_0001"]
+    assert loaded[1][1] == loaded[2][1] and loaded[0][1] != loaded[-1][1]
+
+    manifest = tmp_path / "placements.json"
+    manifest.write_text(json.dumps({"version": 1, "initial": "root", "states": states, "transitions": transitions}))
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps({"version": 1, "events": events}))
+    out = tmp_path / "move"
+    program = _command(capsys, "load", source, "--load-manifest", manifest, "-o", out)
+    _, first, second, third = program["units"]
+    assert (second["size"], second["allocation_size"]) == (12, 288)
+    assert len(program["stubs"]) == 3
+    report = _command(capsys, "trace", trace, "--export", out, "--evidence")
+    assert not report["unmapped"]
+    assert sorted((row["unit_address"], row["runtime_linear"], row["export_evidence"]["address"]["file"]["offset"])
+                  for row in report["mapped"]) == sorted(expected)
+    if os.environ.get("GHIDRA_HOME"):
+        imported = _command(capsys, "ghidra", "import", out, tmp_path / "project", "--load-views")
+        views = imported["load_views"]
+        for state, units in (("heap_2", (first, second)), ("heap_4", (first, third)),
+                             (states[-1]["name"], (second, first))):
+            blocks = views[state]["blocks"][1:]
+            spans = next(row["spans"][1:] for row in program["load_manifest"]["states"] if row["name"] == state)
+            assert [(row["unit"], row["size"], int(row["address"].rsplit(":", 1)[-1], 16)) for row in blocks] == [
+                (unit["name"], unit["size"], span["linear"]) for unit, span in zip(units, spans, strict=True)
+            ]
+
+
+def test_shipped_sparse_move_members_when_available(tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_NETHACK_331_DIR")):
+        pytest.skip("set RETRORE_NETHACK_331_DIR to NetHack 3.3.1 real-mode DOS")
+    source = Path(directory) / "nethack.exe"
+    catalog = _command(capsys, "members", source)["members"]
+    numbers = [row["details"]["overlay_number"] for row in catalog]
+    assert len(numbers) == 366 and numbers[-1] == 392
+    assert 58 in numbers and 59 not in numbers and 60 in numbers
+    assert {row["details"]["overlay_format"] for row in catalog} == {"MS_MOVE"}
+    assert sum(row["details"]["relocation_count"] for row in catalog) == 28475
+    out = tmp_path / "move"
+    program = _command(capsys, "load", source, "--member", "id:move_0188", "--member", "id:move_003c", "-o", out)
+    _, last, after_gap = program["units"]
+    assert [row["overlay_number"] for row in (last, after_gap)] == [392, 60]
+    assert [row["relocation_count"] for row in (last, after_gap)] == [41, 259]
+    assert [row["file_offset"] for row in (last, after_gap)] == [0x1D3E00, 0xB1000]
+    assert len(program["stubs"]) == 11 and "diagnostics" not in program
+    proof = _command(capsys, "bytes", "move_0188:0", "--export", out, "--size", 32)
+    assert bytes.fromhex(proof["original"]) == source.read_bytes()[0x1D3E00:0x1D3E20]
 
 
 @pytest.mark.parametrize(("filename", "count_offset", "selector_count", "window"), [

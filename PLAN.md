@@ -14,16 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, traced Fireflash I and a one-time gold event in the Phantasie III DOS archives.
-The fire spell spent one magic point, and revisiting the gold square kept the total at 256.
-Both traces recorded zero callback-table reads and zero floating-point operand dispatches after
-archive entry. Eight opt-in Phantasie III checks passed with Ghidra 12.2. The standalone suite
-passed 517 tests with 136 skipped.
+On 2026-11-24, finished Phase 12. Added support for unused MOVE directory slots and verified it
+against the NetHack 3.2.2 and 3.3.1 DOS releases. Mapped MOVE eviction and reloads from DOSBox
+and imported the observed states in Ghidra 12.2. Validated external LINK banks with the original
+and cleared directory counts. The standalone suite passed 518 tests with 139 skipped, and the
+focused suites passed all 87 tests with original inputs and Ghidra 12.2 enabled.
 
 Resume Phase 9 with events outside the archives. The conversion callback's far output pointer
 still needs caller provenance, and the alternate parser and comparison entries still need
 reachability evidence. Automatic dispatch bounds require coverage of reachable stores and record
-sources. Shipped Microsoft LINK edge cases and more MOVE placements remain open in Phase 12.
+sources.
 
 ## Why
 
@@ -501,6 +501,8 @@ Continue with the analysis backlog below.
 
 ### Phase 12: loader depth on supported platforms
 
+**Complete for the validated formats.**
+
 - **Implemented.** DOS COM and raw loads record the input byte range and initial segment registers.
   PKLITE recognizes additional XOR- and ADD-scrambled EXE stubs and COM decoder pointers. V1.20
   decoding handles encoded match distances and the ADD variant's big-endian relocation offsets.
@@ -510,6 +512,7 @@ Continue with the analysis backlog below.
   member fixups, including from EXEPACK-compressed resident modules and separate OVL files. It validates
   trailing segments using the member allocation and exports file-backed segment starts. MOVE reads
   member-relative fixups and resolves resident dispatch stubs using its segment and member tables.
+  MOVE directories can have unused slots. Exports preserve the native member IDs across gaps.
   Ghidra backs the rest of each MOVE allocation with uninitialized memory. VROOMM skips header-only
   descriptors for empty code segments and resolves flagged pointer pushes to verified resident stubs.
   Partial layouts and unmapped trailers appear as diagnostics.
@@ -524,9 +527,6 @@ Continue with the analysis backlog below.
 - **Implemented.** `members` and `--member` share selectors for supported disk and container inputs.
   Exports preserve selection order, layout decisions, and member and file offsets. Synthetic tests
   cover these workflows. Original-tool outputs and releases use optional `RETRORE_*_DIR` inputs.
-
-Open validation work includes shipped Microsoft LINK cases with missing directory counts or a
-delayed first segment, and more captured Microsoft MOVE placements.
 
 **Validated with original tools.** PKLITE 1.15 registered small and large XOR outputs match their
 unpacked references. The PKZIP 2.04g installer exercises the ADD decoder and matches Deark on
@@ -558,10 +558,14 @@ checks the window, fixup count, and original file offsets and bytes.
 NetHack 3.0j for DOS exports 63 LINK members and 6,127 fixups from its two original OVL files.
 Its resident directory has 162 selectors and a physical overlay count of 64 including the root.
 Every member's first listed selector is `0x07BA`, the link-time window. The last file has an
-unmapped 330-byte trailer. In separate probes, LINK 3.65 and 5.01.21 both wrote the `$$CGSN`
+unmapped 330-byte trailer. The opt-in test clears the two count words in a temporary copy
+of the release and recovers the same window, fixup count, and file provenance. In separate
+probes, LINK 3.65 and 5.01.21 both wrote the `$$CGSN`
 and `$$COVL` words even with a custom `$$OVLINIT` that only returns. Both link maps placed the
 paragraph-aligned and page-aligned first segments at `OVERLAY_AREA`. The count-free directory
 and delayed first selector have synthetic coverage, including in combination with EXEPACK.
+The shipped static releases inspected so far have native counts and their first listed selectors
+start at the window. An unmodified release with either edge case would extend that coverage.
 Older DOS releases of NetHack 2.3a and 2.3e and PC Hack 3.51 and 3.60 had no appended members
 or separate overlay files. The original all-member NetHack 3.0j import exceeded a 420-second
 headless budget. A JVM recording found that Ghidra spent 99% of the calling-convention
@@ -579,12 +583,22 @@ so use `--member` to select overlays.
 [NetHack 3.1.3 DOS release archive](https://cdimage.debian.org/mirror/archive/ftp.sunet.se/pub/games/nethack/Msdos/NH31/),
 [NetHack 3.1.3 source archive](https://ftp.zx.net.nz/pub/mirror/ftp.funet.fi/pub/unix/games/nethack/)
 
+The NetHack 3.2.2 real-mode executables have 184 and 209 populated MOVE slots. Both segment
+directories include records for empty slots whose file offsets and allocation sizes are zero.
+NetHack 3.3.1 has 366 populated slots out of 392, with 28,475 fixups and 2,090 resolved stubs.
+Ghidra 12.2 imported selected members 392 and 60. [NetHack 3.3.1 DOS release](https://www.nethack.org/v331/ports/download-msdos.html)
+
 LINK 5.30 and the Microsoft C 7 MOVE library produced runnable probes with two overlays,
 including two C code segments in one member. Ghidra decompiled the first member's calls to both
 members. A probe linked with `/OV:62` had 12 file bytes in member 2 and a 288-byte allocation.
 Ghidra imported the tail as a 276-byte uninitialized block. A DOSBox capture placed two members
 at the same segment in different states. A load manifest mapped each state to its original
 file offsets, and Ghidra imported both runtime views into separate address spaces.
+A three-member LINK 5.30 probe used Microsoft's MOVE TRACE utility in DOSBox. With a 19-paragraph
+heap, members 1 and 2 initially coexisted. Member 3 took over member 2's segment, and members 1
+and 2 later reloaded from XMS at different segments. The opt-in test maps all five loads back to
+their source offsets and verifies the coexisting pairs in Ghidra 12.2. In a 96-paragraph heap,
+all three stayed loaded. [Probe build steps](README.md#microsoft-move-heap-probe)
 [Microsoft C 7 distribution](https://www.pcjs.org/software/pcx86/lang/microsoft/c/7.00/),
 [Microsoft C 7 Environment and Tools, chapter 15](https://bitsavers.trailing-edge.com/pdf/microsoft/msdos_c/Microsoft_C_7.0_1991/24778_Environment_and_Tools_199112.pdf)
 

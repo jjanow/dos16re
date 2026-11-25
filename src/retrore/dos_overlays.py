@@ -213,12 +213,14 @@ def _load_static_link(loaded: LoadedMZ, members: dict[int, _LinkMember]) -> tupl
 
 def _move_directory(loaded: LoadedMZ, members: dict[int, _LinkMember]) -> tuple[_MoveSegments, int] | None:
     """Find MOVE's counted segment arrays, file offsets, sizes, and interrupt vector."""
-    numbers = [0, *range(1, len(members) + 1)]
-    if members.keys() != set(numbers[1:]):
-        return None
+    # Unused overlay numbers have zero file offsets and allocation sizes. The
+    # segment directory may still refer to these slots, which have no file data.
+    overlay_count = max(members) + 1
+    slots = [members.get(number) for number in range(1, overlay_count)]
     image = loaded.image
-    offsets = _DWORD.pack(0) + b"".join(_DWORD.pack(members[number].header_offset) for number in numbers[1:])
-    sizes = b"".join(_DWORD.pack(members[number].allocation_paragraphs) for number in numbers[1:])
+    offsets = _DWORD.pack(0) + b"".join(_DWORD.pack(member.header_offset if member else 0) for member in slots)
+    sizes = b"".join(_DWORD.pack(member.allocation_paragraphs if member else 0) for member in slots)
+    required_numbers = {0, *members}
     candidates = []
     file_table = image.find(offsets)
     while file_table != -1:
@@ -227,14 +229,14 @@ def _move_directory(loaded: LoadedMZ, members: dict[int, _LinkMember]) -> tuple[
         if vector < len(image) and image.startswith(sizes, size_table + _DWORD.size):
             # $$CGSN and $$COVL precede $$MPGSNBASE and $$MPGSNOVL, both arrays of words.
             for start in range(file_table - _PAIR.size - 4, max(-1, file_table - 4 * 0x10000), -4):
-                segment_count, overlay_count = _PAIR.unpack_from(image, start)
-                if (overlay_count != len(numbers)
+                segment_count, count_overlays = _PAIR.unpack_from(image, start)
+                if (count_overlays != overlay_count
                         or start + _PAIR.size + segment_count * 4 != file_table):
                     continue
                 segment_table = start + _PAIR.size
                 number_table = segment_table + segment_count * _WORD.size
                 member_numbers = [number for number, in _WORD.iter_unpack(image[number_table:file_table])]
-                if set(member_numbers) == set(numbers):
+                if required_numbers.issubset(member_numbers) and max(member_numbers) < overlay_count:
                     adjustments = (offset for offset, in _WORD.iter_unpack(image[segment_table:number_table]))
                     candidates.append((tuple(zip(member_numbers, adjustments, strict=True)), image[vector]))
         file_table = image.find(offsets, file_table + 1)
@@ -275,7 +277,8 @@ def _move_overlays(loaded: LoadedMZ, members: dict[int, _LinkMember],
                 continue
             number, adjustment = directory[index]
             target = (offset + adjustment) & 0xFFFF
-            if number and target < len(members[number].image):
+            member = members.get(number)
+            if member is not None and target < len(member.image):
                 stubs.setdefault(start, (number, Address((segment + loaded.base_segment) & 0xFFFF, ip), target))
 
     # Overlapping candidate instructions cannot both be dispatch stubs.
