@@ -1671,6 +1671,9 @@ scroll event, a combat round with Fireflash I, and a gold event that runs once w
 the same square twice. The tests check magic and gold totals, monitor the installed callback table
 for reads, and use an ordered load manifest to map member 4's jumps back to `MAIN.EXE`. With Ghidra
 enabled, the combat traces resolve the menu call at `root:721d`.
+The wilderness playthroughs trace the Jolly Inn's refusal when the party has insufficient funds
+and a declined attack on sleeping monsters. They verify travel time and encounter state, map
+member 3's instructions back to `MAIN.EXE`, and check the same callback and floating-point sites.
 
 Phase 12 has optional checks against original tool outputs and releases.
 

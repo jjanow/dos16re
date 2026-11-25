@@ -14,16 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, finished Phase 12. Added support for unused MOVE directory slots and verified it
-against the NetHack 3.2.2 and 3.3.1 DOS releases. Mapped MOVE eviction and reloads from DOSBox
-and imported the observed states in Ghidra 12.2. Validated external LINK banks with the original
-and cleared directory counts. The standalone suite passed 518 tests with 139 skipped, and the
-focused suites passed all 87 tests with original inputs and Ghidra 12.2 enabled.
+On 2026-11-24, extended Phase 9's Phantasie III DOS audit to the wilderness. Added opt-in
+playthroughs for the Jolly Inn's insufficient-funds branch and a declined attack on sleeping
+monsters. Both map LINK member 3's instructions to the original file and check the installed
+callback table, detached entries, and floating-point record activity. Ten focused Phantasie III
+checks passed with original media and Ghidra 12.2. The standalone suite passed 518 tests with
+141 skipped.
 
-Resume Phase 9 with events outside the archives. The conversion callback's far output pointer
-still needs caller provenance, and the alternate parser and comparison entries still need
-reachability evidence. Automatic dispatch bounds require coverage of reachable stores and record
-sources.
+Resume Phase 9 by auditing the unresolved computed transfers for callers of the conversion
+callback, alternate parser, and comparison entry. Trace the callback's far output pointer back
+to its callers if found. Automatic dispatch bounds still require evidence for reachable stores,
+including potential aliases, and record sources.
 
 ## Why
 
@@ -210,7 +211,8 @@ Phases 1–7 are implemented for the initial DOS scope, including the optional D
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
 Sharp X1, Sharp X68000, Classic Macintosh, Nintendo NES / Famicom, and Sega Genesis / Mega Drive
 milestones are complete for the validated releases. X1turbo validation awaits original media.
-Continue with the analysis backlog below.
+Phase 9 has the remaining work in the numbered phases. Additional platform capabilities are
+listed in the parity table and platform milestones below.
 
 ## Analysis backlog
 
@@ -388,6 +390,16 @@ Continue with the analysis backlog below.
   total still at 256. The two routes capture the overlay and root edges and show zero
   FPU operand dispatches or class-byte writes after archive entry. The full runs record
   zero callback-table reads and zero hits at the detached entries.
+- **Traced wilderness events in the shipped DOS release.** With LINK member 3 covering the
+  start of member 2's window, `link_0003:02f3` calls the travel-time update at `root:14a9`
+  on ten road steps. The party arrives at the Jolly Inn at (24, 32) after five thirds of a day.
+  Its empty treasury takes `link_0003:08e1` to the refusal at `:08fb`. After ten steps the
+  party returns to Pendragon with no gold spent. With a different DOS clock seed, the first
+  northbound step at (24, 36) calls `root:de54` from `link_0003:0239`. Declining the sleeping
+  monsters prompt sets the refusal flag and jumps from `root:e020` to `root:e0a3`, bypassing
+  combat. Both runs map the executed member 3 edges to their original file offsets. They record
+  zero callback-table reads and zero hits at the three detached entries. After wilderness
+  entry, both observe zero software FPU operand dispatches and zero class-byte writes.
 - **Validated arithmetic dispatch slots.** `root:12524` and `root:1253f` use the same
   eight-word table at `root:1205e`. The `0x0e` mask and optional XOR with 2 keep BX
   on those slots. At `root:126cf`, arithmetic uses three 16-word tables at `root:12106`,

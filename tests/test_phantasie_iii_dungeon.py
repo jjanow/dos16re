@@ -79,7 +79,7 @@ class _DosSession:
             if name == "MAIN.EXE" and self.window <= address < self.window_end:
                 self.overlay_reads.append((position, address, len(data)))
                 cpu.ctl_remove_cache(self.window, self.window_end)
-            elif name in ("DNGS.DAT", "MONSTERS.CGA"):
+            elif name in ("DNGS.DAT", "MONSTERS.CGA", "WORLD.DAT"):
                 self.data_reads.append((name, position, len(data)))
             cpu.reg_write(x86.UC_X86_REG_AX, len(data))
         elif service == 0x3e:
@@ -142,15 +142,20 @@ class _DosSession:
         return value
 
 
-def _enter_archives_keys(*, wizard=False):
+def _leave_pendragon_keys(*, wizard=False):
     class_keys = ["down"] * 5 if wizard else []
     return [
         # Create a human in the Guild and add her to the party.
         "y", "left", "enter", "down", "down", "down", "enter", "enter", *class_keys, "enter",
         "left", "enter", "a", "d", "a", "enter", "esc", "enter", "down", "down", "enter", "enter", "esc",
-        # Leave Pendragon, enter the archives, and use the original map.
-        "left", "left", "left", "enter", "y", "down", "down", "right", "y", "n", "n",
+        # Leave Pendragon.
+        "left", "left", "left", "enter", "y",
     ]
+
+
+def _enter_archives_keys(*, wizard=False):
+    # Enter the archives and use the original map.
+    return [*_leave_pendragon_keys(wizard=wizard), "down", "down", "right", "y", "n", "n"]
 
 
 def _archives_keys():
@@ -184,40 +189,29 @@ def _gold_keys():
     ]
 
 
-@pytest.mark.parametrize(("route", "keys", "clock_dx"), [
-    pytest.param("scroll", _archives_keys(), 0x0120, id="scroll"),
-    pytest.param("fireflash", _fireflash_keys(), 0x0500, id="fireflash"),
-    pytest.param("gold", _gold_keys(), 0x0b00, id="gold"),
-])
-def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock_dx):
+def _load_game(tmp_path, capsys, *additional_files):
     directory = os.environ.get("RETRORE_PH3_DIR")
     if not directory:
         pytest.skip("set RETRORE_PH3_DIR to the original DOS game directory")
     files = {path.name.upper(): path for path in Path(directory).iterdir() if path.is_file()}
     required = {
-        "MAIN.EXE", "CREATURE.DAT", "DNGS.DAT", "DTOWN.CMP", "INITARMS.DAT", "MONSTERS.CGA",
-        "PICS.CMP", "SHAPES.CGA", "TOWN.CMP", "WORLD.CGA", "WORLD.DAT",
+        "MAIN.EXE", "CREATURE.DAT", "DTOWN.CMP", "INITARMS.DAT", "PICS.CMP", "SHAPES.CGA",
+        "TOWN.CMP", "WORLD.CGA", "WORLD.DAT", *additional_files,
     }
     if missing := required - files.keys():
-        pytest.skip(f"the archives playthrough needs the DOS media files {', '.join(sorted(missing))}")
+        pytest.skip(f"the Phantasie III playthrough needs the DOS media files {', '.join(sorted(missing))}")
     files = {name: files[name] for name in required}
     export = tmp_path / "export"
     assert main(["load", str(files["MAIN.EXE"]), "-o", str(export), "--json"]) == 0, capsys.readouterr().err
     capsys.readouterr()
-    map_path = export / "map.json"
-    program = json.loads(map_path.read_text(encoding="utf-8"))
+    program = json.loads((export / "map.json").read_text(encoding="utf-8"))
     image = (export / "image.bin").read_bytes()
-    units = {unit["name"]: unit for unit in program["units"]}
-    base = units["root"]["segment"]
-    origin = units["root"]["linear"]
-    dungeon = units["link_0004"]
-    window = dungeon["runtime_linear"]
-    long_member = units["link_0002"]
-    casting = route == "fireflash"
-    combat = route != "gold"
-    # The DOS clock seeds the encounter and turn order in each playthrough.
-    dos = _DosSession(files, keys, window, window + long_member["size"], clock_dx=clock_dx)
+    return files, export, program, image
 
+
+def _play_game(image, program, dos, active_member, entry_offset, observe):
+    root = program["units"][0]
+    base, origin = root["segment"], root["linear"]
     psp, environment = base - 0x10, base - 0x110
     prefix = bytearray(0x100)
     pack_into("<HH", prefix, 0, 0x20cd, 0xa000)
@@ -226,8 +220,6 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
     entry = Address(program["entry"]["segment"], program["entry"]["offset"])
 
     callbacks = Address(base + 0x28c0, 0x1dce).linear
-    magic = Address(base + 0x1820, 0x0254).linear
-    party_gold = Address(base + 0x1820, 0x09de).linear
     detached = {origin + offset for offset in (0x6383, 0x68a4, 0x6a12)}
     bottom = Address(base + 0x180a, 0xa0).linear
     record_end = bottom + 15 * 12
@@ -236,40 +228,12 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
     installed_callbacks = []
     callback_reads = []
     detached_hits = []
-    checkpoints = []
-    edges = Counter()
-    instruction_bytes = {}
-    keep_item, round_return = origin + 0xf421, origin + 0x10783
-    round_start, cast_dispatch, fireflash = origin + 0xd8c7, origin + 0xcaac, origin + 0xb42e
-    event_lookup = window + 0x12e2
-    milestones = {
-        "scroll": (keep_item, round_return), "fireflash": (cast_dispatch, fireflash, round_return), "gold": (),
-    }[route]
-    expected_edges = {}
-    if combat:
-        expected_edges.update({
-            (origin + 0xd5c4, origin + 0xd631): 1,
-            (origin + 0x721d, origin + 0x10424): 1,
-            (origin + 0x1046a, origin + 0x104b9): 1,
-        })
-    expected_edges.update({
-        "scroll": {(window + 0x1534, window + 0x156e): 1},
-        "fireflash": {(origin + 0xc3ea, origin + 0xc3ef): 1},
-        "gold": {(window + 0x1534, window + 0x15e7): 1},
-    }[route])
-    tile_dispatch = window + 0x05c1
-    flows = {source: "jump" for source, _ in expected_edges}
-    flows[tile_dispatch] = "jump"
-    if combat:
-        flows[origin + 0x721d] = "call"
-    magic_values = []
-    gold_visits = []
     entered = False
-    prior = None
+    route_entry = active_member["runtime_linear"] + entry_offset
 
     def code(cpu, address, size, _data):
-        nonlocal entered, prior
-        if address == window + 0x062d and dos.overlay_reads and dos.overlay_reads[-1][0] == dungeon["file_offset"]:
+        nonlocal entered
+        if address == route_entry and dos.overlay_reads and dos.overlay_reads[-1][0] == active_member["file_offset"]:
             entered = True
         if address == origin + 0x6028:  # The initializer just copied the five far pointers.
             offset, segment = unpack_from("<HH", cpu.mem_read(callbacks + 8, 4))
@@ -279,20 +243,7 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
         if address == origin + 0x1249b:
             fpu_dispatches[entered] += 1
         if entered:
-            if address in milestones:
-                checkpoints.append(address)
-            if casting and address in (round_start, cast_dispatch, round_return):
-                magic_values.append((address, unpack_from("<H", cpu.mem_read(magic, 2))[0]))
-            if route == "gold" and address == event_lookup:
-                es, bx, si = cpu.reg_read_batch((x86.UC_X86_REG_ES, x86.UC_X86_REG_BX, x86.UC_X86_REG_SI))
-                event_flag = cpu.mem_read(Address(es, (bx + si) & 0xffff).linear, 1)[0]
-                gold_visits.append((event_flag, unpack_from("<I", cpu.mem_read(party_gold, 4))[0]))
-            if prior is not None:
-                edges[prior, address] += 1
-                instruction_bytes[address] = cpu.mem_read(address, size).hex()
-            prior = address if address in flows else None
-            if prior is not None:
-                instruction_bytes[address] = cpu.mem_read(address, size).hex()
+            observe(cpu, address, size)
 
     def setup(cpu):
         ticks = 0
@@ -328,6 +279,83 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
             on_out=lambda _cpu, _port, _size, _value: None, _setup=setup, limit=15_000_000,
         )
     assert entered
+    assert installed_callbacks == [origin + 0x6a12]
+    assert not callback_reads and not detached_hits
+    assert fpu_dispatches[False] > 0 and fpu_dispatches[True] == 0
+    assert class_values == {False: {0, 1}, True: set()}
+
+
+class _EdgeTrace:
+    def __init__(self, flows):
+        self.flows = flows
+        self.edges = Counter()
+        self.instruction_bytes = {}
+        self.prior = None
+
+    def observe(self, cpu, address, size):
+        if self.prior is not None:
+            self.edges[self.prior, address] += 1
+            self.instruction_bytes[address] = cpu.mem_read(address, size).hex()
+        self.prior = address if address in self.flows else None
+        if self.prior is not None:
+            self.instruction_bytes[address] = cpu.mem_read(address, size).hex()
+
+
+@pytest.mark.parametrize(("route", "keys", "clock_dx"), [
+    pytest.param("scroll", _archives_keys(), 0x0120, id="scroll"),
+    pytest.param("fireflash", _fireflash_keys(), 0x0500, id="fireflash"),
+    pytest.param("gold", _gold_keys(), 0x0b00, id="gold"),
+])
+def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock_dx):
+    files, export, program, image = _load_game(tmp_path, capsys, "DNGS.DAT", "MONSTERS.CGA")
+    units = {unit["name"]: unit for unit in program["units"]}
+    base, origin = units["root"]["segment"], units["root"]["linear"]
+    dungeon = units["link_0004"]
+    window = dungeon["runtime_linear"]
+    long_member = units["link_0002"]
+    casting = route == "fireflash"
+    combat = route != "gold"
+    dos = _DosSession(files, keys, window, window + long_member["size"], clock_dx=clock_dx)
+    magic = Address(base + 0x1820, 0x0254).linear
+    party_gold = Address(base + 0x1820, 0x09de).linear
+    keep_item, round_return = origin + 0xf421, origin + 0x10783
+    round_start, cast_dispatch, fireflash = origin + 0xd8c7, origin + 0xcaac, origin + 0xb42e
+    event_lookup = window + 0x12e2
+    milestones = {
+        "scroll": (keep_item, round_return), "fireflash": (cast_dispatch, fireflash, round_return), "gold": (),
+    }[route]
+    expected_edges = {}
+    if combat:
+        expected_edges.update({
+            (origin + 0xd5c4, origin + 0xd631): 1,
+            (origin + 0x721d, origin + 0x10424): 1,
+            (origin + 0x1046a, origin + 0x104b9): 1,
+        })
+    expected_edges.update({
+        "scroll": {(window + 0x1534, window + 0x156e): 1},
+        "fireflash": {(origin + 0xc3ea, origin + 0xc3ef): 1},
+        "gold": {(window + 0x1534, window + 0x15e7): 1},
+    }[route])
+    tile_dispatch = window + 0x05c1
+    flows = {source: "jump" for source, _ in expected_edges}
+    flows[tile_dispatch] = "jump"
+    if combat:
+        flows[origin + 0x721d] = "call"
+    trace = _EdgeTrace(flows)
+    checkpoints, magic_values, gold_visits = [], [], []
+
+    def observe(cpu, address, size):
+        if address in milestones:
+            checkpoints.append(address)
+        if casting and address in (round_start, cast_dispatch, round_return):
+            magic_values.append((address, unpack_from("<H", cpu.mem_read(magic, 2))[0]))
+        if route == "gold" and address == event_lookup:
+            es, bx, si = cpu.reg_read_batch((x86.UC_X86_REG_ES, x86.UC_X86_REG_BX, x86.UC_X86_REG_SI))
+            event_flag = cpu.mem_read(Address(es, (bx + si) & 0xffff).linear, 1)[0]
+            gold_visits.append((event_flag, unpack_from("<I", cpu.mem_read(party_gold, 4))[0]))
+        trace.observe(cpu, address, size)
+
+    _play_game(image, program, dos, dungeon, 0x062d, observe)
     # Member 4 replaces the prefix of the most recent member 2 load, after member 3.
     archive_load = dos.overlay_reads.index((dungeon["file_offset"], window, dungeon["size"]))
     assert archive_load >= 2
@@ -342,10 +370,7 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
     if route == "gold":
         # The interpreter clears the event after the first award. Reentering finds the cleared byte.
         assert gold_visits == [(0x81, 0), (0xff, 256)]
-    assert installed_callbacks == [origin + 0x6a12]
-    assert not callback_reads and not detached_hits
-    assert fpu_dispatches[False] > 0 and fpu_dispatches[True] == 0
-    assert class_values == {False: {0, 1}, True: set()}
+    edges = trace.edges
     tile_targets = {target - window for source, target in edges if source == tile_dispatch}
     expected_tiles = {0x05c6, 0x05cd, 0x05d4, 0x05db, 0x05e2, 0x05e9, 0x05f0}
     if casting:
@@ -353,39 +378,139 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
     assert tile_targets == expected_tiles
     assert {edge: count for edge, count in edges.items() if edge[0] != tile_dispatch} == expected_edges
 
+    project = _check_trace(tmp_path, capsys, export, program, image, "archives", dungeon, trace)
+    if project is not None and combat:
+        assert main(["indirect", "--at", "root:721d", "--project", str(project), "--compact", "--json"]) == 0
+        menu, = json.loads(capsys.readouterr().out)["sites"]
+        assert menu["status"] == "resolved" and "root:10424" in menu["targets"]
+
+
+def test_phantasie_iii_wilderness_inn_trace(tmp_path, capsys):
+    files, export, program, image = _load_game(tmp_path, capsys)
+    units = {unit["name"]: unit for unit in program["units"]}
+    base, origin = units["root"]["segment"], units["root"]["linear"]
+    wilderness, town = units["link_0003"], units["link_0002"]
+    window = wilderness["runtime_linear"]
+    # Walk north to the Jolly Inn, accept the offer, dismiss the refusal, and return to town.
+    keys = [*_leave_pendragon_keys(), *(["up"] * 5), "y", "enter", *(["down"] * 5), "y"]
+    dos = _DosSession(files, keys, window, window + town["size"], clock_dx=0x0120)
+    travel = window + 0x02f3
+    encounter = window + 0x0239
+    enter_place = window + 0x01bc
+    inn_choice = window + 0x0869
+    price_check = window + 0x08e1
+    trace = _EdgeTrace({
+        travel: "call", encounter: "call", enter_place: "call", inn_choice: "jump", price_check: "jump",
+    })
+    far_data = Address(base + 0x1820, 0).linear
+    visits = []
+    outcomes = []
+
+    def observe(cpu, address, size):
+        trace.observe(cpu, address, size)
+        if address == enter_place:
+            x, y = unpack_from("<HH", cpu.mem_read(far_data + 0x4882, 4))
+            days_out, = unpack_from("<I", cpu.mem_read(far_data + 0x09e2, 4))
+            visits.append((x, y, days_out))
+        if address == window + 0x091d:
+            gold, = unpack_from("<I", cpu.mem_read(far_data + 0x09de, 4))
+            outdoors, = unpack_from("<H", cpu.mem_read(far_data + 0x487c, 2))
+            in_town, = unpack_from("<H", cpu.mem_read(far_data + 0xe596, 2))
+            outcomes.append((gold, outdoors, in_town))
+
+    _play_game(image, program, dos, wilderness, 0x0088, observe)
+    assert ("WORLD.DAT", 0, 0x0ea6) in dos.data_reads
+    assert dos.overlay_reads[-2][:2] == (town["file_offset"] + 0x4000, window + 0x4000)
+    assert dos.overlay_reads[-1][:2] == (wilderness["file_offset"], window)
+    assert visits == [(24, 32, 5), (24, 37, 10)]
+    assert outcomes == [(0, 1, 0), (0, 0, 1)]
+    assert trace.edges == {
+        (travel, origin + 0x14a9): 10,
+        (encounter, origin + 0xde54): 8,
+        (enter_place, window + 0x06c8): 2,
+        (inn_choice, window + 0x08cc): 1,
+        (price_check, window + 0x08fb): 1,
+    }
+    _check_trace(tmp_path, capsys, export, program, image, "wilderness", wilderness, trace)
+
+
+def test_phantasie_iii_wilderness_encounter_trace(tmp_path, capsys):
+    files, export, program, image = _load_game(tmp_path, capsys)
+    units = {unit["name"]: unit for unit in program["units"]}
+    base, origin = units["root"]["segment"], units["root"]["linear"]
+    wilderness, town = units["link_0003"], units["link_0002"]
+    window = wilderness["runtime_linear"]
+    # The first road step finds sleeping monsters. Decline the attack.
+    dos = _DosSession(files, [*_leave_pendragon_keys(), "up", "n"],
+                      window, window + town["size"], clock_dx=0x1700)
+    encounter = window + 0x0239
+    sleeping_prompt = origin + 0xdf35
+    decline = origin + 0xdf3f
+    skip_combat = origin + 0xe020
+    combat = origin + 0xe062
+    trace = _EdgeTrace({
+        encounter: "call", sleeping_prompt: "call", decline: "jump", skip_combat: "jump", combat: "call",
+    })
+    far_data = Address(base + 0x1820, 0).linear
+    positions = []
+    declined = []
+
+    def observe(cpu, address, size):
+        trace.observe(cpu, address, size)
+        if address == sleeping_prompt:
+            positions.append(unpack_from("<HH", cpu.mem_read(far_data + 0x4882, 4)))
+        if address == skip_combat:
+            declined.append(unpack_from("<H", cpu.mem_read(far_data + 0xb578, 2))[0])
+
+    _play_game(image, program, dos, wilderness, 0x0088, observe)
+    assert positions == [(24, 36)]
+    assert declined == [1]
+    assert trace.edges == {
+        (encounter, origin + 0xde54): 1,
+        (sleeping_prompt, origin + 0xe294): 1,
+        (decline, origin + 0xdff9): 1,
+        (skip_combat, origin + 0xe0a3): 1,
+    }
+    _check_trace(tmp_path, capsys, export, program, image, "wilderness", wilderness, trace)
+
+
+def _check_trace(tmp_path, capsys, export, program, image, state, active_member, trace):
+    window = active_member["runtime_linear"]
+    origin = program["units"][0]["linear"]
     loads = [{"unit": "root"}]
-    loads.extend({"unit": name, "linear": window, "replace": True} for name in ("link_0002", "link_0004"))
-    manifest = tmp_path / "archive-loads.json"
+    loads.extend({"unit": name, "linear": window, "replace": True}
+                 for name in ("link_0002", active_member["name"]))
+    manifest = tmp_path / "loads.json"
     manifest.write_text(json.dumps({
         "version": 1, "initial": "root",
-        "states": [{"name": "root", "loads": [{"unit": "root"}]}, {"name": "archives", "loads": loads}],
-        "transitions": [{"from": "root", "to": "archives", "kind": "overlay"}],
+        "states": [{"name": "root", "loads": [{"unit": "root"}]}, {"name": state, "loads": loads}],
+        "transitions": [{"from": "root", "to": state, "kind": "overlay"}],
     }), encoding="utf-8")
     apply_load_manifest(manifest, image, program)
-    map_path.write_text(json.dumps(program), encoding="utf-8")
+    (export / "map.json").write_text(json.dumps(program), encoding="utf-8")
 
-    events = [{"kind": "overlay", "state": "archives"}]
+    events = [{"kind": "overlay", "state": state}]
     events.extend({"kind": "instruction", "address": address, "bytes": data}
-                  for address, data in instruction_bytes.items())
-    events.extend({"kind": "edge", "from": source, "to": target, "count": count, "flow": flows[source]}
-                  for (source, target), count in edges.items())
-    trace = tmp_path / "archives.json"
-    trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
-    command = ["trace", str(trace), "--export", str(export), "--evidence", "--json"]
+                  for address, data in trace.instruction_bytes.items())
+    events.extend({"kind": "edge", "from": source, "to": target, "count": count, "flow": trace.flows[source]}
+                  for (source, target), count in trace.edges.items())
+    trace_path = tmp_path / "trace.json"
+    trace_path.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
+    command = ["trace", str(trace_path), "--export", str(export), "--evidence", "--json"]
     assert main(command) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)
     assert {(edge["from"]["runtime_linear"], edge["to"]["runtime_linear"]): edge["count"]
-            for edge in report["edges"]} == edges
+            for edge in report["edges"]} == trace.edges
     for edge in report["edges"]:
         for where in (edge["from"], edge["to"]):
             address = where["runtime_linear"]
-            if window <= address < window + dungeon["size"]:
+            if window <= address < window + active_member["size"]:
                 offset = address - window
-                assert where["location"]["unit_address"] == f"link_0004:{offset:04x}"
-                assert where["export_evidence"]["address"]["file"]["offset"] == dungeon["file_offset"] + offset
+                assert where["location"]["unit_address"] == f"{active_member['name']}:{offset:04x}"
+                assert where["export_evidence"]["address"]["file"]["offset"] == active_member["file_offset"] + offset
             else:
                 assert where["location"]["unit_address"] == f"root:{address - origin:04x}"
-        assert edge["flow"] == flows[edge["from"]["runtime_linear"]]
+        assert edge["flow"] == trace.flows[edge["from"]["runtime_linear"]]
 
     if os.environ.get("GHIDRA_HOME"):
         project = tmp_path / "ph3"
@@ -397,7 +522,5 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
         assert {row["event"] for row in analysis["edge_gaps"]} == {
             event for row in analysis["applied"] if row["kind"] == "flow" for event in row["events"]
         }
-        if combat:
-            assert main(["indirect", "--at", "root:721d", "--project", str(project), "--compact", "--json"]) == 0
-            menu, = json.loads(capsys.readouterr().out)["sites"]
-            assert menu["status"] == "resolved" and "root:10424" in menu["targets"]
+        return project
+    return None
