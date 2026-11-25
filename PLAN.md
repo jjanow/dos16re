@@ -75,9 +75,6 @@ and platform-wide feature parity are deferred.
 
 ## Last session
 
-2026-11-25. Completed DOS-1 through DOS-3. Ran both walkthroughs from fresh exports on the
-original DOS releases and confirmed their file offsets against the source media. The opt-in
-Pool of Radiance and Phantasie III checks passed with Ghidra 12.2, and the default suite passed
-522 tests. The three-run benchmark returned identical call evidence on both paths. The warm
-query took a median 0.058 s and 2,100 JSON bytes with zero Ghidra launches, versus 3.934 s and
-12,559 bytes with one launch. Worker startup took 3.905 s. Resume in maintenance.
+2026-11-25. Verified the maintenance baseline with the default suite (522 passed, 156 skipped)
+and confirmed that the installed deployment matched the tested commit. DOS-1 through DOS-3
+remain complete. Resume with the next reproducible blocker in a named reversing question.
