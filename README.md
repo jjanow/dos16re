@@ -214,7 +214,8 @@ retrore load COLLECTION.d88 --pc88 --member id:disk:2 --pc88-sector '0:0:1@c000'
 
 Catalogs cover DOS MZ overlays, D64, Apple DOS and RDOS, ATR boot sectors and Atari DOS, root
 FAT12 files, disks in D88/D77 and HDM containers, and Classic Macintosh HFS, Disk Copy 4.2, and
-resource fork wrappers. D88/D77 and HDM selection uses the native PC-88, PC-98, or X1 sector options.
+resource fork wrappers. D88/D77 and HDM disk selection uses the native PC-88, PC-98, or X1 sector
+options. Use `--format fat12` to list files on a PC-98 D88/D77 or HDM disk.
 Select `id:boot:1` to load the ATR boot payload explicitly. For a standalone Macintosh resource
 fork or wrapper, `id:application` loads the complete application and individual resources are
 listed for inspection. Repeat `--member` to order co-resident file loads on platforms that
@@ -657,6 +658,24 @@ track when needed. The hexadecimal segment places the span at `SEG:0000`. Explic
 replace the default IPL selection. The map records original disk offsets, with `file_spans` for
 multi-sector loads.
 
+For a PC-98 DOS floppy, list FAT12 files with `members --format fat12` and load them by catalog name
+or selector. The catalog reads short names in the root directory with CP932 encoding. D88/D77 FAT12
+volumes use a DOS BPB and uniform 512- or 1024-byte sectors. HDM uses 1024-byte sectors.
+[Microsoft FAT on-disk specification](https://www.pcjs.org/documents/papers/microsoft/MS_FAT_OVERVIEW_103-2000-12-06.pdf)
+
+```sh
+retrore members TOOLS.d88 --format fat12 --pc98-disk 2 --json
+retrore load TOOLS.d88 --pc98 --pc98-disk 2 --member 'id:file:1@1000' \
+  --member 'HELPER.BIN@3000' -o out/pc98-fat12 --json
+```
+
+Each member contributes its file bytes at the requested hexadecimal segment. Use `--base-segment`
+as the segment for the first member when its selector has no `@SEG`. The first member supplies
+the default entry, and you can add sector spans with `--pc98-sector`. The map keeps file-relative
+offsets and records original disk offsets in `container_spans`, including across fragmented clusters
+and D88 sector headers. Use `address-map --from file --offset-kind container --member id:file:1`
+to resolve an original disk offset.
+
 Use `--base-segment HEX` for a raw root file and repeat `--pc98-unit FILE@SEG` for additional raw
 loads. A layout represents one set of non-overlapping loads in conventional RAM. Export a separate
 layout when another stage or disk replaces those bytes. The first load is the root and its start is
@@ -670,7 +689,7 @@ such as `blue_vram:0012`. [MAME PC-9801 memory map](https://github.com/mamedev/m
 
 ## Sharp X1 loader
 
-Pass `--x1` to `info` or `load`. A `.d88` or `.d77` image defaults to the IPL boot entry. This is
+Pass `--x1` or `--x1turbo` to `info` or `load`. A `.d88` or `.d77` image defaults to the IPL boot entry. This is
 the 32-byte header in cylinder 0, head 0, sector ID 1, with attribute `01`, a 13-byte name,
 extension `Sys`, and the payload size, load address, and execution address at `+12`, `+14`, and
 `+16`. Its 16-bit starting logical sector is at `+1E`. The loader reads the payload from that sector,
@@ -706,12 +725,34 @@ code that uses them stops at a bad instruction. Phantasie I's analysis coverage 
 labels the cartridge ROM, FDC, palette, priority, PCG, CRTC, sub-CPU, PPI, PSG, IPL ROM switch,
 CTC, attribute VRAM, text VRAM, and graphics VRAM blocks. For example, the command
 `xrefs x1_crtc:0001 --project out/x1-project --json` lists writes to the CRTC data register.
-X1turbo bank memory and its additional devices aren't modeled yet.
 
 The Phantasie I Program Disk's IPL entry `PHANTASIE 1` loads 12 sectors from LSN `$370` (C27 H1 R1)
 at `$BF80` and runs `$C000`. The example `load` above adds the second stage. The routine at `$C3D8`
 reads `$70` sectors from LSN `$80` to `$0100`, and `$C465` jumps there.
 [MAME X1 memory and I/O maps](https://github.com/mamedev/mame/blob/master/src/mame/sharp/x1.cpp)
+
+### X1turbo memory banks and devices
+
+With `--x1turbo`, `--x1-bank HEX` takes the byte written to I/O port `$0B00`. Bit 4 clear maps the
+bank selected by bits 0–3 into `$0000–$7FFF` for reads and writes. Bit 4 set restores the low RAM
+or IPL ROM selected by `--x1-view`. `$8000–$FFFF` is shared main RAM. The default byte `$10` selects
+the normal memory view, which defaults to RAM. The JSON map records the latch input, selected bank,
+and IPL setting under `bank_control` and retains original disk offsets for loaded bytes.
+[X Millennium bank window](https://github.com/r-type/xmil-libretro/blob/master/io/memio.c#L8-L30)
+
+Export one visible memory state at a time. This example places a bank 3 routine at `$0100` and a
+switching routine in shared RAM at `$C000`. The I/O map labels the bank register, Z80 DMA and SIO,
+Kanji ROM and VRAM, display control, and option boards such as the FM and EMM interfaces. The
+export describes static addresses for analysis. The caller supplies the bank state and its bytes.
+[MAME X1turbo device map](https://github.com/mamedev/mame/blob/master/src/mame/sharp/x1.cpp#L1301-L1339)
+
+```sh
+.venv/bin/retrore load SWITCHER.BIN --x1turbo --x1-bank 23 --base-address c000 \
+  --x1-unit BANK3.BIN@0100 --entry c000 --entry 0100 -o out/x1-bank3 --json
+.venv/bin/retrore ghidra import out/x1-bank3 out/x1-bank3-project --json
+.venv/bin/retrore xrefs x1_bank_control:0000 --project out/x1-bank3-project --json
+.venv/bin/retrore bytes bank3:0000 --export out/x1-bank3 --size 1 --json
+```
 
 ## Sharp X68000 loader
 

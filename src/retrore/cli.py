@@ -44,7 +44,7 @@ from .pc88 import (
     BOOT_ADDRESS as PC88_BOOT_ADDRESS, DISK_SUFFIXES as PC88_DISK_SUFFIXES, HIGH_BANKS, LOW_BANKS,
     Pc88Error, boot_source, build_pc88_image, copy_source, disk_source,
 )
-from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Source, build_pc98_image
+from .pc98 import HDM_SUFFIX, IPL_SEGMENT, HdmDisk, Pc98Error, Pc98Fat12Disk, Pc98Source, build_pc98_image
 from .queries import QUERIES, option_names
 from .schema import DIALECT, query_schema
 from .layout import apply_layout, layout_lines
@@ -56,7 +56,7 @@ from .search import (
 from .signatures import PASCAL_DGROUP_FILE
 from .trace import TraceError, import_trace
 from .toolchain import ToolchainError, import_linker_map, import_signatures
-from .x1 import DISK_SUFFIXES as X1_DISK_SUFFIXES
+from .x1 import DEFAULT_TURBO_BANK, DISK_SUFFIXES as X1_DISK_SUFFIXES
 from .x1 import MEMORY_VIEWS as X1_VIEWS
 from .x1 import X1Error, build_x1_image
 from .x1 import boot_source as x1_boot_source
@@ -401,7 +401,7 @@ def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     if (args.c64_unit or args.c64_bank is not None or args.apple2_unit or args.apple2_lc is not None
             or args.apple2_disk_order or args.atari8_unit or args.atari8_portb is not None
             or args.msx2_unit or args.msx2_copy):
-        raise X1Error("other platform options cannot be used with --x1")
+        raise X1Error("other platform options cannot be used with --x1 or --x1turbo")
     filename = args.program.name
     disk = header = None
     entries = args.entry
@@ -438,7 +438,11 @@ def _x1_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         if address is None:
             raise X1Error(f"specify an X1 load address for {path.name!r} with @HEX")
         sources.append(Z80Source(path.stem, path.name, address, path.read_bytes()))
-    image, program = build_x1_image(sources, filename, entries, args.x1_view or "ram", disk, header)
+    bank_control = args.x1_bank
+    if args.x1turbo and bank_control is None:
+        bank_control = DEFAULT_TURBO_BANK
+    image, program = build_x1_image(sources, filename, entries, args.x1_view or "ram", disk, header,
+                                    bank_control=bank_control)
     if disk is not None:
         record_container(program, "d88", [disk.member], decisions={
             "selection": "explicit" if index is not None else "default", "boot": header is not None,
@@ -451,6 +455,28 @@ def _sector_decision(cylinder: int, head: int, record: int, count: int, linear: 
     return {"cylinder": cylinder, "head": head, "record": record, "count": count, "linear": linear}
 
 
+def _pc98_member_sources(args: argparse.Namespace, filesystem: Pc98Fat12Disk) -> list[Pc98Source]:
+    sources = []
+    for index, spec in enumerate(args.disk_file):
+        selector, at, suffix = spec.rpartition("@")
+        segment = args.base_segment if index == 0 else None
+        if at:
+            if segment is not None:
+                raise Pc98Error("specify the root member segment once with @SEG or --base-segment")
+            try:
+                segment = _hex_segment(suffix)
+            except argparse.ArgumentTypeError as error:
+                raise Pc98Error(f"invalid PC-98 member load segment in {spec!r}") from error
+        else:
+            selector = spec
+        if segment is None:
+            raise Pc98Error(f"specify a PC-98 load segment for {selector!r} with @SEG")
+        member, contents, spans = filesystem.extract_file(selector)
+        sources.append(Pc98Source("root" if index == 0 else f"member_{index + 1}", args.program.name, segment,
+                                  contents, member=member, container_spans=spans))
+    return sources
+
+
 def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     if (args.base_address is not None or args.overlay or args.entry
             or args.c64_unit or args.c64_bank is not None
@@ -459,7 +485,10 @@ def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         raise Pc98Error("use PC-98 load and entry options with --pc98")
     filename = args.program.name
     extension = args.program.suffix.lower()
-    index = disk_index(args.disk_file, args.pc98_disk, "--pc98-sector")
+    files = any(not selector.casefold().startswith("id:disk:") for selector in args.disk_file)
+    if files and any(selector.casefold().startswith("id:disk:") for selector in args.disk_file):
+        raise Pc98Error("select the D88/D77 disk for FAT12 file loads with --pc98-disk")
+    index = args.pc98_disk if files else disk_index(args.disk_file, args.pc98_disk, "--pc98-sector")
     disk = None
     if extension == HDM_SUFFIX:
         if args.pc98_disk is not None:
@@ -470,16 +499,23 @@ def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     elif extension in D88_SUFFIXES or args.pc98_sector or index is not None:
         disk = D88Disk(data, 1 if index is None else index)
 
+    filesystem = None
+    selections = args.pc98_sector
     if disk is not None:
-        if args.base_segment is not None:
+        if files:
+            filesystem = Pc98Fat12Disk(disk)
+            sources = _pc98_member_sources(args, filesystem)
+        elif args.base_segment is not None:
             raise Pc98Error("set PC-98 disk load segments with --pc98-sector C:H:R[+COUNT]@SEG")
-        selections = args.pc98_sector or [(0, 0, 1, 1, IPL_SEGMENT)]
-        sources = [
-            Pc98Source.from_disk(disk, "root" if index == 0 else f"sector_{c}_{h}_{r}_{seg:04x}",
-                                 filename, c, h, r, count, seg)
-            for index, (c, h, r, count, seg) in enumerate(selections)
-        ]
+        else:
+            sources = []
+            selections = selections or [(0, 0, 1, 1, IPL_SEGMENT)]
+        for c, h, r, count, segment in selections:
+            name = f"sector_{c}_{h}_{r}_{segment:04x}" if sources else "root"
+            sources.append(Pc98Source.from_disk(disk, name, filename, c, h, r, count, segment))
     else:
+        if files:
+            raise Pc98Error("PC-98 FAT12 files require a D88/D77 or HDM disk image")
         if args.base_segment is None:
             raise Pc98Error("--base-segment is required for raw PC-98 files")
         sources = [Pc98Source("root", filename, args.base_segment, data)]
@@ -489,10 +525,18 @@ def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
         sources.append(Pc98Source(path.stem, path.name, segment, path.read_bytes()))
     image, program = build_pc98_image(sources, filename, args.pc98_entry, disk)
     if disk is not None:
-        record_container(program, disk.metadata["format"].lower(), [disk.member], decisions={
-            "selection": "explicit" if index is not None else "default", "boot": not args.pc98_sector,
+        decisions = {
+            "selection": "explicit" if files or index is not None else "default",
+            "boot": not (files or args.pc98_sector),
             "sectors": [_sector_decision(c, h, r, count, seg * 16) for c, h, r, count, seg in selections],
-        })
+        }
+        if filesystem is not None:
+            program["disk"] = filesystem.metadata
+            selected = [source.member for source in sources if source.member is not None]
+            record_container(program, "fat12", selected,
+                             decisions={**decisions, "disk": disk.member.record(), "filesystem": "FAT12"})
+        else:
+            record_container(program, disk.metadata["format"].lower(), [disk.member], decisions=decisions)
     return image, program
 
 
@@ -1126,17 +1170,18 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str], byt
     human68k = data.startswith(X_MAGIC)
     m68k = hunk or human68k or data.startswith(PRG_MAGIC)
     extension = args.program.suffix.lower()
+    x1 = args.x1 or args.x1turbo
     if not args.dos_raw and (args.dos_offset is not None or args.dos_entry is not None):
         raise MZError("--dos-offset and --dos-entry require --dos-raw")
     genesis = args.genesis or (
         not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or args.atari8 or args.atari8_raw
-             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or args.x1 or args.nes or m68k
+             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or x1 or args.nes or m68k
              or data.startswith((b"MZ", NES_MAGIC)) or extension in DISK_SUFFIXES)
         and is_genesis(data)
     )
     nes = args.nes or (
         not (args.c64 or args.apple2 or args.apple2_raw or args.apple2_disk_order or args.atari8 or args.atari8_raw
-             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or args.x1 or genesis)
+             or args.macintosh or args.msx2 or args.pc88 or args.pc98 or x1 or genesis)
         and (data.startswith(NES_MAGIC) or extension == ".nes")
     )
     macintosh = args.macintosh or (
@@ -1152,7 +1197,7 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str], byt
     dos_com = args.dos_com or (
         extension == ".com" and not (
             args.dos_raw or m68k or data.startswith(b"MZ") or args.c64 or args.apple2 or args.apple2_raw
-            or args.apple2_disk_order or args.msx2 or args.pc88 or args.pc98 or args.x1
+            or args.apple2_disk_order or args.msx2 or args.pc88 or args.pc98 or x1
             or atari8 or nes or genesis or macintosh
         )
     )
@@ -1162,9 +1207,11 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str], byt
         raise Pc88Error("PC-88 options require --pc88")
     if not args.pc98 and (args.pc98_disk is not None or args.pc98_sector or args.pc98_unit or args.pc98_entry):
         raise Pc98Error("PC-98 options require --pc98")
-    if not args.x1 and (args.x1_disk is not None or args.x1_ipl or args.x1_sector or args.x1_copy
-                        or args.x1_unit or args.x1_view):
-        raise X1Error("X1 options require --x1")
+    if not x1 and (args.x1_disk is not None or args.x1_ipl or args.x1_sector or args.x1_copy
+                   or args.x1_unit or args.x1_view):
+        raise X1Error("X1 options require --x1 or --x1turbo")
+    if not args.x1turbo and args.x1_bank is not None:
+        raise X1Error("--x1-bank requires --x1turbo")
     if not nes and any(value is not None for value in (args.nes_prg_mode, args.nes_r6, args.nes_r7)):
         raise NesError("NES PRG options require an NES cartridge")
     if not genesis and args.genesis_sram is not None:
@@ -1181,7 +1228,7 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str], byt
         loaded = load_dos_flat(data, base_segment, com=dos_com, offset=args.dos_offset, entry=args.dos_entry)
         overlays = [Overlay(path.name, path.stem, path.read_bytes(), segment) for path, segment in args.overlay]
         image, program_map = build_image(loaded, args.program.name, overlays)
-    elif args.x1:
+    elif x1:
         image, program_map = _x1_image(args, data)
     elif args.pc98:
         image, program_map = _pc98_image(args, data)
@@ -1302,7 +1349,7 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str], byt
             platform = f"PC-88  {program_map['memory_view']}"
         elif program_map["format"] == X1_FORMAT:
             ipl = program_map.get("ipl")
-            platform = f"X1  {program_map['memory_view']}" + (f"  IPL {ipl['name']!r}" if ipl else "")
+            platform = f"{program_map['machine']}  {program_map['memory_view']}" + (f"  IPL {ipl['name']!r}" if ipl else "")
         else:
             platform = f"C64 PRG  bank {program_map['bank']}"
         lines.append(f"{platform}  {len(program_map['units'])} units  {len(entries)} entry points")
@@ -1374,6 +1421,7 @@ def program_options() -> argparse.ArgumentParser:
     platform.add_argument("--pc88", action="store_true", help="interpret the input as a PC-88 D88/D77 disk or raw file")
     platform.add_argument("--pc98", action="store_true", help="interpret the input as a PC-98 disk or raw file")
     platform.add_argument("--x1", action="store_true", help="interpret the input as a Sharp X1 D88 disk or raw file")
+    platform.add_argument("--x1turbo", action="store_true", help="select Sharp X1turbo memory and I/O")
     platform.add_argument(
         "--macintosh", action="store_true", help="interpret the input as a Classic Macintosh 68k application or HFS disk",
     )
@@ -1383,7 +1431,7 @@ def program_options() -> argparse.ArgumentParser:
     )
     command.add_argument(
         "--member", dest="disk_file", action="append", metavar="NAME|ID",
-        help="select a container member by name or catalog selector (repeatable for additional files, @HEX for MSX2)",
+        help="select a container member by name or catalog selector (repeatable, @HEX for MSX2, @SEG for PC-98 files)",
     )
     command.add_argument(
         "--c64-unit", type=_unit_path, action="append", default=[], metavar="FILE[@HEX]",
@@ -1476,6 +1524,8 @@ def program_options() -> argparse.ArgumentParser:
         help="load an additional raw X1 file at its runtime address",
     )
     command.add_argument("--x1-view", choices=X1_VIEWS, help="select RAM or the IPL ROM for reads below 8000")
+    command.add_argument("--x1-bank", type=_hex_address, metavar="HEX",
+                         help=f"X1turbo bank-control byte at port 0b00 (default {DEFAULT_TURBO_BANK:02x})")
     command.add_argument(
         "--entry", type=_hex_address, action="append", default=[], metavar="HEX",
         help="seed 8-bit or Genesis machine-code analysis at this address (repeatable)",
@@ -1491,6 +1541,8 @@ def member_options() -> argparse.ArgumentParser:
                         help="include an external Microsoft LINK overlay file")
     parser.add_argument("--apple2-disk-order", choices=("dos", "prodos", "physical"),
                         help="override Apple II sector ordering")
+    parser.add_argument("--pc98-disk", type=int, metavar="INDEX",
+                        help="select a 1-based D88/D77 disk for --format fat12")
     return parser
 
 
@@ -1745,7 +1797,8 @@ def main(argv: list[str] | None = None) -> int:
         return serve(use_worker=not args.no_worker)
     try:
         if args.command == "members":
-            report = inspect_members(args.program, args.format, args.apple2_disk_order, args.overlay)
+            report = inspect_members(args.program, args.format, args.apple2_disk_order, args.overlay,
+                                     pc98_disk=args.pc98_disk)
             if args.json:
                 print(json.dumps(report))
             else:

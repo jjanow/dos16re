@@ -40,6 +40,8 @@ def _ipl_entry(size, load, start, lsn, attribute=1, extension=b"Sys"):
 _BOOT = bytes.fromhex("01 00 18 3e 0d ed 79 01 00 1e ed 79 c3 00 01")
 # LD BC,0FFC / LD A,80 / OUT (C),A / LD BC,0000 / OUT (C),A / RET
 _STAGE2 = bytes.fromhex("01 fc 0f 3e 80 ed 79 01 00 00 ed 79 c9")
+# Select bank 3, write DMA and kanji VRAM, then call the banked routine at 0100.
+_TURBO_SWITCHER = bytes.fromhex("01 00 0b 3e 23 ed 79 01 80 1f ed 79 01 00 38 ed 79 cd 00 01 c9")
 
 
 def _boot_disk(entry=None):
@@ -150,6 +152,81 @@ def test_x1_disk_without_ipl_and_option_guards(tmp_path, capsys):
     with pytest.raises(SystemExit):
         main(["info", str(disk), "--x1", "--x1-lsn", "zz@100"])
     capsys.readouterr()
+
+
+def test_x1turbo_bank_window_preserves_disk_provenance(tmp_path, capsys):
+    disk = tmp_path / "stages.d88"
+    disk.write_bytes(_boot_disk())
+    switcher = tmp_path / "switcher.bin"
+    switcher.write_bytes(_TURBO_SWITCHER)
+    export = tmp_path / "bank3"
+    assert main(["load", str(disk), "--x1turbo", "--x1-bank", "23", "--x1-view", "ipl-rom",
+                 "--x1-lsn", "10@100", "--x1-unit", f"{switcher}@c000", "--entry", "100", "--entry", "c000",
+                 "-o", str(export), "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    assert (report["format"], report["machine"], report["memory_view"]) == ("X1", "X1turbo", "bank-3")
+    assert report["bank_control"] == {"port": 0x0B00, "value": 0x23, "bank": 3, "ipl_view": "ipl-rom"}
+    assert report["memory_map"] == [
+        {"name": "bank_ram_3", "linear": 0, "size": 0x8000, "read": "ram", "write": "ram"},
+        {"name": "high_ram", "linear": 0x8000, "size": 0x8000, "read": "ram", "write": "ram"},
+    ]
+    regions = report["io_map"]
+    assert all(first["port"] + first["size"] <= second["port"] for first, second in zip(regions, regions[1:]))
+    io = {region["name"]: region for region in regions}
+    assert [(io[name]["port"], io[name]["size"]) for name in ("dma", "sio", "text_vram", "kanji_vram")] == [
+        (0x1F80, 0x10), (0x1F90, 4), (0x3000, 0x800), (0x3800, 0x800),
+    ]
+    assert main(["bytes", "root:0005", "--size", "2", "--export", str(export), "--json"]) == 0
+    proof = json.loads(capsys.readouterr().out)
+    span, = proof["file_spans"]
+    offset = _HEADER_SIZE + 16 + 256 + 16 + 5
+    assert (span["file_offset"], span["size"]) == (offset, 2)
+    assert proof["loaded"] == proof["original"] == disk.read_bytes()[offset:offset + 2].hex() == "ed79"
+
+
+def test_x1turbo_bank_control_defaults_and_disabled_rom(tmp_path, capsys):
+    raw = tmp_path / "demo.com"
+    raw.write_bytes(b"\xc9")
+    assert main(["info", str(raw), "--x1turbo", "--base-address", "0100", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["memory_view"] == "ram"
+    assert report["bank_control"] == {"port": 0x0B00, "value": 0x10, "bank": None, "ipl_view": "ram"}
+
+    command = ["info", str(raw), "--x1turbo", "--x1-view", "ipl-rom", "--x1-bank", "10", "--json"]
+    assert main([*command, "--base-address", "c000"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["memory_view"] == "ipl-rom" and report["memory_map"][0]["read"] == "rom"
+    assert main([*command, "--base-address", "0100"]) == 1
+    assert "hidden by the IPL ROM" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+    assert main(["info", str(raw), "--x1", "--base-address", "0100", "--x1-bank", "0", "--json"]) == 1
+    assert "requires --x1turbo" in json.loads(capsys.readouterr().err)["error"]["message"]
+    assert main(["info", str(raw), "--x1turbo", "--base-address", "0100", "--x1-bank", "100", "--json"]) == 1
+    assert "must be a byte" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+
+def test_ghidra_x1turbo_devices_and_banked_call(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    switcher = tmp_path / "switcher.bin"
+    switcher.write_bytes(_TURBO_SWITCHER)
+    bank = tmp_path / "bank3.bin"
+    bank.write_bytes(b"\xc9")
+    export, project = tmp_path / "image", tmp_path / "x1turbo"
+    assert main(["load", str(switcher), "--x1turbo", "--x1-bank", "23", "--base-address", "c000",
+                 "--x1-unit", f"{bank}@100", "--entry", "c000", "-o", str(export)]) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["memory_view"] == "bank-3"
+    ports = ["x1_bank_control:0000", "x1_dma:0000", "x1_kanji_vram:0000"]
+    *references, transfer = query_batch(project, [
+        *[{"command": "xrefs", "address": port, "compact": True, "direction": "incoming"} for port in ports],
+        {"command": "xrefs", "address": "c011", "compact": True, "direction": "outgoing"},
+    ])["results"]
+    assert [[ref["from"] for ref in result["result"]["incoming"]] for result in references] == [
+        ["root:0005"], ["root:000a"], ["root:000f"],
+    ]
+    assert [ref["to"] for ref in transfer["result"]["outgoing"]] == ["bank3:0000"]
 
 
 def test_ghidra_x1_full_port_references(tmp_path, capsys):

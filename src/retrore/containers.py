@@ -11,7 +11,7 @@ from .errors import CONTRACT_VERSION
 from .macintosh import is_macintosh, list_macintosh_members
 from .members import MemberError
 from .msx2 import Msx2Error, MsxDosDisk
-from .pc98 import HDM_SUFFIX, HdmDisk
+from .pc98 import HDM_SUFFIX, HdmDisk, Pc98Fat12Disk
 
 CONTAINER_FORMATS = ("d64", "apple2", "atr", "fat12", "d88", "hdm", "macintosh", "mz")
 MACINTOSH_SUFFIXES = (".rsrc", ".dc42", ".macbin", ".as", ".ad")
@@ -38,7 +38,7 @@ def _dsk_format(data: bytes, order: str | None) -> str:
 
 
 def inspect_members(program: Path, format_name: str | None = None, order: str | None = None,
-                    overlay_paths: list[Path] | None = None) -> dict:
+                    overlay_paths: list[Path] | None = None, *, pc98_disk: int | None = None) -> dict:
     """Read catalog metadata without extracting or loading the selected program."""
     data = program.read_bytes()
     suffix = program.suffix.lower()
@@ -65,6 +65,8 @@ def inspect_members(program: Path, format_name: str | None = None, order: str | 
         raise MemberError("--apple2-disk-order requires an Apple II sector image")
     if overlay_paths and format_name != "mz":
         raise MemberError("--overlay requires a DOS MZ executable")
+    if pc98_disk is not None and (format_name != "fat12" or suffix not in D88_SUFFIXES):
+        raise MemberError("--pc98-disk requires a D88/D77 image and --format fat12")
 
     details = {}
     if format_name == "d64":
@@ -79,7 +81,13 @@ def inspect_members(program: Path, format_name: str | None = None, order: str | 
                    "directory": "Atari DOS 2.x" if disk.has_directory else None}
         rows = disk.list_members()
     elif format_name == "fat12":
-        rows = MsxDosDisk(data).list_members()
+        if suffix in D88_SUFFIXES or suffix == HDM_SUFFIX:
+            disk = HdmDisk(data) if suffix == HDM_SUFFIX else D88Disk(data, 1 if pc98_disk is None else pc98_disk)
+            filesystem = Pc98Fat12Disk(disk)
+            details = filesystem.metadata
+            rows = filesystem.list_members()
+        else:
+            rows = MsxDosDisk(data).list_members()
     elif format_name == "d88":
         rows = D88Disk.list_members(data)
     elif format_name == "hdm":

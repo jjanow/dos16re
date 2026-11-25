@@ -1,9 +1,10 @@
 """Reconstruct a selected NEC PC-98 real-mode memory layout."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from .d88 import D88Disk, D88Sector
-from .image import PC98_FORMAT, PC98_RAM_END
+from .fat12 import Fat12Bpb, Fat12Disk
+from .image import PC98_FORMAT, PC98_RAM_END, SourceSpan
 from .members import Member
 from .mz import Address
 from .overlays import address_record
@@ -58,6 +59,46 @@ class HdmDisk:
         return tuple(sectors)
 
 
+class Pc98Fat12Disk(Fat12Disk):
+    """Read a PC-98 FAT12 floppy and preserve its physical file offsets."""
+
+    error = Pc98Error
+    filename_encoding = "cp932"
+
+    def __init__(self, disk: HdmDisk | D88Disk):
+        boot, = disk.read_sectors(0, 0, 1)
+        bpb = Fat12Bpb.read(boot.data, self.error)
+        if bpb.sector_size != len(boot.data):
+            raise Pc98Error("FAT12 BPB sector size does not match the PC-98 disk")
+        if isinstance(disk, HdmDisk):
+            sectors = disk.read_sectors(0, 0, 1, bpb.total_sectors)
+            offsets = None
+        else:
+            sectors = self._d88_sectors(disk, bpb)
+            offsets = tuple(sector.file_offset for sector in sectors)
+        super().__init__(b"".join(sector.data for sector in sectors), sector_offsets=offsets)
+        self.disk = disk
+
+    @staticmethod
+    def _d88_sectors(disk: D88Disk, bpb: Fat12Bpb) -> list[D88Sector]:
+        if not 1 <= bpb.sectors_per_track <= 255 or not 1 <= bpb.heads <= 2:
+            raise Pc98Error("invalid FAT12 BPB track geometry")
+        sectors = []
+        for start in range(0, bpb.total_sectors, bpb.sectors_per_track):
+            cylinder, head = divmod(start // bpb.sectors_per_track, bpb.heads)
+            count = min(bpb.sectors_per_track, bpb.total_sectors - start)
+            track = [sector for sector in disk.read_track(cylinder, head) if 1 <= sector.record <= count]
+            if ([sector.record for sector in track] != list(range(1, count + 1))
+                    or any(len(sector.data) != bpb.sector_size for sector in track)):
+                raise Pc98Error(f"FAT12 BPB geometry does not match D88 track {cylinder}:{head}")
+            sectors.extend(track)
+        return sectors
+
+    @property
+    def metadata(self) -> dict:
+        return {**self.disk.metadata, "filesystem": "FAT12", "sector_size": self.bpb.sector_size}
+
+
 @dataclass(frozen=True)
 class Pc98Source:
     name: str
@@ -66,6 +107,8 @@ class Pc98Source:
     data: bytes
     sectors: tuple[D88Sector, ...] = ()
     chs: tuple[int, int, int] | None = None
+    member: Member | None = None
+    container_spans: tuple[SourceSpan, ...] = ()
 
     @classmethod
     def from_disk(
@@ -110,6 +153,9 @@ def build_pc98_image(
                     spans.append({"offset": offset, "file_offset": sector.file_offset, "size": len(sector.data)})
                     offset += len(sector.data)
                 unit["file_spans"] = spans
+        if source.member is not None:
+            unit.update(disk_file=source.member.name, member_id=source.member.id,
+                        container_spans=[asdict(span) for span in source.container_spans])
         units.append(unit)
 
     ordered = sorted(units, key=lambda unit: unit["linear"])

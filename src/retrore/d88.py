@@ -106,6 +106,13 @@ class D88Disk:
             offset += size
         return sectors
 
+    def read_track(self, cylinder: int, head: int) -> tuple[D88Sector, ...]:
+        """Read the recorded sectors on one track in sector ID order."""
+        index = cylinder * self._heads + head
+        if not 0 <= head < self._heads or not 0 <= index < len(self._tracks):
+            raise D88Error("invalid D88 cylinder or head")
+        return tuple(sorted(self._track(index), key=lambda sector: sector.record))
+
     def read_sectors(self, cylinder: int, head: int, record: int, count: int = 1) -> tuple[D88Sector, ...]:
         """Read recorded IDs in ascending order, continuing onto the next track."""
         if not (0 <= head < self._heads and 0 <= cylinder * self._heads + head < len(self._tracks)

@@ -21,6 +21,134 @@ def _sample_disk():
     return bytes(disk)
 
 
+def _fat12_raw(sector_size=1024, total_sectors=1232):
+    disk = bytearray(sector_size * total_sectors)
+    pack_into("<HBHBHHBHHH", disk, 11, sector_size, 2, 1, 2, sector_size // 32, total_sectors, 0xFE, 1, 8, 2)
+    for copy in (1, 2):
+        start = copy * sector_size
+        disk[start:start + 9] = bytes.fromhex("fe ff ff 05 f0 ff 00 f0 ff")  # 2 -> 5, 3 and 5 end
+    for index, (name, cluster, size) in enumerate((
+        (b"DEMO    COM", 2, 2 * sector_size + 11),
+        ("補助".encode("cp932").ljust(8, b" ") + b"BIN", 3, 1),
+    )):
+        offset = 3 * sector_size + 32 * index
+        disk[offset:offset + 11] = name
+        pack_into("<HI", disk, offset + 26, cluster, size)
+    disk[4 * sector_size:4 * sector_size + 4] = bytes.fromhex("b8 01 00 c3")
+    disk[6 * sector_size] = 0xCB
+    disk[10 * sector_size:10 * sector_size + 11] = b"lastcluster"
+    return bytes(disk)
+
+
+def _fat12_d88(data, sector_size):
+    disk = bytearray(0x2B0)
+    disk[0x1B] = 0x20
+    sector_count = len(data) // sector_size
+    offsets = {}
+    for track, start in enumerate(range(0, sector_count, 8)):
+        pack_into("<I", disk, 0x20 + 4 * track, len(disk))
+        cylinder, head = divmod(track, 2)
+        count = min(8, sector_count - start)
+        for record in reversed(range(1, count + 1)):
+            logical = start + record - 1
+            disk += pack("<BBBBH8xH", cylinder, head, record, {512: 2, 1024: 3}[sector_size], count, sector_size)
+            offsets[logical] = len(disk)
+            offset = logical * sector_size
+            disk += data[offset:offset + sector_size]
+    pack_into("<I", disk, 0x1C, len(disk))
+    return bytes(disk), offsets
+
+
+@pytest.mark.parametrize("sector_size", [512, 1024])
+def test_pc98_d88_fat12_members_use_original_sector_offsets(tmp_path, capsys, sector_size):
+    disk = tmp_path / "sample.d77"
+    prefix = _sample_disk()
+    physical, offsets = _fat12_d88(_fat12_raw(sector_size, total_sectors=32), sector_size)
+    disk.write_bytes(prefix + physical)
+    assert main(["members", str(disk), "--json"]) == 0
+    assert [row["id"] for row in json.loads(capsys.readouterr().out)["members"]] == ["disk:1", "disk:2"]
+    assert main(["members", str(disk), "--format", "fat12", "--pc98-disk", "2", "--json"]) == 0
+    catalog = json.loads(capsys.readouterr().out)
+    assert catalog["details"]["index"] == 2
+    assert [(row["selector"], row["name"], row["container_offset"]) for row in catalog["members"]] == [
+        ("id:file:1", "DEMO.COM", len(prefix) + offsets[3]),
+        ("id:file:2", "補助.BIN", len(prefix) + offsets[3] + 32),
+    ]
+
+    export = tmp_path / "export"
+    assert main(["load", str(disk), "--pc98", "--pc98-disk", "2", "--member", "id:file:1@1000",
+                 "--member", "補助.bin@2000", "--pc98-sector", "0:0:1@1fc0", "-o", str(export), "--json"]) == 0
+    layout = json.loads(capsys.readouterr().out)
+    assert layout["container_layout"]["members"] == catalog["members"]
+    assert layout["disk"]["filesystem"] == "FAT12"
+    root, helper, boot = layout["units"]
+    assert root["size"] == 2 * sector_size + 11
+    assert root["container_spans"] == [
+        {"offset": 0, "file_offset": len(prefix) + offsets[4], "size": sector_size},
+        {"offset": sector_size, "file_offset": len(prefix) + offsets[5], "size": sector_size},
+        {"offset": 2 * sector_size, "file_offset": len(prefix) + offsets[10], "size": 11},
+    ]
+    assert (root["member_id"], helper["member_id"], boot["member_id"]) == ("file:1", "file:2", "disk:2")
+    assert (export / "image.bin").read_bytes()[2 * sector_size:2 * sector_size + 11] == b"lastcluster"
+    source_offset = len(prefix) + offsets[10] + 4
+    assert main(["address-map", f"{source_offset:x}", "--from", "file", "--offset-kind", "container",
+                 "--member", "id:file:1", "--export", str(export), "--json"]) == 0
+    match, = json.loads(capsys.readouterr().out)["matches"]
+    assert match["linear"] == 0x10000 + 2 * sector_size + 4
+    assert match["file"]["offset"] == 2 * sector_size + 4
+    assert match["container"]["offset"] == source_offset
+    assert disk.read_bytes()[source_offset:source_offset + 1] == b"c"
+
+    broken = bytearray(physical)
+    broken[offsets[4] - 16 + 2] = 6  # Duplicate a record ID on the first track.
+    disk.write_bytes(prefix + broken)
+    assert main(["members", str(disk), "--format", "fat12", "--pc98-disk", "2", "--json"]) == 1
+    assert "geometry does not match D88 track 0:0" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+
+def test_pc98_hdm_fat12_members_and_load_errors(tmp_path, capsys):
+    disk = tmp_path / "sample.hdm"
+    disk.write_bytes(_fat12_raw())
+    assert main(["members", str(disk), "--format", "fat12", "--json"]) == 0
+    catalog = json.loads(capsys.readouterr().out)
+    assert catalog["details"]["sector_size"] == 1024
+    assert [row["container_offset"] for row in catalog["members"]] == [3072, 3104]
+    options = ["info", str(disk), "--pc98", "--json"]
+    assert main([*options, "--member", "demo.com", "--base-segment", "3000"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["entry"]["linear"] == 0x30000
+    assert report["units"][0]["container_spans"] == [
+        {"offset": 0, "file_offset": 4096, "size": 2048},
+        {"offset": 2048, "file_offset": 10240, "size": 11},
+    ]
+    for flags, message in (
+        (["--member", "demo.com"], "with @SEG"),
+        (["--member", "demo.com@zz"], "invalid PC-98 member load segment"),
+        (["--member", "demo.com@1000", "--base-segment", "3000"], "specify the root member segment once"),
+        (["--member", "unknown.com@1000"], "not found"),
+    ):
+        assert main([*options, *flags]) == 1
+        assert message in json.loads(capsys.readouterr().err)["error"]["message"]
+    broken = bytearray(disk.read_bytes())
+    broken[1027] = 2  # First cluster links to itself.
+    disk.write_bytes(broken)
+    assert main([*options, "--member", "demo.com@1000"]) == 1
+    assert "invalid FAT12 cluster chain" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+
+def test_ghidra_pc98_fat12_program(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    disk = tmp_path / "sample.hdm"
+    disk.write_bytes(_fat12_raw())
+    export, project = tmp_path / "export", tmp_path / "pc98fat12"
+    assert main(["load", str(disk), "--pc98", "--member", "DEMO.COM@1000", "-o", str(export)]) == 0
+    assert main(["ghidra", "import", str(export), str(project)]) == 0, capsys.readouterr().err
+    function, = query_batch(project, [{"command": "decomp", "address": "1000:0000"}])["results"]
+    assert function["result"]["unit_address"] == "root:0000"
+    assert function["result"]["decompilation"]
+
+
 def test_pc98_d88_preserves_root_and_sector_origins(tmp_path, capsys):
     disk = tmp_path / "sample.d88"
     media = _sample_disk()

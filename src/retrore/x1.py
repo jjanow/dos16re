@@ -1,4 +1,4 @@
-"""Build a static Sharp X1 main-CPU view from D88 disk sectors or raw loads."""
+"""Build static Sharp X1 and X1turbo CPU views from disk sectors or raw loads."""
 
 from dataclasses import dataclass
 from struct import unpack_from
@@ -12,6 +12,8 @@ SECTOR_SIZE = 256
 SECTORS_PER_TRACK = 16
 IPL_ROM_END = 0x8000
 MEMORY_VIEWS = ("ram", "ipl-rom")
+TURBO_BANK_PORT = 0x0B00
+DEFAULT_TURBO_BANK = 0x10  # Expansion RAM deselected.
 
 # Main-CPU I/O devices decoded from the full 16-bit BC port address (MAME x1_io_banks).
 IO_MAP = (
@@ -37,6 +39,35 @@ IO_MAP = (
     ("gram_red", 0x8000, 0x4000, (("GRAM_RED", 0x8000),)),
     ("gram_green", 0xC000, 0x4000, (("GRAM_GREEN", 0xC000),)),
 )
+
+# X1turbo and its option boards (MAME x1turbo_io_banks). The kanji attribute
+# plane replaces the base X1's text VRAM mirror at 3800–3FFF.
+TURBO_IO_MAP = tuple(sorted((
+    *(region for region in IO_MAP if region[0] != "text_vram"),
+    ("fm", 0x0700, 0x02, (("FM_REGISTER_SELECT", 0x0700), ("FM_DATA_STATUS", 0x0701))),
+    ("fm_ctc", 0x0704, 0x04, (("FM_CTC_0", 0x0704), ("FM_CTC_1", 0x0705),
+                             ("FM_CTC_2", 0x0706), ("FM_CTC_3", 0x0707))),
+    ("color_image", 0x0800, 0x04, (("COLOR_IMAGE_CONTROL", 0x0800), ("COLOR_IMAGE_STATUS", 0x0801),
+                                  ("COLOR_IMAGE_CONTROL_2", 0x0802), ("COLOR_IMAGE_STATUS_2", 0x0803))),
+    ("stereo", 0x0A00, 0x08, (("STEREO_BOARD", 0x0A00),)),
+    ("bank_control", TURBO_BANK_PORT, 0x01, (("BANK_CONTROL", TURBO_BANK_PORT),)),
+    ("rs232", 0x0C00, 0x100, (("RS232_EXPANSION", 0x0C00),)),
+    ("emm", 0x0D00, 0x04, (("EMM_ADDRESS_LOW", 0x0D00), ("EMM_ADDRESS_MID", 0x0D01),
+                           ("EMM_ADDRESS_HIGH", 0x0D02), ("EMM_DATA", 0x0D03))),
+    ("kanji_rom", 0x0E80, 0x04, (("KANJI_ROM_LOW", 0x0E80), ("KANJI_ROM_HIGH", 0x0E81),
+                                 ("KANJI_ROM_SELECT", 0x0E82))),
+    ("sasi", 0x0FD0, 0x04, (("SASI_INTERFACE", 0x0FD0),)),
+    ("fdc_8inch", 0x0FE8, 0x08, (("FDC_8INCH", 0x0FE8),)),
+    ("dma", 0x1F80, 0x10, (("DMA_CONTROL", 0x1F80),)),
+    ("sio", 0x1F90, 0x04, (("SIO_A_DATA", 0x1F90), ("SIO_A_CONTROL", 0x1F91),
+                           ("SIO_B_DATA", 0x1F92), ("SIO_B_CONTROL", 0x1F93))),
+    ("extended_sio_ctc", 0x1F98, 0x08, (("EXTENDED_SIO_CTC", 0x1F98),)),
+    ("display_control", 0x1FD0, 0x10, (("DISPLAY_CONTROL", 0x1FD0),)),
+    ("black_clip", 0x1FE0, 0x01, (("BLACK_CLIP", 0x1FE0),)),
+    ("dip_switches", 0x1FF0, 0x01, (("DIP_SWITCHES", 0x1FF0),)),
+    ("text_vram", 0x3000, 0x0800, (("TEXT_VRAM", 0x3000),)),
+    ("kanji_vram", 0x3800, 0x0800, (("KANJI_VRAM", 0x3800),)),
+), key=lambda region: region[1]))
 
 
 class X1Error(ValueError):
@@ -126,26 +157,39 @@ def copy_source(sources: list[Z80Source], address: int, size: int, destination: 
 
 def build_x1_image(
     sources: list[Z80Source], program: str, entries: list[int], view: str, disk: D88Disk | None,
-    header: IplHeader | None = None,
+    header: IplHeader | None = None, *, bank_control: int | None = None,
 ) -> tuple[bytes, dict]:
+    turbo = bank_control is not None
+    if turbo and not 0 <= bank_control <= 0xFF:
+        raise X1Error("X1turbo bank control must be a byte (00–ff)")
+    # X Millennium's bank window covers only 0000–7FFF. Bit 4 enables
+    # expansion RAM when clear and bits 0–3 choose its page.
+    bank = bank_control & 0x0F if turbo and not bank_control & 0x10 else None
+    ipl_visible = bank is None and view == "ipl-rom"
+    low_kind = "rom" if ipl_visible else "ram"
+    low_name = "ipl_rom" if ipl_visible else "low_ram"
+    if bank is not None:
+        low_name = f"bank_ram_{bank:x}"
     image, layout = place_z80_sources(sources, entries, X1_FORMAT, X1Error)
-    if view == "ipl-rom" and any(unit["linear"] < IPL_ROM_END for unit in layout["units"]):
+    if ipl_visible and any(unit["linear"] < IPL_ROM_END for unit in layout["units"]):
         raise X1Error("loaded bytes are hidden by the IPL ROM below 8000 for reads; select --x1-view ram")
     program_map = {
-        "version": 1, "format": X1_FORMAT, "program": program, "machine": "X1",
-        "memory_view": view,
+        "version": 1, "format": X1_FORMAT, "program": program, "machine": "X1turbo" if turbo else "X1",
+        "memory_view": view if bank is None else f"bank-{bank:x}",
         "memory_map": [
-            {"name": "ipl_rom" if view == "ipl-rom" else "low_ram", "linear": 0, "size": IPL_ROM_END,
-             "read": "rom" if view == "ipl-rom" else "ram", "write": "ram"},
+            {"name": low_name, "linear": 0, "size": IPL_ROM_END, "read": low_kind,
+             "write": "ram"},
             {"name": "high_ram", "linear": IPL_ROM_END, "size": 0x10000 - IPL_ROM_END, "read": "ram", "write": "ram"},
         ],
         "io_map": [
             {"name": name, "port": port, "size": size,
              "labels": [{"name": label, "port": address} for label, address in labels]}
-            for name, port, size, labels in IO_MAP
+            for name, port, size, labels in (TURBO_IO_MAP if turbo else IO_MAP)
         ],
         **layout,
     }
+    if turbo:
+        program_map["bank_control"] = {"port": TURBO_BANK_PORT, "value": bank_control, "bank": bank, "ipl_view": view}
     if disk is not None:
         program_map["disk"] = disk.metadata
     if header is not None:

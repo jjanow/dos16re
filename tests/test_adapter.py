@@ -19,6 +19,7 @@ from retrore.queries import QUERIES, QueryError, validate_query
 from retrore.schema import DIALECT, query_schema
 from test_c64 import _disk, _prg
 from test_errors import _FAKE, _wait_dead
+from test_pc98 import _fat12_d88, _fat12_raw, _sample_disk
 
 ROOT = Path(__file__).resolve().parents[1]
 # The server subprocess imports the same retrore as the tests: the checkout's src or an installed wheel.
@@ -550,6 +551,50 @@ def test_mcp_members_and_selection_match_cli(tmp_path, capsys):
     ])
     assert responses[1]["result"]["structuredContent"] == catalog
     assert responses[2]["result"]["structuredContent"]["container_layout"]["members"] == [member]
+
+
+def test_mcp_x1turbo_load_matches_cli(tmp_path, capsys):
+    program = tmp_path / "boot.bin"
+    payload = bytes.fromhex("01000bed79c9")
+    program.write_bytes(payload)
+    assert main(["info", str(program), "--x1turbo", "--x1-bank", "22", "--base-address", "200", "--json"]) == 0
+    cli = json.loads(capsys.readouterr().out)
+    output = tmp_path / "turbo"
+    responses = _session([
+        *_initialize(),
+        _call(1, "load", {"program": str(program), "output": str(output), "x1turbo": True,
+                          "x1_bank": "22", "base_address": "200"}),
+    ])
+    result = responses[1]["result"]
+    assert result["isError"] is False and result["structuredContent"] == cli
+    assert (output / "image.bin").read_bytes() == payload
+
+
+def test_mcp_pc98_fat12_catalog_and_load(tmp_path, capsys):
+    program = tmp_path / "collection.d88"
+    disk, offsets = _fat12_d88(_fat12_raw(1024, 32), 1024)
+    first_disk = _sample_disk()
+    program.write_bytes(first_disk + disk)
+    assert main(["members", str(program), "--format", "fat12", "--pc98-disk", "2", "--json"]) == 0
+    catalog = json.loads(capsys.readouterr().out)
+    member = catalog["members"][0]
+    output = tmp_path / "pc98"
+    responses = _session([
+        *_initialize(),
+        _call(1, "members", {"program": str(program), "format": "fat12", "pc98_disk": 2}),
+        _call(2, "load", {"program": str(program), "output": str(output), "pc98": True,
+                          "pc98_disk": 2, "member": [f"{member['selector']}@1000"]}),
+    ])
+    catalog_result, load_result = (responses[i]["result"] for i in (1, 2))
+    assert catalog_result["isError"] is False and catalog_result["structuredContent"] == catalog
+    assert load_result["isError"] is False
+    report = load_result["structuredContent"]
+    assert report["container_layout"]["members"] == [member]
+    unit, = report["units"]
+    assert unit["linear"] == 0x10000 and unit["member_id"] == member["id"]
+    first_span = unit["container_spans"][0]
+    assert first_span["file_offset"] == len(first_disk) + offsets[4]
+    assert (output / "image.bin").read_bytes()[:4] == bytes.fromhex("b80100c3")
 
 
 def _read_response(process: subprocess.Popen, seconds: float = 30) -> dict:

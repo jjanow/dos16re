@@ -10,7 +10,7 @@ through the existing JSON CLI and MCP tools.
 
 A shell-capable agent can reproduce the two DOS answers below from a fresh export. Both answers
 carry enough evidence for a reviewer to check them against the input. A single benchmark measures
-the cost of answering the static question. All three deliverables met their acceptance checks
+the cost of answering the static question. The three DOS deliverables met their acceptance checks
 on 2026-11-25, and the project moved to maintenance.
 
 The loader, Ghidra import, structured traces, evidence queries, and persistent worker already
@@ -25,6 +25,8 @@ The [README](README.md) documents current capabilities, and the
 | DOS-1 | [Reproduce one static cross-overlay call](docs/dos-overlay-call.md) | Complete | None |
 | DOS-2 | [Reproduce one observed call from a reused overlay window](docs/dos-overlay-trace.md) | Complete | None |
 | DOS-3 | [Measure the cost of the DOS-1 answer](docs/benchmarks.md#static-overlay-call-dos-3) | Complete | DOS-1 |
+| X1-1 | [Export X1turbo banked memory and device ports](README.md#x1turbo-memory-banks-and-devices) | Complete | None |
+| PC98-1 | [Catalog and load PC-98 FAT12 members with byte provenance](README.md#nec-pc-98-loader) | Complete | None |
 
 ### DOS-1 · Static cross-overlay call
 
@@ -65,16 +67,27 @@ total JSON bytes read by the agent. Record worker startup separately. With the w
 focused path has lower median query time, fewer JSON bytes, and zero Ghidra launches.
 Use JSON bytes as a proxy for context size and report them as bytes.
 
+### X1-1 · Banked memory and device ports
+
+Export the X1turbo CPU view for a caller-supplied bank control value and resolve device references
+in Ghidra. A synthetic export checks which RAM is visible and maps a device write back to its
+instruction bytes.
+
+### PC98-1 · FAT12 members
+
+Catalog and load PC-98 FAT12 members at supplied segments. A synthetic export checks that a byte
+in a fragmented member maps to its precise offset in the original floppy image.
+
 ## Maintenance and new work
 
 Maintain documented behavior and shared JSON contracts for supported platforms. Keep the default
 suite self-contained and keep original media and anything extracted from it out of the repository.
 Add a new deliverable only when a named reversing question has a reproducible blocker and one
-check can show that it is resolved. X1turbo bank and device support, PC-98 FAT12 member loading,
-and platform-wide feature parity are deferred.
+check can show that it is resolved. Platform-wide feature parity is deferred.
 
 ## Last session
 
-2026-11-25. Verified the maintenance baseline with the default suite (522 passed, 156 skipped)
-and confirmed that the installed deployment matched the tested commit. DOS-1 through DOS-3
-remain complete. Resume with the next reproducible blocker in a named reversing question.
+2026-11-25. Completed X1turbo bank views and device labels, and PC-98 FAT12 cataloging and member
+loading with original disk offsets. Verified the CLI and MCP paths, the default suite (529 passed,
+158 skipped), and five headless Ghidra checks for X1, PC-98, and MSX2. Resume with the next
+reproducible blocker in a named reversing question.
