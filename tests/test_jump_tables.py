@@ -848,20 +848,44 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
     bottom, empty_stack, last_record = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
     records = Address(data_segment, bottom)
     runtime_segment = runtime_address(0x126cf).segment
+    code_base = 0x126cf - runtime_address(0x126cf).offset
     fields = set(range(records.linear + 11, Address(data_segment, last_record + 12).linear, 12))
     written_classes = set()
+    template_copies = {0x12726, 0x1376b}
+    copied_classes = {site: set() for site in (*template_copies, 0x1273c, 0x137ac, 0x137ad)}
     arithmetic_pairs = set()
     arithmetic_tables = dict.fromkeys((0xc1, 0xe1, 0xe9), 0x816) | {0xc9: 0x836, 0xf1: 0x856, 0xf9: 0x856}
     scratch = Address(0x7000, 0)
 
     def audit_classes(cpu):
-        def record_write(_cpu, _access, address, size, value, _data):
+        def record_write(cpu, _access, address, size, value, _data):
+            nonlocal exchanged_class
             for byte in range(address, address + size):
                 if byte in fields:
                     field = (value >> (8 * (byte - address))) & 0xff
                     assert 0 <= field <= 3
                     written_classes.add(field)
+                    cs, ip = cpu.reg_read_batch((x86.UC_X86_REG_CS, x86.UC_X86_REG_IP))
+                    assert cs == runtime_segment
+                    site = code_base + ip
+                    if site not in copied_classes:
+                        continue
+                    ds, si = cpu.reg_read_batch((x86.UC_X86_REG_DS, x86.UC_X86_REG_SI))
+                    assert ds == data_segment and size == 2 and byte == address + 1
+                    if site == 0x137ad:
+                        # FXCH saved the old destination in BX before the preceding STOSW.
+                        assert exchanged_class == field
+                        exchanged_class = None
+                    else:
+                        source = Address(cs if site in template_copies else ds, si + 1).linear
+                        if site not in template_copies:
+                            assert source in fields
+                        assert cpu.mem_read(source, 1)[0] == field
+                        if site == 0x137ac:
+                            exchanged_class = cpu.mem_read(byte, 1)[0]
+                    copied_classes[site].add(field)
 
+        exchanged_class = None
         hook = cpu.hook_add(UC_HOOK_MEM_WRITE, record_write, begin=records.linear, end=max(fields))
         return lambda: cpu.hook_del(hook)
 
@@ -937,7 +961,22 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
         significand = 0x8000000000000000 if exponent else 0
         operands = pack("<QHQH", significand, exponent, significand, exponent)
         assert probe("cd372e0002 cd372e0a02", operands, operation) == expected
+
+    # FLD1, FLDL2T, FLDL2E, FLDPI, FLDLG2, FLDLN2, and FLDZ copy constant records.
+    for opcode in range(0xe8, 0xef):
+        emulator.call(
+            scratch, regs={"ss": scratch.segment, "sp": 0xff00},
+            writes=[*setup, (scratch, bytes((0xcd, 0x35, opcode, 0xc3)))],
+            ivt_interrupts=vectors, _setup=audit_classes,
+        )
     assert written_classes == {0, 1, 2, 3}
+    assert copied_classes == {
+        0x12726: {1, 2, 3},
+        0x1273c: {0, 1, 2, 3},
+        0x1376b: {0, 1},
+        0x137ac: {0, 1, 2, 3},
+        0x137ad: {0, 1, 2, 3},
+    }
 
 
 def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phantasie_iii_float_runtime):
@@ -1170,6 +1209,99 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
         assert {(row["from"]["unit_address"], row["to"]["unit_address"]) for row in applied if row["kind"] == "flow"} == {
             ("root:6a5b", "root:123db"), ("root:6a5f", "root:123be"),
         }
+
+
+def test_phantasie_iii_float_output_store_families(phantasie_iii_float_runtime):
+    emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
+    bottom, _, last = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
+    records = Address(data_segment, bottom)
+    record_size = last - bottom + 12
+    scratch = Address(0x7000, 0)
+    output = Address(0x7100, 0x300)
+    control = Address(output.segment, 0x218)
+    runtime_segment = runtime_address(0x1241c).segment
+    code_base = 0x1241c - runtime_address(0x1241c).offset
+
+    def check(load, operand, store, expected, sites, *, control_word=0x037f):
+        # Load the operand first so the output trace can check the entire allocation.
+        registers = {"ds": output.segment, "ss": scratch.segment, "sp": 0xff00}
+        stack_top = Address(data_segment, 0x10)
+        loaded = emulator.call(
+            scratch, regs=registers, ivt_interrupts=vectors,
+            writes=[*setup, (scratch, bytes.fromhex(f"cd352e1802 {load} c3")),
+                    (Address(output.segment, 0x200), operand), (control, pack("<H", control_word))],
+            reads=[(records, record_size), (stack_top, 2), (Address(data_segment, 6), 8)],
+        )
+        observed = []
+
+        def audit(cpu):
+            def write(cpu, _access, address, size, _value, _data):
+                assert address + size <= records.linear or address >= records.linear + record_size
+                if output.linear <= address < output.linear + len(expected):
+                    cs, ip, es, di = cpu.reg_read_batch((
+                        x86.UC_X86_REG_CS, x86.UC_X86_REG_IP, x86.UC_X86_REG_ES, x86.UC_X86_REG_DI,
+                    ))
+                    assert cs == runtime_segment
+                    assert Address(es, di).linear == address
+                    site = code_base + ip
+                    if site in range(0x13540, 0x13544) or site in range(0x135bf, 0x135c3):
+                        # Extended output copies eight significand bytes from the live DS record.
+                        ds, si = cpu.reg_read_batch((x86.UC_X86_REG_DS, x86.UC_X86_REG_SI))
+                        assert Address(ds, si).linear == records.linear + 12 + address - output.linear
+                    observed.append((site, address - output.linear, size))
+
+            hook = cpu.hook_add(UC_HOOK_MEM_WRITE, write)
+            return lambda: cpu.hook_del(hook)
+
+        # Guard both ends of the caller's output buffer.
+        guarded = Address(output.segment, output.offset - 1)
+        sentinel = b"\xa5"
+        result = emulator.call(
+            scratch, regs=registers, ivt_interrupts=vectors, _setup=audit,
+            writes=[*setup, *loaded.memory, (scratch, bytes.fromhex(f"{store} c3")),
+                    (guarded, sentinel * (len(expected) + 2))],
+            reads=[(guarded, len(expected) + 2)],
+        )
+        assert observed == [
+            (site, offset, 2) for offset, site in zip(range(0, len(expected), 2), sites, strict=True)
+        ]
+        assert result.memory[0][1] == sentinel + expected + sentinel
+
+    # FSTP m32real, m64real, and m80real from each of the four record classes.
+    single, double, extended = "cd351e0003", "cd391e0003", "cd373e0003"
+    for single_bits, double_bits, extended_value, stores in (
+        (0x40400000, 0x4008000000000000, (0xc000000000000000, 0x4000),
+         ((0x12e40, 0x12e43), (0x130ce, 0x130d1, 0x130d4, 0x130ec), range(0x135bf, 0x135c4))),
+        (0, 0, (0, 0),
+         ((0x12e40, 0x12e43), range(0x12fcc, 0x12fd0), range(0x1358a, 0x1358f))),
+        (0x7fc00000, 0x7ff8000000000000, (0xc000000000000000, 0x7fff),
+         ((0x12e40, 0x12e43), (0x12ffd, 0x13000, 0x13003, 0x13011), (*range(0x13540, 0x13544), 0x13549))),
+        (0x7f800000, 0x7ff0000000000000, (0x8000000000000000, 0x7fff),
+         ((0x12e79, 0x12e7c), (0x13110, 0x13112, 0x13114, 0x1311a),
+          (0x13561, 0x13562, 0x13563, 0x13567, 0x1356d))),
+    ):
+        operand = pack("<I", single_bits)
+        expected_outputs = (operand, pack("<Q", double_bits), pack("<QH", *extended_value))
+        for store, expected, sites in zip(
+            (single, double, extended), expected_outputs, stores, strict=True,
+        ):
+            check("cd35060002", operand, store, expected, sites)
+
+    # Round-toward-zero overflow emits the high word of the saturation template first.
+    check("cd372e0002", pack("<QH", 1 << 63, 0x7ffe), single, pack("<HH", 0x7f7f, 0xffff),
+          (0x12e94, 0x12e99), control_word=0x0f7f)
+    check("cd372e0002", pack("<QH", 1 << 63, 0x3fff - 1030), double, pack("<d", 2.0 ** -1030),
+          (0x1315d, 0x13160, 0x13163, 0x13166))
+
+    # Integer outputs and the software control/status word stores also use the caller's buffer.
+    for store, expected, sites in (
+        ("cd3b1e0003", pack("<h", 3), (0x1320e,)),
+        ("cd371e0003", pack("<i", 3), (0x1327e, 0x13281)),
+        ("cd3b3e0003", pack("<q", 3), (0x1333d, 0x13340, 0x13343, 0x13346)),
+        ("cd353e0003", pack("<H", 0x037f), (0x135f8,)),
+        ("cd393e0003", pack("<H", 0), (0x135ff,)),
+    ):
+        check("cd35060002", pack("<f", 3.0), store, expected, sites)
 
 
 def test_phantasie_iii_shipped_float_store_destinations(

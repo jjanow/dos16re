@@ -441,26 +441,40 @@ def test_phantasie_iii_wilderness_inn_trace(tmp_path, capsys):
     _check_trace(tmp_path, capsys, export, program, image, "wilderness", wilderness, trace)
 
 
-def test_phantasie_iii_wilderness_encounter_trace(tmp_path, capsys):
-    files, export, program, image = _load_game(tmp_path, capsys)
+@pytest.mark.parametrize("attack", [False, True], ids=["decline", "attack"])
+def test_phantasie_iii_wilderness_encounter_trace(tmp_path, capsys, attack):
+    files, export, program, image = _load_game(tmp_path, capsys, *(("MONSTERS.CGA",) if attack else ()))
     units = {unit["name"]: unit for unit in program["units"]}
     base, origin = units["root"]["segment"], units["root"]["linear"]
     wilderness, town = units["link_0003"], units["link_0002"]
     window = wilderness["runtime_linear"]
-    # The first road step finds sleeping monsters. Decline the attack.
-    dos = _DosSession(files, [*_leave_pendragon_keys(), "up", "n"],
-                      window, window + town["size"], clock_dx=0x1700)
+    # The first road step finds sleeping monsters. The attack route completes one round.
+    keys = ["y", "enter", "enter", "esc"] if attack else ["n"]
+    dos = _DosSession(files, [*_leave_pendragon_keys(), "up", *keys], window, window + town["size"], clock_dx=0x1700)
     encounter = window + 0x0239
     sleeping_prompt = origin + 0xdf35
     decline = origin + 0xdf3f
     skip_combat = origin + 0xe020
     combat = origin + 0xe062
+    menu_call = origin + 0x721d
+    round_return = origin + 0x10783
     trace = _EdgeTrace({
         encounter: "call", sleeping_prompt: "call", decline: "jump", skip_combat: "jump", combat: "call",
+        menu_call: "call", origin + 0x1046a: "jump",
     })
     far_data = Address(base + 0x1820, 0).linear
+    dgroup = base + 0x28c0
+    selection = far_data + 0xb5a8
+    menu, descriptor = Address(dgroup, 0x0834), Address(dgroup, 0x095e)
     positions = []
     declined = []
+    selection_writes = []
+    menu_targets = []
+    rounds = []
+
+    def read_pointer(cpu, linear):
+        offset, segment = unpack_from("<HH", cpu.mem_read(linear, 4))
+        return Address(segment, offset)
 
     def observe(cpu, address, size):
         trace.observe(cpu, address, size)
@@ -468,16 +482,44 @@ def test_phantasie_iii_wilderness_encounter_trace(tmp_path, capsys):
             positions.append(unpack_from("<HH", cpu.mem_read(far_data + 0x4882, 4)))
         if address == skip_combat:
             declined.append(unpack_from("<H", cpu.mem_read(far_data + 0xb578, 2))[0])
+        if address in (origin + 0x103b3, origin + 0x103ba):
+            # Each instruction executes immediately after one half of the selection pointer is stored.
+            assert cpu.reg_read(x86.UC_X86_REG_ES) * 16 == far_data
+            word = selection if address == origin + 0x103b3 else selection + 2
+            selection_writes.append(unpack_from("<H", cpu.mem_read(word, 2))[0])
+        if address == menu_call:
+            assert read_pointer(cpu, selection) == menu
+            assert read_pointer(cpu, menu.linear + 6) == descriptor
+            es, bx = cpu.reg_read_batch((x86.UC_X86_REG_ES, x86.UC_X86_REG_BX))
+            assert Address(es, bx) == descriptor
+            target = read_pointer(cpu, descriptor.linear + 4)
+            template = descriptor.linear + 4 - origin
+            assert cpu.mem_read(descriptor.linear + 4, 4) == image[template:template + 4]
+            menu_targets.append(target.linear)
+        if address == round_return:
+            rounds.append(address)
 
     _play_game(image, program, dos, wilderness, 0x0088, observe)
     assert positions == [(24, 36)]
-    assert declined == [1]
-    assert trace.edges == {
+    expected_edges = {
         (encounter, origin + 0xde54): 1,
         (sleeping_prompt, origin + 0xe294): 1,
-        (decline, origin + 0xdff9): 1,
-        (skip_combat, origin + 0xe0a3): 1,
     }
+    if attack:
+        assert any(name == "MONSTERS.CGA" and size > 0 for name, _, size in dos.data_reads)
+        assert selection_writes == [menu.offset, menu.segment]
+        assert menu_targets == [origin + 0x10424]
+        assert not declined and rounds == [round_return]
+        expected_edges.update({
+            (combat, origin + 0x104c0): 1,
+            (menu_call, origin + 0x10424): 1,
+            (origin + 0x1046a, origin + 0x104b9): 1,
+        })
+    else:
+        assert declined == [1]
+        assert not selection_writes and not menu_targets and not rounds
+        expected_edges.update({(decline, origin + 0xdff9): 1, (skip_combat, origin + 0xe0a3): 1})
+    assert trace.edges == expected_edges
     _check_trace(tmp_path, capsys, export, program, image, "wilderness", wilderness, trace)
 
 

@@ -14,17 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, audited the 11 unresolved computed transfers in the Phantasie III DOS
-Ghidra listing. Checked the guarded runtime hooks, the argument builder's saved return, the
-floating-point exception call, and far-pointer aliases in the load image. The audit found no
-callers of the conversion callback, alternate parser, or comparison entry in the listing or
-traced paths. All 10 focused checks passed with the original DOS media and Ghidra 12.2.
-The standalone suite passed 518 tests with 141 skipped.
+On 2026-11-24, traced software FPU output buffers and the source classes of template copies,
+register copies, and exchanges in Phantasie III DOS. The wilderness combat route traced the
+runtime-built selection pointer to its relocated handler and completed one round. The three
+detached entries had zero hits. All 12 focused checks passed with the original DOS media
+and Ghidra 12.2.
+The standalone suite passed 518 tests with 143 skipped.
 
-Resume Phase 9 by tracing remaining reachable stores that may alias the floating-point record
-allocation and tracking the source classes of record copies. For the detached entries, follow
-runtime-created pointers on paths outside the traced routes and trace the conversion output
-pointer from any caller found.
+Resume Phase 9 by replaying FPU interrupt entries and checking `record-writes` segment
+context against the observed copies and stores. Follow computed pointers through additional
+routes and trace the conversion output pointer if a caller reaches the detached callback.
 
 ## Why
 
@@ -414,6 +413,13 @@ listed in the parity table and platform milestones below.
   combat. Both runs map the executed member 3 edges to their original file offsets. They record
   zero callback-table reads and zero hits at the three detached entries. After wilderness
   entry, both observe zero software FPU operand dispatches and zero class-byte writes.
+- **Traced the wilderness combat menu pointer.** Accepting the same road encounter starts
+  combat at `root:104c0` and completes one round. Stores at `root:103ac` and `:103b3`
+  build the current selection at `2820:b5a8` with the value DGROUP:`0834`. The two `LES`
+  instructions before `root:721d` follow that selection to the descriptor at DGROUP:`095e`.
+  Its relocated far pointer at DGROUP:`0962` supplies the observed call to `root:10424`.
+  This route makes zero reads of the installed callback table and reaches none of the three
+  detached entries.
 - **Validated arithmetic dispatch slots.** `root:12524` and `root:1253f` use the same
   eight-word table at `root:1205e`. The `0x0e` mask and optional XOR with 2 keep BX
   on those slots. At `root:126cf`, arithmetic uses three 16-word tables at `root:12106`,
@@ -432,6 +438,17 @@ listed in the parity table and platform milestones below.
   dispatcher, which registers the handler at `root:602b`. That handler reaches DOS process
   termination with exit codes `0x83`, `0x8b`, and `0x8a` for these cases. Automatic recovery
   still needs to account for unresolved store aliases.
+- **Traced FPU output destinations and class-copy sources.** The software output probes cover
+  `FSTP` to single, double, and extended formats for all four record classes, plus integer,
+  control-word, and status-word stores. The traces check each word's physical destination against
+  the caller buffer and the entire 15-slot allocation. The extended output copies its significand from the
+  active `DS:SI` record with `MOVSW`. Double subnormal output uses the four stores from
+  `root:1315d` to `:13166`. The single round-toward-zero overflow path emits `7f7f` then
+  `ffff` at `root:12e94` and `:12e99`. The traces observe classes 1–3 from arithmetic
+  templates at `root:12726` and classes 0 and 1 from constant loads at `root:1376b`.
+  The register copy at `root:1273c` and both writes of the exchange at `root:137ac` and
+  `:137ad` propagate all four source classes. The static listing still has unknown
+  destinations and undefined code in the floating-point runtime.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry

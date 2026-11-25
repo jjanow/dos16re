@@ -1663,7 +1663,10 @@ U.S./Europe `Buck Rogers: Countdown to Doomsday` Genesis cartridge image. The Gh
 `GHIDRA_HOME` and include synthetic programs for all
 supported platforms. Tests skip when their input variables are unset.
 
-The Phantasie III DOS tests exercise floating-point arithmetic and register-stack copies in Unicorn.
+The Phantasie III DOS tests exercise floating-point arithmetic and trace class bytes from their
+source templates and register records through stack copies and exchanges in Unicorn. The output probes
+check the physical write addresses and output bytes of the real, integer, control-word, and
+status-word stores against the caller's buffer and the internal register allocation.
 The Ghidra test audits computed targets across the root and four LINK members, then replays
 observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
 The audit checks the error and stack-check hook defaults, the argument builder's saved return,
@@ -1675,8 +1678,10 @@ the same square twice. The tests check magic and gold totals, monitor the instal
 for reads, and use an ordered load manifest to map member 4's jumps back to `MAIN.EXE`. With Ghidra
 enabled, the combat traces resolve the menu call at `root:721d`.
 The wilderness playthroughs trace the Jolly Inn's refusal when the party has insufficient funds
-and a declined attack on sleeping monsters. They verify travel time and encounter state, map
-member 3's instructions back to `MAIN.EXE`, and check the same callback and floating-point sites.
+and both responses to the sleeping-monsters prompt. The combat route follows the runtime-built
+menu selection through the descriptor to the far call at `root:721d`. The tests verify travel
+time and encounter state, map member 3's instructions back to `MAIN.EXE`, and check the same
+callback and floating-point sites.
 
 Phase 12 has optional checks against original tool outputs and releases.
 
