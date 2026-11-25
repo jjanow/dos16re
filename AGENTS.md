@@ -10,6 +10,7 @@ AmigaDOS Hunk executables, and other platforms as they are added. See `PLAN.md` 
   environment variables and skip when unset.
 - Every CLI command supports `--json`; keep default output short.
 - Keep `README.md` and `PLAN.md` current as phases land.
+- Build only when needed for testing or a release. Reuse the tested wheel for publication.
 - The deployed copy (`~/.local/share/retrore`, the `retrore` command on `PATH`, and the user-scope
   `retrore` MCP server) is installed by `tools/deploy.sh` and redeployed by git hooks whenever `main`
   moves in this checkout. Check `~/.local/share/retrore/COMMIT` against `main` and rerun the script if

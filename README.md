@@ -9,7 +9,16 @@ patterns.
 
 ## Installation
 
-From the `retrore` checkout, use Python 3.12 or newer to install the CLI in a virtual environment.
+Use Python 3.12 or newer. Download the wheel from [GitHub Releases](https://github.com/jjanow/retrore/releases)
+and install it in a virtual environment. For version 1.0.0, run these commands from the download directory.
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install ./retrore-1.0.0-py3-none-any.whl
+.venv/bin/retrore --help
+```
+
+For development, install from the `retrore` checkout.
 
 ```sh
 python3 -m venv .venv
@@ -32,9 +41,8 @@ verification and configured for release CI.
 | Release CI configuration for the installed wheel | 3.12 | 12.2 | Temurin 25 |
 | Release CI Windows job: worker, MCP, and synthetic Ghidra tests | 3.12 | 12.2 | Temurin 25 |
 
-See the [release workflow](.github/workflows/release-ci.yml) for the exact CI setup. It runs for each
-published release and can be started by hand to verify changes, such as Windows worker hosting, that
-can't be tested locally.
+See the [release workflow](.github/workflows/release-ci.yml) for the exact CI setup. Run it manually
+on the release candidate to test the same wheel on Linux and Windows before publication.
 
 ### Try a synthetic program
 
@@ -1733,8 +1741,9 @@ Phase 12 has optional checks against original tool outputs and releases.
 | `RETRORE_AMIGA_OVERLAY_DIR` | An original hierarchical executable named `overlay` |
 | `RETRORE_DPAINT_AMIGA_DIR` | `dpaint` from the 1986 DeluxePaint I disk. With Ghidra, the test imports it and decompiles an overlay entry. [Release background](https://computerhistory.org/blog/electronic-arts-deluxepaint-early-source-code/) |
 
-Release CI runs when a tagged GitHub release is published. It builds and installs the wheel and
-runs the synthetic suites with the headless tests enabled. [Release workflow](.github/workflows/release-ci.yml)
+Release CI builds one wheel and runs the synthetic suites with headless tests on Linux and Windows.
+After both jobs pass, use that wheel from the workflow artifacts for the GitHub release.
+[Release workflow](.github/workflows/release-ci.yml)
 
 ### Microsoft LINK 2.x probes
 

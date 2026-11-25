@@ -1,18 +1,37 @@
 name: Release CI
 
 on:
-  release:
-    types: [published]
-  # Manual runs verify changes that can't be tested locally, such as Windows worker hosting.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  wheel:
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Build the release wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+
+      - name: Upload the release wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: retrore-wheel
+          path: dist/retrore-*.whl
+          if-no-files-found: error
+
+  wheel:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
@@ -25,9 +44,13 @@ jobs:
           distribution: temurin
           java-version: '25'
 
-      - name: Build and install the wheel
+      - uses: actions/download-artifact@v8
+        with:
+          name: retrore-wheel
+          path: dist
+
+      - name: Install the wheel
         run: |
-          python -m pip wheel --no-deps --wheel-dir dist .
           python -m venv "$RUNNER_TEMP/retrore-test"
           "$RUNNER_TEMP/retrore-test/bin/python" -m pip install dist/retrore-*.whl pytest
 
@@ -48,6 +71,7 @@ jobs:
           "$RUNNER_TEMP/retrore-test/bin/python" -I -m pytest -q tests
 
   windows:
+    needs: build
     runs-on: windows-latest
     timeout-minutes: 90
     defaults:
@@ -65,9 +89,13 @@ jobs:
           distribution: temurin
           java-version: '25'
 
-      - name: Build and install the wheel
+      - uses: actions/download-artifact@v8
+        with:
+          name: retrore-wheel
+          path: dist
+
+      - name: Install the wheel
         run: |
-          python -m pip wheel --no-deps --wheel-dir dist .
           python -m venv "$RUNNER_TEMP/retrore-test"
           "$RUNNER_TEMP/retrore-test/Scripts/python" -m pip install dist/retrore-*.whl pytest
 

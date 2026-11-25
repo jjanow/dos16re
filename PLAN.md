@@ -216,8 +216,8 @@ Additional platform capabilities are listed in the parity table and platform mil
 
 ### Phase 8: faster queries and reproducible releases
 
-- **Implemented.** Publication of a tagged GitHub release builds a wheel, installs it in a clean
-  environment, and runs the standalone and synthetic Ghidra suites against the installed package.
+- **Implemented.** Before a GitHub release, run Release CI on the candidate commit. It builds one
+  wheel and tests the installed package on Linux and Windows. Publish the wheel from that run.
 - **Implemented.** `retrore batch` runs decompilation and address queries against one project in
   one read-only headless session. It shares the decompiler, preserves request order, and returns
   individual failures alongside successful results.
