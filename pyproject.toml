@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "retrore"
-version = "1.0.0"
+version = "1.1.0"
 description = "Reverse-engineering tools for DOS, AmigaDOS, Atari, Commodore 64, Apple II, MSX2, NEC, Sharp, Classic Macintosh, NES, and Sega Genesis"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -17,11 +17,11 @@ answering the first question with a warm query worker.
 ## Installation
 
 Use Python 3.12 or newer. Download the wheel from [GitHub Releases](https://github.com/jjanow/retrore/releases)
-and install it in a virtual environment. For version 1.0.0, run these commands from the download directory.
+and install it in a virtual environment. For version 1.1.0, run these commands from the download directory.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install ./retrore-1.0.0-py3-none-any.whl
+.venv/bin/python -m pip install ./retrore-1.1.0-py3-none-any.whl
 .venv/bin/retrore --help
 ```
 
