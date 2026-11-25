@@ -114,6 +114,7 @@ def _verify_microsoft_pascal_startup(source, program, main_linear):
 
     psp = root.base_segment - 0x10
     maximum = dgroup["max_shift_paragraphs"]
+    captures = []
     for available in (0x80, maximum + 0x80):
         uc = Uc(UC_ARCH_X86, UC_MODE_16)
         uc.mem_map(0, 0x100000)
@@ -133,6 +134,9 @@ def _verify_microsoft_pascal_startup(source, program, main_linear):
         assert uc.reg_read(UC_X86_REG_DS) == uc.reg_read(UC_X86_REG_SS) == selector
         assert uc.reg_read(UC_X86_REG_SP) == dgroup["stack_offset"] - 4  # The far call to the main routine.
         assert uc.mem_read(origin + literal + shift * 16, 6) == b"VALUE "
+        captures.append((selector, bytes(uc.mem_read((dgroup["copy_start_segment"] + shift) * 16,
+                                                    (dgroup["copy_end_segment"] - dgroup["copy_start_segment"]) * 16))))
+    return captures
 
 
 @pytest.mark.parametrize("name", ["PROBE", "ALT"])
@@ -156,12 +160,22 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
         assert signature["address"]["linear"] == publics[symbol]
     assert signatures["GETHQQ"]["result"] == "void*"
     assert [signatures[symbol]["stack_purge"] for symbol in ("INIFQQ", "GETHQQ", "WTLFQQ")] == [0, 2, 2]
-    _verify_microsoft_pascal_startup(source, program, publics["ENTGQQ"])
+    captures = _verify_microsoft_pascal_startup(source, program, publics["ENTGQQ"])
 
     if not os.environ.get("GHIDRA_HOME"):
         return
+    segment, data = captures[0 if name == "PROBE" else 1]
+    capture = tmp_path / "capture.bin"
+    capture.write_bytes(data)
+    captured_export = tmp_path / "captured"
+    assert main(["load", str(source), "--pascal-dgroup", f"{capture}@{segment:04x}",
+                 "-o", str(captured_export), "--json"]) == 0, capsys.readouterr().err
+    captured = json.loads(capsys.readouterr().out)["microsoft_pascal_capture"]
+    assert (captured_export / "image.bin").read_bytes() == (export / "image.bin").read_bytes()
+    export = captured_export
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
     report = json.loads(capsys.readouterr().out)
+    assert report["microsoft_pascal_capture"] == captured
     assert report["runtime_signatures"] == 3
     assert report["microsoft_pascal_frame_calls"] >= 3
     origin = program["units"][0]["linear"]
@@ -169,11 +183,13 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
     requests.write_text(json.dumps([
         {"command": "decomp", "address": f"root:{publics['ENTGQQ'] - origin:04x}"},
         {"command": "decomp", "address": f"root:{publics['GETHQQ'] - origin:04x}"},
+        {"command": "func", "address": f"root:{publics['ENTGQQ'] - origin:04x}"},
         *({"command": "disasm", "address": f"root:{publics[symbol] - origin:04x}", "limit": 8}
           for symbol in ("INIFQQ", "GETHQQ", "WTLFQQ")),
     ]), encoding="utf-8")
     assert main(["batch", str(requests), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    entry, heap, *frames = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+    entry, heap, function, *frames = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+    assert function["segments"]["DS"] == function["segments"]["SS"] == segment
     decompilation = entry["decompilation"]
     assert all(call in decompilation for call in ("INIFQQ();", "GETHQQ(2);", "WTLFQQ("))
     assert "(size);" in heap["decompilation"]  # The allocator receives the recovered stack parameter.
@@ -190,6 +206,94 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
         assert refs["FALL_THROUGH"] == continuation["address"]["linear"] == call["address"]["linear"] + 5
         helper = refs["UNCONDITIONAL_CALL"] - origin
         assert image[helper:helper + 4] == bytes.fromhex("5e 2e 8b 0c")
+
+
+@pytest.fixture
+def pascal_capture_inputs(tmp_path):
+    # A recognized ENTXQQ layout in a small synthetic MZ. The analysis follows the startup into a
+    # callee with direct DS and SS reads. The copied range ends eight bytes beyond the file image.
+    image = bytearray.fromhex(
+        "ba 89 01 b4 25 b0 00 8c c9 8e d9 cd 21 ba 10 f4 d1 ea b9 00 80 2b ca d1 ea d1 ea d1 ea 42"
+        " 26 a1 02 00 8b e8 2d 00 00 72 00 33 db 2b c2 73 02 2b d8 2b d3"
+        " b8 00 00 8e d8 8c 06 8e fc be 00 00 2b f0 d1 e6 d1 e6 d1 e6 d1 e6"
+        " 81 fe 00 00 73 08 01 54 02 83 c6 04 eb f2"
+        " b8 00 00 8b c8 81 e9 00 10 8e d9 03 ca 8e c1 2d 00 00 be fe ff 8b fe fd"
+        " 2d 00 10 76 13 b9 00 80 f3 a5 8c c1 81 e9 00 10 8e c1 2b ca 8e d9 eb e8"
+        " 05 00 10 8b c8 d1 e1 d1 e1 d1 e1 f3 a5 fc 81 c2 00 00 8e da fa 8e d2 bc 10 f6 fb"
+    )
+    assert len(image) == 0xA2
+    image += bytes.fromhex("e8 0b 00 f4")
+    image = image.ljust(0xB0, b"\xcc") + bytes.fromhex("a1 80 ff 36 03 06 c0 ff c3")
+    image = image.ljust(0x178, b"\0")
+    relocations = {0x25: 0x18, 0x34: 0xF018, 0x3D: 0x10, 0x58: 0x18, 0x67: 0x10, 0x97: 0xF018}
+    for offset, value in relocations.items():
+        pack_into("<H", image, offset, value)
+    header = pack("<2s13H", b"MZ", 64 + len(image), 1, len(relocations), 4, 0, 0, 0x10, 0x80,
+                  0, 0, 0, 28, 0) + b"".join(pack("<2H", offset, 0) for offset in relocations)
+    source, capture, overlay = (tmp_path / name for name in ("sample.exe", "capture.bin", "extra.ovr"))
+    source.write_bytes(header.ljust(64, b"\0") + image)
+    capture.write_bytes(pack("<H", 0x1234).ljust(0x40, b"\0") + pack("<H", 0x5678).ljust(0x40, b"\0"))
+    overlay.write_bytes(b"\xc3")
+    return source, capture, overlay
+
+
+def test_microsoft_pascal_capture_export(pascal_capture_inputs, tmp_path, capsys):
+    source, capture, overlay = pascal_capture_inputs
+    export = tmp_path / "export"
+    assert main(["load", str(source), "--pascal-dgroup", f"{capture}@001c", "--overlay", str(overlay),
+                 "-o", str(export), "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    record = report["microsoft_pascal_capture"]
+    assert (record["segment"], record["shift_paragraphs"], record["linear"], record["size"]) == (0x1C, 4, 0x10140, 0x80)
+    assert (export / "pascal-dgroup.bin").read_bytes() == capture.read_bytes()
+    assert report["units"][1]["linear"] == 0x101C0
+    assert (export / "image.bin").read_bytes()[0x140:0x178] == bytes(0x38)
+    assert main(["info", str(source), "--pascal-dgroup", f"{capture}@0118", "--overlay", str(overlay),
+                 "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["units"][1]["linear"] == 0x10180
+    for options, message in (
+        (["--pascal-dgroup", f"{capture}@0017"], "outside the startup shift range"),
+        (["--pascal-dgroup", f"{capture}@001c", "--overlay", f"{overlay}@1018"], "overlaps captured DGROUP"),
+    ):
+        assert main(["info", str(source), *options, "--json"]) == 1
+        assert message in json.loads(capsys.readouterr().err)["error"]["message"]
+    capture.write_bytes(b"short")
+    assert main(["info", str(source), "--pascal-dgroup", f"{capture}@001c", "--json"]) == 1
+    assert "must contain 128 bytes" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+
+def test_ghidra_microsoft_pascal_capture(pascal_capture_inputs, tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    source, capture, overlay = pascal_capture_inputs
+    export, project, requests, manifest = (tmp_path / name for name in ("export", "project", "queries.json", "states.json"))
+    manifest.write_text(json.dumps({"version": 1, "initial": "pre", "states": [
+        {"name": "pre", "loads": [{"unit": "root"}]},
+    ]}), encoding="utf-8")
+    assert main(["load", str(source), "--pascal-dgroup", f"{capture}@001c", "--overlay", str(overlay),
+                 "--load-manifest", str(manifest), "-o", str(export), "--json"]) == 0, capsys.readouterr().err
+    program = json.loads(capsys.readouterr().out)
+    assert main(["ghidra", "import", str(export), str(project), "--load-views", "--json"]) == 0, capsys.readouterr().err
+    imported = json.loads(capsys.readouterr().out)
+    assert imported["microsoft_pascal_capture"] == program["microsoft_pascal_capture"]
+    static, = imported["load_views"]["pre"]["blocks"]
+    requests.write_text(json.dumps([
+        {"command": "func", "address": "root:00b0"},
+        {"command": "decomp", "address": "root:00b0"},
+        {"command": "disasm", "address": "001c:ff80", "limit": 2},
+        {"command": "disasm", "address": "001c:ffc0", "limit": 2},
+        {"command": "disasm", "address": f"{static['block']}:0140", "limit": 2},
+    ]), encoding="utf-8")
+    assert main(["batch", str(requests), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    function, routine, data, tail, prior = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+    assert function["segments"]["DS"] == function["segments"]["SS"] == 0x1C
+    assert "DGROUP_ff80" in routine["decompilation"] and "DGROUP_ffc0" in routine["decompilation"]
+    assert [data["rows"][0]["bytes"], tail["rows"][0]["bytes"]] == ["3412", "7856"]
+    assert "".join(row["bytes"] for row in prior["rows"]) == "0000"
+
+    (export / "pascal-dgroup.bin").write_bytes(bytes(0x80))
+    assert main(["ghidra", "import", str(export), str(tmp_path / "tampered"), "--json"]) == 1
+    assert "DGROUP does not match map.json" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
 def test_ghidra_microsoft_pascal_frame_uses_each_inline_size(tmp_path, capsys):

@@ -53,6 +53,7 @@ from .search import (
     ENCODINGS, POINTER_KINDS, WIDTHS, SearchError, find_bytes, find_pointers, find_relocations, find_text, lookup_symbols,
     search_pattern,
 )
+from .signatures import PASCAL_DGROUP_FILE
 from .trace import TraceError, import_trace
 from .toolchain import ToolchainError, import_linker_map, import_signatures
 from .x1 import DISK_SUFFIXES as X1_DISK_SUFFIXES
@@ -495,7 +496,7 @@ def _pc98_image(args: argparse.Namespace, data: bytes) -> tuple[bytes, dict]:
     return image, program
 
 
-def _export_image(output: Path, image: bytes, program_map: dict) -> None:
+def _export_image(output: Path, image: bytes, program_map: dict, pascal_capture: bytes | None = None) -> None:
     output.mkdir(parents=True, exist_ok=True)
     image_path = output / "image.bin"
     map_path = output / "map.json"
@@ -505,6 +506,11 @@ def _export_image(output: Path, image: bytes, program_map: dict) -> None:
         with image_path.open("xb") as image_file:
             rollback.callback(image_path.unlink)
             image_file.write(image)
+        if pascal_capture is not None:
+            capture_path = output / PASCAL_DGROUP_FILE
+            with capture_path.open("xb") as capture_file:
+                rollback.callback(capture_path.unlink)
+                capture_file.write(pascal_capture)
         with map_path.open("x", encoding="utf-8") as map_file:
             rollback.callback(map_path.unlink)
             map_file.write(map_text)
@@ -1107,9 +1113,15 @@ def _seconds(value: str) -> float:
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
-def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
-    """Build the image and map selected by parsed info or load options, with a text summary."""
+def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str], bytes | None]:
+    """Build the image and map, with a text summary and any runtime capture to export."""
     data = args.program.read_bytes()
+    pascal_capture = None
+    if args.pascal_dgroup is not None:
+        path, segment = args.pascal_dgroup
+        if segment is None:
+            raise MZError("specify a captured Microsoft Pascal DS selector with --pascal-dgroup FILE@SEG")
+        pascal_capture = (segment, path.read_bytes())
     hunk = data.startswith(HUNK_MAGIC)
     human68k = data.startswith(X_MAGIC)
     m68k = hunk or human68k or data.startswith(PRG_MAGIC)
@@ -1243,9 +1255,11 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
                         for selector in args.disk_file]
             embedded = [overlay for _, overlay in selected]
         overlays = [*embedded, *other_overlays]
-        image, program_map = build_image(loaded, args.program.name, overlays)
+        image, program_map = build_image(loaded, args.program.name, overlays, pascal_capture=pascal_capture)
         if selected:
             record_container(program_map, "mz", [member for member, _ in selected], decisions={"selection": "explicit"})
+    if pascal_capture is not None and "microsoft_pascal_capture" not in program_map:
+        raise MZError("--pascal-dgroup requires a recognized Microsoft Pascal MZ program")
     if args.load_manifest:
         image = apply_load_manifest(args.load_manifest, image, program_map)
     else:
@@ -1313,7 +1327,9 @@ def build_program(args: argparse.Namespace) -> tuple[bytes, dict, list[str]]:
         lines.extend(f"  {row['message']}" for row in diagnostics[:3])
         if len(diagnostics) > 3:
             lines.append("  Use --json for all diagnostics.")
-    return image, program_map, lines
+    if capture := program_map.get("microsoft_pascal_capture"):
+        lines.append(f"captured DGROUP  DS {capture['segment']:04x}  {capture['size']} bytes")
+    return image, program_map, lines, pascal_capture[1] if pascal_capture is not None else None
 
 
 def program_options() -> argparse.ArgumentParser:
@@ -1321,6 +1337,8 @@ def program_options() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(add_help=False)
     command.add_argument("program", type=Path, metavar="PROGRAM")
     command.add_argument("--load-manifest", type=Path, metavar="FILE", help="define runtime states and transitions")
+    command.add_argument("--pascal-dgroup", type=_overlay, metavar="FILE@SEG",
+                         help="map a captured Microsoft Pascal DGROUP using its runtime DS selector")
     command.add_argument("--linker-map", action="append", type=Path, default=[], metavar="FILE",
                          help="import public symbols and source lines from a DOS LINK/TLINK map")
     command.add_argument("--signatures", action="append", type=Path, default=[], metavar="FILE",
@@ -1872,9 +1890,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{status}  {report['additions']} additions  {report['conflicts']} conflicts  "
                       f"{report['unchanged']} unchanged")
             return int(bool(args.apply and report["conflicts"]))
-        image, program_map, summary = build_program(args)
+        image, program_map, summary, pascal_capture = build_program(args)
         if args.command == "load":
-            _export_image(args.output, image, program_map)
+            _export_image(args.output, image, program_map, pascal_capture)
     except HANDLED_ERRORS as error:
         report = error_report(error)
         message = json.dumps(report) if args.json else f"retrore: {error}"
@@ -1884,7 +1902,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(program_map))
     elif args.command == "load":
-        print(f"Wrote image.bin and map.json to {args.output}")
+        if pascal_capture is not None:
+            print(f"Wrote image.bin, map.json, and {PASCAL_DGROUP_FILE} to {args.output}")
+        else:
+            print(f"Wrote image.bin and map.json to {args.output}")
         if diagnostics := program_map.get("diagnostics"):
             print(f"{len(diagnostics)} loader diagnostics are in map.json.")
     else:

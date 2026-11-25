@@ -6,7 +6,7 @@ from struct import Struct, pack, unpack_from
 
 from .jump_tables import FarTableImage, recover_jump_tables
 from .mz import Address, LoadedMZ, MZError
-from .signatures import detect_compiler, match_runtime, microsoft_pascal_dgroup
+from .signatures import Compiler, detect_compiler, match_runtime, microsoft_pascal_capture, microsoft_pascal_dgroup
 
 _DESCRIPTOR = Struct("<4xI3H")
 _TRAP = b"\xcd\x3f"
@@ -168,11 +168,13 @@ def _read_units(root: bytes, overlays: list[Overlay | LinkedOverlay]) -> list[_U
     return units
 
 
-def _place_units(root_end: int, memory_end: int, units: list[_Unit]) -> list[int]:
+def _place_units(root_end: int, memory_end: int, units: list[_Unit],
+                 captured_range: tuple[int, int] | None = None) -> list[int]:
     """Assign segments to units without one.
 
     Explicit segments only have to clear the root's file image. Automatic placement also clears
     the root's uninitialized data, minimum allocation, and initial stack, which end at memory_end.
+    Both kinds of placement clear a captured DGROUP range when present.
     """
     used = []
     for unit in units:
@@ -182,10 +184,15 @@ def _place_units(root_end: int, memory_end: int, units: list[_Unit]) -> list[int
         end = start + unit.placement_size
         if not 0 <= unit.segment <= 0xFFFF or start < root_end or end > _IMAGE_LIMIT:
             raise MZError(f"overlay {unit.name} segment is outside available image space")
+        if captured_range is not None and start < captured_range[1] and end > captured_range[0]:
+            raise MZError(f"overlay {unit.name} overlaps captured DGROUP")
         used.append((start, end))
     used.sort()
     if any(right[0] < left[1] for left, right in zip(used, used[1:])):
         raise MZError("explicit overlay segments overlap")
+    if captured_range is not None:
+        used.append(captured_range)
+        used.sort()
 
     segments = []
     next_start = max(root_end, memory_end)
@@ -291,11 +298,9 @@ def _add_jump_tables(image: bytes, program_map: dict) -> None:
         program_map["jump_tables"] = tables
 
 
-def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
+def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict, compiler: Compiler | None) -> None:
     _add_jump_tables(image, program_map)
     units = program_map["units"]
-    compiler = detect_compiler(root, pascal_overlays=any("file_offset" in unit and "overlay_format" not in unit
-                                                        for unit in units[1:]))
     program_map["compiler"] = None
     program_map["runtime_signatures"] = signatures = []
     if compiler is None:
@@ -303,8 +308,6 @@ def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
     program_map["compiler"] = {
         "family": compiler.family, "version": compiler.version, "evidence": compiler.evidence,
     }
-    if dgroup := microsoft_pascal_dgroup(root, compiler):
-        program_map["microsoft_pascal_dgroup"] = dgroup
     for unit in units:
         start = unit["image_offset"]
         data = image[start:start + unit["size"]]
@@ -322,7 +325,8 @@ def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
             })
 
 
-def build_image(root: LoadedMZ, program: str, overlays: list[Overlay | LinkedOverlay]) -> tuple[bytes, dict]:
+def build_image(root: LoadedMZ, program: str, overlays: list[Overlay | LinkedOverlay], *,
+                pascal_capture: tuple[int, bytes] | None = None) -> tuple[bytes, dict]:
     origin = root.base_segment * 16
     root_record = _unit_record("root", root.base_segment, origin, len(root.image))
     program_map = {
@@ -349,15 +353,24 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay | LinkedOve
     root_fixups = [fixup.linear for fixup in root.relocations]
     if root_fixups != sorted(fixup_positions):
         program_map["root_relocation_order"] = root_fixups
+    units = _read_units(root.image, overlays)
+    compiler = detect_compiler(root, pascal_overlays=any(unit.descriptor and unit.linked is None for unit in units))
+    dgroup = microsoft_pascal_dgroup(root, compiler) if compiler else None
+    if dgroup is not None:
+        program_map["microsoft_pascal_dgroup"] = dgroup
+    captured_range = None
+    if pascal_capture is not None:
+        capture = microsoft_pascal_capture(dgroup, *pascal_capture)
+        program_map["microsoft_pascal_capture"] = capture
+        captured_range = (capture["linear"], capture["linear"] + capture["size"])
     if not overlays:
         if fixup_positions:
             program_map["relocations"] = sorted(fixup_positions)
-        _add_analysis(root, root.image, program_map)
+        _add_analysis(root, root.image, program_map, compiler)
         return root.image, program_map
 
-    units = _read_units(root.image, overlays)
     root_end = origin + max(len(root.image), 1)
-    segments = _place_units(root_end, root.memory_end, units)
+    segments = _place_units(root_end, root.memory_end, units, captured_range)
     linked_segments = {unit.name: segment for unit, segment in zip(units, segments) if unit.linked is not None}
     image = bytearray(root.image)
     stub_targets = {}
@@ -448,5 +461,5 @@ def build_image(root: LoadedMZ, program: str, overlays: list[Overlay | LinkedOve
     if overlay_edits:
         program_map["overlay_edits"] = overlay_edits
     relocated = bytes(image)
-    _add_analysis(root, relocated, program_map)
+    _add_analysis(root, relocated, program_map, compiler)
     return relocated, program_map

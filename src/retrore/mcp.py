@@ -367,9 +367,9 @@ def _call_program(command: str, arguments: dict) -> dict:
     if command == "members":
         return inspect_members(args.program, args.format, args.apple2_disk_order, args.overlay)
     args.command = command
-    image, program_map, _ = build_program(args)
+    image, program_map, _, pascal_capture = build_program(args)
     if command == "load":
-        _export_image(args.output, image, program_map)
+        _export_image(args.output, image, program_map, pascal_capture)
     return program_map
 
 

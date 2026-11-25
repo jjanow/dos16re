@@ -14,15 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, modeled the Microsoft Pascal 3.20 frame helper's normal BP and SP effects in
-Ghidra. A synthetic probe covered zero-byte and 260-byte frames and agreed with Unicorn. The
-original LINK 2.40 and 2.45 builds decompiled the heap routine with its recovered stack argument.
-Ghidra 12.2 identified 39 frame calls in each LINK overlay probe and resolved a constant stack
-argument in file initialization. The default suite passed 520 tests. The runtime, segment, and
-DOS suites passed 55 tests with Ghidra enabled.
+On 2026-11-25, added `--pascal-dgroup FILE@SEG` to map a captured Microsoft Pascal DGROUP in
+Ghidra. A synthetic probe verified overlapping root bytes, DS- and SS-relative globals, and
+the pre-copy manifest view. Original LINK 2.40 and 2.45 probes propagated the selectors observed
+in Unicorn and retained the recovered heap argument. The default suite passed 521 tests. The
+runtime, segment, and DOS suites passed 57 tests with Ghidra 12.2 enabled.
 
-Resume with mapping captured Microsoft Pascal DGROUP into Ghidra or with original X1turbo media
-when available. The [platform parity table](#platform-capability-parity) tracks other extensions.
+Resume with corroborating Microsoft Pascal version detection using another toolchain release,
+or with X1turbo validation when original media is available. The
+[platform parity table](#platform-capability-parity) tracks other extensions.
 
 ## Why
 
@@ -144,8 +144,10 @@ maximal shift, and new stack offset. Unicorn verified the resulting DS and SS an
 string literal under two DOS allocation limits per build. Ghidra preserves frame-helper calls and
 marks their inline local size words as data, with fall-through at the following instruction.
 A call fixup uses each inline size to model BP and SP on the normal return path. The decompiler
-recovers the heap routine's argument and local stack slot on both LINK builds. Version detection
-and mapping captured runtime DGROUP into Ghidra remain open.
+recovers the heap routine's argument and local stack slot on both LINK builds. With an explicit
+capture, Ghidra maps the copied bytes at their runtime addresses and propagates DS and SS from
+the recognized startup switch. The LINK 2.40 probe validated overlapping source and destination
+ranges, and the LINK 2.45 probe validated the capped shift. Runtime version detection remains open.
 [Probe build steps](README.md#microsoft-pascal-runtime-probe)
 
 ### Phase 6: emulator harness

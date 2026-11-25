@@ -91,6 +91,7 @@ public class RetroreSegments extends HeadlessScript {
     private final Map<Address, Summary> symbolicSummaries = new HashMap<>();
     private Map<Address, Summary> contextSummaries = new HashMap<>();
     private Startup startup;
+    private PascalCapture pascalCapture;
     private boolean auditingWrites;
     private int skippedJumps;
     private final Map<String, Object> segmentStats = new LinkedHashMap<>();
@@ -226,6 +227,7 @@ public class RetroreSegments extends HeadlessScript {
     }
 
     private record Startup(int dgroup, Address call) {}
+    private record PascalCapture(long startup, int segment) {}
     private record Access(int operand, Register segment, int offset, List<Register> bases, int size, RefType type) {}
     // Register values when a function returns: concrete values or SYMBOL + index for an entry value.
     // A missing register is changed to an unknown value. Purge counts argument words the return removes.
@@ -261,6 +263,9 @@ public class RetroreSegments extends HeadlessScript {
             }
             if (microsoftPascal) {
                 report.put("microsoft_pascal_frame_calls", frameCalls);
+            }
+            if (pascalCapture != null) {
+                report.put("microsoft_pascal_capture", map.getAsJsonObject("microsoft_pascal_capture"));
             }
             if (map.has("format") && map.get("format").getAsString().equals("PC98")) {
                 report.put("format", "PC98");
@@ -545,6 +550,10 @@ public class RetroreSegments extends HeadlessScript {
 
 
     private void applySegments(JsonObject map, boolean onlyWrites) throws Exception {
+        if (map.has("microsoft_pascal_capture")) {
+            pascalCapture = new PascalCapture(map.getAsJsonObject("microsoft_pascal_dgroup").get("startup_linear").getAsLong(),
+                map.getAsJsonObject("microsoft_pascal_capture").get("segment").getAsInt());
+        }
         cs = currentProgram.getRegister("CS");
         ds = currentProgram.getRegister("DS");
         es = currentProgram.getRegister("ES");
@@ -629,7 +638,7 @@ public class RetroreSegments extends HeadlessScript {
 
         if (!onlyWrites) {
             Integer detachedSS = pc98 ? null : unchangedStackSegment(initial.registers.get(ss));
-            startup = findStartup(entry, initial, 2);
+            startup = pascalCapture == null ? findStartup(entry, initial, 2) : null;
             recoverListingContext(entryStates, detachedSS);
         }
         // Listing references benefit from compiler conventions and DGROUP guesses. A write
@@ -1170,7 +1179,15 @@ public class RetroreSegments extends HeadlessScript {
             boolean handled = true;
             Integer left = input.registers.get(dest);
             switch (op) {
-                case "MOV" -> result = value(instruction, 1, input);
+                case "MOV" -> {
+                    // ENTXQQ transfers the computed selector from DX in these two recognized instructions.
+                    if (pascalCapture != null && ((dest.equals(ds) && at.getOffset() == pascalCapture.startup() + 0x99) ||
+                            (dest.equals(ss) && at.getOffset() == pascalCapture.startup() + 0x9c))) {
+                        result = pascalCapture.segment();
+                    } else {
+                        result = value(instruction, 1, input);
+                    }
+                }
                 case "XOR", "SUB" -> {
                     if (dest.equals(instruction.getRegister(1))) {
                         result = 0;
@@ -1682,7 +1699,9 @@ public class RetroreSegments extends HeadlessScript {
         }
         var symbol = currentProgram.getSymbolTable().getPrimarySymbol(address);
         if (symbol == null || symbol.getSource() == SourceType.DEFAULT) {
-            String name = startup != null && startup.dgroup() == address.getSegment()
+            boolean dgroup = pascalCapture != null ? pascalCapture.segment() == address.getSegment()
+                : startup != null && startup.dgroup() == address.getSegment();
+            String name = dgroup
                 ? String.format("DGROUP_%04x", address.getSegmentOffset())
                 : String.format("FAR%04x_%04x", address.getSegment(), address.getSegmentOffset());
             currentProgram.getSymbolTable().createLabel(address, name, SourceType.ANALYSIS).setPrimary();

@@ -407,6 +407,7 @@ def _analyze(report: dict, image: ExportEvidence, project: Path, *, timeout: flo
     if apply and image.format in ("MZ", "PC98"):
         coverage["segment_map"] = {key: image.program[key] for key in (
             "format", "units", "entry", "entries", "stack", "initial_segments", "image_origin", "relocations", "jump_tables",
+            "microsoft_pascal_dgroup", "microsoft_pascal_capture",
         ) if key in image.program}
     if "edges" in report:
         coverage["edges"] = [

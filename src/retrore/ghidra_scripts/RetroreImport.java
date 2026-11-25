@@ -17,13 +17,17 @@ import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.SourceType;
 
+import java.io.ByteArrayInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.Map;
 
 public class RetroreImport extends HeadlessScript {
     private SegmentedAddressSpace space;
+    private static final String PASCAL_DGROUP_FILE = "pascal-dgroup.bin";
 
     @Override
     public void run() throws Exception {
@@ -32,7 +36,7 @@ public class RetroreImport extends HeadlessScript {
         Path result = Path.of(args[1]);
         try {
             JsonObject map = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
-            loadMap(map);
+            loadMap(map, Path.of(args[0]).resolveSibling(PASCAL_DGROUP_FILE));
             setHeadlessContinuationOption(HeadlessContinuationOption.CONTINUE);
         } catch (Exception error) {
             Files.writeString(result, new Gson().toJson(Map.of("error", error.toString())));
@@ -40,7 +44,7 @@ public class RetroreImport extends HeadlessScript {
         }
     }
 
-    private void loadMap(JsonObject map) throws Exception {
+    private void loadMap(JsonObject map, Path capturePath) throws Exception {
         // Maps written before versioning have no "version" and read as version 1.
         if (map.has("version") && map.get("version").getAsInt() != 1) {
             throw new IllegalArgumentException("unsupported retrore map version");
@@ -88,8 +92,12 @@ public class RetroreImport extends HeadlessScript {
                 }
             }
         }
+        long[] capturedRange = null;
+        if (map.has("microsoft_pascal_capture")) {
+            capturedRange = loadPascalCapture(map, memory, capturePath, memory.getBlock("root"));
+        }
         if (map.has("memory_end")) {
-            addRootAllocation(units, root, map.get("memory_end").getAsLong(), memory);
+            addRootAllocation(units, root, map.get("memory_end").getAsLong(), memory, capturedRange);
         }
         if (pc98) {
             addPc98Hardware(map.getAsJsonArray("memory_map"), memory);
@@ -153,8 +161,58 @@ public class RetroreImport extends HeadlessScript {
         }
     }
 
-    /** Back the root's uninitialized data and stack with memory, skipping explicitly placed units. */
-    private void addRootAllocation(JsonArray units, JsonObject root, long end, Memory memory)
+    private long[] loadPascalCapture(JsonObject map, Memory memory, Path path, MemoryBlock root) throws Exception {
+        var capture = map.getAsJsonObject("microsoft_pascal_capture");
+        var layout = map.getAsJsonObject("microsoft_pascal_dgroup");
+        int segment = capture.get("segment").getAsInt();
+        int shift = (segment - layout.get("biased_segment").getAsInt()) & 0xffff;
+        long start = (layout.get("copy_start_segment").getAsLong() + shift) * 16;
+        long end = (layout.get("copy_end_segment").getAsLong() + shift) * 16;
+        if (segment < 0 || segment > 0xffff || shift > layout.get("max_shift_paragraphs").getAsInt() ||
+                shift != capture.get("shift_paragraphs").getAsInt() || start != capture.get("linear").getAsLong() ||
+                end - start != capture.get("size").getAsLong() || start < root.getStart().getOffset() ||
+                start < layout.get("startup_linear").getAsLong() + 0xa2 || end <= start || end > 0x100000L) {
+            throw new IllegalArgumentException("invalid captured Microsoft Pascal DGROUP range");
+        }
+        if (Files.size(path) != end - start) {
+            throw new IllegalArgumentException("captured Microsoft Pascal DGROUP has the wrong length");
+        }
+        byte[] data = Files.readAllBytes(path);
+        String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(data));
+        if (data.length != end - start || !hash.equals(capture.get("sha256").getAsString())) {
+            throw new IllegalArgumentException("captured Microsoft Pascal DGROUP does not match map.json");
+        }
+        for (var block : memory.getBlocks()) {
+            if (!block.getName().equals("root") && start <= block.getEnd().getOffset() && end > block.getStart().getOffset()) {
+                throw new IllegalArgumentException("captured Microsoft Pascal DGROUP overlaps " + block.getName());
+            }
+        }
+        // A small shift can leave part of the destination in the original root file range.
+        int overlap = (int) Math.max(0, Math.min(end, root.getEnd().getOffset() + 1) - start);
+        if (overlap > 0) {
+            // Keep BinaryLoader's FileBytes available to manifest views of the static image.
+            Address rootStart = root.getStart();
+            byte[] view = new byte[(int) root.getSize()];
+            memory.getBytes(rootStart, view);
+            System.arraycopy(data, 0, view, (int) (start - rootStart.getOffset()), overlap);
+            memory.removeBlock(root, monitor);
+            var replacement = memory.createInitializedBlock("root", rootStart, new ByteArrayInputStream(view),
+                view.length, monitor, false);
+            replacement.setExecute(true);
+            replacement.setWrite(true);
+        }
+        if (overlap < data.length) {
+            var block = memory.createInitializedBlock("pascal_dgroup", space.getAddress(start + overlap),
+                new ByteArrayInputStream(data, overlap, data.length - overlap), data.length - overlap, monitor, false);
+            block.setWrite(true);
+            block.setExecute(false);
+            block.setComment("Captured Microsoft Pascal DGROUP (SHA-256 " + hash + ")");
+        }
+        return new long[] {start, end};
+    }
+
+    /** Back the root's uninitialized data and stack, skipping placed units and captured data. */
+    private void addRootAllocation(JsonArray units, JsonObject root, long end, Memory memory, long[] capturedRange)
             throws Exception {
         long start = root.get("linear").getAsLong() + root.get("size").getAsLong();
         var used = new java.util.ArrayList<long[]>();
@@ -162,6 +220,9 @@ public class RetroreImport extends HeadlessScript {
             JsonObject unit = item.getAsJsonObject();
             long linear = unit.get("linear").getAsLong();
             used.add(new long[] {linear, linear + unit.get("size").getAsLong()});
+        }
+        if (capturedRange != null) {
+            used.add(capturedRange);
         }
         used.sort((left, right) -> Long.compare(left[0], right[0]));
         int part = 0;

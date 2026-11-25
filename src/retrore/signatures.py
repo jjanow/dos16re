@@ -2,9 +2,12 @@
 
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from struct import unpack_from
 
-from .mz import LoadedMZ
+from .mz import LoadedMZ, MZError
+
+PASCAL_DGROUP_FILE = "pascal-dgroup.bin"
 
 
 def _pattern(hex_bytes: str) -> re.Pattern[bytes]:
@@ -144,6 +147,24 @@ def microsoft_pascal_dgroup(root: LoadedMZ, compiler: Compiler) -> dict[str, int
         "max_shift_paragraphs": (shift_word >> 4) + 1,
         "stack_offset": stack_offset,
     }
+
+
+def microsoft_pascal_capture(dgroup: dict | None, segment: int, data: bytes) -> dict:
+    if dgroup is None:
+        raise MZError("DGROUP capture requires a recognized Microsoft Pascal DGROUP copy")
+    shift = (segment - dgroup["biased_segment"]) & 0xFFFF
+    if not 0 <= segment <= 0xFFFF or shift > dgroup["max_shift_paragraphs"]:
+        raise MZError("captured DGROUP selector is outside the startup shift range at this load base")
+    start = (dgroup["copy_start_segment"] + shift) * 16
+    end = (dgroup["copy_end_segment"] + shift) * 16
+    if start < dgroup["startup_linear"] + 0xA2:
+        raise MZError("captured DGROUP overlaps the Microsoft Pascal startup")
+    if end > 0x100000:
+        raise MZError("captured DGROUP extends past the 1 MiB image limit")
+    if len(data) != end - start:
+        raise MZError(f"DGROUP capture must contain {end - start} bytes, got {len(data)}")
+    return {"segment": segment, "shift_paragraphs": shift, "linear": start,
+            "size": len(data), "sha256": sha256(data).hexdigest()}
 
 
 @dataclass(frozen=True)
