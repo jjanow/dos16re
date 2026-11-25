@@ -1666,6 +1666,9 @@ supported platforms. Tests skip when their input variables are unset.
 The Phantasie III DOS tests exercise floating-point arithmetic and register-stack copies in Unicorn.
 The Ghidra test audits computed targets across the root and four LINK members, then replays
 observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
+The audit checks the error and stack-check hook defaults, the argument builder's saved return,
+and the registered floating-point exception handler. It checks for far-pointer aliases to the
+three detached entries in the loaded bytes of all five units.
 The archives playthroughs also use the original DOS data files in `RETRORE_PH3_DIR`. They trace a
 scroll event, a combat round with Fireflash I, and a gold event that runs once when the party visits
 the same square twice. The tests check magic and gold totals, monitor the installed callback table

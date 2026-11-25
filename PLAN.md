@@ -14,17 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, extended Phase 9's Phantasie III DOS audit to the wilderness. Added opt-in
-playthroughs for the Jolly Inn's insufficient-funds branch and a declined attack on sleeping
-monsters. Both map LINK member 3's instructions to the original file and check the installed
-callback table, detached entries, and floating-point record activity. Ten focused Phantasie III
-checks passed with original media and Ghidra 12.2. The standalone suite passed 518 tests with
-141 skipped.
+On 2026-11-24, audited the 11 unresolved computed transfers in the Phantasie III DOS
+Ghidra listing. Checked the guarded runtime hooks, the argument builder's saved return, the
+floating-point exception call, and far-pointer aliases in the load image. The audit found no
+callers of the conversion callback, alternate parser, or comparison entry in the listing or
+traced paths. All 10 focused checks passed with the original DOS media and Ghidra 12.2.
+The standalone suite passed 518 tests with 141 skipped.
 
-Resume Phase 9 by auditing the unresolved computed transfers for callers of the conversion
-callback, alternate parser, and comparison entry. Trace the callback's far output pointer back
-to its callers if found. Automatic dispatch bounds still require evidence for reachable stores,
-including potential aliases, and record sources.
+Resume Phase 9 by tracing remaining reachable stores that may alias the floating-point record
+allocation and tracking the source classes of record copies. For the detached entries, follow
+runtime-created pointers on paths outside the traced routes and trace the conversion output
+pointer from any caller found.
 
 ## Why
 
@@ -369,6 +369,20 @@ listed in the parity table and platform milestones below.
   entered at `link_0004:062d` and its tile dispatch at `:05c1` reached `:05c6` and `:05e9`.
   The DOS read shim invalidates Unicorn's translation cache for the overlay window when it writes
   a member, so execution uses the newly loaded code.
+- **Audited the 11 unresolved transfers in the Ghidra 12.2 listing.** Eight were far.
+  The initializer, argument return, interrupt thunk, and two menu calls have observed targets.
+  The argument builder writes DGROUP:`1d9e` at `root:447e` and `:4482`. The live jump at
+  `root:4621` uses that slot to return to `root:4264`. Probes confirm that the error callback
+  at `root:441d` skips a null slot at DGROUP:`1d94` and the stack-check jump at `root:4454`
+  skips the `ffff:ffff` sentinel at DGROUP:`1d98`. The listing identifies reads of those
+  slots and no direct writers. The floating-point exception call at `root:11e86` reads the
+  pointer in `280a:0000`; probes confirm its far return frame on entry to `root:602b`.
+  The other three listed sites, `root:1191c`, `root:126cf`, and `root:13721`, transfer
+  within the floating-point runtime's CS `218f`, above the three detached entries. A scan
+  at every byte alignment of the five loaded units, including segment aliases and 20-bit wrap,
+  found only the relocated template pointer at `root:2b0d4`. The observed menu selections
+  and initialized pointers cover the audited paths. Reachability via runtime writes, untraced
+  selections, and undefined code remains open.
 - **Traced an archives event and combat in the shipped DOS release.** An opt-in Unicorn
   playthrough creates and adds a fighter in Pendragon, loads the first `DNGS.DAT` record, keeps
   the scroll in the west room, and completes a round against a wandering group. Member 4

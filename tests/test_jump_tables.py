@@ -505,6 +505,50 @@ def _phantasie_iii_town_dispatch(tmp_path, program):
     return events, {f"link_0002:{handler:04x}" for handler in targets}
 
 
+def _phantasie_iii_check_detached_pointer_sources(image, program, detached):
+    origin = program["units"][0]["linear"]
+    targets = {origin + int(address.split(":")[1], 16): address for address in detached}
+    sources = []
+    for unit in program["units"]:
+        start = unit["image_offset"]
+        # Test every byte alignment, including alternative segment:offset encodings and A20 wrap.
+        for index in range(start, start + unit["size"] - 3):
+            offset, segment = unpack_from("<HH", image, index)
+            target = targets.get((segment * 16 + offset) & 0xfffff)
+            if target is not None:
+                sources.append((unit["name"], index - start, target))
+    assert sources == [("root", 0x2b0d4, "root:6a12")]
+
+
+def _phantasie_iii_check_default_runtime_hooks(image, program):
+    emulator = Emulator(image, program)
+    base = program["units"][0]["segment"]
+    dgroup = base + 0x28c0
+    code = base + 0x3b2
+
+    def root(offset):
+        return Address(code, offset - 0x3b20)
+
+    class GuardSkippedHook(Exception):
+        pass
+
+    def skipped(_cpu):
+        raise GuardSkippedHook
+
+    # The error handler tests the callback's segment word. The stack probe checks
+    # the offset sentinel after forcing the insufficient-stack branch.
+    for entry, skip, slot, value, ax in (
+        (0x4416, 0x4421, 0x1d94, (0, 0), 0),
+        (0x4434, 0x444d, 0x1d98, (0xffff, 0xffff), 0x8000),
+    ):
+        assert unpack_from("<HH", image, Address(dgroup, slot).linear - base * 16) == value
+        with pytest.raises(GuardSkippedHook):
+            emulator.call(
+                root(entry), far=True, regs={"ds": dgroup, "ss": dgroup, "sp": 0x7600, "ax": ax},
+                hooks={root(skip): skipped}, limit=20,
+            )
+
+
 def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_startup, capsys):
     tmp_path, program = phantasie_iii_export
     export = tmp_path / "export"
@@ -531,6 +575,10 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     for target in ("13b2:2863", "13b2:2d84"):  # Runtime CS:IP for root:6383 and root:68a4.
         assert main(["where-is", "--export", str(export), "--pointer", target, "--pointer-kind", "near", "--json"]) == 0
         assert json.loads(capsys.readouterr().out)["matches"] == []
+    detached = {"root:6383", "root:68a4", "root:6a12"}
+    image = (export / "image.bin").read_bytes()
+    _phantasie_iii_check_detached_pointer_sources(image, program, detached)
+    _phantasie_iii_check_default_runtime_hooks(image, program)
 
     town_events, town_targets = _phantasie_iii_town_dispatch(tmp_path, program)
     town_trace = tmp_path / "town-dispatch.json"
@@ -573,12 +621,23 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     requests.extend({"command": "xrefs", "address": address, "direction": "incoming"} for address in (
         "38c0:1dd6", "root:6a12", "root:6383", "root:68a4", "root:6349",
     ))
+    runtime_slots = {
+        "38c0:1d94": {("root:441d", "READ")},
+        "38c0:1d96": {("root:4416", "READ")},
+        "38c0:1d98": {("root:4447", "READ"), ("root:4454", "READ")},
+        "38c0:1d9a": set(),
+        "38c0:1d9e": {("root:447e", "WRITE"), ("root:4621", "READ")},
+        "38c0:1da0": {("root:4482", "WRITE")},
+    }
+    requests.extend({"command": "xrefs", "address": address, "direction": "incoming", "compact": True}
+                    for address in runtime_slots)
     batch = tmp_path / "queries.json"
     batch.write_text(json.dumps(requests), encoding="utf-8")
     assert main(["batch", str(batch), "--project", str(project), "--evidence", "--json"]) == 0
-    callback_result, dispatch_result, inventory, writes_result, *references = [
+    callback_result, dispatch_result, inventory, writes_result, *reference_results = [
         row["result"] for row in json.loads(capsys.readouterr().out)["results"]
     ]
+    references = reference_results[:5]
     callback, = callback_result["sites"]
     dispatch, = dispatch_result["sites"]
     assert (callback["status"], callback["segment"], callback["table"]) == (
@@ -589,12 +648,25 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     assert dispatch["status"] == "unresolved" and dispatch["reason"] == "no_valid_entries"
     # Audit Ghidra's targets and candidates across the root and all four LINK members.
     assert inventory["pagination"]["sites"]["next_offset"] is None
-    detached = {"root:6383", "root:68a4", "root:6a12"}
     observed_targets = {
         target for site in inventory["sites"]
         for target in (*site["targets"], *(row["target"] for row in site.get("candidates", ())))
     }
     assert detached.isdisjoint(observed_targets)
+    # Account for every other listed site. The two runtime hooks use guarded defaults.
+    # The initializer, argument return, interrupt thunk, menu calls, and FPU exception
+    # call have separate runtime evidence. Near transfers in the FPU segment cannot reach
+    # the detached entries, which are below that segment's base.
+    audited_far = {"root:4405", "root:441d", "root:4454", "root:4621", "root:52c2",
+                   "root:721d", "root:724f", "root:11e86"}
+    audited_near = {"root:1191c", "root:126cf", "root:13721"}
+    for site in inventory["sites"]:
+        if site["status"] != "unresolved":
+            continue
+        far = site["instruction"].split()[0] in ("CALLF", "JMPF")
+        assert site["address"] in (audited_far if far else audited_near), site
+    for report, expected in zip(reference_results[5:], runtime_slots.values(), strict=True):
+        assert {(ref["from"], ref["type"]) for ref in report["incoming"]} == expected
     # The listing shows the integer-parser call but has no incoming reference for these paths.
     assert [report["incoming"] for report in references[:-1]] == [[], [], [], []]
     parser_call, = references[-1]["incoming"]
@@ -775,6 +847,7 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
     stack_top = Address(data_segment, 0x10)
     bottom, empty_stack, last_record = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
     records = Address(data_segment, bottom)
+    runtime_segment = runtime_address(0x126cf).segment
     fields = set(range(records.linear + 11, Address(data_segment, last_record + 12).linear, 12))
     written_classes = set()
     arithmetic_pairs = set()
@@ -796,6 +869,7 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
         dispatches = []
 
         def observe(cpu, comparison):
+            assert cpu.reg_read(x86.UC_X86_REG_CS) == runtime_segment
             segment = cpu.reg_read(x86.UC_X86_REG_DS) * 16
             registers = (x86.UC_X86_REG_SI, x86.UC_X86_REG_DI) if comparison else (x86.UC_X86_REG_SI,)
             classes = tuple(cpu.mem_read(segment + cpu.reg_read(register) + 11, 1)[0] for register in registers)
@@ -805,6 +879,7 @@ def test_phantasie_iii_arithmetic_and_stack_record_classes(phantasie_iii_float_r
             dispatches.append(classes)
 
         def observe_arithmetic(cpu):
+            assert cpu.reg_read(x86.UC_X86_REG_CS) == runtime_segment
             segment = cpu.reg_read(x86.UC_X86_REG_DS) * 16
             si, di = (cpu.reg_read(register) for register in (x86.UC_X86_REG_SI, x86.UC_X86_REG_DI))
             left, right = (cpu.mem_read(segment + index + 11, 1)[0] for index in (di, si))
@@ -889,14 +964,18 @@ def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phan
     dgroup = base + 0x28c0
     c_segment = base + 0x3b2
     sp = program["stack"]["offset"] + 0x6c4e - 0x100
+    game_callback = Address(c_segment, 0x602b - 0x3b20)
+    exception_call = runtime_address(0x11e86)
     registered = emulator.call(
         Address(c_segment, 0x42eb - 0x3b20), regs={"ds": dgroup, "ss": dgroup, "sp": sp},
         writes=[(Address(c_segment, 0x42fa - 0x3b20), b"\xc3")], reads=[(handler_pointer, 4)],
     )
-    assert registered.memory == ((handler_pointer, pack("<HH", 0x602b - 0x3b20, c_segment)),)
+    assert registered.memory == ((handler_pointer, pack("<HH", game_callback.offset, game_callback.segment)),)
 
     class ProgramExit(Exception):
         pass
+
+    game_errors = []
 
     def dos(cpu, _number):
         ax = cpu.reg_read(x86.UC_X86_REG_AX)
@@ -925,7 +1004,13 @@ def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phan
             return lambda: cpu.hook_del(hook)
 
         def exception(cpu):
-            errors.append(cpu.reg_read(x86.UC_X86_REG_AL))
+            ss, sp = cpu.reg_read_batch((x86.UC_X86_REG_SS, x86.UC_X86_REG_SP))
+            assert cpu.mem_read(Address(ss, sp).linear, 4) == pack(
+                "<HH", exception_call.offset + 4, exception_call.segment,
+            )
+            assert cpu.reg_read(x86.UC_X86_REG_DS) == data_segment
+            assert cpu.mem_read(handler_pointer.linear, 4) == pack("<HH", target.offset, target.segment)
+            (game_errors if game_handler else errors).append(cpu.reg_read(x86.UC_X86_REG_AL))
 
         def observe_test(cpu):
             assert cpu.reg_read(x86.UC_X86_REG_DS) == data_segment
@@ -939,6 +1024,7 @@ def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phan
         handler = registered.memory if game_handler else (
             (handler_pointer, pack("<HH", report.offset, report.segment)), (report, b"\xcb"),
         )
+        target = game_callback if game_handler else report
         result = emulator.call(
             scratch, regs={"ds": scratch.segment, "ss": dgroup if game_handler else scratch.segment,
                            "sp": sp if game_handler else 0xff00},
@@ -950,7 +1036,7 @@ def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phan
                 *handler,
             ],
             reads=[(stack_top, 2)], ivt_interrupts=vectors, interrupts={0x21: dos} if game_handler else {},
-            hooks={report: exception, runtime_address(0x13721): observe_test}, _setup=audit,
+            hooks={target: exception, runtime_address(0x13721): observe_test}, _setup=audit,
         )
         final_top, = unpack_from("<H", result.memory[0][1])
         return errors, classes, final_top, writes
@@ -984,6 +1070,7 @@ def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phan
         with pytest.raises(ProgramExit) as error:
             probe(*operation, game_handler=True)
         assert error.value.args == (status,)
+    assert game_errors == [0x83, 0x8b, 0x8a]
 
 
 def test_phantasie_iii_float_store_outputs_and_interrupt_edges(

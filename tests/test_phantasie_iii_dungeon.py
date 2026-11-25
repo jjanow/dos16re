@@ -228,6 +228,7 @@ def _play_game(image, program, dos, active_member, entry_offset, observe):
     installed_callbacks = []
     callback_reads = []
     detached_hits = []
+    argument_returns = []
     entered = False
     route_entry = active_member["runtime_linear"] + entry_offset
 
@@ -238,6 +239,11 @@ def _play_game(image, program, dos, active_member, entry_offset, observe):
         if address == origin + 0x6028:  # The initializer just copied the five far pointers.
             offset, segment = unpack_from("<HH", cpu.mem_read(callbacks + 8, 4))
             installed_callbacks.append(Address(segment, offset).linear)
+        if address == origin + 0x4621:  # The argument builder jumps to the far return saved on entry.
+            ds = cpu.reg_read(x86.UC_X86_REG_DS)
+            assert ds == base + 0x28c0
+            offset, segment = unpack_from("<HH", cpu.mem_read(Address(ds, 0x1d9e).linear, 4))
+            argument_returns.append(Address(segment, offset).linear)
         if address in detached:
             detached_hits.append(address)
         if address == origin + 0x1249b:
@@ -279,6 +285,7 @@ def _play_game(image, program, dos, active_member, entry_offset, observe):
             on_out=lambda _cpu, _port, _size, _value: None, _setup=setup, limit=15_000_000,
         )
     assert entered
+    assert argument_returns == [origin + 0x4264]
     assert installed_callbacks == [origin + 0x6a12]
     assert not callback_reads and not detached_hits
     assert fpu_dispatches[False] > 0 and fpu_dispatches[True] == 0
