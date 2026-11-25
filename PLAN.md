@@ -14,17 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, replayed all seven observed Phantasie III DOS FPU interrupt edges in Ghidra 12.2.
-Interrupt continuations recovered the instruction at `root:688d`. Refreshed write analysis follows
-the observed handler edges and reports both register exchange writes as possible aliases. Added
-caller-verified x86 register arguments and joined return storage, two Microsoft C runtime signatures,
-and 11 IOCS prototypes. Recovered Apple II PICPLOT's biased split table and verified its writes in py65.
-The standalone suite passed 518 tests with 146 skipped. The focused recovery suite passed 111 checks
-with Ghidra and original media. All six Phantasie III archives and wilderness playthroughs passed.
+On 2026-11-25, completed Phase 9 for the validated releases. Traced Phantasie III's live heap pointer
+at two DOS allocation bases, checked additional floating-point output cases, and ran a Microsoft C 5.1
+scanner probe to identify the corresponding parser path and callback. Added Microsoft C heap signatures
+and typed 13 OPMDRV subcalls. Recognized DOS interrupts now decompile as one service call. The standalone
+suite passed 518 tests with 149 skipped. The six original DOS archives and wilderness routes passed with
+Ghidra replay, and both heap placements passed in Unicorn.
 
-Resume with runtime observations for the detached DOS conversion entries and dynamic heap pointers.
-Additional calling-convention evidence and the DOS `swi(0x21)` decompiler behavior remain in the
-Phase 9 follow-up notes.
+Resume validation when original X1turbo media or a new compiler runtime is available. For the three
+detached DOS entries, the Phase 9 results record their callable behavior and observed reachability.
 
 ## Why
 
@@ -211,7 +209,7 @@ Phases 1–7 are implemented for the initial DOS scope, including the optional D
 The Commodore Amiga, Atari ST, Commodore 64, Apple II, Atari 8-bit, MSX2, NEC PC-88, NEC PC-98,
 Sharp X1, Sharp X68000, Classic Macintosh, Nintendo NES / Famicom, and Sega Genesis / Mega Drive
 milestones are complete for the validated releases. X1turbo validation awaits original media.
-Phase 9 covers the code and data recovery workflows below and records open research separately.
+Phase 9 is implemented and validated on the releases documented below.
 Additional platform capabilities are listed in the parity table and platform milestones below.
 
 ## Analysis backlog
@@ -469,7 +467,15 @@ Additional platform capabilities are listed in the parity table and platform mil
   of `memcpy` and `isatty` from the compiler probes. Short straight-line routines can infer register
   parameters and `DX:AX` or `DX:BX:AX` return storage from direct callers. Real48 signatures retain
   their type. X68000 IOCS stubs have register prototypes for 43 services. Caller-validated XC stack
-  parameters restore the `_rand(100)` argument in `_frand`.
+  parameters restore the `_rand(100)` argument in `_frand`. The `_brkctl`, `_fmalloc`, and `_ffree`
+  signatures match the Microsoft C 5.1 libraries and the shipped Phantasie III routines. `_brkctl`
+  includes the four-byte increment and far block argument. It and `_fmalloc` return a far pointer
+  in `DX:AX`. `_ffree` takes a far pointer. Phantasie IV's 13 OPMDRV wrappers use a constant in
+  `D1` to select the subcall. Each typed stub declares the
+  `D2` and `A1` inputs used by that wrapper. A bypassable selector load falls back to `_OPMDRV`.
+  Ghidra's call fixup elides the separate `swi(0x21)` at recognized DOS sites while retaining the
+  service call and its carry result. Unrecognized DOS services and BIOS interrupts retain their
+  ordinary vector lookup. The disassembly retains the original interrupt bytes.
 - **Implemented.** Searches without Ghidra: `where-is --string` tries each platform's encodings
   (PETSCII and screen codes, high-bit Apple II, ATASCII, Shift-JIS, and others), `--pointer` finds
   stored near, far, or absolute pointers and marks relocated ones, `relocs` filters relocations, and
@@ -487,10 +493,26 @@ Additional platform capabilities are listed in the parity table and platform mil
   the high-byte operand base is outside the export. The original routine copies the first two rows
   of a supplied panel into the predicted HGR locations in py65.
 
-**Follow-up research.** Heap pointers that only exist at runtime, unresolved floating-point stores,
-and callers for the detached DOS conversion entries require more runtime observations. Continue
-extending runtime and IOCS signature coverage as new binaries are validated. Ghidra still emits a
-separate `swi(0x21)` operation alongside recognized DOS service calls.
+- **Traced runtime-only heap pointers.** Phantasie III's `_brkctl` receives the allocated DOS
+  selector in AX at `root:4f05`. The runtime stores it in DGROUP:`1dc6` at `root:4cf4` and
+  returns the map allocation from `_fmalloc` in `DX:AX` at `root:4cbc`. Archives member 4's `LES` at
+  `link_0004:1316` loads the pointer from `2820:b63c` and the next instruction reads a tile byte.
+  The same sequence uses heap selectors `6000` and `6200` in separate runs. `trace --evidence`
+  identifies the reader's file offset and records the heap location as runtime-only.
+- **Verified remaining output cases.** The single subnormal and double saturation paths write
+  the expected words to the caller's buffer. Masked invalid `FISTP` writes the indefinite integer
+  at each of the 16-, 32-, and 64-bit destinations. Packed BCD, environment, and state stores
+  terminate the software runtime with DOS exit `0x87` before writing the destination. Direct calls
+  to `root:68a4` preserve AX and transfer each ordered comparison result from `SS:[BP-2]` to FLAGS.
+  Static `possible` overlaps remain conditional on runtime selectors and offsets.
+- **Identified the conversion callback's library caller.** A Microsoft C 5.1 `/AL` probe linked
+  with `LLIBCR`, `LLIBFP`, `EM`, and `LIBH` runs in DOSBox and Unicorn with `NO87=1`. Its `sscanf`
+  call parses `%lf %f` as `2.5` and `3.25`. Unicorn observes the third far pointer in
+  `__cfltcvt_tab` taking both scanner calls to `__fassign`, the library equivalent of `root:6a12`.
+  The library ASCII converter also falls through to the equivalent of `root:6383` after a status check.
+  Linking `__fcompp` from `LLIBFP`'s `87fcmp.asm` object reproduces all 25 bytes at `root:68a4`.
+  The shipped Phantasie III routes make no reads of the installed callback table
+  and observe no calls to the three entries.
 
 ### Phase 10: inspectable evidence and reusable analysis
 

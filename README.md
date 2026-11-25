@@ -710,7 +710,9 @@ program. The original bytes stay in `image.bin`.
   `uVar2 % param_1` or `(dVar2 + dVar1) / 2.0`. Compares set the condition codes.
 - `trap #15` calls whose number is loaded into D0 just before the trap become calls to
   `IOCS::_CRTMOD`-style stubs, with the name in the comment. Supported IOCS calls declare their
-  register arguments and results.
+  register arguments and results. When a preceding `MOVEQ` establishes D1, OPMDRV calls use
+  a stub for the selected command, such as `IOCS::_OPMDRV_03(value,buffer)`. The generic stub
+  covers calls with an unknown selector.
 - For rejoined XC functions, a direct caller whose stack cleanup corroborates the decompiler's
   inferred stack slots lets the importer persist those parameters. Phantasie IV's `_frand` shows
   the call to `_rand(100)`.
@@ -858,6 +860,8 @@ For short straight-line routines, agreeing direct callers can establish register
 the value as Real48.
 `int 21h` sites with AH loaded in the same straight-line code become calls to stubs such as
 `DOS::SeekFile` in a `dos_services` block. The carry flag reads as `extraout_CF` after the call.
+A site-specific call fixup removes the redundant `swi(0x21)` from decompilation. Ghidra may
+display a note about that injection. Unrecognized services retain the interrupt vector lookup.
 Re-export images made by older versions to include the relocation metadata.
 
 ```sh
@@ -1045,14 +1049,18 @@ listing alone. Reimport to use tracked register values.
 The Phantasie III check compares this report with Unicorn observations of the single-precision
 output words and class words. The query flags the output stores, constant copy, register copy,
 and both register exchange writes as possible overlaps. Changing the caller's segment and offset
-can make an output store overwrite an internal class byte.
+can make an output store overwrite an internal class byte. Structured `trace` memory events can
+identify a writer or reader and its original file offset even when its destination is on the
+runtime heap and has no image location.
 
 With `RETRORE_PH3_DIR` set, the Phantasie III validation runs the shipped software floating-point
 handlers and checks writes from parser, formatter, conversion, and LINK overlay code against the
 record stack. It checks the class bytes used by six arithmetic operations across all 16 input class
 pairs, plus temporary records and selected exception paths. The startup probe follows the computed
 initializer call and replays it in Ghidra. The installed conversion callback uses a caller-supplied
-far pointer for either output. Its callers remain unresolved.
+far pointer for either output. A Microsoft C 5.1 probe observes `sscanf` passing that pointer to
+the corresponding library callback for `%f` and `%lf`. The shipped playthroughs observe no callback
+table reads.
 
 ```sh
 .venv/bin/python -m pytest -q tests/test_jump_tables.py tests/test_phantasie_iii_dungeon.py -k phantasie_iii
@@ -1685,11 +1693,12 @@ status-word stores against the caller's buffer and the internal register allocat
 The Ghidra test audits computed targets across the root and four LINK members, then replays
 observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
 The interrupt test reads the saved return address and installed vector for seven shipped
-call sites. Ghidra imports six edges across the common operand, segment override, and WAIT
-handlers. It reports the `INT 39h` at `root:688d` as an instruction offcut.
+call sites. Ghidra imports all seven edges across the common operand, segment override, and WAIT
+handlers. The observed continuations recover `INT 39h` at `root:688d` and skip its inline operands.
 The audit checks the error and stack-check hook defaults, the argument builder's saved return,
 and the registered floating-point exception handler. It checks for far-pointer aliases to the
-three detached entries in the loaded bytes of all five units.
+three detached entries in the loaded bytes of all five units. The heap test follows the return from
+DOS allocation through the Microsoft C heap and a LINK member's tile reader at two heap bases.
 The archives playthroughs also use the original DOS data files in `RETRORE_PH3_DIR`. They trace a
 scroll event, a combat round with Fireflash I, and a gold event that runs once when the party visits
 the same square twice. The tests check magic and gold totals, monitor the installed callback table

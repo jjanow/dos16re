@@ -233,6 +233,9 @@ def test_x68k_dos_prototypes_in_map():
     assert iocs["21"]["parameters"] == [{"name": "text", "type": "char*", "register": "A1"}]
     assert [parameter["register"] for parameter in iocs["45"]["parameters"]] == ["D1", "D2", "D3", "A1"]
     assert [parameter["register"] for parameter in iocs["77"]["parameters"]] == ["D1u", "D1w", "D2u", "D2w"]
+    subcalls = program["line_f_calls"]["iocs_subcalls"]
+    assert subcalls["F000"]["parameters"] == []
+    assert [parameter["register"] for parameter in subcalls["F003"]["parameters"]] == ["D2", "A1"]
 
 
 def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
@@ -252,6 +255,26 @@ def test_x68k_ghidra_dos_call_arguments(tmp_path, capsys):
     assert main(["callers", "01000420", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     calling, = json.loads(capsys.readouterr().out)["callers"]
     assert calling["from"]["unit_address"] == "text:002c"
+
+
+def test_x68k_ghidra_iocs_subcalls_require_an_unambiguous_selector(tmp_path, capsys):
+    if not os.environ.get("GHIDRA_HOME"):
+        pytest.skip("set GHIDRA_HOME to run the Ghidra integration test")
+    code = bytes.fromhex(
+        " 742a 227c 0001 0200 7203 70f0 4e4f"  # OPMDRV subcall 3 with D2 and A1.
+        " 4a80 6702 720c 70f0 4e4f 4e75"      # A branch can bypass the next subcall selector.
+    )
+    source, export, project = (tmp_path / name for name in ("OPM.X", "out", "project"))
+    source.write_bytes(_x(code, b"", relocations=b"", symbols=b"", entry=0))
+    assert main(["load", str(source), "-o", str(export)]) == 0
+    capsys.readouterr()
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["line_f"]["iocs_calls"] == 2
+    assert main(["decomp", "text:0", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    code = json.loads(capsys.readouterr().out)["decompilation"]
+    assert re.search(r"IOCS::_OPMDRV_03\((?:0x2a|42),", code)
+    assert "IOCS::_OPMDRV(" in code
+    assert "IOCS::_OPMDRV_0C(" not in code
 
 
 def test_x68k_recovers_arguments_of_rejoined_xc_routine(tmp_path, capsys):
@@ -359,3 +382,4 @@ def test_ghidra_phantasie_iv_dos_and_fpack_calls(tmp_path, capsys):
     assert "return (double)iVar1 / 100.0;" in random
     crt_mode = decompile("text:3b676")
     assert "void _CRTMOD(short param_1)" in crt_mode and "IOCS::_CRTMOD(param_1);" in crt_mode
+    assert "IOCS::_OPMDRV_03(" in decompile("text:3b57c")

@@ -198,8 +198,8 @@ def _medium(prototype: Prototype) -> Prototype:
     return Prototype(prototype.name, prototype.result, prototype.parameters, variadic=prototype.variadic, far=True)
 
 
-# Microsoft C 5.1 /AM probes linked against MLIBCR. Medium model keeps data pointers near and uses
-# far calls for public functions. Offsets and selectors resolved by the linker are wildcarded.
+# Microsoft C 5.1 far-code probes linked against MLIBCR and LLIBCR. The startup is shared across
+# data models. Match pointer widths from each routine and wildcard linker offsets and selectors.
 _MICROSOFT_C_MEDIUM = (
     (_medium(_MEMCPY), "55 8b ec 8b d7 8b de 8c d8 8e c0 8b 76 08 8b 7e 06 8b c7 8b 4e 0a e3 0e a8 01 74 02 a4 49 "
                       "d1 e9 f3 a5 13 c9 f3 a4 8b f3 8b fa 5d cb"),
@@ -214,6 +214,15 @@ _MICROSOFT_C_MEDIUM = (
      "55 8b ec 83 ec 08 57 56 be ?? ?? 8d 46 08 89 46 fc 56 9a ?? ?? ?? ?? 83 c4 02 8b f8 8d 46 08"),
     (_medium(_MALLOC), "55 8b ec 56 57 bb ?? ?? 83 3f 00 75 29 1e 07 b8 05 00 e8 ?? ?? 75 05 33 c0 99"),
     (_medium(_FREE), "55 8b ec 8b 5e 06 0b db 74 04 80 4f fe 01 8b e5 5d cb"),
+    (Prototype("_fmalloc", "farptr", _MALLOC.parameters, result_registers=("DX", "AX"), far=True),
+     "55 8b ec 83 ec 02 56 57 8b 46 06 3d f1 ff 73 1e 83 3e ?? ?? 00 75 08 e8 25 00 74 12 a3 ?? ?? "
+     "e8 ?? ?? 75 15 e8 18 00 74 05 e8 ?? ?? 75 0b ff 76 06 9a ?? ?? ?? ?? 83 c4 02 5f 5e 8b e5 5d cb"),
+    (Prototype("_ffree", "void", (Parameter("memory", "farptr"),), far=True),
+     "55 8b ec c4 5e 06 8c c0 0b c3 74 05 26 80 4f fe 01 8b e5 5d cb"),
+    (Prototype("_brkctl", "farptr", (Parameter("operation", "int"), Parameter("increment", "long"),
+                                    Parameter("block", "farptr")), result_registers=("DX", "AX"), far=True),
+     "55 8b ec 56 57 06 83 7e 0a 00 75 38 bf ?? ?? 8b 56 08 8b 46 06 48 75 07 e8 53 00 72 27 eb 48 "
+     "8b 36 ?? ?? 48 74 11 3b f7 74 0d"),
     (Prototype("write", "int", (Parameter("handle", "int"), Parameter("buffer", "void*"), Parameter("count", "uint")),
                far=True),
      "55 8b ec 83 ec 08 8b 5e 06 3b 1e ?? ?? 72 07 b8 00 09 f9 e9 ?? ?? f6 87 ?? ?? 20"),

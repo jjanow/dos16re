@@ -81,7 +81,7 @@ CONVENTIONS = bytes.fromhex(
     " b8 03 00 50"     # 0022 push 3
     " e8 1d 00"        # 0026 call difference       C: caller cleanup
     " 83 c4 04"        # 0029 add sp,4
-    " a3 74 00"        # 002c mov [result],ax
+    " e8 22 00"        # 002c call unknown_interrupts
     " b4 4c cd 21"     # 002f mov ah,4ch; int 21h   exit
     " 90"
     " 55 8b ec"        # 0034 first_plus(value, far name)
@@ -93,6 +93,8 @@ CONVENTIONS = bytes.fromhex(
     " 8b 46 04"        # 0049 mov ax,[bp+4]
     " 2b 46 06"        # 004c sub ax,[bp+6]
     " 5d c3"           # 004f pop bp; ret
+    " b4 ff cd 21"     # 0051 an unrecognized DOS service
+    " cd 16 c3"        # 0055 a BIOS interrupt
 ).ljust(0x60, b"\x90") + b"A.DAT\0"
 
 
@@ -118,10 +120,19 @@ def test_ghidra_dos_conventions_and_services(tmp_path, capsys):
     entry = decompile("root:0000")
     assert "DOS::OpenFile(0,(char *)0x60);" in entry and "if (!extraout_CF) {" in entry
     assert "DOS::Exit((byte)" in entry
+    assert "swi(0x21)" not in entry
     # The far pointer argument is one parameter, and the C routine takes the two words its caller removes.
     assert "FUN_1000_0034((void *)CONCAT22(unaff_CS,(void *)0x60),7);" in entry
     assert "FUN_1000_0046(3,5);" in entry
     assert "int FUN_1000_0034(void *param_1,int param_2)" in decompile("root:0034")
+    unknown = decompile("root:0051")
+    assert "swi(0x21)" in unknown and "swi(0x16)" in unknown
+    assert main(["callees", "root:0000", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    calls = json.loads(capsys.readouterr().out)["callees"]
+    assert [row["to"]["unit_address"] for row in calls if row["type"] == "CALL_OVERRIDE_UNCONDITIONAL"] == [
+        "dos_services:003d", "dos_services:004c",
+    ]
+    assert all(row["type"] != "CALLOTHER_OVERRIDE_CALL" for row in calls)
     assert main(["callers", "dos_services:003d", "--project", str(project), "--json"]) == 0, capsys.readouterr().err
     site, = json.loads(capsys.readouterr().out)["callers"]
     assert site["from"]["unit_address"] == "root:0008"
@@ -202,7 +213,8 @@ def test_ghidra_pool_of_radiance_conventions_and_services(tmp_path, capsys):
     # Turbo Pascal's Seek: the file record is one far pointer, and the carry flag comes from INT 21h AH=42h.
     seek = decompile("root:c4e3")
     assert "void __stdcall16far FUN_1000_c4e3(uint param_1,int param_2,void *param_3)" in seek
-    assert "DOS::SeekFile(0,*(undefined2 *)param_3," in seek and "if (extraout_CF) {" in seek
+    assert "DOS::SeekFile(0,*(undefined2 *)param_3," in seek and "extraout_CF" in seek
+    assert "swi(0x21)" not in seek
     # GetTime(var Hour, Minute, Second, Sec100) stores the CX and DX results of AH=2Ch.
     timing = decompile("root:a3c2")
     assert "DOS::GetTime();" in timing and "*(uint *)param_4 = (uint)extraout_CH;" in timing

@@ -68,6 +68,7 @@ public class RetroreM68kImport extends HeadlessScript {
     private final Map<Integer, JsonObject> dosPrototypes = new HashMap<>();
     private final Map<Integer, String> iocsNames = new HashMap<>();
     private final Map<Integer, JsonObject> iocsPrototypes = new HashMap<>();
+    private final TreeMap<Integer, JsonObject> iocsSubcalls = new TreeMap<>();
     private final Set<Address> linkedEntries = new LinkedHashSet<>();
     private final Set<Integer> noReturn = new HashSet<>();
     private final Map<String, Integer> callCounts = new TreeMap<>();
@@ -207,9 +208,11 @@ public class RetroreM68kImport extends HeadlessScript {
             // analysis misreads that split as a call that never returns and drops the code after its callers.
             // Line-F exit calls get explicit flow overrides instead.
             setAnalysisOption(currentProgram, "Non-Returning Functions - Discovered", "false");
-            // DOS stubs, then FPACK stubs, then IOCS stubs, 256 two-byte slots each.
-            var block = memory.createInitializedBlock(CALL_BLOCK, address(CALL_BASE), 0x600, (byte) 0, monitor, false);
-            for (int index = 0; index < 0x300; index++) {
+            // DOS, FPACK, and IOCS each have 256 two-byte slots, followed by the typed IOCS subcalls.
+            int slots = 0x300 + iocsSubcalls.size();
+            var block = memory.createInitializedBlock(CALL_BLOCK, address(CALL_BASE), slots * 2L,
+                (byte) 0, monitor, false);
+            for (int index = 0; index < slots; index++) {
                 memory.setShort(block.getStart().addNoWrap(index * 2L), RTS);
             }
             block.setExecute(true);
@@ -219,7 +222,7 @@ public class RetroreM68kImport extends HeadlessScript {
                 .applyTo(currentProgram, monitor);
             block.setComment("retrore stubs for Human68k DOS ($FFxx) and FPACK ($FExx) line-F calls and IOCS calls");
             addFpackFixups();
-            if (!iocsPrototypes.isEmpty()) {
+            if (!iocsPrototypes.isEmpty() || !iocsSubcalls.isEmpty()) {
                 addIocsConvention();
             }
         }
@@ -436,6 +439,11 @@ public class RetroreM68kImport extends HeadlessScript {
         if (calls.has("iocs_prototypes")) {
             for (var entry : calls.getAsJsonObject("iocs_prototypes").entrySet()) {
                 iocsPrototypes.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsJsonObject());
+            }
+        }
+        if (calls.has("iocs_subcalls")) {
+            for (var entry : calls.getAsJsonObject("iocs_subcalls").entrySet()) {
+                iocsSubcalls.put(Integer.parseInt(entry.getKey(), 16), entry.getValue().getAsJsonObject());
             }
         }
         if (calls.has("dos_prototypes")) {
@@ -772,7 +780,15 @@ public class RetroreM68kImport extends HeadlessScript {
             if (name == null) {
                 continue;
             }
-            var entry = block.getStart().addNoWrap(0x400 + number * 2L);
+            long offset = 0x400 + number * 2L;
+            var prototype = iocsPrototypes.get(number);
+            Integer subcall = iocsSubcall(number, load);
+            if (subcall != null) {
+                offset = 0x600 + iocsSubcalls.headMap(subcall).size() * 2L;
+                prototype = iocsSubcalls.get(subcall);
+                name += String.format("_%02X", subcall & 0xff);
+            }
+            var entry = block.getStart().addNoWrap(offset);
             var function = getFunctionAt(entry);
             if (function == null) {
                 disassemble(entry);
@@ -781,8 +797,8 @@ public class RetroreM68kImport extends HeadlessScript {
                 function = createFunction(entry, name);
                 function.setParentNamespace(namespace);
                 function.setComment(String.format("X68000 IOCS call $%02X (trap #15)", number));
-                if (iocsPrototypes.containsKey(number)) {
-                    applyIocsPrototype(function, iocsPrototypes.get(number));
+                if (prototype != null) {
+                    applyIocsPrototype(function, prototype);
                 }
             }
             boolean present = false;
@@ -798,6 +814,21 @@ public class RetroreM68kImport extends HeadlessScript {
             named++;
         }
         return named;
+    }
+
+    private Integer iocsSubcall(int number, Instruction load) throws Exception {
+        if (iocsSubcalls.isEmpty() || jumpedTo(load)) {
+            return null;
+        }
+        var from = load.getFallFrom();
+        var selector = from == null ? null : currentProgram.getListing().getInstructionAt(from);
+        if (selector == null || selector.getLength() != 2) {
+            return null;
+        }
+        int word = memoryWord(from);
+        int subcall = number << 8 | (word & 0x7f);
+        // Require MOVEQ #command,D1 before the D0 load on every path to the trap.
+        return (word & 0xff80) == 0x7200 && iocsSubcalls.containsKey(subcall) ? subcall : null;
     }
 
     private boolean jumpedTo(ghidra.program.model.listing.Instruction instruction) {

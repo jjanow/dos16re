@@ -26,14 +26,14 @@ class _KeyboardExhausted(Exception):
 class _DosSession:
     """DOS and BIOS services used by this opt-in playthrough."""
 
-    def __init__(self, files, keys, window, window_end, *, clock_dx):
+    def __init__(self, files, keys, window, window_end, *, clock_dx, heap=0x6000):
         self.files = files
         self.keys = deque(_BIOS_KEYS[key] if key in _BIOS_KEYS else ord(key) for key in keys)
         self.window = window
         self.window_end = window_end
         self.clock_dx = clock_dx
         self.handles = {}
-        self.heap = 0x6000
+        self.heap = heap
         self.ports = {}
         self.overlay_reads = []
         self.data_reads = []
@@ -209,7 +209,7 @@ def _load_game(tmp_path, capsys, *additional_files):
     return files, export, program, image
 
 
-def _play_game(image, program, dos, active_member, entry_offset, observe):
+def _play_game(image, program, dos, active_member, entry_offset, observe, *, observe_startup=False):
     root = program["units"][0]
     base, origin = root["segment"], root["linear"]
     psp, environment = base - 0x10, base - 0x110
@@ -248,7 +248,7 @@ def _play_game(image, program, dos, active_member, entry_offset, observe):
             detached_hits.append(address)
         if address == origin + 0x1249b:
             fpu_dispatches[entered] += 1
-        if entered:
+        if entered or observe_startup:
             observe(cpu, address, size)
 
     def setup(cpu):
@@ -545,9 +545,86 @@ def test_phantasie_iii_wilderness_encounter_trace(tmp_path, capsys, attack):
     _check_trace(tmp_path, capsys, export, program, image, "wilderness", wilderness, trace)
 
 
-def _check_trace(tmp_path, capsys, export, program, image, state, active_member, trace):
+@pytest.mark.parametrize("heap", [0x6000, 0x6200], ids=["heap-6000", "heap-6200"])
+def test_phantasie_iii_runtime_heap_trace(tmp_path, capsys, heap):
+    files, export, program, image = _load_game(tmp_path, capsys, "DNGS.DAT", "MONSTERS.CGA")
+    units = {unit["name"]: unit for unit in program["units"]}
+    base, origin = units["root"]["segment"], units["root"]["linear"]
+    dungeon = units["link_0004"]
+    window = dungeon["runtime_linear"]
+    far_data = base + 0x1820
+    dgroup = base + 0x28c0
+    selector_slot = Address(dgroup, 0x1dc6)
+    map_pointer = Address(far_data, 0xb63c)
+    dos = _DosSession(files, _archives_keys(), window, window + units["link_0002"]["size"],
+                      clock_dx=0x0120, heap=heap)
+    events = []
+    sampled_tile = None
+    reading_tiles = tile_checked = False
+
+    def access(kind, pc, address, data):
+        events.append({"kind": "memory", "access": kind, "pc": pc, "address": str(address),
+                       "size": len(data), "bytes": data.hex()})
+
+    def observe(cpu, address, _size):
+        nonlocal sampled_tile, reading_tiles, tile_checked
+        if address == origin + 0x4f05:
+            # DOS Allocate just returned the segment to _brkctl.
+            ax, bx, flags = cpu.reg_read_batch((x86.UC_X86_REG_AX, x86.UC_X86_REG_BX, x86.UC_X86_REG_EFLAGS))
+            assert (ax, bx, flags & 1) == (heap, 0xec, 0)
+            events.append({"kind": "snapshot", "pc": address, "registers": {"ax": ax, "bx": bx}})
+        elif address == origin + 0x4cf7:
+            assert cpu.mem_read(selector_slot.linear, 2) == pack("<H", heap)
+            access("write", address - 3, selector_slot, pack("<H", heap))
+        elif address == origin + 0x4cbc:
+            # The far allocator's epilogue preserves the returned pointer in DX:AX.
+            ax, dx = cpu.reg_read_batch((x86.UC_X86_REG_AX, x86.UC_X86_REG_DX))
+            if (dx, ax) == (heap, 0x1a9c):
+                events.append({"kind": "snapshot", "pc": address, "registers": {"ax": ax, "dx": dx}})
+        elif address == window + 0x062d and dos.overlay_reads[-1][0] == dungeon["file_offset"]:
+            events.append({"kind": "overlay", "state": "archives"})
+            reading_tiles = True
+        elif reading_tiles and sampled_tile is None and address == window + 0x131b:
+            es, bx, si = cpu.reg_read_batch((x86.UC_X86_REG_ES, x86.UC_X86_REG_BX, x86.UC_X86_REG_SI))
+            pointer = pack("<HH", si, es)
+            assert (es, si) == (heap, 0x1a9c)
+            assert cpu.mem_read(map_pointer.linear, 4) == pointer
+            access("read", window + 0x1316, map_pointer, pointer)
+            tile = Address(es, (bx + si + 1) & 0xffff)
+            sampled_tile = bytes(cpu.mem_read(tile.linear, 1))
+            access("read", address, tile, sampled_tile)
+        elif sampled_tile is not None and not tile_checked and address == window + 0x131f:
+            assert cpu.reg_read(x86.UC_X86_REG_AL) == sampled_tile[0]
+            events.append({"kind": "instruction", "address": address})
+            tile_checked = True
+
+    _play_game(image, program, dos, dungeon, 0x062d, observe, observe_startup=True)
+    signatures = {item["name"]: item for item in program["runtime_signatures"]}
+    for name, offset in (("_brkctl", 0x4eac), ("_fmalloc", 0x4c83)):
+        assert signatures[name]["unit_offset"] == offset and signatures[name]["result_registers"] == ["DX", "AX"]
+    assert signatures["_ffree"]["unit_offset"] == 0x4c6e
+    assert signatures["_ffree"]["parameters"][0]["type"] == "farptr"
+    _route_manifest(tmp_path, export, program, image, "archives", dungeon)
+    trace = tmp_path / "heap.json"
+    trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
+    assert main(["trace", str(trace), "--export", str(export), "--evidence", "--json"]) == 0, capsys.readouterr().err
+    report = json.loads(capsys.readouterr().out)
+    allocation, allocated_pointer = report["snapshots"]
+    assert allocation["pc"]["location"]["unit_address"] == "root:4f05"
+    assert allocated_pointer["pc"]["location"]["unit_address"] == "root:4cbc"
+    assert allocated_pointer["registers"] == {"ax": 0x1a9c, "dx": heap}
+    write, pointer_read, tile_read = report["memory"]
+    assert write["pc"]["location"]["unit_address"] == "root:4cf4"
+    assert pointer_read["pc"]["location"]["unit_address"] == "link_0004:1316"
+    assert tile_read["location"] is None and tile_read["spans"][0]["location"] is None
+    assert heap * 16 + 0x1a9c <= tile_read["runtime_linear"] < heap * 16 + 0x2e4c
+    assert tile_read["pc"]["export_evidence"]["address"]["file"]["offset"] == dungeon["file_offset"] + 0x131b
+    tile_result, = report["mapped"]
+    assert tile_result["unit_address"] == "link_0004:131f"
+
+
+def _route_manifest(tmp_path, export, program, image, state, active_member):
     window = active_member["runtime_linear"]
-    origin = program["units"][0]["linear"]
     loads = [{"unit": "root"}]
     loads.extend({"unit": name, "linear": window, "replace": True}
                  for name in ("link_0002", active_member["name"]))
@@ -560,6 +637,11 @@ def _check_trace(tmp_path, capsys, export, program, image, state, active_member,
     apply_load_manifest(manifest, image, program)
     (export / "map.json").write_text(json.dumps(program), encoding="utf-8")
 
+
+def _check_trace(tmp_path, capsys, export, program, image, state, active_member, trace):
+    window = active_member["runtime_linear"]
+    origin = program["units"][0]["linear"]
+    _route_manifest(tmp_path, export, program, image, state, active_member)
     events = [{"kind": "overlay", "state": state}]
     events.extend({"kind": "instruction", "address": address, "bytes": data}
                   for address, data in trace.instruction_bytes.items())

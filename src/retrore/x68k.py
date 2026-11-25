@@ -160,6 +160,30 @@ _IOCS_PROTOTYPES = {
     0xB2: ("int", (("D1", "int", "page_bits"),)),
 }
 
+# OPMDRV dispatches on D1. Its X68000 callers set D2 and A1 only for the commands that consume them.
+_OPMDRV_VALUE = ("D2", "int", "value")
+_OPMDRV_BUFFER = ("A1", "void*", "buffer")
+_OPMDRV_INPUTS = {
+    0x00: (),
+    0x01: (_OPMDRV_VALUE,),
+    0x02: (_OPMDRV_VALUE,),
+    0x03: (_OPMDRV_VALUE, _OPMDRV_BUFFER),
+    0x04: (_OPMDRV_VALUE, _OPMDRV_BUFFER),
+    0x05: (_OPMDRV_VALUE,),
+    0x06: (_OPMDRV_VALUE, _OPMDRV_BUFFER),
+    0x07: (_OPMDRV_VALUE,),
+    0x08: (_OPMDRV_VALUE,),
+    0x09: (_OPMDRV_VALUE,),
+    0x0A: (_OPMDRV_VALUE,),
+    0x0B: (_OPMDRV_VALUE,),
+    0x0C: (_OPMDRV_VALUE,),
+}
+
+
+def _iocs_prototype(result, parameters):
+    return {"result": result, "parameters": [{"name": name, "type": kind, "register": register}
+                                             for register, kind, name in parameters]}
+
 # Stock X68000 address map (24-bit bus). Programs load in main RAM; the rest is video, I/O, SRAM, and ROM.
 MEMORY_MAP = (
     (0x000000, 0xC00000, "main_ram", "ram"), (0xC00000, 0xE00000, "gvram", "ram"), (0xE00000, 0xE80000, "tvram", "ram"),
@@ -394,12 +418,12 @@ def build_x_image(data: bytes, program: str, base: int = DEFAULT_M68K_BASE) -> t
             "no_return": [f"{0xFF00 | number:04X}" for number in DOS_NO_RETURN],
             "iocs": {f"{number:02X}": name for number, name in IOCS_CALLS.items()},
             "iocs_prototypes": {
-                f"{number:02X}": {
-                    "parameters": [{"name": name, "type": kind, "register": register}
-                                   for register, kind, name in parameters],
-                    "result": result,
-                }
+                f"{number:02X}": _iocs_prototype(result, parameters)
                 for number, (result, parameters) in _IOCS_PROTOTYPES.items()
+            },
+            "iocs_subcalls": {
+                f"F0{command:02X}": _iocs_prototype("int", parameters)
+                for command, parameters in _OPMDRV_INPUTS.items()
             },
             "dos_prototypes": {
                 f"{0xFF00 | number:04X}": {

@@ -46,6 +46,7 @@ import java.util.regex.Pattern;
 
 public class RetroreConventions extends HeadlessScript {
     private static final String SERVICE_BLOCK = "dos_services";
+    static final String INTERRUPT_LOOKUP_FIXUP = "retrore_dos_interrupt_lookup";
     // INT 21h services by AH (names after Ralf Brown's Interrupt List).
     private static final Map<Integer, String> SERVICES = new HashMap<>();
     private static final Set<Integer> EXITS = Set.of(0x00, 0x31, 0x4c);
@@ -155,6 +156,7 @@ public class RetroreConventions extends HeadlessScript {
         }
         addServiceConventions();
         var references = currentProgram.getReferenceManager();
+        Address lookup = block.getStart().addNoWrap(0x100);
         int named = 0;
         for (var site : sites) {
             monitor.checkCancelled();
@@ -163,11 +165,20 @@ public class RetroreConventions extends HeadlessScript {
             if (name == null) {
                 continue;
             }
+            if (named == 0) {
+                var function = createFunction(lookup, INTERRUPT_LOOKUP_FIXUP);
+                function.setCallFixup(INTERRUPT_LOOKUP_FIXUP);
+            }
             var stub = serviceStub(block, service, name);
             references.removeAllReferencesFrom(site.getAddress());
             var reference = references.addMemoryReference(site.getAddress(), stub.getEntryPoint(),
                 RefType.CALL_OVERRIDE_UNCONDITIONAL, SourceType.IMPORTED, Reference.MNEMONIC);
             references.setPrimary(reference, true);
+            // SLEIGH models INT as a vector lookup followed by an indirect call. The
+            // call override supplies the target, so elide the lookup at this site only.
+            var lookupReference = references.addMemoryReference(site.getAddress(), lookup,
+                RefType.CALLOTHER_OVERRIDE_CALL, SourceType.IMPORTED, 0);
+            references.setPrimary(lookupReference, true);
             if (EXITS.contains(service)) {
                 // Drop the fall-through here, so non-returning analysis has nothing left to override.
                 site.setFallThrough(null);
@@ -231,16 +242,16 @@ public class RetroreConventions extends HeadlessScript {
         // The top of the BIOS area, which DOS programs never load into.
         for (int segment = 0xffe0; segment >= 0xf000; segment -= 0x20) {
             Address start = space.getAddress(segment, 0);
-            Address end = start.addNoWrap(0xff);
+            Address end = start.addNoWrap(0x100);
             if (memory.getBlock(start) != null || memory.getBlock(end) != null ||
                     memory.intersects(start, end)) {
                 continue;
             }
-            var block = memory.createInitializedBlock(SERVICE_BLOCK, start, 0x100, (byte) 0xcf, monitor, false);
+            var block = memory.createInitializedBlock(SERVICE_BLOCK, start, 0x101, (byte) 0xcf, monitor, false);
             block.setExecute(true);
             block.setWrite(false);
             // Each stub is an iret: the segmented calling convention analyzer resets functions that end in ret.
-            block.setComment("retrore stubs for INT 21h services, one per AH value");
+            block.setComment("retrore stubs for INT 21h services and the overridden vector lookup");
             new DisassembleCommand(new AddressSet(start, end), null, false).applyTo(currentProgram, monitor);
             return block;
         }
@@ -250,6 +261,8 @@ public class RetroreConventions extends HeadlessScript {
     // INT 21h pushes nothing the caller sees, so the stubs need a convention with no stack effect.
     private void addServiceConventions() throws Exception {
         var extension = new SpecExtension(currentProgram);
+        extension.addReplaceCompilerSpecExtension("<callfixup name=\"" + INTERRUPT_LOOKUP_FIXUP +
+            "\"><pcode><body>local unused:1 = 0;</body></pcode></callfixup>", monitor);
         String inputs = "<input>" + entry("AX") + entry("BX") + entry("CX") + entry("DX") + "</input>";
         String outputs = "<output>" + entry("AX") +
             "<pentry minsize=\"3\" maxsize=\"4\"><addr space=\"join\" piece1=\"DX\" piece2=\"AX\"/></pentry></output>";

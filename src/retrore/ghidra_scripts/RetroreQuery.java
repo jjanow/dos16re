@@ -1013,7 +1013,7 @@ public class RetroreQuery extends GhidraScript {
         var calls = new ArrayList<Reference>();
         for (var reference : manager.getReferencesTo(function.getEntryPoint())) {
             monitor.checkCancelled();
-            if (reference.getReferenceType().isCall() && options.matches(reference)) {
+            if (isCall(reference) && options.matches(reference)) {
                 calls.add(reference);
             }
         }
@@ -1026,12 +1026,23 @@ public class RetroreQuery extends GhidraScript {
         for (Address source : manager.getReferenceSourceIterator(function.getBody(), true)) {
             monitor.checkCancelled();
             for (var reference : manager.getReferencesFrom(source)) {
-                if (reference.getReferenceType().isCall() && options.matches(reference)) {
+                if (isCall(reference) && options.matches(reference)) {
                     calls.add(reference);
                 }
             }
         }
         return calls;
+    }
+
+    private boolean isCall(Reference reference) {
+        var type = reference.getReferenceType();
+        if (type == RefType.CALLOTHER_OVERRIDE_CALL) {
+            var target = getFunctionAt(reference.getToAddress());
+            if (target != null && RetroreConventions.INTERRUPT_LOOKUP_FIXUP.equals(target.getCallFixup())) {
+                return false;  // The vector lookup is replaced with a no-op by the decompiler.
+            }
+        }
+        return type.isCall();
     }
 
     private void describe(Function function, Address address, Options options, Map<String, Object> report) {

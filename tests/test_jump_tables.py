@@ -631,12 +631,18 @@ def test_phantasie_iii_root_switches(phantasie_iii_export, phantasie_iii_float_s
     }
     requests.extend({"command": "xrefs", "address": address, "direction": "incoming", "compact": True}
                     for address in runtime_slots)
+    requests.extend({"command": "context", "address": address, "fields": ["function", "parameters", "return_type"]}
+                    for address in ("root:4eac", "root:4c83", "root:4c6e"))
     batch = tmp_path / "queries.json"
     batch.write_text(json.dumps(requests), encoding="utf-8")
     assert main(["batch", str(batch), "--project", str(project), "--evidence", "--json"]) == 0
-    callback_result, dispatch_result, inventory, writes_result, *reference_results = [
+    callback_result, dispatch_result, inventory, writes_result, *reference_results, brkctl, allocate, free = [
         row["result"] for row in json.loads(capsys.readouterr().out)["results"]
     ]
+    for prototype, name, result in ((brkctl, "_brkctl", "void *"), (allocate, "_fmalloc", "void *"),
+                                    (free, "_ffree", "void")):
+        assert (prototype["function"]["name"], prototype["return_type"]) == (name, result)
+    assert [parameter["name"] for parameter in brkctl["parameters"]] == ["operation", "increment", "block"]
     references = reference_results[:5]
     callback, = callback_result["sites"]
     dispatch, = dispatch_result["sites"]
@@ -1401,18 +1407,55 @@ def test_phantasie_iii_float_output_store_families(phantasie_iii_float_runtime):
     # Round-toward-zero overflow emits the high word of the saturation template first.
     check("cd372e0002", pack("<QH", 1 << 63, 0x7ffe), single, pack("<HH", 0x7f7f, 0xffff),
           (0x12e94, 0x12e99), control_word=0x0f7f)
+    check("cd372e0002", pack("<QH", 1 << 63, 0x3fff - 140), single, pack("<f", 2.0 ** -140),
+          (0x12e40, 0x12e43))
     check("cd372e0002", pack("<QH", 1 << 63, 0x3fff - 1030), double, pack("<d", 2.0 ** -1030),
           (0x1315d, 0x13160, 0x13163, 0x13166))
+    check("cd372e0002", pack("<QH", 1 << 63, 0x7ffe), double, pack("<Q", 0x7fefffffffffffff),
+          (0x13110, 0x13112, 0x13114, 0x1311a), control_word=0x0f7f)
 
     # Integer outputs and the software control/status word stores also use the caller's buffer.
     for store, expected, sites in (
         ("cd3b1e0003", pack("<h", 3), (0x1320e,)),
         ("cd371e0003", pack("<i", 3), (0x1327e, 0x13281)),
         ("cd3b3e0003", pack("<q", 3), (0x1333d, 0x13340, 0x13343, 0x13346)),
+    ):
+        check("cd35060002", pack("<f", 3.0), store, expected, sites)
+        # With invalid operation masked, the indefinite integer has only its sign bit set.
+        check("cd35060002", pack("<f", float("inf")), store, bytes(len(expected) - 1) + b"\x80", sites)
+    for store, expected, sites in (
         ("cd353e0003", pack("<H", 0x037f), (0x135f8,)),
         ("cd393e0003", pack("<H", 0), (0x135ff,)),
     ):
         check("cd35060002", pack("<f", 3.0), store, expected, sites)
+
+    # The software runtime rejects packed BCD, save-environment, and save-state
+    # stores before touching the destination, even with numeric exceptions masked.
+    class ProgramExit(Exception):
+        pass
+
+    sentinel = b"\xa5" * 108  # The largest real-mode FPU state fits in this region.
+
+    def terminate(cpu, _number):
+        assert cpu.reg_read(x86.UC_X86_REG_AX) == 0x4c87
+        assert cpu.mem_read(output.linear, len(sentinel)) == sentinel
+        raise ProgramExit
+
+    def audit_rejected_store(cpu):
+        def write(_cpu, _access, address, size, _value, _data):
+            assert address + size <= output.linear or address >= output.linear + len(sentinel)
+
+        hook = cpu.hook_add(UC_HOOK_MEM_WRITE, write)
+        return lambda: cpu.hook_del(hook)
+
+    for store in ("cd3b360003", "cd35360003", "cd39360003"):
+        with pytest.raises(ProgramExit):
+            emulator.call(
+                scratch, regs={"ds": output.segment, "ss": scratch.segment, "sp": 0xff00},
+                writes=[*setup, (scratch, bytes.fromhex(f"cd352e1802 cd35e8 {store} c3")),
+                        (control, pack("<H", 0x037f)), (output, sentinel)],
+                ivt_interrupts=vectors, interrupts={0x21: terminate}, _setup=audit_rejected_store,
+            )
 
 
 def test_phantasie_iii_shipped_float_store_destinations(
@@ -1494,7 +1537,7 @@ def test_phantasie_iii_shipped_float_store_destinations(
             site: set(range(destination.linear, destination.linear + width))
             for site, (destination, width) in stores.items()
         }
-        return dict(result.memory)
+        return result
 
     text = Address(dgroup, 0x7000)
     double = Address(dgroup, 0x2582)
@@ -1509,14 +1552,14 @@ def test_phantasie_iii_shipped_float_store_destinations(
         root(0x502c), decimal_stores,
         arguments=pack("<HH", text.offset, text.segment), writes=[(text, ascii_number)], reads=[(double, 8)],
     )
-    assert converted[double] == pack("<d", 1.25)
+    assert dict(converted.memory)[double] == pack("<d", 1.25)
 
     integer = check(
         root(0x67d6), {root(0x606f): (Address(dgroup, 0x2533), 2), root(0x60f4): (double, 8)},
         arguments=pack("<HHHHH", text.offset, text.segment, 2, 0, 16),
         writes=[(text, b"2a")], reads=[(double, 8)],
     )
-    assert integer[double] == pack("<d", 42.0)
+    assert dict(integer.memory)[double] == pack("<d", 42.0)
 
     extended = Address(dgroup, 0x2538)
     check(
@@ -1549,30 +1592,38 @@ def test_phantasie_iii_shipped_float_store_destinations(
             writes=[*installed, (text, ascii_number), (slot, pack("<HH", output.offset, output.segment))],
             reads=[(output, len(expected))],
         )
-        assert converted[output] == expected
+        assert dict(converted.memory)[output] == expected
 
     # Enter these detached paths directly with valid operands. Neither test establishes a caller.
     stack_top = Address(data_segment, 0x10)
     records = Address(data_segment, bottom)
     record_size = records_end - records_start
 
-    def load_ones(count):
+    def load_values(*values):
+        operands = Address(dgroup, 0x7040)
+        code = b"".join(b"\xcd\x39\x06" + pack("<H", operands.offset + index * 8)
+                        for index in range(len(values)))
         return emulator.call(
-            text, regs=regs, writes=[*setup, (text, bytes.fromhex("cd35e8" * count + "c3"))],
+            text, regs=regs, writes=[*setup, (text, code + b"\xc3"),
+                                     (operands, pack(f"<{len(values)}d", *values))],
             reads=[(stack_top, 2), (records, record_size)], ivt_interrupts=vectors,
         ).memory
 
     stored = check(
         root(0x6383), {root(0x6386): (double, 8), root(0x6389): (Address(dgroup, 0x2531), 2)},
-        writes=load_ones(1), reads=[(double, 8)], far=False, di=double.offset, cx=0,
+        writes=load_values(1.0), reads=[(double, 8)], far=False, di=double.offset, cx=0,
     )
-    assert stored[double] == pack("<d", 1.0)
+    assert dict(stored.memory)[double] == pack("<d", 1.0)
 
     comparison = Address(dgroup, sp - 8)
-    compared = check(
-        root(0x68a4), {root(0x68ae): (comparison, 2)}, writes=load_ones(2), reads=[(comparison, 2)],
-    )
-    assert unpack_from("<H", compared[comparison])[0] & 0x4500 == 0x4000  # Equal operands.
+    for prior, top, status in ((0.0, 1.0, 0), (1.0, 1.0, 0x4000), (1.0, 0.0, 0x100)):
+        compared = check(
+            root(0x68a4), {root(0x68ae): (comparison, 2)}, writes=load_values(prior, top), reads=[(comparison, 2)],
+            ax=0x5a32,
+        )
+        assert unpack_from("<H", dict(compared.memory)[comparison])[0] & 0x4500 == status
+        assert compared.registers["ax"] == 0x5a32
+        assert compared.registers["flags"] & 0x45 == status >> 8
 
     # Place the LINK member in the original window and stop after each conversion call.
     member = next(unit for unit in program["units"] if unit["name"] == "link_0002")
