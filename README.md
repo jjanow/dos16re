@@ -9,6 +9,11 @@ MSX2, NEC PC-88 and PC-98, Sharp X1 and X68000, Classic Macintosh 68k, NES / Fam
 Sega Genesis / Mega Drive inputs. See the [roadmap](PLAN.md) for the project finish line and
 the [validation reference](docs/validation.md) for representative releases.
 
+Follow the DOS walkthroughs to [resolve a static overlay call](docs/dos-overlay-call.md) or
+[identify the caller in a reused overlay window](docs/dos-overlay-trace.md). The
+[static call benchmark](docs/benchmarks.md#static-overlay-call-dos-3) measures the cost of
+answering the first question with a warm query worker.
+
 ## Installation
 
 Use Python 3.12 or newer. Download the wheel from [GitHub Releases](https://github.com/jjanow/retrore/releases)

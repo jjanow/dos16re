@@ -124,3 +124,102 @@ Through the daemon a CLI query costs Python startup plus the query, about 0.1 s.
 The worker reuses one Ghidra session across dependent steps. The Pool of Radiance scenarios took
 11–19 s with a launch per query, 8–11 s with a launch per batch, about 4 s with a cold worker, and
 0.03–0.11 s with a warm worker.
+
+## Static overlay call (DOS-3)
+
+Use the fresh Pool of Radiance DOS v1.3 project from the [static call walkthrough](dos-overlay-call.md).
+Both paths start with the caller's file offset `0x65b4`. Each resolves the file coordinate with
+`address-map`, queries the instruction with Ghidra, and asks `bytes` for five caller bytes and one
+callee byte. The one-shot path requests the default 64-byte disassembly and all fields. The warm
+path requests just the five-byte call and the `rows` field.
+
+The script runs the CLI entry point in one Python process, as `tools/bench.py` does. Wall time
+covers the four requests per answer. JSON bytes count the complete UTF-8 responses, including
+their trailing newlines, as a proxy for the amount of context the agent reads. Import, worker
+startup, and the walkthrough's independent disk read are outside query time.
+
+Measured 2026-11-25 on Linux with a Core i9-9900K, Python 3.14, Ghidra 12.2, and OpenJDK 25.
+Each row gives the median wall time and the launch count and JSON bytes per answer over
+three runs.
+
+| Path | Median wall time | Ghidra launches | Total JSON bytes |
+|---|---:|---:|---:|
+| Full one-shot | 3.934 s | 1 | 12,559 B |
+| Focused warm worker | 0.058 s | 0 | 2,100 B |
+
+Worker startup took 3.905 s and one Ghidra launch. All six answers agreed on the
+callee `tpov_0085:0ab3`, the disassembled call, and both sets of file and byte evidence.
+
+```sh
+RETRORE_WORKER=1 RETRORE_WORKER_DIR="$por_work/workers" .venv/bin/python - "$por_work" <<'PY'
+import io
+import json
+import sys
+import time
+from contextlib import redirect_stdout
+from pathlib import Path
+
+from retrore import ghidra, worker
+from retrore.cli import main
+from tools.bench import Counter, one_shot, summarize
+
+work = Path(sys.argv[1])
+project, export = work / "project", work / "export"
+counter = Counter()
+ghidra._launch = counter
+
+
+def answer(disasm_options):
+    output_bytes = 0
+
+    def request(*args):
+        nonlocal output_bytes
+        output = io.StringIO()
+        with redirect_stdout(output):
+            assert main([*args, "--json"]) == 0
+        payload = output.getvalue()
+        output_bytes += len(payload.encode("utf-8"))
+        return json.loads(payload)
+
+    before = counter.launches
+    started = time.perf_counter()
+    location, = request("address-map", "65b4", "--from", "file", "--source", "GAME.OVR",
+                        "--export", str(export))["matches"]
+    caller = location["unit_address"]
+    call = request("disasm", caller, "--project", str(project), *disasm_options)["rows"][0]
+    reference, = [ref for ref in call["references"] if ref["type"] == "UNCONDITIONAL_CALL"]
+    callee = reference["target"]["unit_address"]
+    caller_proof = request("bytes", caller, "--size", "5", "--export", str(export))
+    callee_proof = request("bytes", callee, "--size", "1", "--export", str(export))
+    sample = {"seconds": time.perf_counter() - started, "launches": counter.launches - before,
+              "output_bytes": output_bytes}
+    assert callee == "tpov_0085:0ab3" and callee_proof["address"]["file"]["offset"] == 0x21aed
+    assert call["bytes"] == caller_proof["loaded"]
+    return sample, (location, call, caller_proof, callee_proof)
+
+
+with one_shot():
+    full = [answer([]) for _ in range(3)]
+
+before = counter.launches
+started = time.perf_counter()
+host = worker.Host(project, owner="bench")
+try:
+    host.warm()
+    startup = {"seconds": round(time.perf_counter() - started, 3), "launches": counter.launches - before}
+    focused = [answer(["--limit", "5", "--fields", "rows"]) for _ in range(3)]
+finally:
+    host.close()
+
+assert all(evidence == full[0][1] for _, evidence in full + focused)
+for runs, launches in ((full, 1), (focused, 0)):
+    assert all(sample["launches"] == launches for sample, _ in runs)
+    assert all(sample["output_bytes"] == runs[0][0]["output_bytes"] for sample, _ in runs)
+full_summary = summarize([sample for sample, _ in full])
+focused_summary = summarize([sample for sample, _ in focused])
+assert focused_summary["median_seconds"] < full_summary["median_seconds"]
+assert focused_summary["output_bytes"] < full_summary["output_bytes"]
+print(json.dumps({"full_one_shot": full_summary, "focused_warm": focused_summary,
+                  "worker_startup": startup}, indent=2))
+PY
+```

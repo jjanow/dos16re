@@ -523,6 +523,11 @@ def test_phantasie_iii_wilderness_encounter_trace(tmp_path, capsys, attack):
 
     _play_game(image, program, dos, wilderness, 0x0088, observe)
     assert positions == [(24, 36)]
+    town_start, town_tail, wilderness_read = dos.overlay_reads[-3:]
+    assert town_start == (town["file_offset"], window, 0x4000)
+    assert town_tail[:2] == (town["file_offset"] + 0x4000, window + 0x4000)
+    assert wilderness_read[:2] == (wilderness["file_offset"], window)
+    assert wilderness["size"] <= wilderness_read[2] < town["size"]
     expected_edges = {
         (encounter, origin + 0xde54): 1,
         (sleeping_prompt, origin + 0xe294): 1,

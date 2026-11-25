@@ -10,8 +10,8 @@ through the existing JSON CLI and MCP tools.
 
 A shell-capable agent can reproduce the two DOS answers below from a fresh export. Both answers
 carry enough evidence for a reviewer to check them against the input. A single benchmark measures
-the cost of answering the static question. Close the milestone when all three deliverables meet
-their acceptance checks, then move to maintenance.
+the cost of answering the static question. All three deliverables met their acceptance checks
+on 2026-11-25, and the project moved to maintenance.
 
 The loader, Ghidra import, structured traces, evidence queries, and persistent worker already
 shipped in [1.0.0](https://github.com/jjanow/retrore/releases/tag/v1.0.0). Use those entry points.
@@ -22,12 +22,9 @@ The [README](README.md) documents current capabilities, and the
 
 | ID | Deliverable | State | Depends on |
 |---|---|---|---|
-| DOS-1 | Reproduce one static cross-overlay call | Ready | None |
-| DOS-2 | Reproduce one observed call from a reused overlay window | Ready | None |
-| DOS-3 | Measure the cost of the DOS-1 answer | Queued | DOS-1 |
-
-DOS-1 and DOS-2 can proceed independently. Each owns its own walkthrough. DOS-3 records its
-results in [the benchmark notes](docs/benchmarks.md).
+| DOS-1 | [Reproduce one static cross-overlay call](docs/dos-overlay-call.md) | Complete | None |
+| DOS-2 | [Reproduce one observed call from a reused overlay window](docs/dos-overlay-trace.md) | Complete | None |
+| DOS-3 | [Measure the cost of the DOS-1 answer](docs/benchmarks.md#static-overlay-call-dos-3) | Complete | DOS-1 |
 
 ### DOS-1 · Static cross-overlay call
 
@@ -78,7 +75,9 @@ and platform-wide feature parity are deferred.
 
 ## Last session
 
-2026-11-25. Replaced the phase backlog with three DOS deliverables and a maintenance endpoint.
-Moved validation evidence into the reference and updated the README. The default suite passed
-522 tests, and the Pool of Radiance overlay and Phantasie III wilderness checks passed with Ghidra.
-Resume with DOS-1 and DOS-2 independently. Start DOS-3 after DOS-1.
+2026-11-25. Completed DOS-1 through DOS-3. Ran both walkthroughs from fresh exports on the
+original DOS releases and confirmed their file offsets against the source media. The opt-in
+Pool of Radiance and Phantasie III checks passed with Ghidra 12.2, and the default suite passed
+522 tests. The three-run benchmark returned identical call evidence on both paths. The warm
+query took a median 0.058 s and 2,100 JSON bytes with zero Ghidra launches, versus 3.934 s and
+12,559 bytes with one launch. Worker startup took 3.905 s. Resume in maintenance.
