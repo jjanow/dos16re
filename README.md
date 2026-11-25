@@ -1665,10 +1665,11 @@ supported platforms. Tests skip when their input variables are unset.
 The Phantasie III DOS tests exercise floating-point arithmetic and register-stack copies in Unicorn.
 The Ghidra test audits computed targets across the root and four LINK members, then replays
 observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
-The archives playthrough also uses the original DOS data files in `RETRORE_PH3_DIR`. It traces
-a dungeon event and one combat round, checks the installed callback table for reads, and uses
-an ordered load manifest to map member 4's jumps back to `MAIN.EXE`. With Ghidra enabled, the
-trace resolves the combat menu's call at `root:721d`.
+The archives playthroughs also use the original DOS data files in `RETRORE_PH3_DIR`. They trace a
+scroll event, a combat round with Fireflash I, and a gold event that runs once when the party visits
+the same square twice. The tests check magic and gold totals, monitor the installed callback table
+for reads, and use an ordered load manifest to map member 4's jumps back to `MAIN.EXE`. With Ghidra
+enabled, the combat traces resolve the menu call at `root:721d`.
 
 Phase 12 has optional checks against original tool outputs and releases.
 

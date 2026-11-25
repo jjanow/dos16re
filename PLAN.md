@@ -14,17 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, traced Phantasie III from Pendragon through the archives' scroll event and a full
-combat round. The trace confirmed seven tile targets and recovered a combat menu call in Ghidra
-12.2. The dungeon path made no floating-point operand dispatches or class-byte writes. The callback table
-was installed and went unread throughout the run. Six opt-in Phantasie III checks passed with
-Ghidra 12.2. The standalone suite passed 517 tests with 134 skipped.
+On 2026-11-24, traced Fireflash I and a one-time gold event in the Phantasie III DOS archives.
+The fire spell spent one magic point, and revisiting the gold square kept the total at 256.
+Both traces recorded zero callback-table reads and zero floating-point operand dispatches after
+archive entry. Eight opt-in Phantasie III checks passed with Ghidra 12.2. The standalone suite
+passed 517 tests with 136 skipped.
 
-Resume Phase 9 with spellcasting and later dungeon events. The conversion callback's far output
-pointer still needs caller provenance, and the alternate parser and comparison entries still need
-reachability evidence. An automatic dispatch bound requires coverage of reachable stores and record
-sources. Phase 12 still needs shipped Microsoft LINK cases with missing directory counts or a
-delayed first segment, and more captured Microsoft MOVE placements.
+Resume Phase 9 with events outside the archives. The conversion callback's far output pointer
+still needs caller provenance, and the alternate parser and comparison entries still need
+reachability evidence. Automatic dispatch bounds require coverage of reachable stores and record
+sources. Shipped Microsoft LINK edge cases and more MOVE placements remain open in Phase 12.
 
 ## Why
 
@@ -380,6 +379,15 @@ Continue with the analysis backlog below.
   to `root:104b9`. The played dungeon path, including the combat round, makes zero software
   FPU operand dispatches and writes no record class bytes. The full run has zero reads of the
   five installed far pointers at DGROUP:`1dce` and no hits at the three detached entries.
+- **Traced Fireflash I and a one-time gold event in the shipped DOS release.** A second
+  archives playthrough creates a wizard and starts a round in the west passage. The first
+  cast reaches `root:caac`, takes the jump at `root:c3ea` to `root:c3ef`, and calls
+  `root:b42e`. The wizard's magic drops from 7 to 6. In a third run, the party finds
+  256 gold at (12, 13). The event dispatch at `link_0004:1534` reaches `:15e7` once.
+  A return to the square finds the event byte changed from `0x81` to `0xff` and the gold
+  total still at 256. The two routes capture the overlay and root edges and show zero
+  FPU operand dispatches or class-byte writes after archive entry. The full runs record
+  zero callback-table reads and zero hits at the detached entries.
 - **Validated arithmetic dispatch slots.** `root:12524` and `root:1253f` use the same
   eight-word table at `root:1205e`. The `0x0e` mask and optional XOR with 2 keep BX
   on those slots. At `root:126cf`, arithmetic uses three 16-word tables at `root:12106`,
@@ -516,6 +524,9 @@ Continue with the analysis backlog below.
 - **Implemented.** `members` and `--member` share selectors for supported disk and container inputs.
   Exports preserve selection order, layout decisions, and member and file offsets. Synthetic tests
   cover these workflows. Original-tool outputs and releases use optional `RETRORE_*_DIR` inputs.
+
+Open validation work includes shipped Microsoft LINK cases with missing directory counts or a
+delayed first segment, and more captured Microsoft MOVE placements.
 
 **Validated with original tools.** PKLITE 1.15 registered small and large XOR outputs match their
 unpacked references. The PKZIP 2.04g installer exercises the ADD decoder and matches Deark on

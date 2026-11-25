@@ -26,11 +26,12 @@ class _KeyboardExhausted(Exception):
 class _DosSession:
     """DOS and BIOS services used by this opt-in playthrough."""
 
-    def __init__(self, files, keys, window, window_end):
+    def __init__(self, files, keys, window, window_end, *, clock_dx):
         self.files = files
         self.keys = deque(_BIOS_KEYS[key] if key in _BIOS_KEYS else ord(key) for key in keys)
         self.window = window
         self.window_end = window_end
+        self.clock_dx = clock_dx
         self.handles = {}
         self.heap = 0x6000
         self.ports = {}
@@ -106,7 +107,7 @@ class _DosSession:
             cpu.reg_write(x86.UC_X86_REG_DX, 0x0612)
         elif service == 0x2c:
             cpu.reg_write(x86.UC_X86_REG_CX, 0x0c00)
-            cpu.reg_write(x86.UC_X86_REG_DX, 0x0120)
+            cpu.reg_write(x86.UC_X86_REG_DX, self.clock_dx)
         elif service == 0x40:
             assert bx < 5  # The route can write to the DOS console.
             cpu.reg_write(x86.UC_X86_REG_AX, cx)
@@ -141,13 +142,20 @@ class _DosSession:
         return value
 
 
-def _archives_keys():
+def _enter_archives_keys(*, wizard=False):
+    class_keys = ["down"] * 5 if wizard else []
     return [
-        # Start a new game and create a Human Fighter, then add her to the party.
-        "y", "left", "enter", "down", "down", "down", "enter", "enter", "enter",
+        # Create a human in the Guild and add her to the party.
+        "y", "left", "enter", "down", "down", "down", "enter", "enter", *class_keys, "enter",
         "left", "enter", "a", "d", "a", "enter", "esc", "enter", "down", "down", "enter", "enter", "esc",
         # Leave Pendragon, enter the archives, and use the original map.
         "left", "left", "left", "enter", "y", "down", "down", "right", "y", "n", "n",
+    ]
+
+
+def _archives_keys():
+    return [
+        *_enter_archives_keys(),
         # Reach the west room at (2, 10), answer the quiz, and keep the scroll.
         *(["down"] * 6), *(["left"] * 5), *(["down"] * 4), *(["left"] * 4), "down", "enter", "y",
         # Meet a wandering group in the west passage and fight one round.
@@ -155,7 +163,33 @@ def _archives_keys():
     ]
 
 
-def test_phantasie_iii_archives_event_trace(tmp_path, capsys):
+def _fireflash_keys():
+    return [
+        *_enter_archives_keys(wizard=True),
+        # Turn down the west passage and take the wandering encounter.
+        *(["down"] * 6), *(["left"] * 5), "down", "down", "enter", "enter",
+        # Select the wizard, choose Cast Spell and Fireflash I, and start the round.
+        "enter", *(["down"] * 4), "enter", "enter", "enter", "esc",
+    ]
+
+
+def _gold_keys():
+    return [
+        *_enter_archives_keys(),
+        # Circle through the south corridor to the hidden room at (12, 13).
+        *(["down"] * 6), *(["left"] * 5), *(["down"] * 10), *(["right"] * 10),
+        *(["up"] * 3), *(["left"] * 4), "enter",
+        # Leave and reenter the gold square.
+        "right", "left",
+    ]
+
+
+@pytest.mark.parametrize(("route", "keys", "clock_dx"), [
+    pytest.param("scroll", _archives_keys(), 0x0120, id="scroll"),
+    pytest.param("fireflash", _fireflash_keys(), 0x0500, id="fireflash"),
+    pytest.param("gold", _gold_keys(), 0x0b00, id="gold"),
+])
+def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock_dx):
     directory = os.environ.get("RETRORE_PH3_DIR")
     if not directory:
         pytest.skip("set RETRORE_PH3_DIR to the original DOS game directory")
@@ -179,7 +213,10 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys):
     dungeon = units["link_0004"]
     window = dungeon["runtime_linear"]
     long_member = units["link_0002"]
-    dos = _DosSession(files, _archives_keys(), window, window + long_member["size"])
+    casting = route == "fireflash"
+    combat = route != "gold"
+    # The DOS clock seeds the encounter and turn order in each playthrough.
+    dos = _DosSession(files, keys, window, window + long_member["size"], clock_dx=clock_dx)
 
     psp, environment = base - 0x10, base - 0x110
     prefix = bytearray(0x100)
@@ -189,6 +226,8 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys):
     entry = Address(program["entry"]["segment"], program["entry"]["offset"])
 
     callbacks = Address(base + 0x28c0, 0x1dce).linear
+    magic = Address(base + 0x1820, 0x0254).linear
+    party_gold = Address(base + 0x1820, 0x09de).linear
     detached = {origin + offset for offset in (0x6383, 0x68a4, 0x6a12)}
     bottom = Address(base + 0x180a, 0xa0).linear
     record_end = bottom + 15 * 12
@@ -200,11 +239,31 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys):
     checkpoints = []
     edges = Counter()
     instruction_bytes = {}
-    flows = {
-        window + 0x05c1: "jump", window + 0x1534: "jump", origin + 0xd5c4: "jump",
-        origin + 0x721d: "call", origin + 0x1046a: "jump",
-    }
     keep_item, round_return = origin + 0xf421, origin + 0x10783
+    round_start, cast_dispatch, fireflash = origin + 0xd8c7, origin + 0xcaac, origin + 0xb42e
+    event_lookup = window + 0x12e2
+    milestones = {
+        "scroll": (keep_item, round_return), "fireflash": (cast_dispatch, fireflash, round_return), "gold": (),
+    }[route]
+    expected_edges = {}
+    if combat:
+        expected_edges.update({
+            (origin + 0xd5c4, origin + 0xd631): 1,
+            (origin + 0x721d, origin + 0x10424): 1,
+            (origin + 0x1046a, origin + 0x104b9): 1,
+        })
+    expected_edges.update({
+        "scroll": {(window + 0x1534, window + 0x156e): 1},
+        "fireflash": {(origin + 0xc3ea, origin + 0xc3ef): 1},
+        "gold": {(window + 0x1534, window + 0x15e7): 1},
+    }[route])
+    tile_dispatch = window + 0x05c1
+    flows = {source: "jump" for source, _ in expected_edges}
+    flows[tile_dispatch] = "jump"
+    if combat:
+        flows[origin + 0x721d] = "call"
+    magic_values = []
+    gold_visits = []
     entered = False
     prior = None
 
@@ -220,8 +279,14 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys):
         if address == origin + 0x1249b:
             fpu_dispatches[entered] += 1
         if entered:
-            if address in (keep_item, round_return):
+            if address in milestones:
                 checkpoints.append(address)
+            if casting and address in (round_start, cast_dispatch, round_return):
+                magic_values.append((address, unpack_from("<H", cpu.mem_read(magic, 2))[0]))
+            if route == "gold" and address == event_lookup:
+                es, bx, si = cpu.reg_read_batch((x86.UC_X86_REG_ES, x86.UC_X86_REG_BX, x86.UC_X86_REG_SI))
+                event_flag = cpu.mem_read(Address(es, (bx + si) & 0xffff).linear, 1)[0]
+                gold_visits.append((event_flag, unpack_from("<I", cpu.mem_read(party_gold, 4))[0]))
             if prior is not None:
                 edges[prior, address] += 1
                 instruction_bytes[address] = cpu.mem_read(address, size).hex()
@@ -264,25 +329,29 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys):
         )
     assert entered
     # Member 4 replaces the prefix of the most recent member 2 load, after member 3.
-    assert dos.overlay_reads[-1] == (dungeon["file_offset"], window, dungeon["size"])
-    assert dos.overlay_reads[-2][0] == units["link_0003"]["file_offset"]
-    assert dos.overlay_reads[-3][:2] == (long_member["file_offset"] + 0x4000, window + 0x4000)
+    archive_load = dos.overlay_reads.index((dungeon["file_offset"], window, dungeon["size"]))
+    assert archive_load >= 2
+    assert dos.overlay_reads[archive_load - 1][0] == units["link_0003"]["file_offset"]
+    assert dos.overlay_reads[archive_load - 2][:2] == (long_member["file_offset"] + 0x4000, window + 0x4000)
     assert ("DNGS.DAT", 0, 0x1080) in dos.data_reads
-    assert any(name == "MONSTERS.CGA" and size > 0 for name, _, size in dos.data_reads)
-    assert checkpoints == [keep_item, round_return]
+    if combat:
+        assert any(name == "MONSTERS.CGA" and size > 0 for name, _, size in dos.data_reads)
+    assert checkpoints == list(milestones)
+    if casting:
+        assert magic_values == [(round_start, 7), (cast_dispatch, 6), (round_return, 6)]
+    if route == "gold":
+        # The interpreter clears the event after the first award. Reentering finds the cleared byte.
+        assert gold_visits == [(0x81, 0), (0xff, 256)]
     assert installed_callbacks == [origin + 0x6a12]
     assert not callback_reads and not detached_hits
     assert fpu_dispatches[False] > 0 and fpu_dispatches[True] == 0
     assert class_values == {False: {0, 1}, True: set()}
-    assert {target - window for source, target in edges if source == window + 0x05c1} == {
-        0x05c6, 0x05cd, 0x05d4, 0x05db, 0x05e2, 0x05e9, 0x05f0,
-    }
-    assert {edge: count for edge, count in edges.items() if edge[0] != window + 0x05c1} == {
-        (window + 0x1534, window + 0x156e): 1,
-        (origin + 0xd5c4, origin + 0xd631): 1,
-        (origin + 0x721d, origin + 0x10424): 1,
-        (origin + 0x1046a, origin + 0x104b9): 1,
-    }
+    tile_targets = {target - window for source, target in edges if source == tile_dispatch}
+    expected_tiles = {0x05c6, 0x05cd, 0x05d4, 0x05db, 0x05e2, 0x05e9, 0x05f0}
+    if casting:
+        expected_tiles -= {0x05cd, 0x05db}
+    assert tile_targets == expected_tiles
+    assert {edge: count for edge, count in edges.items() if edge[0] != tile_dispatch} == expected_edges
 
     loads = [{"unit": "root"}]
     loads.extend({"unit": name, "linear": window, "replace": True} for name in ("link_0002", "link_0004"))
@@ -328,6 +397,7 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys):
         assert {row["event"] for row in analysis["edge_gaps"]} == {
             event for row in analysis["applied"] if row["kind"] == "flow" for event in row["events"]
         }
-        assert main(["indirect", "--at", "root:721d", "--project", str(project), "--compact", "--json"]) == 0
-        menu, = json.loads(capsys.readouterr().out)["sites"]
-        assert menu["status"] == "resolved" and "root:10424" in menu["targets"]
+        if combat:
+            assert main(["indirect", "--at", "root:721d", "--project", str(project), "--compact", "--json"]) == 0
+            menu, = json.loads(capsys.readouterr().out)["sites"]
+            assert menu["status"] == "resolved" and "root:10424" in menu["targets"]
