@@ -14,15 +14,13 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, completed Phase 9 for the validated releases. Traced Phantasie III's live heap pointer
-at two DOS allocation bases, checked additional floating-point output cases, and ran a Microsoft C 5.1
-scanner probe to identify the corresponding parser path and callback. Added Microsoft C heap signatures
-and typed 13 OPMDRV subcalls. Recognized DOS interrupts now decompile as one service call. The standalone
-suite passed 518 tests with 149 skipped. The six original DOS archives and wilderness routes passed with
-Ghidra replay, and both heap placements passed in Unicorn.
+On 2026-11-25, published [retrore 1.0.0](https://github.com/jjanow/retrore/releases/tag/v1.0.0).
+[Release CI](https://github.com/jjanow/retrore/actions/runs/45638059673) built one wheel and passed
+the Linux and Windows suites with Python 3.12 and Ghidra 12.2. The release and local deployment use
+that wheel. Builds are reserved for releases and testing blockers that require a build.
 
-Resume validation when original X1turbo media or a new compiler runtime is available. For the three
-detached DOS entries, the Phase 9 results record their callable behavior and observed reachability.
+Resume validation when original X1turbo media or a new compiler runtime is available. The
+[platform parity table](#platform-capability-parity) and milestones track the remaining extensions.
 
 ## Why
 

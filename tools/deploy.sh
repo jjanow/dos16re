@@ -8,6 +8,7 @@
 #
 # Environment: RETRORE_DEPLOY_DIR (default ~/.local/share/retrore), RETRORE_DEPLOY_BRANCH (main),
 # RETRORE_BIN_DIR (default ~/.local/bin), GHIDRA_HOME (default /snap/ghidra/current/ghidra).
+# RETRORE_DEPLOY_WHEEL installs a tested release wheel for the selected code into an existing deployment.
 set -euo pipefail
 
 repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -16,6 +17,7 @@ deploy=${RETRORE_DEPLOY_DIR:-$HOME/.local/share/retrore}
 bin_dir=${RETRORE_BIN_DIR:-$HOME/.local/bin}
 ghidra=${GHIDRA_HOME:-/snap/ghidra/current/ghidra}
 python=${PYTHON:-python3}
+wheel=${RETRORE_DEPLOY_WHEEL:-}
 
 install_hooks=0
 register_mcp=0
@@ -30,12 +32,21 @@ done
 commit=$(git -C "$repo" rev-parse --verify "$branch^{commit}")
 mkdir -p "$deploy" "$bin_dir"
 if [ ! -x "$deploy/venv/bin/python" ]; then
+    if [ -n "$wheel" ]; then
+        echo "Wheel deployment requires an existing virtual environment with retrore's dependencies." >&2
+        exit 1
+    fi
     "$python" -m venv "$deploy/venv"
 fi
 
-# pip clones the commit itself, so uncommitted changes never reach the deployment.
-"$deploy/venv/bin/python" -m pip install --quiet --force-reinstall --upgrade-strategy only-if-needed \
-    "retrore @ git+file://$repo@$commit"
+if [ -n "$wheel" ]; then
+    "$deploy/venv/bin/python" -m pip install --quiet --force-reinstall --no-deps "$wheel"
+    "$deploy/venv/bin/python" -m pip check
+else
+    # pip clones the commit itself, so uncommitted changes never reach the deployment.
+    "$deploy/venv/bin/python" -m pip install --quiet --force-reinstall --upgrade-strategy only-if-needed \
+        "retrore @ git+file://$repo@$commit"
+fi
 echo "$commit" > "$deploy/COMMIT"
 
 # A wrapper that supplies GHIDRA_HOME when the caller has not set it.
