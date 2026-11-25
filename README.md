@@ -1043,7 +1043,7 @@ initializer call and replays it in Ghidra. The installed conversion callback use
 far pointer for either output. Its callers remain unresolved.
 
 ```sh
-.venv/bin/python -m pytest -q tests/test_jump_tables.py -k phantasie_iii
+.venv/bin/python -m pytest -q tests/test_jump_tables.py tests/test_phantasie_iii_dungeon.py -k phantasie_iii
 ```
 
 ### Limit Ghidra address query results
@@ -1665,6 +1665,10 @@ supported platforms. Tests skip when their input variables are unset.
 The Phantasie III DOS tests exercise floating-point arithmetic and register-stack copies in Unicorn.
 The Ghidra test audits computed targets across the root and four LINK members, then replays
 observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
+The archives playthrough also uses the original DOS data files in `RETRORE_PH3_DIR`. It traces
+a dungeon event and one combat round, checks the installed callback table for reads, and uses
+an ordered load manifest to map member 4's jumps back to `MAIN.EXE`. With Ghidra enabled, the
+trace resolves the combat menu's call at `root:721d`.
 
 Phase 12 has optional checks against original tool outputs and releases.
 

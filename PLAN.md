@@ -14,20 +14,17 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, audited computed transfers in Phantasie III's root and four LINK members. Unicorn
-traces identified the FPU startup and shutdown routes, the stack-built interrupt thunk, and five
-Pendragon calls into the tail of member 2 after member 3 replaced its prefix. Ghidra replayed the
-startup and menu calls using an ordered load manifest. The audit found no callers of the three
-detached floating-point entries. Five opt-in checks passed with Ghidra 12.2. The standalone suite
-passed 517 tests with 133 skipped.
+On 2026-11-24, traced Phantasie III from Pendragon through the archives' scroll event and a full
+combat round. The trace confirmed seven tile targets and recovered a combat menu call in Ghidra
+12.2. The dungeon path made no floating-point operand dispatches or class-byte writes. The callback table
+was installed and went unread throughout the run. Six opt-in Phantasie III checks passed with
+Ghidra 12.2. The standalone suite passed 517 tests with 134 skipped.
 
-Resume Phase 9 with deeper dungeon and other untraced game paths. The conversion callback's far output
+Resume Phase 9 with spellcasting and later dungeon events. The conversion callback's far output
 pointer still needs caller provenance, and the alternate parser and comparison entries still need
-reachability evidence. An automatic dispatch bound requires coverage of reachable stores and
-record sources.
-Microsoft LINK still needs a shipped executable with missing directory counts or a member whose first
-listed segment starts after the overlay window start. Expand Microsoft MOVE runtime views as more
-captured placements become available.
+reachability evidence. An automatic dispatch bound requires coverage of reachable stores and record
+sources. Phase 12 still needs shipped Microsoft LINK cases with missing directory counts or a
+delayed first segment, and more captured Microsoft MOVE placements.
 
 ## Why
 
@@ -371,6 +368,18 @@ Continue with the analysis backlog below.
   entered at `link_0004:062d` and its tile dispatch at `:05c1` reached `:05c6` and `:05e9`.
   The DOS read shim invalidates Unicorn's translation cache for the overlay window when it writes
   a member, so execution uses the newly loaded code.
+- **Traced an archives event and combat in the shipped DOS release.** An opt-in Unicorn
+  playthrough creates and adds a fighter in Pendragon, loads the first `DNGS.DAT` record, keeps
+  the scroll in the west room, and completes a round against a wandering group. Member 4
+  replaces the overlay window prefix previously occupied by members 2 and 3. The ordered load
+  manifest retains member 2's tail, and the trace maps the executions in member 4 to their
+  original file offsets. The tile dispatch at `link_0004:05c1` visits seven targets from
+  `:05c6` through `:05f0`. The event interpreter jumps from `link_0004:1534` to `:156e`,
+  the item handler. Ghidra 12.2 adds the previously unresolved call from `root:721d` to
+  `root:10424` and confirms the jumps from `root:d5c4` to `root:d631` and from `root:1046a`
+  to `root:104b9`. The played dungeon path, including the combat round, makes zero software
+  FPU operand dispatches and writes no record class bytes. The full run has zero reads of the
+  five installed far pointers at DGROUP:`1dce` and no hits at the three detached entries.
 - **Validated arithmetic dispatch slots.** `root:12524` and `root:1253f` use the same
   eight-word table at `root:1205e`. The `0x0e` mask and optional XOR with 2 keep BX
   on those slots. At `root:126cf`, arithmetic uses three 16-word tables at `root:12106`,
