@@ -29,6 +29,11 @@ _PASCAL_STARTUPS = (
     ("6.0", _pattern(_PASCAL_ENTRY + _PASCAL_HEAP + "a3 ?? ?? 26 8b 16 02 00")),
     ("7.0", _pattern(_PASCAL_ENTRY + "e8 ?? ?? e8 ?? ?? " + _PASCAL_HEAP)),
 )
+_MICROSOFT_PASCAL_START = _pattern(
+    "ba ?? ?? b4 25 b0 00 8c c9 8e d9 cd 21 ba ?? ?? d1 ea b9 00 80 2b ca d1 ea d1 ea d1 ea 42 "
+    "26 a1 02 00 8b e8 2d ?? ?? 72 ?? 33 db 2b c2 73 02 2b d8 2b d3 "
+    "b8 ?? ?? 8e d8 8c 06 ?? ?? be ?? ?? 2b f0 d1 e6 d1 e6 d1 e6 d1 e6"
+)
 _BORLAND_C_START = _pattern("ba ?? ?? 2e 89 16 ?? ?? b4 30 cd 21 8b 2e 02 00 8b 1e 2c 00 8e da")
 _BORLAND_C_MARKERS = (
     (b"Turbo-C - Copyright (c) 1988 Borland Intl.", "Turbo C", "2.x"),
@@ -43,25 +48,29 @@ _MICROSOFT_C_FAR_START = _pattern("72 03 be 00 10 fa 8e d7 81 c4 ?? ?? fb 73 14 
 
 
 def _microsoft_startup(image: bytes, entry: int, origin: int, relocations: set[int]) -> Compiler | None:
-    # A small preloader may do setup and then jump to the actual C runtime.
-    starts = [(entry, "startup")]
+    # A small preloader may do setup and then jump to the runtime startup.
+    starts = [(entry, "")]
     for position in sorted(relocations):
         if not entry + 3 <= position < min(entry + 0x80, len(image) - 1) or image[position - 3] != 0xEA:
             continue
         offset, segment = unpack_from("<HH", image, position - 2)
         start = segment * 16 + offset - origin
         if 0 <= start < len(image):
-            starts.append((start, "relocated entry jump to startup"))
+            starts.append((start, "relocated entry jump to "))
 
-    for start, evidence in starts:
+    for start, prefix in starts:
+        # ENTXQQ uses an absolute DGROUP selector, a biased selector, and the COMADS selector.
+        if ({start + 0x25, start + 0x34, start + 0x3D} <= relocations
+                and _MICROSOFT_PASCAL_START.match(image, start)):
+            return Compiler("microsoft_pascal", "Microsoft Pascal", None, prefix + "ENTXQQ startup")
         for version, relocation, pattern in _MICROSOFT_C_STARTUPS:
             match = pattern.match(image, start)
             if match is None or start + relocation not in relocations:
                 continue
             far = _MICROSOFT_C_FAR_START.match(image, match.end())
             if far is not None and far.end() in relocations:
-                return Compiler("microsoft_c_medium", "Microsoft C", version, evidence)
-            return Compiler("microsoft_c", "Microsoft C", version, evidence)
+                return Compiler("microsoft_c_medium", "Microsoft C", version, prefix + "startup")
+            return Compiler("microsoft_c", "Microsoft C", version, prefix + "startup")
     return None
 
 
@@ -151,6 +160,20 @@ _PASCAL = (
     (_OVR_INIT, "55 8b ec 81 ec 82 00 fc 83 3e ?? ?? 00 74 1f a0 ?? ?? 88 46 fe e8 ?? ??"),
 )
 
+# Microsoft Pascal 3.20 PASCAL.LIB. These routines start with a near call to a frame
+# helper that consumes the inline local-frame size word before returning.
+_MICROSOFT_PASCAL = (
+    (_pascal("INIFQQ", 0),
+     "e8 b0 00 00 00 b8 02 00 50 9a ?? ?? ?? ?? c7 06 ?? ?? 00 00 c6 06 ?? ?? 00 "
+     "b8 ?? ?? 50 b8 ff 00 50 b8 01 00 50"),
+    (_pascal("GETHQQ", 2, Parameter("size", "uint"), result="void*"),
+     "e8 53 00 02 00 b8 04 00 50 9a ?? ?? ?? ?? ff 76 06 9a ?? ?? ?? ?? 89 46 fe "
+     "83 7e fe 02 73 12 83 7e fe 00 75 07"),
+    (_pascal("WTLFQQ", 2, Parameter("file", "void*")),
+     "e8 b4 01 00 00 b8 04 00 50 9a ?? ?? ?? ?? ff 76 06 b8 01 00 50 9a ?? ?? ?? ?? "
+     "d1 e8 73 59 8b 76 06 80 7c 08 02"),
+)
+
 _STRCPY = Prototype("strcpy", "char*", (Parameter("destination", "char*"), Parameter("source", "char*")))
 _STRLEN = Prototype("strlen", "uint", (Parameter("s", "char*"),))
 _PUTS = Prototype("puts", "int", (Parameter("s", "char*"),))
@@ -234,7 +257,8 @@ _MICROSOFT_C_MEDIUM = (
 _CATALOG = {
     group: tuple((prototype, _pattern(pattern)) for prototype, pattern in entries)
     for group, entries in (
-        ("pascal", _PASCAL), ("borland_c", _BORLAND_C), ("microsoft_c", _MICROSOFT_C),
+        ("pascal", _PASCAL), ("microsoft_pascal", _MICROSOFT_PASCAL),
+        ("borland_c", _BORLAND_C), ("microsoft_c", _MICROSOFT_C),
         ("microsoft_c_medium", _MICROSOFT_C_MEDIUM),
     )
 }

@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 from struct import pack_into
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from retrore.cli import main
 from retrore.mz import Address, LoadedMZ, MZExecutable
 from retrore.overlays import Overlay, build_image
+from retrore.toolchain import import_linker_map
 
 
 @pytest.mark.parametrize("base", [0, 0x1000, 0xAA55])
@@ -64,6 +66,62 @@ def test_detects_medium_model_at_relocated_startup_target():
 
     unknown = LoadedMZ(base, bytes(image), root.entry, root.stack, root.relocations[1:])
     assert build_image(unknown, "test.exe", [])[1]["compiler"] is None
+
+
+@pytest.mark.parametrize("preloader", [False, True])
+def test_microsoft_pascal_startup_requires_relocations(preloader):
+    base = 0x2000
+    startup = bytes.fromhex(
+        "ba 89 01 b4 25 b0 00 8c c9 8e d9 cd 21 ba 10 f4 d1 ea b9 00 80 2b ca d1 ea d1 ea d1 ea 42"
+        " 26 a1 02 00 8b e8 2d 5d 24 72 c4 33 db 2b c2 73 02 2b d8 2b d3"
+        " b8 5d 14 8e d8 8c 06 8e fc be 49 24 2b f0 d1 e6 d1 e6 d1 e6 d1 e6"
+    )
+    image = bytes.fromhex("ea 20 00 00 20").ljust(0x20, b"\xcc") + startup
+    entry = Address(base, 0 if preloader else 0x20)
+    stack = Address(base + 0x100, 0x200)
+    selectors = (Address(0, 0x45), Address(0, 0x54), Address(0, 0x5D))
+    jump = (Address(0, 3),) if preloader else ()
+    root = LoadedMZ(base, image, entry, stack, selectors + jump)
+    _, report = build_image(root, "test.exe", [])
+    assert report["compiler"] == {
+        "family": "Microsoft Pascal", "version": None,
+        "evidence": "relocated entry jump to ENTXQQ startup" if preloader else "ENTXQQ startup",
+    }
+
+    for missing in root.relocations:
+        incomplete = LoadedMZ(base, image, entry, stack, tuple(r for r in root.relocations if r != missing))
+        assert build_image(incomplete, "test.exe", [])[1]["compiler"] is None
+
+
+@pytest.mark.parametrize("name", ["PROBE", "ALT"])
+def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
+    if not (directory := os.environ.get("RETRORE_MS_PASCAL_DIR")):
+        pytest.skip("set RETRORE_MS_PASCAL_DIR to the Microsoft Pascal 3.20 runtime probes")
+    directory = Path(directory)
+    export, project = tmp_path / "export", tmp_path / "project"
+    assert main(["load", str(directory / f"{name}.EXE"), "-o", str(export), "--json"]) == 0
+    program = json.loads(capsys.readouterr().out)
+    assert program["compiler"] == {
+        "family": "Microsoft Pascal", "version": None, "evidence": "ENTXQQ startup",
+    }
+    # Use the LINK listing as independent evidence, without adding its labels to the export.
+    import_linker_map(directory / f"{name}.MAP", program)
+    publics = {row["name"]: row["linear"] for row in program["toolchain_symbols"]}
+    signatures = {row["name"]: row for row in program["runtime_signatures"]}
+    assert set(signatures) == {"INIFQQ", "GETHQQ", "WTLFQQ"}
+    for symbol, signature in signatures.items():
+        assert signature["address"]["linear"] == publics[symbol]
+    assert signatures["GETHQQ"]["result"] == "void*"
+    assert [signatures[symbol]["stack_purge"] for symbol in ("INIFQQ", "GETHQQ", "WTLFQQ")] == [0, 2, 2]
+
+    if not os.environ.get("GHIDRA_HOME"):
+        return
+    assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
+    assert json.loads(capsys.readouterr().out)["runtime_signatures"] == 3
+    address = f"root:{publics['ENTGQQ'] - program['units'][0]['linear']:04x}"
+    assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    decompilation = json.loads(capsys.readouterr().out)["decompilation"]
+    assert all(call in decompilation for call in ("INIFQQ();", "GETHQQ(2);", "WTLFQQ("))
 
 
 CONVENTIONS = bytes.fromhex(

@@ -14,13 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, published [retrore 1.0.0](https://github.com/jjanow/retrore/releases/tag/v1.0.0).
-[Release CI](https://github.com/jjanow/retrore/actions/runs/45638059673) built one wheel and passed
-the Linux and Windows suites with Python 3.12 and Ghidra 12.2. The release and local deployment use
-that wheel. Builds are reserved for releases and testing blockers that require a build.
+On 2026-11-25, added Microsoft Pascal startup detection and three runtime signatures from 3.20.
+DOSBox ran both LINK builds of the probe. The opt-in checks compare signatures with original LINK
+maps and check the named calls in Ghidra 12.2. The existing LINK overlay probes verify startup
+detection through the relocated preloader jump. Default suite passed 520 tests. The focused
+runtime and LINK checks passed 10 tests.
 
-Resume validation when original X1turbo media or a new compiler runtime is available. The
-[platform parity table](#platform-capability-parity) and milestones track the remaining extensions.
+Resume with original X1turbo media or another DOS compiler runtime. For deeper Microsoft Pascal
+analysis, start with `ENTXQQ`'s runtime DGROUP placement and the frame helper's inline size word.
+The [platform parity table](#platform-capability-parity) and milestones track the other extensions.
 
 ## Why
 
@@ -115,6 +117,7 @@ targets. Auto-analysis finds Mystic SCORE at `OV1:20bb` through a call in one of
 
 1. **Implemented.** Masked byte patterns cover selected Turbo Pascal 5.5, 6.0, and 7.0 routines and
    small-model Turbo C 2.01, Turbo C++ 1.01, Borland C++ 2.0, and Microsoft C 5.1 and 6.0a routines.
+   The Microsoft Pascal 3.20 patterns cover `INIFQQ`, `GETHQQ`, and `WTLFQQ`.
 2. **Implemented.** Ghidra names and types matches at analyzed function entries. The Pascal catalog includes
    Real48 addition, string copy and concatenation, set union, `Write` for strings, `WriteLn`, `GetMem`,
    `FreeMem`, and `OvrInit`. The C catalog covers selected string, output, and heap routines.
@@ -131,6 +134,13 @@ object against its 6.0a DOS runtime library.
 [Turbo C 2.01](https://altd.embarcadero.com/download/museum/tc201.zip),
 [Turbo C++ 1.01](https://altd.embarcadero.com/download/museum/tcpp101.zip), [Borland C++ 2.0](https://winworldpc.com/product/borland-c/20),
 [Microsoft C 5.x](https://winworldpc.com/product/microsoft-c-c/5x), [Microsoft C 6.x](https://winworldpc.com/product/microsoft-c-c/6x).
+
+**Validated with Microsoft Pascal 3.20.** LINK 2.40 and 2.45 place all three helpers at different
+addresses. Both builds print `VALUE 42` in DOSBox, and Ghidra 12.2 decompiles the main routine
+with calls to file initialization, heap allocation, and newline output under their original names.
+The relocation-backed `ENTXQQ` entry identifies the runtime family. The overlay probes reach it
+through a relocated far jump. Version detection remains open.
+[Probe build steps](README.md#microsoft-pascal-runtime-probe)
 
 ### Phase 6: emulator harness
 
@@ -216,6 +226,9 @@ Additional platform capabilities are listed in the parity table and platform mil
 
 - **Implemented.** Before a GitHub release, run Release CI on the candidate commit. It builds one
   wheel and tests the installed package on Linux and Windows. Publish the wheel from that run.
+  [Release CI](https://github.com/jjanow/retrore/actions/runs/45638059673) built and tested the
+  [1.0.0 release wheel](https://github.com/jjanow/retrore/releases/tag/v1.0.0) with Python 3.12
+  and Ghidra 12.2 on both platforms.
 - **Implemented.** `retrore batch` runs decompilation and address queries against one project in
   one read-only headless session. It shares the decompiler, preserves request order, and returns
   individual failures alongside successful results.

@@ -700,6 +700,9 @@ def test_original_link_2x_padded_member(filename, count_offset, selector_count, 
     _, first, second = program["units"]
     runtime = (0x1000 + window) * 16
     assert "diagnostics" not in program
+    assert program["compiler"] == {
+        "family": "Microsoft Pascal", "version": None, "evidence": "relocated entry jump to ENTXQQ startup",
+    }
     assert first["runtime_linear"] == second["runtime_linear"] == runtime
     assert second["segment_offsets"] == [0, 0x10]
     assert second["size"] == 0x20
