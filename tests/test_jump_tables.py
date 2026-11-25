@@ -1115,7 +1115,7 @@ def test_phantasie_iii_float_exception_record_classes(phantasie_iii_export, phan
 def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
     phantasie_iii_export, phantasie_iii_float_runtime, capsys,
 ):
-    tmp_path, _ = phantasie_iii_export
+    tmp_path, program = phantasie_iii_export
     emulator, runtime_address, data_segment, vectors, setup = phantasie_iii_float_runtime
     bottom, top, limit = unpack_from("<3H", dict(setup)[Address(data_segment, 0x0e)])
     assert top == bottom and (limit - bottom) // 12 + 1 == 15
@@ -1137,13 +1137,16 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
     prefixed_store = emulator.resolve("root:6a5b")
     wait = emulator.resolve("root:6a5f")
     edges = set()
+    observed_writes = []
 
     def entry(cpu, target):
-        ss = cpu.reg_read(x86.UC_X86_REG_SS)
-        sp = cpu.reg_read(x86.UC_X86_REG_SP)
+        ss, sp = cpu.reg_read_batch((x86.UC_X86_REG_SS, x86.UC_X86_REG_SP))
         ip, cs = unpack_from("<HH", cpu.mem_read(Address(ss, sp).linear, 4))
         caller = Address(cs, (ip - 2) & 0xffff)
-        edges.add((caller.linear, target.linear, cpu.mem_read(caller.linear, 2).hex()))
+        opcode, vector = cpu.mem_read(caller.linear, 2)
+        assert opcode == 0xcd and vector in vectors
+        assert unpack_from("<HH", cpu.mem_read(vector * 4, 4)) == (target.offset, target.segment)
+        edges.add((caller.linear, target.linear, bytes((opcode, vector)).hex()))
 
     for prefixed in (False, True):
         for alias in (False, True):
@@ -1154,6 +1157,8 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
                 record = Address(cpu.reg_read(x86.UC_X86_REG_DS), cpu.reg_read(x86.UC_X86_REG_SI))
                 destination = Address(cpu.reg_read(x86.UC_X86_REG_ES), cpu.reg_read(x86.UC_X86_REG_DI))
                 stores.append((record, destination))
+                cs, ip = cpu.reg_read_batch((x86.UC_X86_REG_CS, x86.UC_X86_REG_IP))
+                observed_writes.append((Address(cs, ip).linear, "ES", destination, None, None))
 
             hooks = dict.fromkeys((runtime_address(0x12e40), runtime_address(0x12e43)), observe_store)
             patches = [*setup, *loaded.memory]
@@ -1188,10 +1193,62 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
             if prefixed:
                 assert final.memory[-1][1] == bytes.fromhex("89c0")  # The WAIT handler patches its own call site.
 
+    # Execute the shipped double-to-integer helper through both operand entries.
+    conversion = emulator.resolve("root:69f1")
+    operand = Address(scratch.segment, 0x200)
+    args = Address(scratch.segment, regs["sp"])
+    handlers = (runtime_address(0x123db), runtime_address(0x1241c))
+    converted = emulator.call(
+        conversion, far=True, regs=regs, ivt_interrupts=vectors,
+        writes=[*setup, (args, pack("<HH", operand.offset, operand.segment)), (operand, pack("<d", 1.25))],
+        hooks={target: lambda cpu, target=target: entry(cpu, target) for target in handlers},
+    )
+    assert converted.registers["ax"] == 1
+    origin = program["units"][0]["linear"]
     assert edges == {
+        (origin + 0x69f7, runtime_address(0x123db).linear, "cd3c"),
+        (origin + 0x69fb, runtime_address(0x1241c).linear, "cd39"),
+        (origin + 0x6887, runtime_address(0x1241c).linear, "cd35"),
+        (origin + 0x688a, runtime_address(0x1241c).linear, "cd3a"),
+        (origin + 0x688d, runtime_address(0x1241c).linear, "cd39"),
         (prefixed_store.linear, runtime_address(0x123db).linear, "cd3c"),
         (wait.linear, runtime_address(0x123be).linear, "cd3d"),
     }
+
+    copy_sites = {0x1273c: "DS", 0x1376b: "CS", 0x137ac: None, 0x137ad: None}
+
+    def audit_copies(cpu):
+        def write(cpu, _access, linear, width, value, _data):
+            if (linear - records.linear) % 12 != 10:
+                return
+            cs, ip, ds, es, si, di = cpu.reg_read_batch((
+                x86.UC_X86_REG_CS, x86.UC_X86_REG_IP, x86.UC_X86_REG_DS, x86.UC_X86_REG_ES,
+                x86.UC_X86_REG_SI, x86.UC_X86_REG_DI,
+            ))
+            address = Address(cs, ip).linear
+            site = address - origin
+            if site not in copy_sites:
+                return
+            selector = "DS" if site == 0x137ad else "ES"
+            destination = Address(ds, si) if selector == "DS" else Address(es, di)
+            assert destination.segment == data_segment and destination.linear == linear and width == 2
+            source_register = copy_sites[site]
+            source = None
+            if source_register:
+                source = Address(cs if source_register == "CS" else ds, si)
+                assert cpu.mem_read(source.linear, width) == pack("<H", value)
+            observed_writes.append((address, selector, destination, source_register, source))
+
+        hook = cpu.hook_add(UC_HOOK_MEM_WRITE, write, begin=records.linear, end=records.linear + size - 1)
+        return lambda: cpu.hook_del(hook)
+
+    # Push the runtime's constant one, duplicate and exchange, then store it into ST(1).
+    emulator.call(
+        scratch, regs=regs, ivt_interrupts=vectors,
+        writes=[*setup, (scratch, bytes.fromhex("cd35e8 cd35c0 cd35c9 cd34d1 c3"))],
+        _setup=audit_copies,
+    )
+    assert {address - origin for address, *_ in observed_writes} == {0x12e40, 0x12e43, *copy_sites}
     if os.environ.get("GHIDRA_HOME"):
         export, project = tmp_path / "export", tmp_path / "float"
         assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
@@ -1203,12 +1260,63 @@ def test_phantasie_iii_float_store_outputs_and_interrupt_edges(
                           {"kind": "edge", "from": caller, "to": target, "flow": "interrupt"})
         ]
         trace.write_text(json.dumps({"version": 1, "events": events}), encoding="utf-8")
-        assert main(["trace", str(trace), "--export", str(export), "--project", str(project),
-                     "--apply", "--json"]) == 0, capsys.readouterr().err
+        command = ["trace", str(trace), "--export", str(export), "--project", str(project), "--json"]
+        assert main([*command, "--apply"]) == 0, capsys.readouterr().err
         applied = json.loads(capsys.readouterr().out)["analysis"]["applied"]
-        assert {(row["from"]["unit_address"], row["to"]["unit_address"]) for row in applied if row["kind"] == "flow"} == {
-            ("root:6a5b", "root:123db"), ("root:6a5f", "root:123be"),
-        }
+        offcut = origin + 0x688d
+        assert {
+            (row["from"]["linear"], row["to"]["linear"], row["type"]) for row in applied if row["kind"] == "flow"
+        } == {(caller, target, "COMPUTED_CALL") for caller, target, _ in edges if caller != offcut}
+        assert main(command) == 0, capsys.readouterr().err
+        replay = json.loads(capsys.readouterr().out)
+        miss, = replay["analysis"]["missed"]
+        assert (miss["linear"], miss["reason"], miss["observed_bytes"]) == (offcut, "instruction_offcut", ["cd39"])
+        gap, = replay["analysis"]["edge_gaps"]
+        assert gap["reason"] == "source_not_disassembled"
+        assert gap["event"] == next(
+            edge["event"] for edge in replay["edges"] if edge["from"]["runtime_linear"] == offcut
+        )
+        assert replay["analysis"]["additions"] == []
+
+        dgroup = program["units"][0]["segment"] + 0x28c0
+        request = {"command": "record-writes", "stride": 12, "count": 15, "limit": 1000, "compact": True}
+        batch = tmp_path / "float_writes.json"
+        batch.write_text(json.dumps([
+            {**request, "address": str(Address(data_segment, bottom + 11)),
+             "code_start": "root:1273c", "code_end": "root:137ad"},
+            {**request, "address": str(Address(dgroup, bottom + 11)),
+             "code_start": "root:137ac", "code_end": "root:137ad"},
+        ]), encoding="utf-8")
+        assert main(["batch", str(batch), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+        report, exchange_report = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+        assert report["pagination"]["writes"]["next_offset"] is None
+        assert report["undefined_bytes"] > 0 and report["unresolved_transfers"] > 0
+        rows = {row["address"]: row for row in report["writes"]}
+        # The detached-entry DGROUP assumption reaches both exchange stores. It
+        # excludes the physical record stack despite the observed DS and ES values.
+        exchange = {row["address"]: row for row in exchange_report["writes"]}
+        assert set(exchange) == {"root:137ac", "root:137ad"}
+        assert rows.keys().isdisjoint(exchange)
+        for address, selector, destination, source_register, source in observed_writes:
+            site = f"root:{address - origin:x}"
+            if site in exchange:
+                row = exchange[site]
+                assert row["context"] and row["width"] == 2 and row["status"] == "possible"
+                assert row["destination"] == {"register": selector, "segment": dgroup, "offset": None,
+                                              "linear": None}
+                assert destination.segment == data_segment != dgroup
+                continue
+            row = rows[site]
+            assert row["context"]
+            assert row["width"] == 2 and row["destination"]["register"] == selector
+            assert row["status"] == "possible" and row["hits"] == []
+            for static, actual in ((row["destination"], destination), (row["source"], source)):
+                if actual is not None:
+                    assert static["segment"] in (None, actual.segment)
+                    assert static["offset"] in (None, actual.offset)
+                    assert static["linear"] in (None, actual.linear)
+            if source is not None:
+                assert row["source"]["register"] == source_register
 
 
 def test_phantasie_iii_float_output_store_families(phantasie_iii_float_runtime):

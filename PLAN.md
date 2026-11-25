@@ -14,16 +14,16 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-24, traced software FPU output buffers and the source classes of template copies,
-register copies, and exchanges in Phantasie III DOS. The wilderness combat route traced the
-runtime-built selection pointer to its relocated handler and completed one round. The three
-detached entries had zero hits. All 12 focused checks passed with the original DOS media
-and Ghidra 12.2.
-The standalone suite passed 518 tests with 143 skipped.
+On 2026-11-25, traced seven software FPU interrupt call sites in Phantasie III DOS and
+replayed six edges in Ghidra 12.2. Compared `record-writes` with live output stores and class
+copies and found two missed exchange stores. Verified the archives' computed jumps against
+the table words they read. All 12 focused checks passed using the original DOS media and
+Ghidra. The standalone suite passed 518 tests with 143 skipped.
 
-Resume Phase 9 by replaying FPU interrupt entries and checking `record-writes` segment
-context against the observed copies and stores. Follow computed pointers through additional
-routes and trace the conversion output pointer if a caller reaches the detached callback.
+Resume Phase 9 by keeping assumed DGROUP values from excluding writes in `record-writes`.
+Recover the instruction boundary at `root:688d` so its observed interrupt edge can be
+imported. Follow segment context through the handlers and dispatches to narrow possible store
+aliases. Trace the conversion output pointer if a played route reaches the detached callback.
 
 ## Why
 
@@ -449,6 +449,16 @@ listed in the parity table and platform milestones below.
   The register copy at `root:1273c` and both writes of the exchange at `root:137ac` and
   `:137ad` propagate all four source classes. The static listing still has unknown
   destinations and undefined code in the floating-point runtime.
+- **Replayed shipped FPU interrupt edges.** The saved interrupt frames and live vector table
+  identify seven call sites. Ghidra 12.2 imports six across `root:1241c`, `root:123db`,
+  and `root:123be`. It reports the `INT 39h` at `root:688d` inside a listed instruction.
+  `record-writes` classifies the two single-precision output words, the constant and register
+  copies at `root:1376b` and `:1273c` as possible overlaps. The reported source and
+  destination registers agree with Unicorn. It omits the exchange at `root:137ac` and
+  `:137ad` from the record query because its detached-entry assumptions assign DGROUP
+  `38c0` to ES and DS. Both stores use `280a` at runtime and update record class bytes.
+  Archives playthroughs check the live CS-relative table entries for tile, event, combat,
+  and spell dispatch against the export and the observed successors.
 - **Implemented.** A conventions pass sizes stack arguments from `ret n`, caller cleanup, and frame reads.
   It treats 16-bit frame displacements as signed and skips inferred argument areas over 256 bytes.
   It makes `les`/`lds` arguments far pointers and names `int 21h` services as `DOS::` stubs, with carry

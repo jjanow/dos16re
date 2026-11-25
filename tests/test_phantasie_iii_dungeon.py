@@ -349,6 +349,14 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
     if combat:
         flows[origin + 0x721d] = "call"
     trace = _EdgeTrace(flows)
+    tables = {
+        tile_dispatch: (dungeon, 0x05f7, 7),
+        window + 0x1534: (dungeon, 0x1aea, 27),
+        origin + 0xc3ea: (units["root"], 0x15a1, 24),
+        origin + 0xd5c4: (units["root"], 0x2563, 15),
+        origin + 0x1046a: (units["root"], 0x0ae9, 8),
+    }
+    table_edges = Counter()
     checkpoints, magic_values, gold_visits = [], [], []
 
     def observe(cpu, address, size):
@@ -360,6 +368,19 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
             es, bx, si = cpu.reg_read_batch((x86.UC_X86_REG_ES, x86.UC_X86_REG_BX, x86.UC_X86_REG_SI))
             event_flag = cpu.mem_read(Address(es, (bx + si) & 0xffff).linear, 1)[0]
             gold_visits.append((event_flag, unpack_from("<I", cpu.mem_read(party_gold, 4))[0]))
+        if address in tables:
+            unit, table, slots = tables[address]
+            cs, bx = cpu.reg_read_batch((x86.UC_X86_REG_CS, x86.UC_X86_REG_BX))
+            assert bx % 2 == 0 and bx // 2 < slots
+            assert cpu.mem_read(address, size) == b"\x2e\xff\xa7" + pack("<H", table)
+            slot = Address(cs, table + bx).linear
+            unit_start = unit.get("runtime_linear", origin)
+            assert unit_start <= slot <= unit_start + unit["size"] - 2
+            source = unit["image_offset"] + slot - unit_start
+            word = cpu.mem_read(slot, 2)
+            assert word == image[source:source + 2]
+            target, = unpack_from("<H", word)
+            table_edges[address, Address(cs, target).linear] += 1
         trace.observe(cpu, address, size)
 
     _play_game(image, program, dos, dungeon, 0x062d, observe)
@@ -378,6 +399,7 @@ def test_phantasie_iii_archives_event_trace(tmp_path, capsys, route, keys, clock
         # The interpreter clears the event after the first award. Reentering finds the cleared byte.
         assert gold_visits == [(0x81, 0), (0xff, 256)]
     edges = trace.edges
+    assert table_edges == {edge: count for edge, count in edges.items() if edge[0] in tables}
     tile_targets = {target - window for source, target in edges if source == tile_dispatch}
     expected_tiles = {0x05c6, 0x05cd, 0x05d4, 0x05db, 0x05e2, 0x05e9, 0x05f0}
     if casting:

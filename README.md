@@ -1036,6 +1036,12 @@ the selected code range. Results depend on the listing and the segment analysis'
 entry assumptions. A project imported before write context was recorded still reports
 possible overlaps from the listing. Reimport to use tracked register values.
 
+The Phantasie III check compares this report with Unicorn observations of the single-precision
+output words and class words. The query flags the output stores, constant copy, and register
+copy as possible overlaps. Changing the caller's segment and offset can make an output store
+overwrite an internal class byte. The query misses the two writes from the register exchange
+because detached-function analysis assigns DGROUP to the destination registers.
+
 With `RETRORE_PH3_DIR` set, the Phantasie III validation runs the shipped software floating-point
 handlers and checks writes from parser, formatter, conversion, and LINK overlay code against the
 record stack. It checks the class bytes used by six arithmetic operations across all 16 input class
@@ -1669,6 +1675,9 @@ check the physical write addresses and output bytes of the real, integer, contro
 status-word stores against the caller's buffer and the internal register allocation.
 The Ghidra test audits computed targets across the root and four LINK members, then replays
 observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
+The interrupt test reads the saved return address and installed vector for seven shipped
+call sites. Ghidra imports six edges across the common operand, segment override, and WAIT
+handlers. It reports the `INT 39h` at `root:688d` as an instruction offcut.
 The audit checks the error and stack-check hook defaults, the argument builder's saved return,
 and the registered floating-point exception handler. It checks for far-pointer aliases to the
 three detached entries in the loaded bytes of all five units.
@@ -1676,7 +1685,9 @@ The archives playthroughs also use the original DOS data files in `RETRORE_PH3_D
 scroll event, a combat round with Fireflash I, and a gold event that runs once when the party visits
 the same square twice. The tests check magic and gold totals, monitor the installed callback table
 for reads, and use an ordered load manifest to map member 4's jumps back to `MAIN.EXE`. With Ghidra
-enabled, the combat traces resolve the menu call at `root:721d`.
+enabled, the combat traces resolve the menu call at `root:721d`. The playthroughs read the
+live CS-relative table words for tile, event, combat, and spell dispatch and verify them against
+the exported bytes and the executed targets.
 The wilderness playthroughs trace the Jolly Inn's refusal when the party has insufficient funds
 and both responses to the sleeping-monsters prompt. The combat route follows the runtime-built
 menu selection through the descriptor to the far call at `root:721d`. The tests verify travel
