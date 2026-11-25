@@ -87,7 +87,9 @@ check can show that it is resolved. Platform-wide feature parity is deferred.
 
 ## Last session
 
-2026-11-25. Completed X1turbo bank views and device labels, and PC-98 FAT12 cataloging and member
-loading with original disk offsets. Verified the CLI and MCP paths, the default suite (529 passed,
-158 skipped), and five headless Ghidra checks for X1, PC-98, and MSX2. Resume with the next
-reproducible blocker in a named reversing question.
+2026-11-25. Published [retrore 1.1.0](https://github.com/jjanow/retrore/releases/tag/v1.1.0) and
+installed the same wheel locally. [Release CI](https://github.com/jjanow/retrore/actions/runs/45683733253)
+passed on Linux and Windows with Ghidra 12.2. The local suite passed (529 passed, 158 skipped), and
+the installed CLI, Codex MCP, and Claude Code MCP returned the expected callee in a synthetic Ghidra
+project. The Claude Code check used a scripted model response. No roadmap items are open. Resume
+when a named reversing question has a reproducible blocker.
