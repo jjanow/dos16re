@@ -1,11 +1,13 @@
 # retrore
 
-Standalone reverse-engineering tools for 16-bit real-mode DOS programs, AmigaDOS Hunk executables,
-Atari ST GEMDOS executables, Commodore 64 PRGs, Apple II binaries, Atari 8-bit executables, MSX2 programs,
-NEC PC-88 and PC-98 programs, Sharp X1 programs, Sharp X68000 Human68k executables, Classic
-Macintosh 68k applications, NES / Famicom cartridges, and Sega Genesis / Mega Drive cartridges.
-The games in [PLAN.md](PLAN.md) are optional validation targets for executable formats and compiler
-patterns.
+retrore helps LLMs reverse 16-bit real-mode DOS executables and overlays. It reconstructs the
+runtime layout for Ghidra and returns focused JSON with instruction addresses, original file
+coordinates where available, and evidence for recovered transfers.
+
+The toolkit also supports AmigaDOS Hunk, Atari ST GEMDOS, Commodore 64, Apple II, Atari 8-bit,
+MSX2, NEC PC-88 and PC-98, Sharp X1 and X68000, Classic Macintosh 68k, NES / Famicom, and
+Sega Genesis / Mega Drive inputs. See the [roadmap](PLAN.md) for the project finish line and
+the [validation reference](docs/validation.md) for representative releases.
 
 ## Installation
 
@@ -282,7 +284,7 @@ to resident dispatch stubs. Verified stubs become far jumps to selected members 
 image. Ghidra backs any allocation beyond the file bytes with uninitialized memory. MOVE chooses
 physical placements at runtime. Supply segments from a capture with `--runtime-base` and
 `--overlay-segment UNIT=HEX`, or describe observed states in a load manifest.
-See the [Phase 12 validation notes](PLAN.md#phase-12-loader-depth-on-supported-platforms).
+See the [loader and overlay validation](docs/validation.md#loader-and-overlay-validation).
 
 `load` creates `image.bin` and `map.json` in an output directory where both filenames are available.
 Byte zero is at the root unit's linear address. The map gives the
@@ -312,8 +314,7 @@ Borland C++ 2.0, and Microsoft C 5.1 and 6.0a. Microsoft C signatures include ne
 evidence for the 3.20 runtime. An `ENTXQQ` match alone leaves `compiler.version` null. For 3.30,
 the detector requires the fixed-stack `__astart` and its Pascal initialization sequence. The 3.20
 catalog identifies file initialization (`INIFQQ`), heap allocation (`GETHQQ`), and newline output
-(`WTLFQQ`). See the validation notes in
-[PLAN.md](PLAN.md#phase-5-runtime-signatures).
+(`WTLFQQ`). See the [runtime signature validation](docs/validation.md#runtime-signature-validation).
 
 For the recognized Microsoft Pascal 3.20 DGROUP copy, `info --json` and `map.json` report
 `microsoft_pascal_dgroup`. The copy moves the range from `copy_start_segment:0000` through
@@ -1729,33 +1730,10 @@ U.S./Europe `Buck Rogers: Countdown to Doomsday` Genesis cartridge image. The Gh
 `GHIDRA_HOME` and include synthetic programs for all
 supported platforms. Tests skip when their input variables are unset.
 
-The Phantasie III DOS tests exercise floating-point arithmetic and trace class bytes from their
-source templates and register records through stack copies and exchanges in Unicorn. The output probes
-check the physical write addresses and output bytes of the real, integer, control-word, and
-status-word stores against the caller's buffer and the internal register allocation.
-The Ghidra test audits computed targets across the root and four LINK members, then replays
-observed startup calls, Pendragon menu calls, and `FTST`, `FCOM`, and `FCOMP` successors.
-The interrupt test reads the saved return address and installed vector for seven shipped
-call sites. Ghidra imports all seven edges across the common operand, segment override, and WAIT
-handlers. The observed continuations recover `INT 39h` at `root:688d` and skip its inline operands.
-The audit checks the error and stack-check hook defaults, the argument builder's saved return,
-and the registered floating-point exception handler. It checks for far-pointer aliases to the
-three detached entries in the loaded bytes of all five units. The heap test follows the return from
-DOS allocation through the Microsoft C heap and a LINK member's tile reader at two heap bases.
-The archives playthroughs also use the original DOS data files in `RETRORE_PH3_DIR`. They trace a
-scroll event, a combat round with Fireflash I, and a gold event that runs once when the party visits
-the same square twice. The tests check magic and gold totals, monitor the installed callback table
-for reads, and use an ordered load manifest to map member 4's jumps back to `MAIN.EXE`. With Ghidra
-enabled, the combat traces resolve the menu call at `root:721d`. The playthroughs read the
-live CS-relative table words for tile, event, combat, and spell dispatch and verify them against
-the exported bytes and the executed targets.
-The wilderness playthroughs trace the Jolly Inn's refusal when the party has insufficient funds
-and both responses to the sleeping-monsters prompt. The combat route follows the runtime-built
-menu selection through the descriptor to the far call at `root:721d`. The tests verify travel
-time and encounter state, map member 3's instructions back to `MAIN.EXE`, and check the same
-callback and floating-point sites.
+The [validation reference](docs/validation.md#dos-reversing-checks) summarizes the DOS checks,
+including the Phantasie III floating-point probes and overlay trace playthroughs.
 
-Phase 12 has optional checks against original tool outputs and releases.
+The following optional checks use original tool outputs and releases.
 
 | Environment variable | Inputs |
 |---|---|
@@ -2115,8 +2093,6 @@ trace MOVE.TRC > TIGHT.TXT
 `TIGHT.OUT` ends with `10 5 9 10`. The trace shows member 3 replacing member 2 and member 1
 reloading at a different segment. Changing `MOVE_HEAP` to `0060` gives all three members room
 to stay loaded after the first call to each.
-
-The roadmap tracks upcoming work. [PLAN.md](PLAN.md)
 
 ## License
 

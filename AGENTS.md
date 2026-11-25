@@ -1,7 +1,8 @@
 # retrore
 
-Toolkit for reverse engineering retro executables: 16-bit real-mode DOS programs and their overlays,
-AmigaDOS Hunk executables, and other platforms as they are added. See `PLAN.md` for the roadmap.
+Toolkit that helps LLMs reverse 16-bit real-mode DOS executables and overlays using Ghidra and
+compact, byte-linked evidence. See `PLAN.md` for current deliverables and `README.md` for all
+supported platforms.
 
 - Python 3.12+, dependencies in a `.venv/` (`capstone`, `unicorn`, `pytest`). Ghidra 12.x via `GHIDRA_HOME`.
 - Keep execution and the default test suite self-contained. Keep game-specific assumptions in opt-in
@@ -9,7 +10,7 @@ AmigaDOS Hunk executables, and other platforms as they are added. See `PLAN.md` 
 - Never commit game files or anything extracted from them. Real-game tests read paths from `RETRORE_*_DIR`
   environment variables and skip when unset.
 - Every CLI command supports `--json`; keep default output short.
-- Keep `README.md` and `PLAN.md` current as phases land.
+- Keep `README.md` and `PLAN.md` current as deliverables land.
 - Build for releases or when an actual testing blocker requires a build. Reuse the tested wheel
   for publication and deployment.
 - The deployed copy (`~/.local/share/retrore`, the `retrore` command on `PATH`, and the user-scope
