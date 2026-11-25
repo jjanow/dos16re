@@ -6,7 +6,7 @@ from struct import Struct, pack, unpack_from
 
 from .jump_tables import FarTableImage, recover_jump_tables
 from .mz import Address, LoadedMZ, MZError
-from .signatures import detect_compiler, match_runtime
+from .signatures import detect_compiler, match_runtime, microsoft_pascal_dgroup
 
 _DESCRIPTOR = Struct("<4xI3H")
 _TRAP = b"\xcd\x3f"
@@ -303,6 +303,8 @@ def _add_analysis(root: LoadedMZ, image: bytes, program_map: dict) -> None:
     program_map["compiler"] = {
         "family": compiler.family, "version": compiler.version, "evidence": compiler.evidence,
     }
+    if dgroup := microsoft_pascal_dgroup(root, compiler):
+        program_map["microsoft_pascal_dgroup"] = dgroup
     for unit in units:
         start = unit["image_offset"]
         data = image[start:start + unit["size"]]

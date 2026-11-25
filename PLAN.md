@@ -14,15 +14,15 @@ references, and returning compact evidence that an agent can verify against the 
 
 ## Last session
 
-On 2026-11-25, added Microsoft Pascal startup detection and three runtime signatures from 3.20.
-DOSBox ran both LINK builds of the probe. The opt-in checks compare signatures with original LINK
-maps and check the named calls in Ghidra 12.2. The existing LINK overlay probes verify startup
-detection through the relocated preloader jump. Default suite passed 520 tests. The focused
-runtime and LINK checks passed 10 tests.
+On 2026-11-25, added Microsoft Pascal 3.20 DGROUP placement evidence and recovered the
+frame helper's inline size word in Ghidra. Unicorn verified a relocated literal and the stack
+switch at two allocation limits per LINK build. The LINK overlay probes verified the copy bounds
+through a preloader, and Ghidra 12.2 recovered 39 frame calls in each overlay probe. The default
+suite passed 520 tests. The runtime, segment, and DOS suites passed 54 tests with Ghidra enabled.
 
-Resume with original X1turbo media or another DOS compiler runtime. For deeper Microsoft Pascal
-analysis, start with `ENTXQQ`'s runtime DGROUP placement and the frame helper's inline size word.
-The [platform parity table](#platform-capability-parity) and milestones track the other extensions.
+Resume with Microsoft Pascal's BP and SP effects in the decompiler or with original X1turbo
+media when available. The [platform parity table](#platform-capability-parity) tracks other
+extensions.
 
 ## Why
 
@@ -139,7 +139,12 @@ object against its 6.0a DOS runtime library.
 addresses. Both builds print `VALUE 42` in DOSBox, and Ghidra 12.2 decompiles the main routine
 with calls to file initialization, heap allocation, and newline output under their original names.
 The relocation-backed `ENTXQQ` entry identifies the runtime family. The overlay probes reach it
-through a relocated far jump. Version detection remains open.
+through a relocated far jump. The loader reports the fixed DGROUP copy bounds, selector bias,
+maximal shift, and new stack offset. Unicorn verified the resulting DS and SS and the relocated
+string literal under two DOS allocation limits per build. Ghidra preserves frame-helper calls and
+marks their inline local size words as data, with fall-through at the following instruction.
+Version detection, mapping captured runtime DGROUP into Ghidra, and modeling the helper's BP and SP
+effects in the decompiler remain open.
 [Probe build steps](README.md#microsoft-pascal-runtime-probe)
 
 ### Phase 6: emulator harness

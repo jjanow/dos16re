@@ -20,6 +20,7 @@ class Compiler:
     family: str
     version: str | None
     evidence: str
+    startup_offset: int | None = None
 
 
 _PASCAL_ENTRY = "ba ?? ?? 8e da 8c 06 ?? ?? 33 ed "
@@ -33,6 +34,14 @@ _MICROSOFT_PASCAL_START = _pattern(
     "ba ?? ?? b4 25 b0 00 8c c9 8e d9 cd 21 ba ?? ?? d1 ea b9 00 80 2b ca d1 ea d1 ea d1 ea 42 "
     "26 a1 02 00 8b e8 2d ?? ?? 72 ?? 33 db 2b c2 73 02 2b d8 2b d3 "
     "b8 ?? ?? 8e d8 8c 06 ?? ?? be ?? ?? 2b f0 d1 e6 d1 e6 d1 e6 d1 e6"
+)
+# The 3.20 startup copies the fixed portion of DGROUP backwards from the end of
+# the image, then sets DS and SS to the shifted, biased selector.
+_MICROSOFT_PASCAL_DGROUP = _pattern(
+    "81 fe ?? ?? 73 08 01 54 02 83 c6 04 eb f2 "
+    "b8 ?? ?? 8b c8 81 e9 00 10 8e d9 03 ca 8e c1 2d ?? ?? be fe ff 8b fe fd "
+    "2d 00 10 76 13 b9 00 80 f3 a5 8c c1 81 e9 00 10 8e c1 2b ca 8e d9 eb e8 "
+    "05 00 10 8b c8 d1 e1 d1 e1 d1 e1 f3 a5 fc 81 c2 ?? ?? 8e da fa 8e d2 bc ?? ?? fb"
 )
 _BORLAND_C_START = _pattern("ba ?? ?? 2e 89 16 ?? ?? b4 30 cd 21 8b 2e 02 00 8b 1e 2c 00 8e da")
 _BORLAND_C_MARKERS = (
@@ -62,7 +71,7 @@ def _microsoft_startup(image: bytes, entry: int, origin: int, relocations: set[i
         # ENTXQQ uses an absolute DGROUP selector, a biased selector, and the COMADS selector.
         if ({start + 0x25, start + 0x34, start + 0x3D} <= relocations
                 and _MICROSOFT_PASCAL_START.match(image, start)):
-            return Compiler("microsoft_pascal", "Microsoft Pascal", None, prefix + "ENTXQQ startup")
+            return Compiler("microsoft_pascal", "Microsoft Pascal", None, prefix + "ENTXQQ startup", start)
         for version, relocation, pattern in _MICROSOFT_C_STARTUPS:
             match = pattern.match(image, start)
             if match is None or start + relocation not in relocations:
@@ -104,6 +113,37 @@ def detect_compiler(root: LoadedMZ, *, pascal_overlays: bool) -> Compiler | None
     if pascal_overlays:
         return Compiler("pascal", "Turbo Pascal", None, "Turbo Pascal overlay directory")
     return None
+
+
+def microsoft_pascal_dgroup(root: LoadedMZ, compiler: Compiler) -> dict[str, int] | None:
+    start = compiler.startup_offset
+    if compiler.group != "microsoft_pascal" or start is None:
+        return None
+    image = root.image
+    if not _MICROSOFT_PASCAL_DGROUP.match(image, start + 0x49):
+        return None
+    relocations = {address.linear for address in root.relocations}
+    if not {start + 0x58, start + 0x67, start + 0x97} <= relocations or start + 0x0E in relocations:
+        return None
+    shift_word, = unpack_from("<H", image, start + 0x0E)
+    end, = unpack_from("<H", image, start + 0x25)
+    biased, = unpack_from("<H", image, start + 0x34)
+    copy_end, = unpack_from("<H", image, start + 0x58)
+    copy_start, = unpack_from("<H", image, start + 0x67)
+    final_bias, = unpack_from("<H", image, start + 0x97)
+    stack_offset, = unpack_from("<H", image, start + 0x9F)
+    if (end != copy_end or biased != final_bias or ((end - biased) & 0xFFFF) != 0x1000
+            or not root.base_segment <= copy_start < end or copy_start != root.stack.segment
+            or copy_start * 16 >= root.base_segment * 16 + len(image) or end * 16 > root.memory_end):
+        return None
+    return {
+        "startup_linear": root.base_segment * 16 + start,
+        "copy_start_segment": copy_start,
+        "copy_end_segment": end,
+        "biased_segment": biased,
+        "max_shift_paragraphs": (shift_word >> 4) + 1,
+        "stack_offset": stack_offset,
+    }
 
 
 @dataclass(frozen=True)

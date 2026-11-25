@@ -5,6 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.SegmentedAddress;
@@ -24,6 +25,7 @@ import ghidra.program.model.data.UnsignedShortDataType;
 import ghidra.program.model.data.VoidDataType;
 import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Parameter;
@@ -43,11 +45,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.regex.Pattern;
 
 public class RetroreSegments extends HeadlessScript {
     private static final int WORD_MASK = 0xffff;
@@ -58,6 +62,11 @@ public class RetroreSegments extends HeadlessScript {
     private static final int SUMMARY_PASSES = 6;
     private static final int SUMMARY_STEPS = 50000;
     private static final int CONTEXT_ROUNDS = 4;
+    private static final int PASCAL_FRAME_ROUNDS = 8;
+    private static final int PASCAL_FRAME_HELPER_SIZE = 31;
+    // Read the size at CS:[return IP], save BP, check the stack, and jump past the size word.
+    private static final Pattern PASCAL_FRAME_HELPER = Pattern.compile(
+        "5e2e8b0c4646558bec2be972063b2e[0-9a-f]{4}7706569a[0-9a-f]{8}8be503e9ffe6");
     // Per instruction: "REG=origin;..." with the linear address where each unknown segment value was lost.
     private static final String LOSS_MAP = "RetroreSegmentLosses";
     // Per origin: one "REG\treason\tdetail" line for each segment register lost there.
@@ -232,6 +241,10 @@ public class RetroreSegments extends HeadlessScript {
         Path result = Path.of(args[1]);
         try {
             JsonObject map = JsonParser.parseString(Files.readString(Path.of(args[0]))).getAsJsonObject();
+            var compiler = map.get("compiler");
+            boolean microsoftPascal = compiler != null && compiler.isJsonObject() &&
+                compiler.getAsJsonObject().get("family").getAsString().equals("Microsoft Pascal");
+            int frameCalls = microsoftPascal ? recoverPascalFrames() : 0;
             int farProcedures = recoverFarProcedures();
             int runtimeSignatures = applyRuntimeSignatures(map.getAsJsonArray("runtime_signatures"));
             applySegments(map, false);
@@ -241,6 +254,9 @@ public class RetroreSegments extends HeadlessScript {
             ));
             if (!segmentStats.isEmpty()) {
                 report.put("segment_analysis", segmentStats);
+            }
+            if (microsoftPascal) {
+                report.put("microsoft_pascal_frame_calls", frameCalls);
             }
             if (map.has("format") && map.get("format").getAsString().equals("PC98")) {
                 report.put("format", "PC98");
@@ -252,6 +268,85 @@ public class RetroreSegments extends HeadlessScript {
             Files.writeString(result, new Gson().toJson(Map.of("error", error.toString())));
             throw error;
         }
+    }
+
+    private int recoverPascalFrames() throws Exception {
+        var listing = currentProgram.getListing();
+        var memory = currentProgram.getMemory();
+        var helperMatches = new HashMap<Address, Boolean>();
+        int recovered = 0;
+        for (int round = 0; round < PASCAL_FRAME_ROUNDS; round++) {
+            var sites = new ArrayList<Address>();
+            for (var instruction : listing.getInstructions(true)) {
+                monitor.checkCancelled();
+                if (instruction.getLength() != 3 || !instruction.getFlowType().isCall() ||
+                        instruction.isFallThroughOverridden() || memory.getByte(instruction.getAddress()) != (byte) 0xe8) {
+                    continue;
+                }
+                Address[] targets = instruction.getFlows();
+                if (targets.length != 1) {
+                    continue;
+                }
+                Address target = targets[0];
+                var block = memory.getBlock(target);
+                if (block == null || !block.isInitialized() || !block.isExecute() ||
+                        block.getEnd().subtract(target) < PASCAL_FRAME_HELPER_SIZE - 1) {
+                    continue;
+                }
+                if (!helperMatches.containsKey(target)) {
+                    byte[] bytes = new byte[PASCAL_FRAME_HELPER_SIZE];
+                    memory.getBytes(target, bytes);
+                    helperMatches.put(target, PASCAL_FRAME_HELPER.matcher(HexFormat.of().formatHex(bytes)).matches());
+                }
+                if (helperMatches.get(target)) {
+                    sites.add(instruction.getAddress());
+                }
+            }
+            int previous = recovered;
+            for (Address site : sites) {
+                var call = getInstructionAt(site);
+                if (call == null) {
+                    continue;
+                }
+                Address word = call.getMaxAddress().next();
+                var block = memory.getBlock(site);
+                if (word == null || block.getEnd().subtract(word) < 2 ||
+                        hasOtherFrameWordEntry(site, word) || hasOtherFrameWordEntry(site, word.next())) {
+                    continue;
+                }
+                Address resume = word.addNoWrap(2);
+                var function = getFunctionContaining(site);
+                call.setFallThrough(resume);
+                listing.clearCodeUnits(word, word.next(), false);
+                listing.createData(word, WordDataType.dataType);
+                listing.setComment(word, CommentType.EOL,
+                    "Microsoft Pascal local frame size: " + (memory.getShort(word) & WORD_MASK) + " bytes");
+                disassemble(resume);
+                if (function != null) {
+                    CreateFunctionCmd.fixupFunctionBody(currentProgram, function, monitor);
+                }
+                recovered++;
+            }
+            if (recovered == previous) {
+                break;
+            }
+            analyzeChanges(currentProgram);
+        }
+        return recovered;
+    }
+
+    private boolean hasOtherFrameWordEntry(Address call, Address wordByte) {
+        if (currentProgram.getSymbolTable().isExternalEntryPoint(wordByte)) {
+            return true;
+        }
+        for (var reference : currentProgram.getReferenceManager().getReferencesTo(wordByte)) {
+            if (reference.getReferenceType().isFlow() &&
+                    !reference.getFromAddress().equals(call) &&
+                    !reference.getFromAddress().equals(call.add(3))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private int recoverFarProcedures() throws Exception {

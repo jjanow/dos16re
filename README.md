@@ -313,6 +313,18 @@ initialization (`INIFQQ`), heap allocation (`GETHQQ`), and newline output (`WTLF
 identify the Microsoft Pascal family and leave `compiler.version` null. See the validation notes in
 [PLAN.md](PLAN.md#phase-5-runtime-signatures).
 
+For the recognized Microsoft Pascal 3.20 DGROUP copy, `info --json` and `map.json` report
+`microsoft_pascal_dgroup`. The copy moves the range from `copy_start_segment:0000` through
+`copy_end_segment:0000` (exclusive). For a run that reaches the copy, subtract `copy_end_segment`
+from the DOS allocation limit in PSP word `0002h` and cap the result at `max_shift_paragraphs`.
+Add that shift to both copy endpoints for the runtime range. At startup's stack switch, DS and SS
+receive `(biased_segment + shift) & 0xffff` and SP receives `stack_offset`. The export retains the
+pre-copy layout. [Microsoft Pascal manual, section 8.3.2](https://bitsavers.org/pdf/victor/victor9000/MS-PASCAL_Volume_I.pdf)
+
+For recognized frame-helper calls, Ghidra marks the inline local size as a two-byte data word and
+resumes disassembly after it. The listing retains the original call and bytes. The helper's BP and
+SP changes still need decompiler modeling.
+
 ### Linker maps and signature catalogs
 
 Pass `--linker-map PROGRAM.MAP` to `load` or `info` to import resident public symbols and source-line
@@ -1739,7 +1751,7 @@ Phase 12 has optional checks against original tool outputs and releases.
 | `RETRORE_DOS_OVERLAY_PROBE_DIR` | LINK 3.65 `PADDED.EXE` with a page-aligned overlay segment and TLINK 3.01 `VROOMM.EXE` and `VROOM86.EXE` function-pointer probes built with Turbo C++ 1.01 |
 | `RETRORE_DOS_NATIVE_OVERLAY_DIR` | LINK 3.65 and 5.01.21 `TAIL365.EXE`, `TAIL501.EXE`, `BSS365.EXE`, and `BSS501.EXE` plus TLINK 3.01 and 4.0 `INSEG.EXE` and `INSEG4.EXE`. See the [build steps](#trailing-link-segments-and-flagged-tlink-pointers). |
 | `RETRORE_BORLAND_COMPILERS_DIR` | Original `TCC.EXE` from [Turbo C++ 1.01](https://altd.embarcadero.com/download/museum/tcpp101.zip) and `BCC.EXE` from [Borland C++ 2.0](https://winworldpc.com/product/borland-c/20) |
-| `RETRORE_MS_PASCAL_DIR` | `PROBE.EXE`, `PROBE.MAP`, `ALT.EXE`, and `ALT.MAP` from the [Microsoft Pascal runtime probe](#microsoft-pascal-runtime-probe). Checks startup detection and helper addresses, and with Ghidra, the named calls. |
+| `RETRORE_MS_PASCAL_DIR` | `PROBE.EXE`, `PROBE.MAP`, `ALT.EXE`, and `ALT.MAP` from the [Microsoft Pascal runtime probe](#microsoft-pascal-runtime-probe). Checks startup detection, DGROUP placement, helper addresses, and Ghidra call flow when available. |
 | `RETRORE_PKLITE_TESTEXE_DIR` | The `compress` directory with `t10fr` and `h10fr` EXE and UNC pairs from [testexe](https://github.com/camoto-project/testexe) |
 | `RETRORE_PKLITE_SFX_DIR` | The [PKZIP 2.04g installer](https://www.hpcalc.org/details/3882) as `pk204g.exe` and its [Deark](https://github.com/jsummers/deark) reference produced by `deark -m pklite -o pk204g-unpacked pk204g.exe` |
 | `RETRORE_AMIGA_OVERLAY_DIR` | An original hierarchical executable named `overlay` |

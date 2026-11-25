@@ -683,11 +683,11 @@ def test_shipped_sparse_move_members_when_available(tmp_path, capsys):
     assert bytes.fromhex(proof["original"]) == source.read_bytes()[0x1D3E00:0x1D3E20]
 
 
-@pytest.mark.parametrize(("filename", "count_offset", "selector_count", "window"), [
-    ("PAD240.EXE", 0x4320, 32, 0x337),
-    ("PAD245.EXE", 0x42F0, 4, 0x335),
+@pytest.mark.parametrize(("filename", "count_offset", "selector_count", "window", "dgroup_end"), [
+    ("PAD240.EXE", 0x4320, 32, 0x337, 0x144D),
+    ("PAD245.EXE", 0x42F0, 4, 0x335, 0x1445),
 ])
-def test_original_link_2x_padded_member(filename, count_offset, selector_count, window, tmp_path, capsys):
+def test_original_link_2x_padded_member(filename, count_offset, selector_count, window, dgroup_end, tmp_path, capsys):
     if not (directory := os.environ.get("RETRORE_DOS_LINK_2X_DIR")):
         pytest.skip("set RETRORE_DOS_LINK_2X_DIR to the Microsoft Pascal LINK 2.x probes")
     source = Path(directory) / filename
@@ -703,6 +703,10 @@ def test_original_link_2x_padded_member(filename, count_offset, selector_count, 
     assert program["compiler"] == {
         "family": "Microsoft Pascal", "version": None, "evidence": "relocated entry jump to ENTXQQ startup",
     }
+    dgroup = program["microsoft_pascal_dgroup"]
+    assert dgroup["startup_linear"] == 0x115B9
+    assert dgroup["copy_start_segment"] == 0x1000 + window + 2
+    assert dgroup["copy_end_segment"] == dgroup_end
     assert first["runtime_linear"] == second["runtime_linear"] == runtime
     assert second["segment_offsets"] == [0, 0x10]
     assert second["size"] == 0x20

@@ -1,9 +1,13 @@
 import json
 import os
 from pathlib import Path
-from struct import pack_into
+from struct import pack, pack_into
 
 import pytest
+from unicorn import UC_ARCH_X86, UC_HOOK_INTR, UC_MODE_16, Uc
+from unicorn.x86_const import (
+    UC_X86_REG_AH, UC_X86_REG_CS, UC_X86_REG_DS, UC_X86_REG_ES, UC_X86_REG_IP, UC_X86_REG_SP, UC_X86_REG_SS,
+)
 
 from retrore.cli import main
 from retrore.mz import Address, LoadedMZ, MZExecutable
@@ -87,10 +91,48 @@ def test_microsoft_pascal_startup_requires_relocations(preloader):
         "family": "Microsoft Pascal", "version": None,
         "evidence": "relocated entry jump to ENTXQQ startup" if preloader else "ENTXQQ startup",
     }
+    assert "microsoft_pascal_dgroup" not in report
 
     for missing in root.relocations:
         incomplete = LoadedMZ(base, image, entry, stack, tuple(r for r in root.relocations if r != missing))
         assert build_image(incomplete, "test.exe", [])[1]["compiler"] is None
+
+
+def _verify_microsoft_pascal_startup(source, program, main_linear):
+    origin = program["units"][0]["linear"]
+    root = MZExecutable.parse(source.read_bytes()).load(origin // 16)
+    dgroup = program["microsoft_pascal_dgroup"]
+    assert dgroup["startup_linear"] == root.entry.linear
+    assert dgroup["copy_end_segment"] - dgroup["biased_segment"] == 0x1000
+    assert dgroup["copy_start_segment"] == root.stack.segment
+    assert dgroup["stack_offset"] == 0xF610
+    literal = root.image.index(b"VALUE ", dgroup["copy_start_segment"] * 16 - origin)
+
+    def interrupt(uc, number, _):
+        # The probe installs an interrupt vector before copying DGROUP.
+        assert (number, uc.reg_read(UC_X86_REG_AH)) == (0x21, 0x25)
+
+    psp = root.base_segment - 0x10
+    maximum = dgroup["max_shift_paragraphs"]
+    for available in (0x80, maximum + 0x80):
+        uc = Uc(UC_ARCH_X86, UC_MODE_16)
+        uc.mem_map(0, 0x100000)
+        uc.mem_write(origin, root.image)
+        uc.mem_write(psp * 16 + 2, pack("<H", dgroup["copy_end_segment"] + available))
+        for register, value in (
+            (UC_X86_REG_CS, root.entry.segment), (UC_X86_REG_IP, root.entry.offset),
+            (UC_X86_REG_DS, psp), (UC_X86_REG_ES, psp),
+            (UC_X86_REG_SS, root.stack.segment), (UC_X86_REG_SP, root.stack.offset),
+        ):
+            uc.reg_write(register, value)
+        uc.hook_add(UC_HOOK_INTR, interrupt)
+        uc.emu_start(root.entry.linear, main_linear, count=100_000)
+        assert uc.reg_read(UC_X86_REG_CS) * 16 + uc.reg_read(UC_X86_REG_IP) == main_linear
+        shift = min(available, maximum)
+        selector = (dgroup["biased_segment"] + shift) & 0xFFFF
+        assert uc.reg_read(UC_X86_REG_DS) == uc.reg_read(UC_X86_REG_SS) == selector
+        assert uc.reg_read(UC_X86_REG_SP) == dgroup["stack_offset"] - 4  # The far call to the main routine.
+        assert uc.mem_read(origin + literal + shift * 16, 6) == b"VALUE "
 
 
 @pytest.mark.parametrize("name", ["PROBE", "ALT"])
@@ -99,7 +141,8 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
         pytest.skip("set RETRORE_MS_PASCAL_DIR to the Microsoft Pascal 3.20 runtime probes")
     directory = Path(directory)
     export, project = tmp_path / "export", tmp_path / "project"
-    assert main(["load", str(directory / f"{name}.EXE"), "-o", str(export), "--json"]) == 0
+    source = directory / f"{name}.EXE"
+    assert main(["load", str(source), "-o", str(export), "--json"]) == 0
     program = json.loads(capsys.readouterr().out)
     assert program["compiler"] == {
         "family": "Microsoft Pascal", "version": None, "evidence": "ENTXQQ startup",
@@ -113,15 +156,37 @@ def test_original_microsoft_pascal_runtime(name, tmp_path, capsys):
         assert signature["address"]["linear"] == publics[symbol]
     assert signatures["GETHQQ"]["result"] == "void*"
     assert [signatures[symbol]["stack_purge"] for symbol in ("INIFQQ", "GETHQQ", "WTLFQQ")] == [0, 2, 2]
+    _verify_microsoft_pascal_startup(source, program, publics["ENTGQQ"])
 
     if not os.environ.get("GHIDRA_HOME"):
         return
     assert main(["ghidra", "import", str(export), str(project), "--json"]) == 0, capsys.readouterr().err
-    assert json.loads(capsys.readouterr().out)["runtime_signatures"] == 3
-    address = f"root:{publics['ENTGQQ'] - program['units'][0]['linear']:04x}"
-    assert main(["decomp", address, "--project", str(project), "--json"]) == 0, capsys.readouterr().err
-    decompilation = json.loads(capsys.readouterr().out)["decompilation"]
+    report = json.loads(capsys.readouterr().out)
+    assert report["runtime_signatures"] == 3
+    assert report["microsoft_pascal_frame_calls"] >= 3
+    origin = program["units"][0]["linear"]
+    requests = tmp_path / "queries.json"
+    requests.write_text(json.dumps([
+        {"command": "decomp", "address": f"root:{publics['ENTGQQ'] - origin:04x}"},
+        *({"command": "disasm", "address": f"root:{publics[symbol] - origin:04x}", "limit": 8}
+          for symbol in ("INIFQQ", "GETHQQ", "WTLFQQ")),
+    ]), encoding="utf-8")
+    assert main(["batch", str(requests), "--project", str(project), "--json"]) == 0, capsys.readouterr().err
+    entry, *frames = (row["result"] for row in json.loads(capsys.readouterr().out)["results"])
+    decompilation = entry["decompilation"]
     assert all(call in decompilation for call in ("INIFQQ();", "GETHQQ(2);", "WTLFQQ("))
+    image = (export / "image.bin").read_bytes()
+    for frame, size in zip(frames, ("0000", "0200", "0000"), strict=True):
+        call, word, continuation = frame["rows"]
+        assert [row["kind"] for row in (call, word, continuation)] == ["instruction", "data", "instruction"]
+        assert word["bytes"] == size
+        assert call["bytes"] + word["bytes"] + continuation["bytes"] == image[
+            call["unit_offset"]:call["unit_offset"] + 8
+        ].hex()
+        refs = {ref["type"]: ref["target"]["linear"] for ref in call["references"]}
+        assert refs["FALL_THROUGH"] == continuation["address"]["linear"] == call["address"]["linear"] + 5
+        helper = refs["UNCONDITIONAL_CALL"] - origin
+        assert image[helper:helper + 4] == bytes.fromhex("5e 2e 8b 0c")
 
 
 CONVENTIONS = bytes.fromhex(
